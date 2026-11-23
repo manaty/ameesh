@@ -27,7 +27,7 @@ PHRASE = "no train declared for nexlink: manual composition by the pilot (§12)"
 
 
 class TrainDeclaredTest(unittest.TestCase):
-    """La lecture de la configuration de l'hôte."""
+    """La lecture de la configuration de l'hôte et de l'état central."""
 
     def cfg(self, **blocks):
         return mock.Mock(spec=["train", "radar"], train=blocks.get("train", {}),
@@ -52,6 +52,16 @@ class TrainDeclaredTest(unittest.TestCase):
             self.cfg(radar=["nexlink"]), "nexlink"))
         self.assertTrue(exploitation._train_declared(
             self.cfg(train={"projects": ["nexlink"]}), "nexlink"))
+
+    def test_un_train_vivant_vu_a_l_etat_central_le_declare(self):
+        # B1 de ameesh-dev3 : le train d'un autre hôte compte, cfg local vide
+        self.assertTrue(exploitation._train_declared(self.cfg(), "nexlink",
+                                                     {"nexlink"}))
+        self.assertFalse(exploitation._train_declared(self.cfg(), "nexlink",
+                                                      {"ameesh"}))
+
+    def test_un_etat_central_illisible_garde_le_comportement_declare(self):
+        self.assertTrue(exploitation._train_declared(self.cfg(), "nexlink", None))
 
 
 class TargetsTest(unittest.TestCase):
@@ -150,6 +160,55 @@ class SloNoTrainTest(PgTestCase):
         self.assertNotIn("orch-amh", briefs)
         self.assertIn(PHRASE, briefs["orch-nx"])
         self.assertIn("dispatch the full CI yourself", briefs["orch-nx"])
+
+    def test_le_pilote_est_celui_du_projet_pas_celui_de_l_equipe_du_porteur(self):
+        # B2 de ameesh-dev3 : l'assigné du porteur n'est pas du projet du lot
+        cfg = dataclasses.replace(self.cfg, train={}, radar={})
+        alert = self.alerts(cfg)[0]
+        for team in ("ameesh", ""):
+            with self.subTest(team=team):
+                listing = [{"name": "dev1", "team": team},
+                           {"name": "orch-nx", "team": "nexlink"},
+                           {"name": "orch-amh", "team": "ameesh"},
+                           {"name": "auditeur", "team": ""}]
+                briefs = alert_briefs.briefs(
+                    alert, listing, orchestrator_names=("orch-nx", "orch-amh"),
+                    auditor_names=("auditeur",))
+                self.assertIn("orch-nx", briefs)
+                self.assertNotIn("orch-amh", briefs)
+                self.assertNotIn("dev1", briefs)
+
+    def live_train(self, *, age_s=60.0, lease=True):
+        """Un train nexlink tenu par un AUTRE hôte : cible centrale et bail."""
+        self.db.execute(
+            "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
+            " VALUES ('nexlink:develop', 'train:autre-hote', 1, now() + interval '1 hour')")
+        self.db.execute(
+            "INSERT INTO integration_trains (target_key, document, updated_at)"
+            " VALUES ('nexlink:develop', '{}'::jsonb, now() - make_interval(secs => %s))",
+            (age_s,))
+        if lease:
+            self.db.execute(
+                "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
+                " VALUES ('train-service:train-role:3', 'train-service:autre-hote:x',"
+                " 1, now() + interval '10 minutes')")
+
+    def test_un_train_vivant_sur_un_autre_hote_garde_le_comportement_actuel(self):
+        self.live_train()
+        cfg = dataclasses.replace(self.cfg, train={}, radar={})
+        alert = self.alerts(cfg)[0]
+        self.assertNotIn("no_train", alert["waiting"] or {})
+        self.assertNotIn("no train declared", alert["detail"])
+
+    def test_une_cible_ancienne_ou_sans_bail_ne_fait_pas_un_train(self):
+        for kwargs in ({"age_s": 3 * 24 * HEURE}, {"lease": False}):
+            with self.subTest(**kwargs):
+                self.db.execute("DELETE FROM integration_trains")
+                self.db.execute("DELETE FROM merge_locks")
+                self.live_train(**kwargs)
+                cfg = dataclasses.replace(self.cfg, train={}, radar={})
+                alert = self.alerts(cfg)[0]
+                self.assertEqual((alert["waiting"] or {}).get("no_train"), "nexlink")
 
     def test_le_niveau_3_pousse_le_pilote_du_projet(self):
         cfg = dataclasses.replace(self.cfg, train={}, radar={})

@@ -3397,6 +3397,10 @@ class WorkItems(interface.WorkItems):
         """P1b #7650 : les projets visés par un train."""
         return self._dev.train_projects()
 
+    def train_live_projects(self, fresh_s):
+        """#8159 : les projets dont un train tourne, vus de tout hôte."""
+        return self._dev.train_live_projects(fresh_s)
+
     def train_receipt_kinds(self, work_item_id, frozen_id, *, exact=False):
         """P1b #7650 : reçus d'allocation/retrait d'un lot (attestation)."""
         return self._dev.train_receipt_kinds(work_item_id, frozen_id, exact=exact)
