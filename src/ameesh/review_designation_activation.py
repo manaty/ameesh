@@ -3664,7 +3664,7 @@ def _continued_seats(db, item: Mapping, inputs: "Inputs",
     answered = {str(name or "").strip() for name in inputs.answered or ()}
     if set(column) & answered:
         return []
-    if set(column) & {str(name or "").strip() for name in inputs.correctors or ()}:
+    if set(column) & rd.names_of(inputs.correctors):
         return []
     families = {str(row.get("family") or "").strip() for row in prior.values()} - {""}
     if len(families) < required:

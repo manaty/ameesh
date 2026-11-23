@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -368,6 +369,35 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
         self.assertEqual(errors, [])
         self.assertTrue(committed.is_set())
         self.assertEqual(mail.passive_reason(self._notifies("r1")[0]), "")
+
+
+class ContinuedSeatsCorrectorTest(unittest.TestCase):
+    """#8118 : un correcteur exclu ne garde pas son siège par continuation.
+
+    Le garde comparait la colonne à `str(corrector)` — la représentation d'un
+    dictionnaire — au lieu du nom : un correcteur exclu par un doute de
+    provenance (famille vide) traversait la continuation et restait relecteur.
+    """
+
+    def test_an_excluded_corrector_breaks_the_continuation(self):
+        inputs = types.SimpleNamespace(
+            manual=[], waiver=False, unknown_authors=[], doubts=[],
+            policy=types.SimpleNamespace(required=2,
+                                         families=["claude", "codex"]),
+            answered=(), authors=[{"name": "author", "family": "deepseek"}],
+            correctors=[{"name": "cx3", "family": "",
+                         "unresolved": "afd35c55"}],
+            candidates=[types.SimpleNamespace(name="cx3", available=True),
+                        types.SimpleNamespace(name="r1", available=True)])
+        context = {"freeze": {"id": 11},
+                   "reviewers": [{"name": "cx3", "family": "codex"},
+                                 {"name": "r1", "family": "claude"}]}
+        with mock.patch.object(act.pg, "PgPort") as port:
+            port.return_value.previous_review.return_value = context
+            seats = act._continued_seats(
+                None, {"id": 7, "reviewers": ["cx3", "r1"]},
+                inputs, {"id": 12})
+        self.assertEqual(seats, [])
 
 
 if __name__ == "__main__":
