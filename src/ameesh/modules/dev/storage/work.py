@@ -205,6 +205,26 @@ class DevWork(DevDomain):
         return [str(row.get("target_key") or "") for row in self.db.query(
             "SELECT DISTINCT target_key FROM integration_trains")]
 
+    def train_live_projects(self, fresh_s: float) -> list[str]:
+        """#8159 : les projets dont un train tourne, vus de tout hôte.
+
+        Une cible est vivante quand le service qui la dessert l'est : le
+        propriétaire de sa réservation (`train:<runner>`, document de la
+        cible) est l'exécuteur d'un bail `train-service…` vivant
+        (`train-service:<runner>:<incarnation>`), et la cible a bougé depuis
+        moins de `fresh_s`. Le bail d'un service qui dessert un autre projet
+        ne fait pas vivre une cible qu'il ne tient pas (B #45894/#45896)."""
+        return [str(row.get("project") or "") for row in self.db.query(
+            "SELECT DISTINCT split_part(t.target_key, ':', 1) AS project"
+            " FROM integration_trains t JOIN merge_locks l"
+            " ON l.target LIKE 'train-service%%' AND l.expires_at > clock_timestamp()"
+            " AND split_part(l.owner, ':', 1) = 'train-service'"
+            " AND split_part(l.owner, ':', 2) <> ''"
+            " AND 'train:' || split_part(l.owner, ':', 2)"
+            " = t.document -> 'reservation' ->> 'owner'"
+            " WHERE t.updated_at > clock_timestamp() - make_interval(secs => %s)",
+            (float(fresh_s),))]
+
     def train_receipt_kinds(self, work_item_id, frozen_id, *, exact=False) -> list[str]:
         """Les reçus d'allocation/retrait d'un lot (attestation de paquet)."""
         if exact:

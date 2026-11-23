@@ -943,6 +943,17 @@ def _slo_breach(alert: dict, *, level: int | None = None,
             move = ("pilot: the %s is carried by packet %s%s and waits for the packet's "
                     "full CI%s — do not reassign or nudge its holder; the composer/pilot "
                     "carries the packet merge" % (v.noun, packet, where, ci))
+        no_train = str(waiting.get("no_train") or "")
+        if no_train:
+            # #8159 : aucun train ni radar n'est déclaré pour le projet ; rien
+            # ne composera le paquet ni ne démarrera sa CI à la place du pilote.
+            move += ("; no train declared for %s: manual composition by the pilot "
+                     "(§12) — %s" % (
+                         no_train,
+                         "push the pilot of %s to compose the packet on the target "
+                         "head and dispatch its full CI" % no_train if level >= 3
+                         else "no train will compose, start or merge it: integrate "
+                         "the target head and dispatch the full CI yourself"))
     elif alert.get("step") == "green_verdict":
         # #3033 : l'avis est dû par le relecteur désigné, pas par le porteur ;
         # le geste est de rendre le verdict, puis de remplacer le relecteur.
@@ -1731,6 +1742,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         # hôte aux claims fermés ne lira pas ; le palier suivant prend le
         # relais, et le brief dit qui manquait.
         teams = _projects(by_name, alert.get("agent"))
+        if (alert.get("waiting") or {}).get("no_train"):
+            # #8159 : sans train déclaré, le pilote visé est celui du projet du
+            # lot (il compose à la main, §12), pas celui des équipes du porteur.
+            teams = {str(alert["waiting"]["no_train"])}
         # #3036 : le pilote se résout ici aussi quand l'alerte ne porte pas
         # `orchestrators` (niveau 1 d'une passe sans autre lot de niveau 2) ;
         # le notificateur fournit les rôles vivants du canon.
