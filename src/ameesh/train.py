@@ -159,7 +159,8 @@ def ordered(rows: list[dict], dependencies: list[dict]) -> list[dict]:
     return result
 
 
-def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0) -> bool:
+def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0,
+        recompose: bool = False) -> bool:
     if not rows:
         return False
     if policy.build_beta:
@@ -169,7 +170,14 @@ def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0
         # must not re-apply the queue timestamp, or that rescued row would
         # still skip the packet.
         slot = policy.cutoff(now)
+        if recompose:
+            # #8096 : un plan paused invalidé (ou abandonné par le pilote)
+            # est un créneau consommé sans promotion. Le remplacement est dû
+            # tout de suite, sans attendre le créneau suivant (§11 bis).
+            return True
         return last_started < slot and bool(rows)
+    if recompose:
+        return True
     # First train: at most an hour from the oldest admitted lot. Subsequent
     # trains: at most an hour since the preceding train, never an idle burst.
     since = max(last_started, min(float(r["queued_ts"]) for r in rows))
@@ -342,6 +350,15 @@ class Engine:
                     state = abandoned.pop("state")
                     return abandoned
             if state is not None and state["phase"] == "paused":
+                # #8096 : un plan en pause dont un membre nommé a quitté
+                # `validated` (revenu en build, retiré ou regelé) ne peut plus
+                # être promu et n'a plus de raison d'attendre un abandon
+                # manuel du pilote. Le service l'invalide sous son bail, avec
+                # la trace du membre, et la passe suivante recompose sans lui.
+                # Sans lecture complète des membres, on reste en pause.
+                left = self._paused_members_left(state)
+                if left is not None:
+                    return self._paused_invalidated(state, left, now)
                 return {"result": "paused"}
             if state is not None and state.get("phase") in EXPIRABLE:
                 # #7967 : l'échéance absolue du ticket de réservation est
@@ -407,7 +424,8 @@ class Engine:
                     # pass writes anything (a stale revision would refuse).
                     state = self.ports.load()
                 rows = self.ports.entries()
-                if self.policy.build_beta:
+                recompose = self._recompose_pending(state)
+                if self.policy.build_beta and not recompose:
                     # A late admission belongs to the next packet, even if
                     # this cutoff was empty or the executor has restarted.
                     # #2965: the instant is the candidate's admissibility,
@@ -418,9 +436,15 @@ class Engine:
                     admitted = getattr(self.ports, "admitted", None)
                     rows = (admitted(rows, slot) if callable(admitted)
                             else [r for r in rows if float(r["queued_ts"]) <= slot])
+                # #8096 (B cx2 #45448) : quand un créneau a été consommé sans
+                # promotion, la recomposition due prend les candidats
+                # admissibles courants, y compris un nouveau gel qualifié
+                # après ce créneau ; sinon le train resterait idle jusqu'au
+                # suivant alors que le marqueur dit la recomposition due.
                 rows = ordered(rows, self.ports.dependencies(rows))
                 if not due(rows, now, self.policy,
-                           last_started=float((state or {}).get("started_ts", 0))):
+                           last_started=float((state or {}).get("started_ts", 0)),
+                           recompose=recompose):
                     return {"result": "idle"}
                 from datetime import datetime, timezone
                 state = dict(schema=SCHEMA, source=self.source, target=self.target,
@@ -628,6 +652,12 @@ class Engine:
                                      reason=request.get("reason", ""), previous_phase=phase,
                                      plan=plan["id"], fire=request.get("fire"),
                                      applied_ts=now)
+        if phase == "paused":
+            # #8096 : un abandon de plan en pause est un créneau consommé sans
+            # promotion ; la recomposition est due sans attendre le calendrier.
+            terminal["recompose"] = dict(at_ts=now, previous_phase="paused",
+                                         plan=plan["id"],
+                                         reason=request.get("reason", ""))
         terminal["abandon_request"] = None
         try:
             saved = abandon(terminal, int(state.get("revision", 0)), self.epoch)
@@ -653,6 +683,129 @@ class Engine:
         if not callable(check) or not isinstance(plan, dict):
             return False
         return bool(check(plan))
+
+    @staticmethod
+    def _paused_named_culprits(state, plan):
+        """#8096 : fautifs NOMMÉS par le diagnostic du plan paused.
+
+        Un rouge multi-lots sans attribution ne prouve aucun coupable : retirer
+        un innocent ne dit rien du lot resté en cause (B cx2 #45452). Seules
+        deux preuves nomment un lot : `diagnosis.attribution.proven_lots` du
+        rapport CI, et un plan de diagnostic dont l'unique suspect est le lot
+        testé. Rend l'ensemble des identifiants nommés (vide sans preuve)."""
+        named = set()
+        diagnosis = (state or {}).get("diagnosis")
+        attribution = diagnosis.get("attribution") if isinstance(diagnosis, dict) else None
+        proven = attribution.get("proven_lots") if isinstance(attribution, dict) else None
+        if isinstance(proven, list):
+            for entry in proven:
+                lot = entry.get("work_item_id") if isinstance(entry, dict) else None
+                if isinstance(lot, int) and not isinstance(lot, bool):
+                    named.add(lot)
+        suspects = plan.get("suspects")
+        if plan.get("diagnostic") and isinstance(suspects, list) and len(suspects) == 1 \
+                and isinstance(suspects[0], dict):
+            lot = suspects[0].get("work_item_id")
+            if isinstance(lot, int) and not isinstance(lot, bool):
+                named.add(lot)
+        return named
+
+    def _paused_members_left(self, state):
+        """#8096 : lots dont le départ prouve que le plan paused est mort.
+
+        Un plan en pause après un rouge ne sera jamais promu tel quel. Le
+        service ne l'invalide que sur une preuve (B cx2 #45452, #45460) :
+        - tous ses membres ont quitté `validated` (plus rien à composer) ;
+        - sinon, tous les fautifs NOMMÉS par le diagnostic ou par la
+          déclaration complète `train-faults: <plan> lots=[<id>,...];` du journal
+          (`plan_faults`) ont quitté : un retrait partiel, un marqueur posé lot
+          par lot, ou le retrait d'un innocent alors qu'un fautif reste, ne
+          prouve rien et garde la pause.
+        Le retour est la liste des lots partis, ou None sans preuve suffisante
+        (ou lecture incomplète : port sans `entries`, document ou erreur),
+        fail-closed.
+        """
+        plan = (state or {}).get("plan")
+        members = plan.get("members") if isinstance(plan, dict) else None
+        if not isinstance(members, list) or not members:
+            return None
+        entries = getattr(self.ports, "entries", None)
+        if not callable(entries):
+            return None
+        try:
+            current = {row["work_item_id"]: row for row in entries()
+                       if isinstance(row, dict)}
+        except (TrainError, KeyError, TypeError):
+            return None
+        if not all(isinstance(row, dict) for row in members):
+            return None
+        left, remaining = [], []
+        for row in members:
+            try:
+                fresh = current.get(row["work_item_id"])
+                same = fresh is not None and identity(fresh) == identity(row)
+                lot_id = row["work_item_id"]
+            except (KeyError, TypeError):
+                return None
+            (remaining if same else left).append(lot_id)
+        if not left:
+            return None
+        if not remaining:
+            # Le plan entier a quitté : aucune recomposition ne peut le
+            # qualifier, et il n'y a plus de coupable à attendre.
+            return left
+        try:
+            named = self._paused_named_culprits(state, plan)
+            faults = getattr(self.ports, "plan_faults", None)
+            if callable(faults):
+                named |= set(faults(plan))
+            member_ids = {int(row["work_item_id"]) for row in members}
+        except (TrainError, KeyError, TypeError, ValueError):
+            return None
+        if named and named <= member_ids and named <= set(left):
+            return left
+        return None
+
+    def _paused_invalidated(self, state, left, now):
+        """#8096 : invalide un plan paused dont un membre n'est plus admissible.
+
+        Écrit sous le bail de la passe, avec la trace des lots partis, puis
+        rend l'époque : la passe suivante recompose sur la tête courante, sans
+        eux. Aucune promotion n'est possible depuis une pause. Le marqueur
+        `recompose` rend cette recomposition due sans attendre le créneau
+        suivant (§11 bis) ; un plan en cours de CI n'entre jamais ici.
+        """
+        plan = state.get("plan") or {}
+        why = ("paused plan can no longer be promoted: member(s) %s left validated, "
+               "were removed or requeued; invalidated without promotion (#8096)"
+               % ", ".join("#%s" % lot for lot in left))
+        state["error"] = why
+        state["invalidated"] = dict(at_ts=now, previous_phase="paused", reason=why,
+                                    members=list(left), plan=plan.get("id"))
+        state["recompose"] = dict(at_ts=now, previous_phase="paused", plan=plan.get("id"),
+                                  reason=why)
+        state["phase"] = "invalidated"
+        state = self._save(state)
+        self.ports.notify(why, state)
+        return {"result": "invalidated", "error": why, "plan": state["plan"],
+                "invalidated": state["invalidated"]}
+
+    @staticmethod
+    def _recompose_pending(state):
+        """#8096 : ce plan terminal a-t-il consommé un créneau sans promotion ?
+
+        Un plan paused invalidé par le service porte `recompose`; un abandon
+        de pilote le porte aussi (et les documents antérieurs au déploiement
+        le disent par `abandoned.previous_phase == "paused"`). Dans les deux
+        cas la recomposition est due immédiatement, une seule CI de paquet à
+        la fois restant garantie par la réservation de la cible.
+        """
+        if not isinstance(state, dict):
+            return False
+        if isinstance(state.get("recompose"), dict):
+            return True
+        abandoned = state.get("abandoned")
+        return isinstance(abandoned, dict) and abandoned.get("previous_phase") == "paused"
 
     def _expired_step(self, state, deadline):
         """#7967 : termine un plan expiré seulement sur une issue établie.
@@ -765,8 +918,12 @@ class Engine:
             # diagnostic halves or silently transferring a green result.
             state["phase"] = "paused"
             state = self._save(state)
-            self.ports.notify("build/beta packet CI red: factual diagnosis unknown; "
-                              "no automatic diagnostic CI", state)
+            self.ports.notify("build/beta packet CI red (plan %s): factual diagnosis "
+                              "unknown; no automatic diagnostic CI. To declare the "
+                              "complete set of culprits, write a note beginning "
+                              "train-faults: %s lots=[<lot>,<lot>]; <reason>; the "
+                              "pause lifts only when every declared culprit has left."
+                              % (state["plan"]["id"][:8], state["plan"]["id"][:8]), state)
             return {"result": "paused"}
         if state["failures"] >= self.policy.max_failures:
             state["phase"] = "paused"

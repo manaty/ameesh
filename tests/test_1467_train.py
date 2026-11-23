@@ -37,6 +37,8 @@ class MemoryPorts:
         self.fired, self.admitted = True, True
         self.synced = None
         self.edges = []
+        #: #8096: ensemble complet des fautifs déclaré pour le plan paused.
+        self.faults = set()
 
     def acquire(self, epoch):
         if epoch is not None:
@@ -67,6 +69,9 @@ class MemoryPorts:
 
     def dependencies(self, rows):
         return copy.deepcopy(self.edges)
+
+    def plan_faults(self, plan):
+        return set(self.faults)
 
     def target(self):
         return self.base

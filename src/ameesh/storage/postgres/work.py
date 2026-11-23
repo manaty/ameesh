@@ -1295,6 +1295,14 @@ class WorkItems(interface.WorkItems):
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), state, note, actor)
+            if lifecycle.canonical(state) == lifecycle.IN_PROGRESS:
+                # #8096 : la file de fusion est un état de « prêt » ; un lot
+                # qui repasse en build en sort dans la même transaction. La
+                # ligne et le reçu `removed` sont écrits par le module dev.
+                DevWork(tx).queue_take_out_on_build(
+                    int(item_id),
+                    note="merge queue: taken out (lot returned to build)",
+                    actor=actor)
             if lifecycle.canonical(state) in lifecycle.COMPLETED:
                 self._release_migration(tx, item_id, rows[0],
                                         why="état %s" % state, actor=actor)
