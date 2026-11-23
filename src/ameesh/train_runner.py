@@ -390,7 +390,9 @@ class Passage:
             return {"result": "off"}
         runtime = self.runtime(db)
         refused = self.canon_refusal(db, runtime)
-        return refused if refused is not None else self._step(runtime, now)
+        result = refused if refused is not None else self._step(runtime, now)
+        self._notify_paused(db, runtime, result)
+        return result
 
     def scheduled_step(self, db, now):
         """Use the very same compiled object for execution and the next wake."""
@@ -403,6 +405,7 @@ class Passage:
             raise train.TrainError("compiled canon must provide a future packet cutoff")
         refused = self.canon_refusal(db, runtime)
         result = refused if refused is not None else self._step(runtime, now)
+        self._notify_paused(db, runtime, result)
         if isinstance(result, dict) and result.get("result") == "paused":
             # #8096 : un plan en pause ne repart jamais seul et aucun créneau
             # ne le réveille. On le revoit dans l'heure pour appliquer la
@@ -410,6 +413,38 @@ class Passage:
             # attendre un geste du pilote.
             deadline = min(deadline, now + PAUSED_RECHECK_S)
         return result, deadline
+
+    def _notify_paused(self, db, runtime, result):
+        """Wake the target project's pilot; retry safely on later passages."""
+        if not isinstance(result, dict) or result.get("result") != "paused":
+            return
+        state = runtime.load() or {}
+        if state.get("phase") != "paused":
+            return
+        plan = state.get("plan") or {}
+        plan_id = plan.get("id")
+        if not plan_id:
+            raise train.TrainError("paused train has no plan identifier")
+        from . import mail, train_canon
+        recipient = train_canon.pilot_of(self.cfg, self.project.name)(db)
+        if not recipient:
+            raise train.TrainError("paused train has no project pilot recipient")
+        lots = [str(row.get("work_item_id")) for row in plan.get("members", [])]
+        attempts = state.get("attempts") or []
+        ci = (attempts[-1].get("ci") or {}) if attempts else {}
+        slug = radar.github_slug(self.project)
+        runs = ["https://github.com/%s/actions/runs/%s" % (slug, workflow["run"])
+                for workflow in ci.get("workflows", []) if workflow.get("run")]
+        body = ("Train %s (%s) en pause : plan %s, lots %s.\n"
+                "Runs : %s\n"
+                "Diagnostiquer le rouge puis ajouter sur un lot du plan une note commençant par la liste complète des fautifs : "
+                "train-faults: %s lots=[<lot>,<lot>]; <motif>. "
+                "Retirer ou remettre en file tous les fautifs pour permettre la recomposition."
+                % (self.project.name, self.project.target, plan_id,
+                   ", ".join("#" + lot for lot in lots) or "aucun",
+                   ", ".join(runs) or "aucun run disponible", plan_id))
+        mail.send(db, "ameesh", recipient, body, kind="mail",
+                  idempotency_key="train-paused:%s:%s" % (plan_id, recipient))
 
     def canon_refusal(self, db, runtime):
         """#2914: refuse by name to compose while the pin differs from the gate.
