@@ -443,7 +443,7 @@ class Passage:
                 % (self.project.name, self.project.target, plan_id,
                    ", ".join("#" + lot for lot in lots) or "aucun",
                    ", ".join(runs) or "aucun run disponible", plan_id))
-        mail.send(db, "ameesh", recipient, body, kind="mail",
+        mail.send(db, "ameesh", recipient, body,
                   idempotency_key="train-paused:%s:%s" % (plan_id, recipient))
 
     def canon_refusal(self, db, runtime):
