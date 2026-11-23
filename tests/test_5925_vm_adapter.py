@@ -147,6 +147,29 @@ class DecisionTest(unittest.TestCase):
                          {'ag1': {}, 'ag2': {}}, {}, now=1000, horizon=60,
                          stalled={'ag1'}), 'ag2')
 
+    def test_elected_wake_leaves_a_ready_candidate_open_host_alone(self):
+        role = dict(name='role', releve='election', lease_live=False, status='idle',
+                    admitted_hosts=['ag1', 'ag2'], vm_wake_mail_id=17)
+        vms = [dict(host='ag1', declared=True, admitted=True, preference_rank=0),
+               dict(host='ag2', declared=True, admitted=True, preference_rank=1)]
+        hub = dict(host='hub', declared=True, admitted=True, ready=True)
+
+        def choose(candidates, **extra):
+            return vm.elected_wake_target(role, candidates, [], {'ag1': {}, 'ag2': {}},
+                                          {}, now=1000, horizon=60, **extra)
+
+        self.assertEqual(choose(vms + [hub]), 'ag1')
+        # #8121: un candidat prêt sur un hôte aux prises ouvertes (le hub,
+        # jamais une cible de l'adaptateur) prend le rôle par élection.
+        self.assertIsNone(choose(vms + [hub], open_hosts={'hub'}))
+        # Seul declared+admitted+ready retient : la place des autres candidats
+        # endormis reste l'évidence avant l'allumage.
+        for absent in ('declared', 'admitted', 'ready'):
+            self.assertEqual(choose(vms + [dict(hub, **{absent: False})],
+                                    open_hosts={'hub'}), 'ag1')
+        # Un hôte fermé (la cible drainée elle-même) ne retient pas le réveil.
+        self.assertEqual(choose(vms + [hub], open_hosts=set()), 'ag1')
+
     def test_stalled_busy_return_allows_reserve_after_bounded_wait(self):
         queue = mock.Mock()
         queue.pending_all.side_effect = lambda host: ([dict(state='busy', created_ts=850,
@@ -230,6 +253,28 @@ class AdapterTest(PgTestCase):
         event = self.db.query("SELECT data FROM ameesh_events WHERE type='vm.elected_wake' "
                               "AND object='burst' ORDER BY id DESC LIMIT 1")[0]['data']
         self.assertEqual((event['role'], event['mail_id']), ('role', 17))
+
+    def test_ready_hub_candidate_does_not_wake_the_drained_vm(self):
+        # #8121: le hub (jamais une cible de l'adaptateur) est prêt et ses
+        # prises sont ouvertes ; le candidat de la VM endormie n'a pas de
+        # relevé frais, mais son placement déclaré ne doit pas la rallumer.
+        self.operations.listing.return_value = [dict(
+            name='role', releve='election', lease_live=False, status='idle',
+            admitted_hosts=['burst', 'hub'], vm_wake_mail_id=17)]
+        self.provider.state.return_value = 'stopped'
+        self.observe_old('stopped')
+        before = self.db.query("SELECT COALESCE(max(id), 0) AS id FROM ameesh_events")[0]['id']
+        status = dict(holder=None, candidates=[
+            dict(host='hub', declared=True, admitted=True, ready=True),
+            dict(host='burst', declared=True, admitted=True,
+                 preference_rank=0, ready=False)])
+        with mock.patch('ameesh.vm_adapter.election.status', return_value=status):
+            self.assertEqual(self.tick(), 'no request')
+        self.provider.action.assert_not_called()
+        self.assertEqual(self.q.pending('burst'), [])
+        self.assertEqual(self.db.query("SELECT * FROM ameesh_events "
+                                       "WHERE type='vm.elected_wake' AND object='burst' "
+                                       "AND id > %s", (before,)), [])
 
     def test_listing_ignores_passive_events_for_vm_wake(self):
         registry.upsert(self.db, 'vm-wake-role', harness='claude', host='burst')
