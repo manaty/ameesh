@@ -626,15 +626,34 @@ def _packet_ci_text(ci: dict) -> str:
     """
     state = str((ci or {}).get("state") or "unknown")
     run = "run %s" % ci["run_id"] if (ci or {}).get("run_id") else "its CI"
+    # #8155 : la tête lue et les workflows rouges ou en cours sont nommés.
+    sha = str((ci or {}).get("head_sha") or "")[:8]
+    on = " on %s" % sha if sha else ""
+    red = ", ".join((ci or {}).get("red_workflows") or ())
+    running = ", ".join((ci or {}).get("running_workflows") or ())
     if state == "running":
-        return " (%s is still running)" % run
+        return " (%s%s is still running%s)" % (
+            run, on, ": %s" % running if running else "")
     if state == "pending":
-        return " (its full CI has not started yet)"
+        return " (its full CI has not started yet%s)" % on
+    if state == "uncertain":
+        # #8155 : la tête actuelle de la branche n'a pas pu être lue ; des runs
+        # existent sur d'autres têtes, aucune n'est présentée comme courante.
+        seen = ", ".join(str(sha)[:8] for sha in (ci or {}).get("seen_heads") or ())
+        recorded = (ci or {}).get("recorded_state")
+        mine = ("the recorded head%s is %s" % (on, recorded) if recorded
+                else "no run on the recorded head%s" % on)
+        return (" (its CI state is unproven: %s, runs seen on %s, and the "
+                "branch's current head could not be read; check the packet PR "
+                "before acting)" % (mine, seen or "other heads"))
     if state == "green":
-        return " (%s is green; the packet merge is pending)" % run
+        return " (%s%s is green; the packet merge is pending)" % (run, on)
     if state == "red":
-        return (" (%s is red: a unit must be fixed or removed before the packet "
-                "merges)" % run)
+        return (" (%s%s is red%s: a unit must be fixed or removed before the packet "
+                "merges; a red also present on the target is not the units' "
+                "fault%s)" % (
+                    run, on, " — %s" % red if red else "",
+                    "; still running: %s" % running if running else ""))
     if state in ("cancelled", "superseded"):
         return " (%s was %s; a new run is expected)" % (run, state)
     return " (its CI is not readable here)"
@@ -1188,6 +1207,12 @@ def slo_vehicle_wait(alert: dict, name: str | None = None) -> bool:
     return True
 
 
+#: #8117 : alertes dont le geste revient à un opérateur (relivrer, relancer
+#: un agent arrêté) : le courrier d'agent part en `info`, sans réveil, sauf
+#: alerte critique ou urgente (P1).
+OPERATOR_GESTURE_TYPES = ("mail_undeliverable",)
+
+
 def quiet_modes(alert: dict, names, by_name: dict) -> dict:
     """#7443 : par destinataire, le mode de son courrier et la raison du choix.
 
@@ -1206,7 +1231,10 @@ def quiet_modes(alert: dict, names, by_name: dict) -> dict:
     #7009 : une pause critique ne réveille pas un destinataire lui-même en
     pause budget sur le même compte (11/11 03:32-04:23Z : auditeur,
     mesh-design et orchestrateur se réveillaient l'un l'autre pour une pause
-    qu'aucun ne pouvait lever) ; il la lit en `info`, sans l'urgence."""
+    qu'aucun ne pouvait lever) ; il la lit en `info`, sans l'urgence.
+
+    #8117 : une alerte de `OPERATOR_GESTURE_TYPES` non critique part en
+    `info` à tous ses destinataires."""
     # Les textes routés portent aussi une escalade de secours (#3036).
     escalated = {name for name, body in names.items()
                  if "Escalated from level " in body} if isinstance(names, dict) else set()
@@ -1220,6 +1248,13 @@ def quiet_modes(alert: dict, names, by_name: dict) -> dict:
                 if account and _budget_paused_on(by_name.get(name), account)}
     if alert.get("urgent"):
         return {}
+    if kind in OPERATOR_GESTURE_TYPES and not alert.get("critical"):
+        # #8117 : le geste revient à un opérateur ; le pilote le lit au tour
+        # suivant, sans réveil ni interruption (l'urgence du type reste celle
+        # de la route humaine, `notify.URGENT_TYPES`).
+        return {name: {"payload": {"info": True, "urgent": False},
+                       "reason": "operator gesture: no wake unless critical"}
+                for name in names}
     # #7308/#7443 : les constats sans geste immédiat restent lisibles au tour
     # suivant.
     if not alert.get("critical") and kind in ("idle_capacity", "plan_underused"):

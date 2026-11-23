@@ -1082,6 +1082,38 @@ class PaquetTest(_Base):
             self.assertIn("do not reassign or nudge its holder", text)
             self.assertNotIn("reassign it now", text)
 
+    def test_8155_ci_lue_sur_la_tete_composee_du_porteur(self):
+        # #8155, cas #7678 : la tête relevée du porteur date d'avant la
+        # recomposition ; la CI tourne sur la tête composée, poussée ensuite.
+        # Le brief dit « running » et nomme le rouge, pas « not started ».
+        self.qa_at(self.GO)
+        head, composed = "a" * 40, "c" * 40
+        self._outside_packet(head)
+        self._ci_on_head(head, self.GO - 10 * 60)
+        carrier = self.packet(body="unités : #%d @ %s" % (self.lot["id"], head),
+                              head=head)
+        self.now = self.GO + 3 * HEURE
+        self._packet_ci_on_head(carrier, composed, status="running", run_id=700101,
+                                workflow="mobile-android-release.yml")
+        self._packet_ci_on_head(carrier, composed, status="failure", run_id=700102,
+                                workflow="host-rust.yml")
+        # La tête actuelle de la branche du porteur, lue à la forge.
+        seen = []
+
+        def reader(db, cfg, row, *, cache):
+            seen.append(int(row["id"]))
+            return lambda branch: ("sha", composed)
+        with mock.patch.object(exploitation, "_carrier_head_reader", reader):
+            alerts = self.slo()
+        self.assertIn(int(carrier["id"]), seen)
+        self.assertEqual([a["step"] for a in alerts], ["verdict_merge"])
+        ci = alerts[0]["waiting"]["ci"]
+        self.assertEqual((ci["state"], ci["head_sha"]), ("red", composed))
+        for text in self.briefs(alerts[0]).values():
+            self.assertNotIn("not started", text)
+            self.assertIn("host-rust.yml", text)
+            self.assertIn("mobile-android-release.yml", text)
+
     def test_hors_paquet_le_niveau_3_garde_la_reassignation(self):
         # #3487, contrôle positif : un lot relu hors paquet (exception
         # déclarée, aucun porteur) garde le geste de réassignation du niveau 3.
