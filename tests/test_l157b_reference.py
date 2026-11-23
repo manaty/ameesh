@@ -72,6 +72,32 @@ class BuildReferenceTest(unittest.TestCase):
         self.assertFalse(by["dev2"]["biased"])           # ×1,58, 2 lots : trop peu
         self.assertEqual([e["estimator"] for e in self.body["bias"]], ["orch"])
 
+    def test_pseudo_estimateur_inconnu_hors_biais(self):
+        # #8130 : « inconnu » est le pseudo-auteur des lots sans `estimate_by`
+        # (`work.UNKNOWN_ACTOR`), pas un estimateur : il n'entre pas dans la
+        # table des biais et ne reçoit aucune alerte.
+        def body_and_alerts(by):
+            rows = [_row(i, "evolution", "m", "dev1", 20.2, by=by, est=10)
+                    for i in range(1, 6)]
+            body = estimates.build_reference(rows, AGENTS, now=NOW)
+            with mock.patch.object(
+                    estimates, "current_reference",
+                    return_value={"id": 7, "published_ts": NOW, "body": body}):
+                alerts = exploitation._estimate_bias(
+                    types.SimpleNamespace(), object(), [], [])
+            return body, alerts
+
+        body, alerts = body_and_alerts(None)
+        self.assertEqual(body["estimators"], [])
+        self.assertEqual(body["bias"], [])
+        self.assertEqual(alerts, [])
+
+        # témoin : le même ratio porté par un estimateur réel reste biaisé
+        body, alerts = body_and_alerts("orch")
+        self.assertEqual([e["estimator"] for e in body["bias"]], ["orch"])
+        self.assertEqual([(a["agent"], a["value"]) for a in alerts],
+                         [("orch", 2.02)])
+
     def test_lecture_et_repli(self):
         b = self.body
         g = estimates.lookup(b, type="evolution", size="m", host="vm1", harness="claude")
@@ -352,6 +378,19 @@ class ReferencePgTest(PgTestCase):
         with self.assertRaises(work.WorkError):
             work.add(self.db, title="x", size="xl")
         self.assertEqual(storage.of(self.db).work.reference()["id"], ref["id"])
+
+    def test_lots_sans_estimateur_ne_levent_aucune_alerte(self):
+        # #8130 : cinq lots à ×2 sans `estimate_by` (« inconnu ») ne font
+        # aucun estimateur biaisé et aucune alerte.
+        for minutes in (21, 22, 23, 24, 25):
+            lot = work.add(self.db, title="sans estimateur %d" % minutes,
+                           actor="", estimate=10, size="m")
+            self._deliver(lot["id"], started_min_ago=minutes)
+        ref = estimates.publish(self.db, actor="auditeur")
+        self.assertEqual(ref["body"]["estimators"], [])
+        self.assertEqual(ref["body"]["bias"], [])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "estimate_bias"], [])
 
     def _three_biased_lots(self):
         for minutes in (20, 30, 40):
