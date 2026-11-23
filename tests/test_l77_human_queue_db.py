@@ -235,6 +235,19 @@ class PickHumanFirstTest(PgTestCase):
         # directement derrière les 200 retenus et le curseur humain n'est pas
         # exercé (fausse régression verte).
         real_active = lot_workdir.mail.unread_active
+        # #8112 : borner de même la priorité (revue du paquet 06) — non bornée,
+        # elle pagine localement derrière les 200 retenus, trouve humain:carol
+        # et le curseur humain n'est plus exercé. Bornée à `UNREAD_LIMIT`, sa
+        # page est pleine de retenus : c'est le pire cas de production que ce
+        # témoin doit prouver.
+        real_priority = lot_workdir.mail.unread_priority
+        priorite = []
+
+        def priorite_suivie(*args, **kwargs):
+            rows = _capped(real_priority)(*args, **kwargs)
+            priorite.append(rows)
+            return rows
+
         curseur = []
 
         def page_suivie(*args, **kwargs):
@@ -245,6 +258,8 @@ class PickHumanFirstTest(PgTestCase):
                                side_effect=_capped(real_unread)), \
                 mock.patch.object(lot_workdir.mail, "unread_active",
                                   side_effect=_capped(real_active)), \
+                mock.patch.object(lot_workdir.mail, "unread_priority",
+                                  side_effect=priorite_suivie), \
                 mock.patch.object(lot_workdir.mail, "unread_human",
                                   side_effect=_capped(real_human)), \
                 mock.patch.object(lot_workdir.mail, "unread_human_page",
@@ -254,6 +269,11 @@ class PickHumanFirstTest(PgTestCase):
             again = worker._pick()
         self.assertTrue(curseur,
                         "le curseur humain (unread_human_page) n'a pas ete exerce")
+        self.assertTrue(priorite and len(priorite[0]) == mail.UNREAD_LIMIT,
+                        "la page prioritaire n'etait pas pleine : temoin incomplet")
+        self.assertTrue(all((row.get("payload") or {}).get("retained")
+                            for row in priorite[0]),
+                        "la page prioritaire n'etait pas faite de retenus")
         self.assertIsNotNone(spec)
         self.assertEqual(spec["kind"], "mail",
                          "200 retained humans filled the page before human 201")
@@ -291,6 +311,16 @@ class PickHumanFirstTest(PgTestCase):
         # #2940 : même borne du secours `active` qu'au cas 200 ; deux picks
         # rendent le même humain sans livraison.
         real_active = lot_workdir.mail.unread_active
+        # #8112 : même borne de la priorité qu'au cas 200 (revue du paquet 06) ;
+        # deux pages bornées, la première pleine de retenus.
+        real_priority = lot_workdir.mail.unread_priority
+        priorite = []
+
+        def priorite_suivie(*args, **kwargs):
+            rows = _capped(real_priority)(*args, **kwargs)
+            priorite.append(rows)
+            return rows
+
         curseur = []
 
         def page_suivie(*args, **kwargs):
@@ -301,6 +331,8 @@ class PickHumanFirstTest(PgTestCase):
                                side_effect=_capped(real_unread)), \
                 mock.patch.object(lot_workdir.mail, "unread_active",
                                   side_effect=_capped(real_active)), \
+                mock.patch.object(lot_workdir.mail, "unread_priority",
+                                  side_effect=priorite_suivie), \
                 mock.patch.object(lot_workdir.mail, "unread_human",
                                   side_effect=_capped(real_human)), \
                 mock.patch.object(lot_workdir.mail, "unread_human_page",
@@ -310,6 +342,8 @@ class PickHumanFirstTest(PgTestCase):
             again = worker._pick()
         self.assertTrue(curseur,
                         "le curseur humain (unread_human_page) n'a pas ete exerce")
+        self.assertTrue(priorite and len(priorite[0]) == mail.UNREAD_LIMIT,
+                        "la page prioritaire n'etait pas pleine : temoin incomplet")
         self.assertIsNotNone(spec)
         self.assertEqual(spec["kind"], "mail",
                          "more than 200 retained humans hid the deliverable human")
@@ -317,6 +351,65 @@ class PickHumanFirstTest(PgTestCase):
         self.assertEqual(spec["ids"], [human])
         self.assertIsNotNone(again)
         self.assertEqual((again["kind"], again["ids"]), ("mail", [human]))
+
+    def test_priority_page_full_of_retained_day_mail_does_not_starve_human(self):
+        """#8112 : une page prioritaire pleine de retenus n'affame pas l'humain.
+
+        Pire cas de production : les 200 plus anciens prioritaires sont du
+        courrier du jour PASSIF rattaché à des lots retenus (`work_item_id`).
+        La page bornée d'`unread_priority` est donc pleine de lignes que
+        `deliverable` écarte ; l'humain remisable qui suit doit rester servi
+        par la recherche humaine, et aucune ligne retenue ne doit être remise.
+        """
+        from unittest import mock
+        from ameesh import lot_workdir, mail, registry
+        name = "worker-pick-retained-day"
+        worker = _make_worker(self, name)
+        self.db.execute(
+            "UPDATE agent_registry SET projects = ARRAY['ameesh', 'second']"
+            " WHERE name = %s", (name,))
+        # Famille « courrier du jour » : passif (info), daté d'aujourd'hui et
+        # rattaché à un lot retenu — le pire cas pour la page bornée.
+        self.db.execute(
+            "INSERT INTO agent_mailbox"
+            " (sender, recipient, body, kind, payload, work_item_id)"
+            " SELECT 'agent:bob', %s, 'day ' || g, 'request',"
+            "        '{\"info\": true}'::jsonb, 'lot-retenu'"
+            " FROM generate_series(1, %s) AS g",
+            (name, mail.UNREAD_LIMIT))
+        human = mail.send(self.db, "human:carol", name, "deliverable human",
+                          payload={"human": True})
+        registry.set_pending_prompt(self.db, name, "a queued instruction")
+
+        def garder(cfg, db, agent, rows, *, deferred=None, canons=None):
+            return [row for row in rows
+                    if row.get("work_item_id") != "lot-retenu"]
+
+        real_unread = lot_workdir.mail.unread
+        real_priority = lot_workdir.mail.unread_priority
+        priorite = []
+
+        def priorite_suivie(*args, **kwargs):
+            rows = _capped(real_priority)(*args, **kwargs)
+            priorite.append(rows)
+            return rows
+
+        with mock.patch.object(lot_workdir.mail, "unread",
+                               side_effect=_capped(real_unread)), \
+                mock.patch.object(lot_workdir.mail, "unread_priority",
+                                  side_effect=priorite_suivie), \
+                mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
+            spec = worker._pick()
+        self.assertTrue(priorite and len(priorite[0]) == mail.UNREAD_LIMIT,
+                        "la page prioritaire n'etait pas pleine : temoin incomplet")
+        self.assertTrue(all(row.get("work_item_id") == "lot-retenu"
+                            for row in priorite[0]),
+                        "la page prioritaire n'etait pas du courrier retenu")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail",
+                         "une page prioritaire pleine de retenus a affame l'humain")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(spec["ids"], [human])
 
     def test_human_after_a_truncated_page_is_served(self):
         """B14 : une page bornée (médié, 200 lignes) ne referme pas la recherche.
@@ -337,6 +430,10 @@ class PickHumanFirstTest(PgTestCase):
         registry.set_pending_prompt(self.db, name, "a queued instruction")
 
         real_unread = lot_workdir.mail.unread
+        # #8112 : borner la priorité comme le reste de la lecture bornée, sinon
+        # elle trouve l'humain par pagination locale et la recherche profonde
+        # n'est pas exercée (le test passerait pour la mauvaise raison).
+        real_priority = lot_workdir.mail.unread_priority
 
         def borne(db, recipient, limit=mail.UNREAD_LIMIT):
             # Backend médié : la page est ramenée à 200 lignes, sans décalage.
@@ -347,6 +444,8 @@ class PickHumanFirstTest(PgTestCase):
                     if not (row.get("payload") or {}).get("retained")]
 
         with mock.patch.object(lot_workdir.mail, "unread", side_effect=borne), \
+                mock.patch.object(lot_workdir.mail, "unread_priority",
+                                  side_effect=_capped(real_priority)), \
                 mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
             spec = worker._pick()
         self.assertIsNotNone(spec)
