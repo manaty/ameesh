@@ -70,12 +70,16 @@ def _ouvrier(batch: float = 90.0) -> AgentWorker:
 
 
 def _simuler(arrivees: list[tuple[float, dict]], *, duree_tour: float = 60.0,
-             fin: float = 900.0, pas: float = 5.0) -> list[float]:
+             fin: float = 900.0, pas: float = 5.0,
+             politique: dict | None = None) -> list[float]:
     """Les instants des réveils de courrier, comme `_pick` les ouvrirait
-    (`_mail_due` ou `_mail_overdue`) ; le courrier arrivé pendant un tour
+    (`_mail_due` ou `_mail_overdue` ; sous une cadence `reveil` déclarée,
+    `_reveil_due`, comme `_mail_spec`) ; le courrier arrivé pendant un tour
     attend sa fin (pire cas : le hook n'en remet rien)."""
     horloge = _Horloge()
     worker = _ouvrier()
+    if politique is not None:
+        worker.agent = {"reveil": politique}
     reveils: list[float] = []
     non_lus: list[dict] = []
     occupe_jusqu = -1.0
@@ -85,7 +89,11 @@ def _simuler(arrivees: list[tuple[float, dict]], *, duree_tour: float = 60.0,
             while file and file[0][0] <= horloge.t:
                 non_lus.append(file.pop(0)[1])
             if non_lus and horloge.t >= occupe_jusqu:
-                if worker._mail_due(non_lus) or worker._mail_overdue(non_lus):
+                if politique is not None:
+                    du = worker._reveil_due(politique, non_lus)
+                else:
+                    du = worker._mail_due(non_lus) or worker._mail_overdue(non_lus)
+                if du:
                     reveils.append(horloge.t)
                     non_lus = []
                     occupe_jusqu = horloge.t + duree_tour
@@ -205,6 +213,43 @@ class CheminsCompletsTest(unittest.TestCase):
             self.assertFalse(_ouvrier()._reveil_due(politique, [_reponse(1, 7000, T0)]))
         with self._a(91.0):
             self.assertTrue(_ouvrier()._reveil_due(politique, [_reponse(1, 7000, T0)]))
+
+
+class CadenceDeclareeTest(unittest.TestCase):
+    """B de mty-amh-impl-11 (gel e753f725) : sous une cadence `reveil`, la
+    fenêtre déclarée est la base de la fenêtre adaptative ; les natures
+    immédiates restent immédiates."""
+
+    def test_rafale_sous_cadence_courte_adaptative(self):
+        politique = {"immediat": ["humain", "urgent"], "fenetre_s": 90}
+        instants = [0.0]
+        for ecart in [112.5] * 8:
+            instants.append(instants[-1] + ecart)
+        arrivees = [(t, _etat(i + 1, T0 + t)) for i, t in enumerate(instants)]
+        reveils = [t for t in _simuler(arrivees, fin=1800, politique=politique)
+                   if t <= 900]
+        self.assertLessEqual(len(reveils), 2, reveils)
+
+    def test_message_seul_attend_la_fenetre_declaree(self):
+        politique = {"immediat": ["humain"], "fenetre_s": 1800}
+        self.assertEqual(_simuler([(0.0, _etat(1, T0))], fin=2000, politique=politique),
+                         [1800.0])
+
+    def test_cadence_par_defaut_inchangee(self):
+        # 100 courriers ordinaires en une heure, 3 expéditeurs sur 3 lots :
+        # au plus deux tours (témoin #7632), la rafale ne recule rien au-delà
+        politique = {"immediat": ["humain", "urgent"], "fenetre_s": 1800}
+        arrivees = [(i * 36.0, _etat(i + 1, T0 + i * 36.0, lot=1 + i % 3,
+                                     sender="pair%d" % (i % 3))) for i in range(100)]
+        reveils = _simuler(arrivees, fin=3600, pas=10.0, politique=politique)
+        self.assertLessEqual(len(reveils), 2, reveils)
+        self.assertEqual(reveils[0], 1800.0)  # comme la fenêtre fixe
+
+    def test_natures_immediates_preservees(self):
+        politique = {"immediat": ["humain", "urgent"], "fenetre_s": 90}
+        arrivees = [(i * 60.0, _etat(i + 1, T0 + i * 60.0)) for i in range(5)]
+        arrivees.append((300.0, _etat(99, T0 + 300, payload={"urgent": True})))
+        self.assertIn(300.0, _simuler(arrivees, fin=400, politique=politique))
 
 
 class ReponseDeDecisionTest(_Base):
