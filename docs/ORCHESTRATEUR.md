@@ -965,7 +965,10 @@ tests) :
 * **n'écris jamais en dur dans `/tmp` ni dans `/dev/shm`, utilise `$TMPDIR`** —
   le dossier de l'agent, sur disque, posé par ameesh à chaque tour
   (`$AMEESH_TMPDIR` est le même) et, pour un tour qui porte un lot, un
-  sous-dossier `ameesh-lot-<id>` gardé d'un tour à l'autre du même lot ;
+  sous-dossier `ameesh-lot-<id>` gardé d'un tour à l'autre du même lot,
+  atteint par un alias court sous `~/.t/<mesh>/l<lot>-<empreinte>` (#8128 :
+  `len($TMPDIR) + 40 <= 107`, pour qu'une socket AF_UNIX du forkserver
+  tienne) ;
   `docker save -o "$TMPDIR/image.tar"`, `git clone … "$TMPDIR/relecture"`,
   `jest --cacheDirectory "$TMPDIR/jest"` ;
 * **rien de plus de 500 Mo dans `/tmp`** : sur un poste, `/tmp` est souvent en

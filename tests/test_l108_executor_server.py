@@ -486,6 +486,13 @@ class PorteeTest(ServeurExecTest):
         self.db.execute("UPDATE agent_registry SET cwd = '/x' WHERE name = 'tresorier'")
         self.assertFalse(self.op("agents.cwd_used", ["/x", "inge-front"]).body["value"])
 
+    def test_review_floor_scope_and_production_result(self):
+        from ameesh import review_floor
+        with mock.patch.object(review_floor, "production_decision_floor", return_value="decision #7"):
+            result = self.op("work.review_floor", [812], token=SESSION)
+            self.assertEqual(result.body["value"], {"floor": 2, "codes": ["production"]})
+            self.assertIsNone(self.op("work.review_floor", [900], token=SESSION).body["value"])
+
     def test_regles_de_session(self):
         self.assertEqual(self.op("leases.state", ["coord"], token=SESSION).body["error"],
                          "forbidden_scope")

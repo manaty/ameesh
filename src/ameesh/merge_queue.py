@@ -250,10 +250,10 @@ def required_verdicts(klass) -> int:
     un plancher qu'on ne lit pas ne se suppose pas absent."""
     base = _scale_verdicts(klass)
     klass = klass or {}
-    if base == 0 and not klass.get("files"):
-        return 0
     if klass.get("reviews_floor_unreadable"):
         return max(base, CRITICAL_REVIEWS)
+    if base == 0 and not klass.get("files") and not klass.get("production_reviews_floor"):
+        return 0
     return max(base, int(klass.get("reviews_floor") or 0))
 
 
@@ -1013,12 +1013,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         exclude_author_family = bool(klass.get("exclude_author_family", False))
     if distinct_families is None:
         distinct_families = bool(klass.get("distinct_families", True))
+    distinct_families = bool(distinct_families or klass.get("production_reviews_floor"))
     # #1979/#2281 : la dispense de re-verdict du pilote (`-none`) lève la
     # porte, comme elle lève l'attente dans `progress` ; elle ne survit pas à
     # un nouveau gel (stockage `_lapse_waiver`) et ne lève jamais un blocage.
     # La marque est relue après les jalons (`_waiver`) pour ne pas appliquer
     # une copie antérieure au gel.
     waived, waived_by, row = _waiver(db, item)
+    if klass.get("production_reviews_floor"):
+        waived, waived_by = False, ""
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "accepted_unfiltered": [], "blocked": [],
@@ -1060,9 +1063,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             # `_corrections_on_freeze` rend None et le correcteur d'un petit
             # correctif compterait sur son propre delta (#2739/#2888).
             outer = klass or {}
-            provenance = {key: outer[key] for key in ("base_sha", "target")
+            provenance = {key: outer[key] for key in ("base_sha", "target", "production_reviews_floor")
                           if outer.get(key)}
             klass = dict(vehicle["klass"], **provenance)
+            if klass.get("production_reviews_floor"):
+                klass["reviews_floor"] = max(int(klass.get("reviews_floor") or 0), 2)
             cls = str(klass.get("class") or cls)
             if klass.get("doubt"):
                 cls = lot_class.SENSITIVE
@@ -1074,7 +1079,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     vehicle_required = 0
     if vehicle is not None and vehicle.get("ok") is not False:
         vehicle_required = int(vehicle.get("required") or 0)
-        if vehicle.get("ok") is True and vehicle_required == 0 and cls != lot_class.RELEASE:
+        if (vehicle.get("ok") is True and vehicle_required == 0
+                and cls != lot_class.RELEASE and not klass.get("production_reviews_floor")):
             klass = {"class": lot_class.LIGHT, "files": []}
             cls = lot_class.LIGHT
             # #4041 : sans cette trace, `queue add` affichait « class light »
@@ -1238,8 +1244,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # et écrit la preuve).
     fallback = None
     fallback_refused = ""
-    if (required == 2 and len(latest_ok) == 1 and db is not None
-            and item is not None):
+    if (not klass.get("production_reviews_floor") and required == 2
+            and len(latest_ok) == 1 and db is not None and item is not None):
         try:
             evidence = _paused_family_fallback(
                 db, item, marks, klass, families, cfg, frozen,

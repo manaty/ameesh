@@ -213,6 +213,7 @@ class Policy:
     policy_required: Optional[int] = None
     #: #6661 : le plancher posé par le pilote (`review_floor`) lu à ce gel
     floor: int = 0
+    production_floor: bool = False
 
 
 @dataclass
@@ -360,20 +361,21 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
     try:
         for source, commit, loaded in policy_sources(cfg, db, project, errors):
             try:
-                need = loaded.reviews_for(paths)
+                need = loaded.reviews_for(paths) if paths else None
                 # #2627 / #3542 : le besoin que la porte de fusion calculera
                 # au feu. Le nombre d'une règle `train_reviews` qui nomme le
                 # chemin fait foi ; `CRITICAL_SCOPE` ne relève que les chemins
                 # qu'aucune règle ne nomme, et `**` ne l'abaisse jamais.
                 from . import merge_queue
-                classified = review.classify(loaded.review_policy, list(paths))
+                classified = (review.classify(loaded.review_policy, list(paths))
+                              if paths else {"class": "light", "files": []})
                 named, wide = _declared_reviews(loaded.rules, paths)
                 classified["train_reviews_paths"] = named
                 classified["train_reviews_wide"] = wide
                 classified["project"] = project
-                required = max(need.reviews, merge_queue.required_verdicts(classified))
+                required = max(need.reviews if need else 0, merge_queue.required_verdicts(classified))
                 # même classe que le lecteur compilé : le max des deux lectures
-                risk = max((need.risk, str(classified.get("class") or "light")),
+                risk = max((need.risk if need else "light", str(classified.get("class") or "light")),
                            key=review.RANK.__getitem__)
             except (mechanics.MechanicsError, review.ReviewError,
                     canon_mod.CanonError) as exc:
@@ -1711,6 +1713,12 @@ def _waiver(item: Mapping) -> bool:
     return any(str(name or "").strip() == REVIEWER_NONE for name in names or ())
 
 
+def _effective_waiver(db, item: Mapping) -> bool:
+    """A signed production decision cannot be waived by a reviewer marker."""
+    return (_waiver(item) and
+            not review_floor.production_decision_floor(db, int(item["id"])))
+
+
 def _delta_reading(commit_families, global_families=()):
     """#7745 : les familles d'auteur par delta, ou None sans lecture.
 
@@ -2027,9 +2035,11 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         return Unavailable("lot #%d declares no project: the review policy is unknown"
                            % int(lot))
     manual = _manual(db, item)
-    waiver = _waiver(item)
+    waiver = _effective_waiver(db, item)
     answered = _verdicts_on(db, int(lot), frozen_sha)
-    if not paths:
+    production_floor = (review_floor.production_decision_floor(db, int(lot))
+                        if not paths else "")
+    if not paths and not production_floor:
         # no changed file: no review is due, and no policy needs to be read
         # #3948 : la marque est bornée par l'id provisoire du gel, comme la
         # lecture des auteurs (`id < gel`) : un gel concurrent arrivé après la
@@ -2059,6 +2069,9 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     floor = review_floor.apply({}, db, int(lot), cfg=cfg)
     if floor.get("reviews_floor_unreadable"):
         return Unavailable("review floor unreadable: %s" % floor["reviews_floor_unreadable"])
+    if floor.get("production_reviews_floor"):
+        policy = dataclasses.replace(policy, review_independence=(True, True),
+                                     production_floor=True)
     policy = dataclasses.replace(policy, floor=int(floor.get("reviews_floor") or 0))
     if int(floor.get("reviews_floor") or 0) > policy.required:
         policy = dataclasses.replace(policy, required=int(floor["reviews_floor"]))
@@ -2316,7 +2329,10 @@ def _floor_of(db, lot: int, cfg) -> int:
     #3592 : an unreadable journal must not read as a floor of 0, otherwise a
     recorded designation looks complete and its completion is skipped without
     a trace. The caller reports the failure and writes nothing."""
-    return int(review_floor.of_lot(db, int(lot), cfg=cfg).get("floor") or 0)
+    floor = review_floor.apply({}, db, int(lot), cfg=cfg)
+    if floor.get("reviews_floor_unreadable"):
+        raise ValueError(floor["reviews_floor_unreadable"])
+    return int(floor.get("reviews_floor") or 0)
 
 
 def _with_live_families(db, seats, *, families) -> list:
@@ -2484,7 +2500,7 @@ def same_head_settled(db, cfg, lot: int, sha: str,
     freeze = dev.latest_freeze(marks)
     if not freeze or not plan_git.same_commit((freeze or {}).get("sha"), sha):
         return None
-    if _waiver(item):
+    if _effective_waiver(db, item):
         return freeze
     if not acquired_on_head(db, cfg, lot, freeze):
         return None
@@ -2932,7 +2948,9 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
         return
     current = [str(name) for name in (rows[0].get("reviewers") or []) if name]
     if "-none" in current:
-        return
+        if not review_floor.production_decision_verified(db, lot):
+            return
+        current.remove("-none")
     names = [str(name or "").strip() for name in names or ()]
     names = [name for name in names if name]
     marks = _marks(db, lot)
@@ -3501,7 +3519,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
         answered=inputs.answered,
         required=inputs.policy.required, advances=inputs.advances,
         deltas=_input_deltas(inputs),
-        global_families=getattr(inputs, "global_families", ()))
+        global_families=getattr(inputs, "global_families", ()),
+        production_floor=inputs.policy.production_floor)
 
 
 def carried_plan(cfg, db, lot: int, sha: str, *,
@@ -3748,7 +3767,7 @@ def _fresh_prepared(cfg, tx, item: Mapping, freeze: Mapping,
                 "the reading cannot be validated: the review floor is "
                 "unreadable under the lock; the designation is left to the "
                 "recovery path")
-        if inputs.paths and int(floor.get("reviews_floor") or 0) > int(
+        if (inputs.paths or floor.get("production_reviews_floor")) and int(floor.get("reviews_floor") or 0) > int(
                 inputs.policy.required):
             return Unavailable(
                 "the reading is stale: the review floor was raised during the "
@@ -3757,7 +3776,7 @@ def _fresh_prepared(cfg, tx, item: Mapping, freeze: Mapping,
                 % (int(inputs.policy.required),
                    int(floor.get("reviews_floor") or 0)))
     manual = _manual(tx, item)
-    waiver = _waiver(item)
+    waiver = _effective_waiver(tx, item)
     # #4582 : un verdict a pu être rendu pendant la lecture préalable ; sous le
     # verrou, il est relu pour ne pas relancer un siège qui a déjà son avis.
     answered = _verdicts_on(tx, int(item.get("id") or 0),
@@ -3849,7 +3868,7 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
     freeze.setdefault("id", 0)
     freeze.setdefault("sha", "")
     manual = _manual(tx, item)
-    if _waiver(item):
+    if _effective_waiver(tx, item):
         return _manual_outcome(tx, item, freeze, manual, waiver=True)
     if carried:
         return _carried_in_transaction(tx, item, freeze, carried)
@@ -3915,7 +3934,7 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
     checkpoint = len(threads)
     _savepoint(tx)
     try:
-        if not inputs.paths or inputs.policy.required == 0:
+        if inputs.policy.required == 0:
             out = {"state": rd.NONE, "required": 0, "reviewers": [],
                    "freeze": freeze,
                    "why": LIGHT_WHY if inputs.paths else NO_PATH_WHY}
@@ -4275,7 +4294,7 @@ def same_head_hook(outcome: Optional[dict] = None, *, previous=None):
                 "(another freeze was written); retry the freeze")
         plan = same_head_plan(tx, lot, str(milestone.get("sha") or ""),
                               previous=previous)
-        if _waiver(item):
+        if _effective_waiver(tx, item):
             result = {"state": rd.NONE, "required": 0, "reviewers": [],
                       "freeze": dict(milestone or {}),
                       "why": "same head re-freeze (#5481): manual waiver kept"}
@@ -4396,7 +4415,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                         "never resolves a ref in its own clone, nothing written"
                         % (freeze.get("id"), str(freeze.get("sha") or "")))}
     manual = _manual(db, item)
-    if _waiver(item):
+    if _effective_waiver(db, item):
         return {"state": "manual", "reviewers": [], "freeze": freeze,
                 "why": "manual waiver (-none)"}
     if force and _force_superseded(db, int(lot), freeze, expected_mark):
@@ -4549,7 +4568,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             return _manual_outcome(db, item, freeze, inputs.manual)
         if completion is not None:
             # #3557 : la désignation du gel est complétée, jamais remplacée.
-            if not inputs.paths or inputs.policy.required == 0:
+            if inputs.policy.required == 0:
                 return dict(completion["shape"])
             # Le snapshot **vivant** du début de passe : seuls les sièges du
             # gel encore présents dans la colonne sont examinés et gardés. Un
@@ -4566,6 +4585,8 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                           for row in (completion["shape"] or {}).get("reviewers") or ()}
             mark_names.discard("")
             removed = mark_names - live_names
+            if inputs.policy.production_floor and _waiver(item):
+                removed = set()
             seats = rd.manual_seats(
                 list(inputs.manual_seats) + live_seats,
                 authors=inputs.authors, fixers=inputs.correctors,
@@ -4608,7 +4629,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     candidates=[candidate for candidate in inputs.candidates
                                 if str(getattr(candidate, "name", "") or "").strip()
                                 not in removed])
-        if not inputs.paths or inputs.policy.required == 0:
+        if inputs.policy.required == 0:
             why = LIGHT_WHY if inputs.paths else NO_PATH_WHY
             with db.transaction() as tx:
                 if not _lock_current_freeze(tx, int(lot), freeze):
@@ -5616,14 +5637,14 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
                          % (freeze.get("id"), str(freeze.get("sha") or "")))
     item = work.get(db, int(lot)) or {"id": int(lot), "state": "", "title": "",
                                       "app": ""}
-    if _waiver(item):
+    if _effective_waiver(db, item):
         return unchanged("manual", "manual waiver (-none)")
     threads = _threads()
     try:
         inputs = prepare(cfg, db, int(lot), freeze=freeze)
         if isinstance(inputs, Unavailable):
             return unchanged("unavailable", inputs.why)
-        if not inputs.paths or inputs.policy.required == 0:
+        if inputs.policy.required == 0:
             return unchanged(rd.NONE, LIGHT_WHY if inputs.paths else NO_PATH_WHY)
         excluded_names = {str(name or "").strip() for name in excluded or ()
                           if str(name or "").strip()}

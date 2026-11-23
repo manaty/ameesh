@@ -73,6 +73,7 @@ class Requirement:
     #: lecteur de la classe (`review_floor.apply`) ; illisible vaut deux avis.
     reviews_floor: int = 0
     reviews_floor_unreadable: str = ""
+    production_reviews_floor: int = 0
 
     def klass(self) -> dict:
         """La classe et les chemins classés, lus par la porte des avis (#2681),
@@ -85,6 +86,8 @@ class Requirement:
             klass["reviews_floor"] = self.reviews_floor
         if self.reviews_floor_unreadable:
             klass["reviews_floor_unreadable"] = self.reviews_floor_unreadable
+        if self.production_reviews_floor:
+            klass["production_reviews_floor"] = self.production_reviews_floor
         return klass
 
     def check(self, row, base):
@@ -102,6 +105,7 @@ class Requirement:
             raise TrainError("malformed review path reading")
         if type(self.reviews_floor) is not int \
                 or not 0 <= self.reviews_floor <= review_floor.MAX_FLOOR \
+                or self.production_reviews_floor not in (0, 2) \
                 or not isinstance(self.reviews_floor_unreadable, str):
             raise TrainError("malformed review floor reading")
         if type(self.reviews) is not int or self.risk not in _RISKS \
@@ -130,7 +134,8 @@ def floored(db, requirement):
     if not floor and not unreadable:
         return requirement
     raised = replace(requirement, reviews_floor=floor,
-                     reviews_floor_unreadable=unreadable)
+                     reviews_floor_unreadable=unreadable,
+                     production_reviews_floor=int(klass.get("production_reviews_floor") or 0))
     return replace(raised, reviews=max(requirement.reviews,
                                        merge_queue.required_verdicts(raised.klass())))
 

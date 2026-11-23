@@ -281,6 +281,14 @@ def warn_checks(root: str, environ) -> tuple:
 
 def _run(check, root: str, env: dict) -> tuple:
     name, args = check
+    # multiprocessing's forkserver adds a socket path below TMPDIR.  When
+    # the inherited directory leaves less than 40 bytes, run compilation
+    # serially instead of failing before any file is checked.
+    if (name == "compilation" and "-j" in args
+            and any(len(os.fsencode(env.get(key) or "")) + 40 > 107
+                    for key in ("TMPDIR", "TMP", "TEMP"))):
+        args = list(args)
+        args[args.index("-j") + 1] = "1"
     start = time.monotonic()
     try:
         proc = subprocess.run([sys.executable, *args], cwd=root, env=env,
