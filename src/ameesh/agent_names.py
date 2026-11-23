@@ -39,6 +39,17 @@ def note_row(row) -> None:
         known.add(row["name"])
 
 
+def primary_known(name: str) -> bool:
+    """#8168 : ce nom est-il déjà confirmé primaire dans la passe courante ?
+
+    `registry.get` s'en sert pour relire un primaire sans repasser par
+    `ameesh_resolve_agent_name` : la première lecture de la passe résout et
+    audite, les suivantes lisent la ligne directement. Hors passe, faux : on
+    ne retient rien d'un passage à l'autre (un renommage reste vu)."""
+    known = _PASS_PRIMARIES.get()
+    return known is not None and name in known
+
+
 def resolve(name: str, *, db=None, canon=None, cfg=None, operation: str = "lookup", row=None) -> str:
     """Resolve an agent spelling to its primary, without granting authority.
 
