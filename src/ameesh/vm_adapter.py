@@ -484,8 +484,12 @@ def stalled_role_wakes(queue, targets, controls, *, now):
 def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
     """Revalidate native release proof and elected leader/reserve at effect time."""
     canons, unknown = host_release._canon_read(cfg)
-    if unknown or not canons:
+    if unknown:
         raise Refused('canon unavailable')
+    if not canons:
+        # #8126: an absent `canons` key is a configuration to write, not a
+        # canon to synchronize; the operator must see which one is missing.
+        raise Refused('no canon configured')
     store = storage.of(db)
     reading = store.hosts.latest(host)
     listing = store.operations.listing()
@@ -744,12 +748,16 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
             try:
                 fp = evidence(cfg, tx, host, control, now=now, quiet_s=quiet_s)
             except Refused as exc:
-                if str(exc) != 'canon unavailable':
+                # #8126: each canon refusal keeps its own durable marker, so
+                # the alert names the right cause; any other refusal still
+                # escapes this tick.
+                refusal = str(exc)
+                if refusal not in host_release.ADAPTER_CANON:
                     raise
-                if request.get('result') != 'canon unavailable':
-                    q.finish(request, 'pending', 'canon unavailable')
-                return 'canon unavailable'
-            if request.get('result') == 'canon unavailable':
+                if request.get('result') != refusal:
+                    q.finish(request, 'pending', refusal)
+                return refusal
+            if request.get('result') in host_release.ADAPTER_CANON:
                 q.finish(request, 'pending', 'canon available')
             quiet = fp.get('idle_since')
             if (quiet is None or now - quiet < quiet_s

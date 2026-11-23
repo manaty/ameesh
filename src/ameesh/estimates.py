@@ -555,7 +555,11 @@ def build_reference(rows: list[dict], agents: dict | None = None, *,
             groups.append(group)
     by_author: dict = {}
     for lot in lots:
-        if lot["estimate"] and not lot["late"]:
+        # #8130 : « inconnu » est le pseudo-auteur des lots sans
+        # `estimate_by` (`work.UNKNOWN_ACTOR`), pas un estimateur : il n'entre
+        # pas dans la table des biais et ne reçoit donc aucune alerte.
+        if lot["estimate"] and not lot["late"] \
+                and lot["by"] != work_mod.UNKNOWN_ACTOR:
             by_author.setdefault(lot["by"], []).append(lot["actual"] / lot["estimate"])
     estimators = []
     for name, ratios in sorted(by_author.items()):
