@@ -262,6 +262,59 @@ class AlerteTest(_Base):
         alerts = [a for a in self.slo() if a["lot"] == lot["id"]]
         self.assertEqual([(a["step"], a["level"]) for a in alerts], [])
 
+    def test_executeur_externe_travail_fait_puis_levee_est_a_clore(self):
+        """#8163 : le lot #8158 du 23/11 — né réservé, travail fait et vérifié,
+        réservation levée à 17:20Z. L'horloge repart de la levée, et le lot est
+        signalé « to close », jamais « unassigned »."""
+        registry.upsert(self.db, "bureau_ext", harness="codex",
+                        host=self.cfg.host)
+        self.db.execute(
+            "UPDATE agent_registry SET mode = 'externe', responsible ="
+            " 'human:proprio', lease_owner = NULL WHERE name = 'bureau_ext'")
+        lot = work.add(self.db, title="prod 11cb", external_executor="bureau_ext",
+                       actor="human:proprio", cfg=self.cfg, priority=1)
+        # créé il y a 2 h, réservé au bureau.
+        self.db.execute(
+            "UPDATE work_items SET created_at = now() - make_interval(secs => %s)"
+            " WHERE id = %s", (2 * HEURE, lot["id"]))
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND state = 'intake'",
+            (2 * HEURE, lot["id"]))
+        # travail fait il y a 40 min, réservation levée il y a 20 min.
+        work.note(self.db, lot["id"],
+                  "FAIT. API, web and media-worker deployed; smoke green",
+                  actor="bureau_ext")
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND note LIKE 'FAIT%%'",
+            (40 * 60.0, lot["id"]))
+        work.set_external_executor(self.db, lot["id"], None,
+                                   actor="human:proprio", cfg=self.cfg,
+                                   clear=True)
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND note LIKE 'external executor cleared%%'",
+            (20 * 60.0, lot["id"]))
+        self.now = time.time()
+        alerts = [a for a in self.slo() if a["lot"] == lot["id"]]
+        self.assertEqual(
+            [(a["step"], a["level"], a["targets"]) for a in alerts],
+            [("intake_started", 1, ["pilot", "avatar", "auditeur"])])
+        alert = alerts[0]
+        self.assertTrue(alert["external_done"])
+        self.assertEqual(alert["external_was"], "bureau_ext")
+        self.assertIn("to close", alert["detail"])
+        # 20 min après la levée (cible P1 15 min), pas 2 h depuis la création.
+        self.assertAlmostEqual(alert["since"], self.now - 20 * 60, delta=10)
+        out = self.briefs(alert)
+        self.assertEqual(sorted(out), ["auditeur", "bureau", "orch"])
+        for text in out.values():
+            self.assertIn("to close", text)
+            self.assertNotIn("unassigned", text)
+        self.assertNotIn("unassigned", out["orch"])
+        self.assertNotIn("reassign it now", out["orch"])
+
     def test_bloquant_fusionne_le_delai_part_de_la_levee(self):
         # #2551 : #2198/#2498 — un lot assigné depuis 13 h mais retenu par
         # #2184 ne doit pas escalader au niveau 3 à la seconde où le bloqueur
@@ -1380,6 +1433,34 @@ class BriefsTest(_Base):
         # #2395 : le texte annonce la vraie cible, pas une notification owner.
         self.assertIn("bureau handles it with the auditor", out["bureau"])
         self.assertIn("no SLO delay is notified to the owner", out["bureau"])
+
+    def test_executeur_externe_travail_fait_est_a_clore(self):
+        """#8163 : la réservation est levée après une note de travail fait ;
+        le lot n'est pas « unassigned » et le geste est la clôture, pas une
+        réassignation — même au niveau 3."""
+        base = {"type": "slo_breach", "lot": self.lot["id"], "agent": None,
+                "step": "intake_started",
+                "step_label": "lot ready (intake) → started (build)",
+                "level": 1, "value": 1200, "threshold": 900,
+                "targets": ["pilot"], "critical": False, "waiting": {},
+                "external_done": True, "external_was": "bureau"}
+        out = self.briefs(base)
+        self.assertEqual(sorted(out), ["orch"])
+        text = out["orch"]
+        self.assertIn("to close", text)
+        self.assertIn("close it now", text)
+        self.assertIn("ameesh work close %d" % self.lot["id"], text)
+        self.assertNotIn("unassigned", text)
+        self.assertNotIn("reassign it now", text)
+
+        # Au niveau 3, les destinataires changent, jamais le geste.
+        high = dict(base, level=3, targets=["avatar", "auditeur"])
+        out = self.briefs(high)
+        self.assertEqual(sorted(out), ["auditeur", "bureau"])
+        for text in out.values():
+            self.assertIn("to close", text)
+            self.assertNotIn("unassigned", text)
+            self.assertNotIn("reassign it now", text)
 
 
 class AttentePorteurTest(_Base):
