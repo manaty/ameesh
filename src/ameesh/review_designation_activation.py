@@ -4280,7 +4280,12 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
     `fetch=False` (#3836) interdit le rapatriement par la forge : la
     notification tourne dans la transaction du gel et ne doit jamais y attendre
     le réseau. `threads=None` écrit le courrier dans la transaction courante
-    (chemin différé après commit, #3948) ; une liste le diffère à son tour."""
+    (chemin différé après commit, #3948) ; une liste le diffère à son tour.
+
+    #8127 : le courrier n'appelle aucun geste (« si vous voulez re-relire »),
+    donc il est déposé en `info` : lu au tour suivant, sans réveil. Le réveil
+    d'un siège dû reste celui de la demande de désignation, qui couvre déjà le
+    relecteur redésigné sur la nouvelle tête."""
     lot, freeze_id, sha, candidates = _superseded_candidates(
         db, item, freeze, outcome)
     if not candidates:
@@ -4316,7 +4321,10 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
         mail.send(db, SENDER, actor, body, work_item_id=str(lot),
                   payload={"review_block_superseded": {
                       "lot": lot, "freeze": freeze_id, "sha": sha,
-                      "blocked_sha": mark_sha}},
+                      "blocked_sha": mark_sha},
+                      # #8127 : aucune action attendue de ce courrier ; sans
+                      # `info`, il ouvrait un tour pour rien (R1 de #6002).
+                      "info": True},
                   after_commit=threads)
 
 
