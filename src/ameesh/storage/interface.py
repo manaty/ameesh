@@ -1811,6 +1811,26 @@ class Mailbox(Domain):
         """Dépose un message ; rend id, created_ts et les projets du fil
         (`sender_project`, `recipient_project`) des deux agents."""
 
+    def send_passive_notice(self, sender: str, recipient: str, body: str, *,
+                            passive_head: str, host: str | None, kind: str,
+                            payload: dict | None, work_item_id: str | None,
+                            signature: str | None, signature_key: str | None,
+                            signed_payload: str | None, nonce: str | None,
+                            created_us: int | None,
+                            expires_us: int | None) -> dict:
+        """#8118 : dépose un avis qui peut rester passif sans perdre son réveil.
+
+        `passive_head` est la tête gelée que `body` annonce et que l'appelant
+        a déjà reconnue. Le pilote Postgres relit la demande de relecture sous
+        le verrou du destinataire et ne rend l'avis passif que si elle attend
+        encore livraison (B #231419). Le dépôt par défaut reste **actif** : un
+        stockage qui ne sert pas ce couplage ne retire jamais un réveil."""
+        return self.send(sender, recipient, body, host=host, kind=kind,
+                         payload=payload, work_item_id=work_item_id,
+                         signature=signature, signature_key=signature_key,
+                         signed_payload=signed_payload, nonce=nonce,
+                         created_us=created_us, expires_us=expires_us)
+
     @abc.abstractmethod
     def send_reply(self, sender: str, recipient: str, body: str, *, host: str | None,
                    kind: str, payload: dict | None, work_item_id: str | None,

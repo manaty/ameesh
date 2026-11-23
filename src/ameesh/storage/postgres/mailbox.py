@@ -164,6 +164,32 @@ class Mailbox(interface.Mailbox):
                                         automatic=isinstance(review, dict))
         return self._insert(sender, recipient, body, **args)
 
+    def send_passive_notice(self, sender, recipient, body, *, passive_head,
+                            host, kind, payload, work_item_id, signature,
+                            signature_key, signed_payload, nonce, created_us,
+                            expires_us) -> dict:
+        """#8118 : voir `interface.Mailbox.send_passive_notice`.
+
+        B #231419 : la relecture de la demande et le dépôt sont dans la même
+        transaction, sous le verrou partagé du destinataire que `reserve` et
+        `deliver` prennent en exclusif. Une livraison committée avant la
+        relecture rend l'avis actif ; une livraison qui arrive ensuite attend
+        le dépôt, donc la demande ouvre le tour APRÈS que l'avis passif est en
+        boîte et le relecteur le lit."""
+        with self.db.transaction() as tx:
+            box = Mailbox(tx)
+            box.lock_recipient(recipient)
+            lot = str(work_item_id or "").strip()
+            if lot.isdigit():
+                head = box.review_notice_head(sender, recipient, int(lot))
+                if head and head.lower() == str(passive_head).strip().lower():
+                    payload = dict(payload or {}, info=True)
+            return box._insert(sender, recipient, body, host=host, kind=kind,
+                               payload=payload, work_item_id=work_item_id,
+                               signature=signature, signature_key=signature_key,
+                               signed_payload=signed_payload, nonce=nonce,
+                               created_us=created_us, expires_us=expires_us)
+
     def send_reply(self, sender, recipient, body, *, host, kind, payload,
                    work_item_id, signature, signature_key, signed_payload,
                    nonce, created_us, expires_us, in_reply_to) -> dict:

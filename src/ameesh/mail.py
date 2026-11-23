@@ -216,40 +216,42 @@ def _announces_freeze(body: str, head: str) -> bool:
     return any(word in text for word in _FREEZE_WORDS)
 
 
-def _review_notice_passive(db: Db, sender: str, recipient: str, kind: str,
-                           payload: dict | None, work_item_id: str | None,
-                           body: str) -> bool:
-    """#8118 : une annonce de gel ne double pas le réveil de la demande.
+def _review_notice_head(db: Db, sender: str, recipient: str, kind: str,
+                        payload: dict | None, work_item_id: str | None,
+                        body: str) -> str:
+    """#8118 : tête gelée qu'une annonce de `sender` double sans la réveiller.
 
-    Sur un lot gelé (`qa`) dont `recipient` est un relecteur désigné au verdict
-    encore dû sur la tête, un simple `notify` de l'auteur du contenu gelé
-    n'ouvre pas de tour **tant que la demande de relecture de cette tête
-    attend encore livraison** : c'est elle, le réveil en attente. Une demande
-    livrée, ou tout autre message (question, réponse, consigne), réveille.
-    L'avis n'est ni perdu ni retiré : il devient passif (lu au tour suivant,
-    comme une copie), et la porte (#2442) ne change pas.
-    Un humain, le système, un urgent, un `reply`/`decision`, une consigne d'un
-    autre agent et tout avis après un verdict rendu réveillent toujours ; une
-    erreur de lecture laisse le message actif, jamais perdu.
+    Rend le SHA de la dernière tête gelée quand `body` annonce son gel, que
+    `sender` est l'auteur du contenu gelé, que `recipient` est un relecteur
+    désigné au verdict encore dû sur cette tête, que le lot est en `qa` et
+    qu'une demande de relecture de cette tête lui a été déposée sans être
+    encore livrée. Rend "" sinon : l'avis reste actif.
+
+    La livraison de la demande peut gagner entre cette lecture et le dépôt :
+    le dépôt (`send_passive_notice`) relit sous le verrou du destinataire et
+    ne rend l'avis passif que si la demande attend encore livraison
+    (B #231419). Un humain, le système, un urgent, une réponse, une consigne
+    d'un autre agent et tout avis après un verdict rendu réveillent toujours ;
+    une erreur de lecture laisse le message actif, jamais perdu.
     """
     if kind != "notify":
-        return False
+        return ""
     if payload is not None and not isinstance(payload, dict):
-        return False
+        return ""
     if (payload or {}).get("urgent") or (payload or {}).get("human"):
-        return False
+        return ""
     if not str(work_item_id or "").strip().isdigit():
-        return False
+        return ""
     if not sender or sender.startswith("human:") or sender == "ameesh":
-        return False
+        return ""
     try:
         # #8118 : la lecture du siège est dans le stockage ; un pilote qui ne
         # la sert pas rend "", et l'avis reste actif.
         head = storage.of(db).mailbox.review_notice_head(
             sender, recipient, int(work_item_id))
-        return bool(head) and _announces_freeze(body, head)
+        return head if _announces_freeze(body, head) else ""
     except Exception:  # noqa: BLE001 - un avis reste actif plutôt que perdu
-        return False
+        return ""
 
 
 def send(
@@ -352,17 +354,25 @@ def send(
             raise ValueError("payload.idempotency_key does not match the key")
         payload["idempotency_key"] = idempotency_key
     fil.ensure_readable(body, allow_structured)
-    if _review_notice_passive(db, sender, recipient, kind, payload,
-                              work_item_id, body):
-        # #8118 : le dépôt reste le même ; seule l'ouverture du tour change.
-        payload = dict(payload or {})
-        payload["info"] = True
+    # #8118 : une annonce de gel ne double pas le réveil de la demande de
+    # relecture. Une réponse (`in_reply_to`) reste toujours active : c'est le
+    # dialogue, jamais l'annonce que la désignation porte déjà.
+    passive_head = ""
+    if in_reply_to is None:
+        passive_head = _review_notice_head(db, sender, recipient, kind,
+                                           payload, work_item_id, body)
     mailbox = storage.of(db).mailbox
     args = dict(host=host, kind=kind, payload=payload,
                 work_item_id=work_item_id, signature=signature,
                 signature_key=signature_key, signed_payload=signed_payload,
                 nonce=nonce, created_us=created_us, expires_us=expires_us)
-    if in_reply_to is None:
+    if in_reply_to is None and passive_head:
+        # Le dépôt relit la demande sous le verrou du destinataire : la
+        # livraison ne peut pas se glisser entre la lecture et le dépôt
+        # (B #231419). Un stockage qui ne sert pas ce couplage dépose actif.
+        row = mailbox.send_passive_notice(sender, recipient, body,
+                                          passive_head=passive_head, **args)
+    elif in_reply_to is None:
         row = mailbox.send(sender, recipient, body, **args)
     else:
         # #7672 : la corrélation a son propre dépôt, refusé à l'exécuteur

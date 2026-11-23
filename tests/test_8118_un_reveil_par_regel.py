@@ -7,15 +7,21 @@ désignation du siège est le réveil ; l'annonce de gel que l'auteur envoie
 devant elle devient passive (lue au tour suivant) et ne double plus ce réveil.
 Une demande déjà livrée n'est plus un réveil en attente (B #231383) : la
 réponse de l'auteur réveille, et une question qui n'annonce pas le gel aussi.
+La livraison ne peut pas se glisser entre la lecture et le dépôt (B #231419) :
+le dépôt relit sous le verrou du destinataire.
 
 La porte ne change pas (#2442) : la demande exacte reste déposée sur la tête
 gelée et le verdict reste dû.
 """
 from __future__ import annotations
 
+import threading
+import time
 import unittest
+from unittest import mock
 
 from ameesh import mail, work
+from ameesh.storage.postgres import mailbox as _pg
 from ameesh.work_reviewers import designated
 
 from .support import PgTestCase
@@ -188,6 +194,95 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
                   "#%d : l'option A te va-t-elle ?" % self.lot,
                   kind="notify", work_item_id=str(self.lot))
         self.assertEqual(len(self._wakes("r1")), before + 1)
+
+    def test_delivery_between_the_read_and_the_deposit_keeps_the_wake(self):
+        # B #231419 : la livraison gagne entre la lecture de la demande et le
+        # dépôt. Le dépôt relit sous le verrou du destinataire : l'avis reste
+        # actif, le relecteur ne termine pas son tour sans le voir.
+        self.freeze()
+        real = _pg.Mailbox.review_notice_head
+        calls = []
+
+        def deliver_between(box, sender, recipient, lot):
+            head = real(box, sender, recipient, lot)
+            calls.append(head)
+            if len(calls) == 1:
+                box.db.execute(
+                    "UPDATE agent_mailbox SET delivered_at = now()"
+                    " WHERE work_item_id = %s AND kind = 'request'",
+                    (str(self.lot),))
+            return head
+
+        with mock.patch.object(_pg.Mailbox, "review_notice_head",
+                               deliver_between):
+            mail.send(self.db, "author", "r1",
+                      "#%d : nouveau gel %s" % (self.lot, self.frozen),
+                      kind="notify", work_item_id=str(self.lot))
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(mail.passive_reason(self._notifies("r1")[0]), "")
+
+    def test_the_deposit_waits_for_a_delivery_in_flight(self):
+        # B #231419 : une livraison en cours tient le verrou exclusif du
+        # destinataire ; le dépôt attend son COMMIT, relit la demande livrée
+        # et reste actif. Sans ce verrou, le dépôt aurait lu « non livrée »
+        # et rendu passif un message que le relecteur ne verrait pas.
+        self.freeze()
+        other = self.connect()
+        self.addCleanup(other.close)
+        locked = threading.Event()
+        release = threading.Event()
+        committed = threading.Event()
+        attempted = threading.Event()
+        errors = []
+        real_lock = _pg.Mailbox.lock_recipient
+
+        def note_lock(box, recipient):
+            attempted.set()
+            return real_lock(box, recipient)
+
+        def deliver():
+            try:
+                with other.transaction() as tx:
+                    tx.query("SELECT 1 FROM agent_registry"
+                             " WHERE name = %s FOR UPDATE", ("r1",))
+                    locked.set()
+                    if not release.wait(30):
+                        raise RuntimeError("dépôt non libéré")
+                    tx.execute(
+                        "UPDATE agent_mailbox SET delivered_at = now()"
+                        " WHERE work_item_id = %s AND kind = 'request'",
+                        (str(self.lot),))
+                committed.set()
+            except Exception as exc:  # noqa: BLE001 - remonté au témoin
+                errors.append(exc)
+                locked.set()
+                committed.set()
+
+        def send():
+            try:
+                mail.send(self.db, "author", "r1",
+                          "#%d : nouveau gel %s" % (self.lot, self.frozen),
+                          kind="notify", work_item_id=str(self.lot))
+            except Exception as exc:  # noqa: BLE001 - remonté au témoin
+                errors.append(exc)
+
+        deliver_thread = threading.Thread(target=deliver, daemon=True)
+        deliver_thread.start()
+        self.assertTrue(locked.wait(10), "livraison non verrouillée")
+        with mock.patch.object(_pg.Mailbox, "lock_recipient", note_lock):
+            send_thread = threading.Thread(target=send, daemon=True)
+            send_thread.start()
+            self.assertTrue(attempted.wait(10), "dépôt sans verrou")
+            time.sleep(0.2)
+            self.assertTrue(send_thread.is_alive(),
+                            "le dépôt n'a pas attendu la livraison")
+            release.set()
+            send_thread.join(30)
+            self.assertFalse(send_thread.is_alive(), "dépôt bloqué")
+            deliver_thread.join(30)
+        self.assertEqual(errors, [])
+        self.assertTrue(committed.is_set())
+        self.assertEqual(mail.passive_reason(self._notifies("r1")[0]), "")
 
 
 if __name__ == "__main__":
