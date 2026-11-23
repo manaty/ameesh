@@ -87,6 +87,26 @@ class SettingsTest(unittest.TestCase):
         # forme courte : aucune base déclarée, le défaut du veilleur s'applique
         self.assertIsNone(plan_github.parse_settings(SETTINGS).bases_for(PUBLIC))
 
+    def test_dispatcher_declare(self):
+        """#8156 : le dispatcher d'un projet est un chemin du dépôt."""
+        script = "scripts/ci/dispatch-due-parts.mjs"
+        settings = plan_github.parse_settings({"projects": {"app": {
+            "repo": PRIVATE, "ci": {"dispatcher": script}}}})
+        self.assertEqual(settings.dispatcher_for(PRIVATE), script)
+        self.assertEqual(settings.dispatcher_for(PRIVATE.upper()), script)
+        self.assertIsNone(settings.dispatcher_for(PUBLIC))
+        self.assertIsNone(settings.dispatcher_for(""))
+        # forme courte : aucun dispatcher, le chemin d'étiquette reste
+        self.assertIsNone(plan_github.parse_settings(SETTINGS).dispatcher_for(PUBLIC))
+        # deux noms de projet sur le même dépôt, même dispatcher : admis ;
+        # un dispatcher différent pour le même dépôt : refusé (ci-dessous).
+        settings = plan_github.parse_settings({"projects": {
+            "app": {"repo": PRIVATE, "ci": {"dispatcher": script}},
+            "app-bis": {"repo": PRIVATE, "ci": {"dispatcher": script}},
+            "web": {"repo": PUBLIC, "ci": {"dispatcher": "ci/other.mjs"}}}})
+        self.assertEqual(settings.dispatcher_for(PRIVATE), script)
+        self.assertEqual(settings.dispatcher_for(PUBLIC), "ci/other.mjs")
+
     def test_refus(self):
         for raw, needle in (
             ([], "JSON object"),
@@ -110,6 +130,32 @@ class SettingsTest(unittest.TestCase):
             ({"projects": {"web": {"repo": PUBLIC, "base": 7}}}, "branch name"),
             ({"projects": {"web": {"repo": PUBLIC, "base": "de velop"}}}, "branch name"),
             ({"projects": {"web": {"repo": PUBLIC, "base": [""]}}}, "branch name"),
+            ({"projects": {"web": {"repo": PUBLIC, "ci": "dispatch.mjs"}}},
+             "object"),
+            ({"projects": {"web": {"repo": PUBLIC, "ci": {"dispatcher": ""}}}},
+             "repository path"),
+            ({"projects": {"web": {"repo": PUBLIC, "ci": {"dispatcher": 7}}}},
+             "repository path"),
+            ({"projects": {"web": {"repo": PUBLIC,
+                                   "ci": {"dispatcher": "/usr/ci.mjs"}}}},
+             "path inside the repository"),
+            ({"projects": {"web": {"repo": PUBLIC,
+                                   "ci": {"dispatcher": "scripts/../ci.mjs"}}}},
+             "path inside the repository"),
+            ({"projects": {"web": {"repo": PUBLIC,
+                                   "ci": {"dispatcher": "scripts\\ci.mjs"}}}},
+             "path inside the repository"),
+            ({"projects": {"web": {"repo": PUBLIC,
+                                   "ci": {"dispatcher": "scripts/ci.mjs/"}}}},
+             "path inside the repository"),
+            ({"projects": {"web": {"repo": PUBLIC,
+                                   "ci": {"dispacher": "scripts/ci.mjs"}}}},
+             "unknown key(s)"),
+            ({"projects": {"web": {"repo": PUBLIC,
+                                   "ci": {"dispatcher": "scripts/a.mjs"}},
+                           "site": {"repo": PUBLIC,
+                                    "ci": {"dispatcher": "scripts/b.mjs"}}}},
+             "already declares"),
         ):
             with self.subTest(raw=raw):
                 with self.assertRaises(plan_github.SettingsError) as ctx:
