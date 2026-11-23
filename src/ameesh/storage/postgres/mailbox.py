@@ -900,9 +900,12 @@ class Mailbox(interface.Mailbox):
             (recipient, str(lot)),
         )
 
-    def review_notice_passive(self, sender, recipient, lot) -> bool:
-        """#8118 : voir `interface.Mailbox.review_notice_passive`.
+    def review_notice_head(self, sender, recipient, lot) -> str:
+        """#8118 : voir `interface.Mailbox.review_notice_head`.
 
+        B #231383 : la demande de relecture doit encore attendre livraison
+        (`delivered_at IS NULL`) — une demande livrée n'est plus un réveil en
+        attente, et une réponse de l'auteur doit ouvrir le tour du relecteur.
         Seul l'auteur du contenu gelé (acteur du jalon `frozen` ou assigné du
         lot) est concerné : une consigne du pilote ou de mesh-design garde son
         réveil. Le verdict doit être encore dû sur la tête — un relecteur qui a
@@ -910,7 +913,7 @@ class Mailbox(interface.Mailbox):
         est le dernier jalon `frozen` du lot, jamais un argument d'appelant."""
         rows = self.db.query(
             """
-            SELECT 1
+            SELECT f.sha
               FROM work_items w
               JOIN LATERAL (
                     SELECT m.sha, m.actor
@@ -929,9 +932,18 @@ class Mailbox(interface.Mailbox):
                        AND v.kind = 'verdict'
                        AND v.actor = %s
                        AND lower(coalesce(v.sha, '')) = lower(coalesce(f.sha, '')))
+               AND EXISTS (
+                    SELECT 1
+                      FROM agent_mailbox r
+                     WHERE r.recipient = %s
+                       AND r.kind = 'request'
+                       AND btrim(r.work_item_id) = w.id::text
+                       AND r.delivered_at IS NULL
+                       AND lower(coalesce(r.payload->'review_designation'->>'sha', ''))
+                           = lower(coalesce(f.sha, '')))
              LIMIT 1
-            """, (int(lot), recipient, sender, sender, recipient))
-        return bool(rows)
+            """, (int(lot), recipient, sender, sender, recipient, recipient))
+        return str(rows[0]["sha"] or "") if rows else ""
 
     def delivered_for_lot(self, recipient, lot, limit) -> list[dict]:
         """#2539 : les derniers messages déjà remis de CE lot, filtrés dans la

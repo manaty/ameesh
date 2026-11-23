@@ -1848,18 +1848,20 @@ class Mailbox(Domain):
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis marqués `payload.urgent`."""
 
-    def review_notice_passive(self, sender: str, recipient: str, lot: int) -> bool:
-        """#8118 : l'avis de `sender` double-t-il le réveil de la désignation ?
+    def review_notice_head(self, sender: str, recipient: str, lot: int) -> str:
+        """#8118 : tête gelée dont la demande de relecture attend livraison.
 
-        Vrai quand `sender` est l'auteur du contenu gelé (acteur du jalon
-        `frozen` ou assigné du lot), que `recipient` est un relecteur désigné
-        dont le verdict est encore dû sur la dernière tête gelée, et que le lot
-        est en `qa` : la demande de désignation du siège est le réveil en
-        attente, l'avis attend le tour suivant.
+        Rend le SHA de la dernière tête gelée quand l'avis de `sender` peut
+        doubler un réveil encore en attente : `sender` est l'auteur du contenu
+        gelé (acteur du jalon `frozen` ou assigné du lot), le lot est en `qa`,
+        `recipient` est un relecteur désigné sans verdict sur cette tête, et
+        une demande de relecture de cette tête lui a été déposée **sans être
+        encore livrée** (`delivered_at IS NULL`). Une demande déjà livrée
+        n'est plus un réveil en attente : l'avis doit réveiller (B #231383).
 
         Lecture locale au pilote Postgres : un stockage qui ne la sert pas
-        (exécuteur médié) rend False, et l'avis reste actif."""
-        return False
+        (exécuteur médié) rend "", et l'avis reste actif."""
+        return ""
 
     @abc.abstractmethod
     def unread_human(self, recipient: str, limit: int, *,

@@ -196,16 +196,38 @@ def _avatar_correspondence(db, *agents) -> bool:
     return any(fil.avatar_conversation(row) for row in rows)
 
 
+#: #8118 : mots d'une annonce de gel (français et anglais).
+_FREEZE_WORDS = ("gel", "freeze", "frozen")
+
+
+def _announces_freeze(body: str, head: str) -> bool:
+    """#8118 : le message annonce-t-il le gel de cette tête ?
+
+    Une annonce de gel nomme la tête gelée (son SHA complet ou son abréviation
+    de 12 caractères) et le gel lui-même. Une question, une réponse ou une
+    consigne de l'auteur ne le fait pas : elle réveille, même si la demande de
+    relecture attend encore livraison. Un message non reconnu réveille : le
+    silence ne se devine pas (B #231383).
+    """
+    text = str(body or "").lower()
+    sha = str(head or "").strip().lower()
+    if len(sha) < 12 or sha[:12] not in text:
+        return False
+    return any(word in text for word in _FREEZE_WORDS)
+
+
 def _review_notice_passive(db: Db, sender: str, recipient: str, kind: str,
-                           payload: dict | None,
-                           work_item_id: str | None) -> bool:
-    """#8118 : un avis d'auteur ne double pas le réveil d'une demande de relecture.
+                           payload: dict | None, work_item_id: str | None,
+                           body: str) -> bool:
+    """#8118 : une annonce de gel ne double pas le réveil de la demande.
 
     Sur un lot gelé (`qa`) dont `recipient` est un relecteur désigné au verdict
     encore dû sur la tête, un simple `notify` de l'auteur du contenu gelé
-    n'ouvre pas de tour : la demande de désignation du siège est le réveil en
-    attente. L'avis n'est ni perdu ni retiré : il devient passif (lu au tour
-    suivant, comme une copie), et la porte (#2442) ne change pas.
+    n'ouvre pas de tour **tant que la demande de relecture de cette tête
+    attend encore livraison** : c'est elle, le réveil en attente. Une demande
+    livrée, ou tout autre message (question, réponse, consigne), réveille.
+    L'avis n'est ni perdu ni retiré : il devient passif (lu au tour suivant,
+    comme une copie), et la porte (#2442) ne change pas.
     Un humain, le système, un urgent, un `reply`/`decision`, une consigne d'un
     autre agent et tout avis après un verdict rendu réveillent toujours ; une
     erreur de lecture laisse le message actif, jamais perdu.
@@ -222,9 +244,10 @@ def _review_notice_passive(db: Db, sender: str, recipient: str, kind: str,
         return False
     try:
         # #8118 : la lecture du siège est dans le stockage ; un pilote qui ne
-        # la sert pas rend False, et l'avis reste actif.
-        return bool(storage.of(db).mailbox.review_notice_passive(
-            sender, recipient, int(work_item_id)))
+        # la sert pas rend "", et l'avis reste actif.
+        head = storage.of(db).mailbox.review_notice_head(
+            sender, recipient, int(work_item_id))
+        return bool(head) and _announces_freeze(body, head)
     except Exception:  # noqa: BLE001 - un avis reste actif plutôt que perdu
         return False
 
@@ -329,7 +352,8 @@ def send(
             raise ValueError("payload.idempotency_key does not match the key")
         payload["idempotency_key"] = idempotency_key
     fil.ensure_readable(body, allow_structured)
-    if _review_notice_passive(db, sender, recipient, kind, payload, work_item_id):
+    if _review_notice_passive(db, sender, recipient, kind, payload,
+                              work_item_id, body):
         # #8118 : le dépôt reste le même ; seule l'ouverture du tour change.
         payload = dict(payload or {})
         payload["info"] = True

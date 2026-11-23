@@ -3,8 +3,10 @@
 
 Témoin du lot : trois regels successifs avec les mêmes relecteurs donnent
 trois réveils par relecteur (un par tête gelée), pas six à neuf. La demande de
-désignation du siège est le réveil ; l'avis que l'auteur envoie autour du gel
-devient passif (lu au tour suivant) et ne double plus ce réveil.
+désignation du siège est le réveil ; l'annonce de gel que l'auteur envoie
+devant elle devient passive (lue au tour suivant) et ne double plus ce réveil.
+Une demande déjà livrée n'est plus un réveil en attente (B #231383) : la
+réponse de l'auteur réveille, et une question qui n'annonce pas le gel aussi.
 
 La porte ne change pas (#2442) : la demande exacte reste déposée sur la tête
 gelée et le verdict reste dû.
@@ -159,6 +161,33 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
         mail.send(self.db, "mesh-design", "r1", "#%d : B à reconsidérer" % self.lot,
                   kind="notify", work_item_id=str(self.lot))
         self.assertEqual(len(self._wakes("r1")), before + 2)
+
+    def test_after_the_request_is_delivered_the_authors_reply_wakes(self):
+        # B #231383 : une demande livrée n'est plus un réveil en attente. La
+        # réponse de l'auteur au relecteur ouvre son tour, même si elle
+        # rappelle le gel et la tête (le corps, seul, la ferait passer pour
+        # une annonce).
+        self.freeze()
+        self.db.execute(
+            "UPDATE agent_mailbox SET delivered_at = now()"
+            " WHERE work_item_id = %s AND kind = 'request'",
+            (str(self.lot),))
+        before = len(self._wakes("r1"))
+        mail.send(self.db, "author", "r1",
+                  "#%d : sur le gel %s, l'option A te va-t-elle ?"
+                  % (self.lot, self.frozen),
+                  kind="notify", work_item_id=str(self.lot))
+        self.assertEqual(len(self._wakes("r1")), before + 1)
+
+    def test_a_question_before_delivery_wakes(self):
+        # B #231383 : seul un avis qui annonce le gel de cette tête double la
+        # demande en attente ; une question de l'auteur réveille.
+        self.freeze()
+        before = len(self._wakes("r1"))
+        mail.send(self.db, "author", "r1",
+                  "#%d : l'option A te va-t-elle ?" % self.lot,
+                  kind="notify", work_item_id=str(self.lot))
+        self.assertEqual(len(self._wakes("r1")), before + 1)
 
 
 if __name__ == "__main__":
