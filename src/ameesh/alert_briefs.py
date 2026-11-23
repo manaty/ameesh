@@ -1188,6 +1188,12 @@ def slo_vehicle_wait(alert: dict, name: str | None = None) -> bool:
     return True
 
 
+#: #8117 : alertes dont le geste revient à un opérateur (relivrer, relancer
+#: un agent arrêté) : le courrier d'agent part en `info`, sans réveil, sauf
+#: alerte critique ou urgente (P1).
+OPERATOR_GESTURE_TYPES = ("mail_undeliverable",)
+
+
 def quiet_modes(alert: dict, names, by_name: dict) -> dict:
     """#7443 : par destinataire, le mode de son courrier et la raison du choix.
 
@@ -1206,7 +1212,10 @@ def quiet_modes(alert: dict, names, by_name: dict) -> dict:
     #7009 : une pause critique ne réveille pas un destinataire lui-même en
     pause budget sur le même compte (11/11 03:32-04:23Z : auditeur,
     mesh-design et orchestrateur se réveillaient l'un l'autre pour une pause
-    qu'aucun ne pouvait lever) ; il la lit en `info`, sans l'urgence."""
+    qu'aucun ne pouvait lever) ; il la lit en `info`, sans l'urgence.
+
+    #8117 : une alerte de `OPERATOR_GESTURE_TYPES` non critique part en
+    `info` à tous ses destinataires."""
     # Les textes routés portent aussi une escalade de secours (#3036).
     escalated = {name for name, body in names.items()
                  if "Escalated from level " in body} if isinstance(names, dict) else set()
@@ -1220,6 +1229,13 @@ def quiet_modes(alert: dict, names, by_name: dict) -> dict:
                 if account and _budget_paused_on(by_name.get(name), account)}
     if alert.get("urgent"):
         return {}
+    if kind in OPERATOR_GESTURE_TYPES and not alert.get("critical"):
+        # #8117 : le geste revient à un opérateur ; le pilote le lit au tour
+        # suivant, sans réveil ni interruption (l'urgence du type reste celle
+        # de la route humaine, `notify.URGENT_TYPES`).
+        return {name: {"payload": {"info": True, "urgent": False},
+                       "reason": "operator gesture: no wake unless critical"}
+                for name in names}
     # #7308/#7443 : les constats sans geste immédiat restent lisibles au tour
     # suivant.
     if not alert.get("critical") and kind in ("idle_capacity", "plan_underused"):
