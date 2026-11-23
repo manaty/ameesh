@@ -44,7 +44,8 @@ class HaltMailTest(unittest.TestCase):
         self.assertEqual(agent['unread'], 1)
         for changes in (dict(urgent_unread=1), dict(actionable_lots=1),
                         dict(has_pending_prompt=True), dict(passive_unread=1),
-                        dict(lease_live=True), dict(urgent_unread=None)):
+                        dict(restart_requested_ts=9001), dict(lease_live=True),
+                        dict(urgent_unread=None)):
             with self.subTest(changes=changes), self.assertRaises(vm.Refused):
                 self.check_stop(control, dict(agent, **changes))
         for changes in (dict(automatic=True), dict(return_ts=None),

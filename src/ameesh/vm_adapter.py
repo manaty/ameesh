@@ -498,8 +498,10 @@ def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
     # for the remaining safety checks. Missing urgent evidence stays unknown.
     idle_listing = listing
     if listing is not None and host_release._dated_manual_drain(control):
-        idle_listing = [dict(row, unread=(row.get('urgent_unread')
-                                          if row.get('unread') is not None else None))
+        idle_listing = [dict(row, unread=(None if row.get('unread') is None
+                                          or row.get('urgent_unread') is None
+                                          else bool(row['urgent_unread']
+                                                    or row.get('restart_requested_ts'))))
                         if row.get('host') == host else row for row in listing]
     fp = host_idle.snapshot(cfg, db, canons, {host: reading}, now=now,
                             listing=idle_listing, history_s=quiet_s).get(host)
