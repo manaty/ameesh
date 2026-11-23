@@ -99,6 +99,8 @@ do, unless ``--no-apply`` is given.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -351,6 +353,34 @@ def _atomic_config_write(path: Path, data: bytes, mode: int) -> None:
         candidate.unlink(missing_ok=True)
 
 
+@contextlib.contextmanager
+def _config_lock(path: Path):
+    """Verrou exclusif partagé par les écrivains de la configuration de l'hôte.
+
+    #8109 : convention `<config>.lock`, prise pour tout le cycle
+    relire-modifier-remplacer par ce module comme par le helper de staging
+    (`deploy/mise-a-jour/canon-executant.py`). Fermer le descripteur rend le
+    verrou ; un fichier de verrou non privé est refusé, jamais suivi.
+    """
+    verrou = path.with_name(path.name + ".lock")
+    try:
+        handle = os.open(verrou, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise TimerError("configuration lock unreadable: %s: %s"
+                         % (verrou, exc.strerror or "?")) from None
+    try:
+        info = os.fstat(handle)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o022):
+            raise TimerError(
+                "configuration lock is not a private regular file: %s" % verrou)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(handle)
+
+
 def sync_github_projects(cfg, declarations) -> dict:
     """Add the canon-watched projects missing from the host's ``github`` key.
 
@@ -360,6 +390,9 @@ def sync_github_projects(cfg, declarations) -> dict:
     overwrites an existing project, and is backed up before the rewrite. The
     base/workflows settings stay the operator's: this is a repository mapping,
     not a full configuration copy.
+
+    The read-modify-write runs under the configuration lock (#8109): a
+    concurrent canon pin update is serialized, never overwritten.
     """
     wanted = {}
     for item in declarations or ():
@@ -370,6 +403,11 @@ def sync_github_projects(cfg, declarations) -> dict:
     if not wanted:
         return {"added": [], "conflicts": [], "path": ""}
     path = _sync_path(cfg)
+    with _config_lock(path):
+        return _sync_github_projects_locked(path, wanted)
+
+
+def _sync_github_projects_locked(path: Path, wanted: dict) -> dict:
     raw, mode = _config_bytes(path)
     try:
         document = json.loads(raw.decode("utf-8"))

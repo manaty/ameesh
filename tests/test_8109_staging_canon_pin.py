@@ -18,6 +18,7 @@ Le banc est hors réseau, hors base et hors hôte : trois dépôts git jetables
 from tests import support  # noqa: F401 — environnement isolé du poste
 
 import contextlib
+import fcntl
 import getpass
 import importlib.util
 import io
@@ -28,6 +29,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -267,6 +270,68 @@ class Banc(unittest.TestCase):
         self.assertEqual(resultat['state'], 'refused', resultat)
         self.assertIn('absente', resultat['reason'])
         self.assertEqual(self._lire_config()['canon_ref'], self.tete)
+
+    def test_ecrivain_concurrent_serialise_sans_perte(self):
+        """Le verrou partagé sérialise l'écrivain qui a son propre delta."""
+        from ameesh import role_timers
+        acquis = threading.Event()
+        ecrit = threading.Event()
+
+        def ecrivain():
+            with role_timers._config_lock(self.config):
+                acquis.set()
+                donnees = self._lire_config()
+                donnees['ecrivain_concurrent'] = {'vue': True}
+                self.config.write_text(json.dumps(donnees, indent=2) + '\n')
+                ecrit.set()
+                time.sleep(0.3)
+
+        fil = threading.Thread(target=ecrivain)
+        fil.start()
+        try:
+            self.assertTrue(acquis.wait(5))
+            resultat = self._lancer()   # attend le verrou, puis pose l'épingle
+            self.assertEqual(resultat['state'], 'installed', resultat)
+        finally:
+            fil.join(timeout=5)
+        self.assertFalse(fil.is_alive())
+        self.assertTrue(ecrit.is_set())
+        donnees = self._lire_config()
+        self.assertEqual(donnees['canon_ref'], self.tete)
+        self.assertEqual(donnees['ecrivain_concurrent'], {'vue': True})
+
+    def test_verrou_non_rendu_refuse_sans_ecrire(self):
+        """Un verrou qui ne se rend pas est un refus nommé, pas une course."""
+        verrou = self.config.with_name(self.config.name + '.lock')
+        handle = os.open(verrou, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            with mock.patch.object(helper, 'LOCK_WAIT', 0.2), \
+                    mock.patch.object(helper, 'LOCK_STEP', 0.02):
+                resultat = self._lancer()
+            self.assertEqual(resultat['state'], 'refused', resultat)
+            self.assertIn('verrouillée', resultat['reason'])
+            self.assertEqual(self._lire_config()['canon_ref'], self.ancien)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            os.close(handle)
+        resultat = self._lancer()
+        self.assertEqual(resultat['state'], 'installed', resultat)
+
+    def test_retour_arriere_n_ecrase_pas_une_ecriture_ulterieure(self):
+        """Le rollback ne remet l'ancienne config que si la nôtre est encore là."""
+        dossier, nom = helper._ouvrir_dossier(self.home, self.config)
+        compte = helper._compte(COMPTE)
+        try:
+            actuel = self.config.read_bytes()
+            self.assertFalse(helper._restaurer_si(
+                dossier, nom, b'pas ce que nous avons ecrit', b'ancienne\n', compte))
+            self.assertEqual(self.config.read_bytes(), actuel)
+            self.assertTrue(helper._restaurer_si(
+                dossier, nom, actuel, b'ancienne\n', compte))
+            self.assertEqual(self.config.read_bytes(), b'ancienne\n')
+        finally:
+            os.close(dossier)
 
     # -- formes de configuration -----------------------------------------
 

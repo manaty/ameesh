@@ -1512,6 +1512,17 @@ la première séquence qui vise un commit la contenant. Le geste manuel
 ci-dessus reste pour un refus à lever et pour un candidat qu'aucune
 séquence ne déploie.
 
+**Écrivains concurrents de `config.json` (#8109).** Le remplacement atomique
+garantit un fichier complet, pas une mise à jour conditionnelle : tout
+écrivain de la configuration de l'hôte prend un `flock` exclusif sur
+`<config>.lock` pour **tout** son cycle relire-modifier-remplacer. Le helper
+de montée et `role_timers.sync_github_projects` suivent cette convention ; le
+helper attend le verrou jusqu'à 10 s puis refuse (état nommé), et son retour
+arrière ne réécrit l'ancienne version que si le fichier porte encore
+exactement les octets qu'il vient d'écrire. Un écrivain qui ignorerait le
+verrou reste détecté par la relecture intégrale avant écriture, sans jamais
+recevoir un fichier tronqué.
+
 Une fois la configuration et les accès approuvés, l'opérateur active les
 services sur les candidats et soumet un SHA complet :
 

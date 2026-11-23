@@ -26,6 +26,7 @@ fichier complet, avant ou après le geste.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import pwd
@@ -34,6 +35,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +45,12 @@ SOURCE = "/home/ameesh/canon"
 SOURCE_REF = "refs/remotes/origin/main"
 CANDIDATE_REF = "refs/ameesh/staging-canon-candidate"
 BACKUP = "config.json.avant-8109"
+#: Convention partagée (#8109) : tout écrivain de la configuration de l'hôte
+#: prend un flock exclusif sur `<config>.lock` pour tout son cycle
+#: relire-modifier-remplacer (voir aussi `role_timers._config_lock`).
+LOCK_SUFFIX = ".lock"
+LOCK_WAIT = 10.0
+LOCK_STEP = 0.05
 MAX_CONFIG = 1 << 20
 GIT_TIMEOUT = 120
 CHECK_TIMEOUT = 600
@@ -265,6 +273,60 @@ def _ecrire_fd(fd: int, nom: str, donnees: bytes, compte: Compte,
         raise
 
 
+def _verrouiller(dossier: int, compte: Compte, nom: str) -> int:
+    """Prend le verrou exclusif partagé par les écrivains de la configuration.
+
+    Convention (#8109) : flock exclusif sur `<config>.lock`, pris pour tout le
+    cycle relire-modifier-remplacer, par ce helper comme par les timers de
+    l'hôte (`role_timers._config_lock`). L'attente est bornée : un verrou qui
+    ne se rend pas est refusé par un état nommé, jamais contourné.
+    """
+    fichier = nom + LOCK_SUFFIX
+    try:
+        handle = os.open(fichier, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, 0o600, dir_fd=dossier)
+    except OSError as exc:
+        raise Refus("verrou de configuration illisible (%s)"
+                    % (exc.strerror or "?")) from None
+    try:
+        os.fchown(handle, compte.uid, compte.gid)
+        os.fchmod(handle, 0o600)
+        limite = time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                if time.monotonic() >= limite:
+                    raise Refus("configuration verrouillée par un autre "
+                                "écrivain") from None
+                time.sleep(LOCK_STEP)
+    except BaseException:
+        os.close(handle)
+        raise
+
+
+def _restaurer_si(dossier: int, nom: str, attendu: bytes, contenu: bytes,
+                  compte: Compte) -> bool:
+    """Remet `contenu` seulement si `nom` porte encore `attendu`.
+
+    Le retour arrière ne doit jamais écraser une écriture plus récente qu'un
+    autre écrivain aurait posée après la nôtre : le contenu courant est
+    comparé aux octets que nous avons écrits, pas à l'ancienne version.
+    """
+    try:
+        actuel = _lire_fd(dossier, nom)
+    except Refus:
+        return False
+    if actuel != attendu:
+        return False
+    try:
+        _ecrire_fd(dossier, nom, contenu, compte)
+        return True
+    except Refus:
+        return False
+
+
 def _decoder(brut: bytes) -> dict:
     try:
         donnees = json.loads(brut.decode("utf-8"))
@@ -414,7 +476,9 @@ def _avancer(compte: Compte, maison: Path, source: Path, source_ref: str,
     dossier, nom = _ouvrir_dossier(maison, config)
     if dossier is None:
         return {"state": "unconfigured", "reason": "configuration absente"}
+    verrou = None
     try:
+        verrou = _verrouiller(dossier, compte, nom)
         ancien_brut = _lire_fd(dossier, nom)
         if ancien_brut is None:
             # Pas de configuration : pas d'exécutant sur cet hôte. Ce n'est pas
@@ -496,6 +560,11 @@ def _avancer(compte: Compte, maison: Path, source: Path, source_ref: str,
             # Relecture sous le même dossier ouvert : une autre écriture
             # pendant le geste est refusée, pas écrasée.
             a_jour, avant = _lire_config(dossier, nom)
+            # Le verrou sérialise les gestes du helper ; un écrivain qui ne le
+            # prend pas (geste manuel hors séquence) est détecté ici, sur le
+            # contenu entier, avant toute écriture.
+            if avant != ancien_brut:
+                raise Refus("la configuration a changé pendant le geste")
             epingle_a_jour = _epingle(a_jour)
             if epingle_a_jour is None or epingle_a_jour[1].strip().lower() != ancien:
                 raise Refus("l'épingle a changé pendant le geste")
@@ -507,18 +576,12 @@ def _avancer(compte: Compte, maison: Path, source: Path, source_ref: str,
                 _ecrire_fd(dossier, BACKUP, avant, compte)
                 _ecrire_fd(dossier, nom, nouvelle_brut, compte)
             except Exception:
-                try:
-                    _ecrire_fd(dossier, nom, avant, compte)
-                except Exception:
-                    pass
+                _restaurer_si(dossier, nom, nouvelle_brut, avant, compte)
                 raise
             relu, _ = _lire_config(dossier, nom)
             epingle_relue = _epingle(relu)
             if epingle_relue is None or epingle_relue[1].strip().lower() != head:
-                try:
-                    _ecrire_fd(dossier, nom, avant, compte)
-                except Exception:
-                    pass
+                _restaurer_si(dossier, nom, nouvelle_brut, avant, compte)
                 raise Refus("configuration relue sans la nouvelle épingle")
             resultat["state"] = "installed"
             resultat["backup"] = BACKUP
@@ -530,6 +593,11 @@ def _avancer(compte: Compte, maison: Path, source: Path, source_ref: str,
                 except FileNotFoundError:
                     pass
     finally:
+        if verrou is not None:
+            try:
+                os.close(verrou)
+            except OSError:
+                pass
         os.close(dossier)
 
 
