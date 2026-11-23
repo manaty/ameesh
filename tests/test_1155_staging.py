@@ -814,6 +814,23 @@ class StagingTest(unittest.TestCase):
         self.assertTrue(any(t['etape'] == 'timers' and t['verdict'] == 'ko'
                             for t in self.traces()))
 
+    def test_canon_refusal_does_not_roll_back_or_stop(self):
+        """#8109 : un refus d'épingle est non concluant, pas un ko d'hôte.
+
+        L'hôte poursuit ses contrôles et la séquence va au bout ; l'alerte
+        `staging_canon_stale` reste le témoin.
+        """
+        (self.state / 'scenario').write_text(
+            'ko=ameesh-agents-1:canon-executant\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertNotIn(('ameesh-agents-1', 'retour'), self.actions())
+        self.assertIn(('ameesh-agents-2', 'installer'), self.actions())
+        traces = self.traces()
+        self.assertTrue(any(
+            t['hote'] == 'ameesh-agents-1' and t['etape'] == 'canon-executant'
+            and t['verdict'] == 'non-concluant' for t in traces), traces)
+
     def test_full_sequence_order_and_trace(self):
         p = self.run_staging()
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
@@ -832,16 +849,19 @@ class StagingTest(unittest.TestCase):
             ('ameesh-agents-1', 'installer'),
             ('ameesh-agents-1', 'redemarrer'),
             ('ameesh-agents-1', 'timers'),
+            ('ameesh-agents-1', 'canon-executant'),
             ('ameesh-agents-1', 'controler'),
             ('ameesh-agents-1', 'unites-desactivees'),
             ('ameesh-agents-2', 'installer'),
             ('ameesh-agents-2', 'redemarrer'),
             ('ameesh-agents-2', 'timers'),
+            ('ameesh-agents-2', 'canon-executant'),
             ('ameesh-agents-2', 'controler'),
             ('ameesh-agents-2', 'unites-desactivees'),
             ('ameesh-agents-3', 'installer'),
             ('ameesh-agents-3', 'redemarrer'),
             ('ameesh-agents-3', 'timers'),
+            ('ameesh-agents-3', 'canon-executant'),
             ('ameesh-agents-3', 'controler'),
             ('ameesh-agents-3', 'unites-desactivees'),
             ('manaty-mesh-1', 'installer'),

@@ -7,7 +7,7 @@
 # faite pour toute la base du mesh, qui est celle du serveur.
 #
 #   deploy/mise-a-jour/vm.sh <étape> [REF]
-#   deploy/mise-a-jour/vm.sh agents verifier|installer|timers|redemarrer|controler|retour [REF]
+#   deploy/mise-a-jour/vm.sh agents verifier|installer|timers|canon-executant|redemarrer|controler|retour [REF]
 #     ou `agents unites-desactivees` (une persona par ligne, voir plus bas)
 #     AGENTS_SSH=root@cible, HOTE_AGENTS=nom du registre dans BASCULE_ENV —
 #     un BASCULE_ENV par VM d'agents ; unités utilisateur sous ameesh, liste
@@ -35,6 +35,11 @@
 #                projection) sur cet hôte s'il est candidat du rôle élu ;
 #                refuse explicitement les passes dont la clé `github` locale
 #                manque (#3327) ; sans effet sur un hôte non candidat
+#   canon-executant  avance l'épingle `canon_ref` de l'exécutant de staging
+#                sur la tête du canon déjà lu par les agents de l'hôte
+#                (#8109) ; rend un JSON, ne modifie rien d'autre, ne pose
+#                aucun fichier sur l'hôte (le helper passe par l'entrée
+#                standard) ; un refus est rendu, pas une panne de l'hôte
 #   controler    unités actives, journal récent, venv du MainPID vivant,
 #                ameesh doctor et minuteries de rôle sur le serveur
 #   unites-desactivees  une persona par ligne : celles du registre (ni
@@ -100,8 +105,8 @@ if [ "${1:-}" = agents ]; then MODE=agents; shift; fi
 ACTION=${1:-}
 if [ "$MODE" = agents ]; then
   case "$ACTION" in
-    redemarrer|controler|verifier|installer|timers|retour|unites-desactivees) ;;
-    *) echo "mode agents : verifier, installer, timers, redemarrer, controler, unites-desactivees ou retour attendu" >&2; exit 2 ;;
+    redemarrer|controler|verifier|installer|timers|canon-executant|retour|unites-desactivees) ;;
+    *) echo "mode agents : verifier, installer, timers, canon-executant, redemarrer, controler, unites-desactivees ou retour attendu" >&2; exit 2 ;;
   esac
   : "${AGENTS_SSH:?AGENTS_SSH manquant dans $BASCULE_ENV}" "${HOTE_AGENTS:?HOTE_AGENTS manquant dans $BASCULE_ENV}"
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
@@ -2288,6 +2293,19 @@ timers_agents() {
   ameesh_agents role timers --role auditeur --install
 }
 
+canon_executant_agents() {
+  # #8109 : l'épingle `canon_ref` de l'exécutant de staging est déplacée au
+  # déploiement, sur la tête du canon que les agents de CET hôte viennent de
+  # lire ; un refus (check rouge, divergence, compte absent) est rendu et
+  # laissé au témoin `staging_canon_stale`, jamais une panne de l'hôte. Le
+  # helper passe par l'entrée standard (`python3 -`) : rien n'est posé dans
+  # l'arbre du compte ameesh, et root ne lit aucun secret.
+  # stdout ne porte que le JSON du helper (staging.sh le lit) : l'en-tête
+  # humain part sur stderr.
+  printf '\n== %s (#8109) sur %s\n' "épingle canon de l'exécutant" "$HOTE_AGENTS" >&2
+  ENTREE_STDIN=1 ssh_agents "python3 -" < "$ICI/canon-executant.py"
+}
+
 installer_sentinelle_agents() {
   # #8062 : la sentinelle des identifiants (`ameesh accounts check`, L226a)
   # est une unité d'hôte, pas un rôle : la mise à jour la pose et l'active.
@@ -2755,6 +2773,7 @@ if [ "$MODE" = agents ]; then
     verifier|controler) controler_agents ;;
     installer) installer_agents "${2:-HEAD}" ;;
     timers) timers_agents ;;
+    canon-executant) canon_executant_agents ;;
     unites-desactivees) unites_desactivees ;;
     retour) retour_agents ;;
   esac

@@ -1696,6 +1696,38 @@ for nom in "${HOTES[@]}"; do
     exec_hote "$nom" timers || echec_hote "$nom" timers "installation des minuteries en echec"
     trace "$nom" timers ok
   fi
+  # #8109 : l'épingle canon de l'exécutant de staging suit la tête du canon
+  # que les agents de CET hôte viennent de lire ; le déploiement staging est
+  # le moment qui possède à la fois le canon et l'accès root au candidat.
+  # Un refus ne fait ni échouer ni revenir l'hôte : `staging_canon_stale`
+  # reste le témoin, et la raison est tracée.
+  if [ "$(mode_de "$nom")" = agents ]; then
+    etape "$nom : canon de l'exécutant"
+    debut_etape "$nom" canon-executant
+    canon_json=""
+    canon_rc=0
+    canon_json=$(exec_hote "$nom" canon-executant) || canon_rc=$?
+    canon_detail=$(printf '%s' "$canon_json" | python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    data = {}
+etat = data.get("state") or "rapport illisible"
+raison = data.get("reason")
+print("%s%s" % (etat, ": " + raison if raison else ""))
+' 2>/dev/null) || canon_detail="rapport illisible"
+    if [ "$canon_rc" = 0 ] && [ -n "$canon_json" ]; then
+      trace "$nom" canon-executant ok "$canon_detail" "$canon_json"
+    else
+      # Verdict non concluant, jamais `ko` : actif.py bornerait les preuves de
+      # l'hôte à ce ko et l'attestation staging ne serait plus émise. Le
+      # refus d'épingle est un témoin (`staging_canon_stale`), pas un échec de
+      # l'hôte (#8109).
+      trace "$nom" canon-executant non-concluant "$canon_detail" "$canon_json"
+      echo "canon de l'exécutant non avancé sur $nom : $canon_detail (non concluant, staging_canon_stale reste le témoin)" >&2
+    fi
+  fi
   etape "$nom : controler"
   debut_etape "$nom" controler
   exec_hote "$nom" controler || echec_hote "$nom" controler "controles en echec"
