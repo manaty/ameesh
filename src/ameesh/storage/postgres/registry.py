@@ -1437,6 +1437,43 @@ class Leases(interface.Leases):
         )
         return rows[0]["lease_expires_ts"] if rows else None
 
+    def renew_many(self, owner, leases) -> dict[str, float] | None:
+        """#8166 : les gardes de `renew`, ligne par ligne, en une requête.
+
+        Verrous pris dans l'ordre des noms (aucun interblocage entre deux
+        exécuteurs), échéance recontrôlée avec `clock_timestamp()` sous le
+        verrou, jamais raccourcie (`GREATEST`, #3115). Un bail perdu, échu ou
+        d'une autre époque n'est simplement pas rendu."""
+        if not leases:
+            return {}
+        names = [str(name) for name, _, _ in leases]
+        rows = self.db.query(
+            """
+            WITH demande AS (
+                SELECT * FROM unnest(%s::text[], %s::bigint[], %s::float8[])
+                       AS d(name, epoch, ttl)
+            ), verrou AS (
+                SELECT name, lease_owner, lease_epoch, lease_expires_at
+                  FROM agent_registry WHERE name = ANY(%s::text[])
+                 ORDER BY name FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET lease_expires_at = GREATEST(
+                       r.lease_expires_at,
+                       clock_timestamp() + make_interval(secs => demande.ttl)),
+                   last_seen        = now(),
+                   updated_at       = now()
+              FROM verrou JOIN demande ON demande.name = verrou.name
+             WHERE r.name = verrou.name
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = demande.epoch
+               AND verrou.lease_expires_at > clock_timestamp()
+            RETURNING r.name, extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+            """,
+            (names, [int(epoch) for _, epoch, _ in leases],
+             [float(ttl) for _, _, ttl in leases], names, owner),
+        )
+        return {row["name"]: row["lease_expires_ts"] for row in rows}
+
     def release(self, name, owner, epoch) -> bool:
         rows = self.db.query(
             """

@@ -565,6 +565,14 @@ class Leases(Domain):
         """Prolonge le bail sans raccourcir son échéance ; rend la nouvelle
         échéance, None si on ne le détient plus."""
 
+    def renew_many(self, owner: str,
+                   leases: list[tuple[str, int, float]]) -> dict[str, float] | None:
+        """#8166 : `renew` pour plusieurs baux (nom, époque, ttl) du même
+        détenteur, en une requête ; rend {nom: nouvelle échéance} des seuls
+        baux renouvelés. None : pas de renouvellement groupé ici (chaque
+        worker garde le sien)."""
+        return None
+
     @abc.abstractmethod
     def release(self, name: str, owner: str, epoch: int) -> bool:
         """Rend le bail ; l'epoch avance."""

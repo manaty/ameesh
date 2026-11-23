@@ -11,20 +11,29 @@ Témoins :
 * aperçu : au repos, ni git ni écriture si HEAD, l'index et le journal
   d'événements n'ont pas bougé ; confirmation au plus tard à `REFRESH` ;
   `STALE_AFTER` couvre cette confirmation ; pendant un tour, git à chaque
-  capture comme avant.
+  capture comme avant ;
+* battement groupé : un seul renouvellement (une connexion, un contrôle, un
+  UPDATE) pour les baux des workers au repos, avec les gardes de `renew`
+  (époque, détenteur, échéance sous verrou, jamais raccourcie) ; le fil du
+  worker s'efface tant qu'il est couvert et reprend au tiers du bail restant.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from ameesh import agent_peek as peek, config
+from ameesh import agent_peek as peek, config, registry, storage
+from ameesh.runner import AgentWorker, Runner
+
+from .support import PgTestCase
 
 
 def _git(root, *args):
@@ -194,6 +203,226 @@ class PublicationAuRepos(unittest.TestCase):
         same = {"events": []}
         _, published = self._run([same] * 3, refresh=3600)
         self.assertEqual(len(published), 2)  # la première, puis celle de fermeture
+
+
+
+class RenouvellementGroupeEnBase(PgTestCase):
+    def _claim(self, name, ttl=60):
+        self.register(name, "claude")
+        return registry.claim(self.db, name, "runner-g", ttl)
+
+    def _expires(self, name):
+        return self.db.query("SELECT extract(epoch from lease_expires_at)::float8 AS echeance"
+                             " FROM agent_registry WHERE name=%s", (name,))[0]["echeance"]
+
+    def test_gardes_de_renew(self):
+        leases = {n: self._claim(n) for n in ("g1", "g2", "g3", "g4")}
+        epoch = {n: int(lease["lease_epoch"]) for n, lease in leases.items()}
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = now() - interval '1 s'"
+                        " WHERE name='g3'")
+        avant = self._expires("g4")
+        got = storage.of(self.db).leases.renew_many("runner-g", [
+            ("g1", epoch["g1"], 120.0), ("g2", epoch["g2"] + 1, 120.0),
+            ("g3", epoch["g3"], 120.0), ("g4", epoch["g4"], 1.0)])
+        self.assertEqual(set(got), {"g1", "g4"})
+        self.assertGreater(got["g1"], avant + 30)
+        # jamais raccourci : un ttl plus court garde l'échéance tenue
+        self.assertGreaterEqual(got["g4"], avant)
+        self.assertEqual(storage.of(self.db).leases.renew_many("autre", [
+            ("g1", epoch["g1"], 120.0)]), {})
+        self.assertEqual(storage.of(self.db).leases.renew_many("runner-g", []), {})
+
+
+class _W:
+    """Worker minimal pour `group_beat_once`."""
+
+    def __init__(self, name, *, resting=True, reste=50.0, ttl=60.0, epoch=1):
+        self.name, self._resting, self.lease_ttl, self.epoch = name, resting, ttl, epoch
+        self.clock = _Clock()
+        self.clock.time = lambda: self.clock.t
+        self.lease_deadline = self.clock.t + reste
+        self.lease_held_until = 0.0
+        self.lease_lost = threading.Event()
+        self._renew_lock = threading.Lock()
+        self.renewals = []
+
+    def call_budget(self):
+        return 5.0
+
+    def _held_until(self):
+        return 42.0
+
+
+class BattementGroupe(unittest.TestCase):
+    def _runner(self, workers):
+        runner = Runner.__new__(Runner)
+        runner.lock = threading.Lock()
+        runner.workers = {w.name: w for w in workers}
+        runner.runner_id = "r"
+        runner.db = types.SimpleNamespace(cfg=config.Config())
+        return runner
+
+    def _once(self, workers, answer):
+        calls = []
+
+        def renew_many(owner, leases):
+            calls.append((owner, sorted(n for n, _, _ in leases)))
+            return answer(leases) if callable(answer) else answer
+
+        leases = types.SimpleNamespace(renew_many=renew_many)
+        with mock.patch("ameesh.runner.db_mod.connect", return_value=mock.Mock()), \
+                mock.patch("ameesh.runner.migrations.require_compatible_writer") as schema, \
+                mock.patch("ameesh.runner.storage.of",
+                           return_value=types.SimpleNamespace(leases=leases)):
+            tour = self._runner(workers).group_beat_once()
+        return tour, calls, schema.call_count
+
+    def test_seuls_les_baux_au_repos_entames_d_un_tiers(self):
+        dus = [_W("a", reste=30), _W("b", reste=39.9)]
+        autres = [_W("c", reste=50), _W("d", resting=False, reste=10), _W("e", reste=10)]
+        autres[2].lease_lost.set()
+        tour, calls, schema = self._once(dus + autres, {})
+        self.assertEqual(calls, [("r", ["a", "b"])])
+        self.assertEqual(schema, 1)  # un contrôle pour tout le lot
+        self.assertEqual(tour, 10.0)  # un sixième du plus court bail tenu
+
+    def test_rien_d_echu_aucune_requete(self):
+        tour, calls, _ = self._once([_W("a", reste=55), _W("b", resting=False, ttl=12)], {})
+        self.assertEqual(calls, [])
+        self.assertEqual(tour, 2.0)  # le bail en tour compte aussi
+        self.assertEqual(self._once([], {})[0], Runner.GROUP_BEAT_IDLE_S)
+
+    def test_application_du_retour(self):
+        a, b, c, d = _W("a", reste=20), _W("b", reste=20), _W("c", reste=20), _W("d", reste=20)
+        base = a.clock.t
+
+        def answer(leases):
+            c.epoch = 2  # bail repris entre l'appel et la réponse
+            d.lease_lost.set()
+            return {"a": base + 60, "c": base + 60, "d": base + 60, "b": None}
+
+        b_avant = b.lease_deadline
+        self._once([a, b, c, d], answer)
+        self.assertEqual(a.lease_deadline, base + 60)
+        self.assertEqual(a.lease_held_until, 42.0)
+        self.assertEqual(b.lease_deadline, b_avant)  # absent : rien n'est déclaré perdu
+        self.assertFalse(b.lease_lost.is_set())
+        self.assertEqual(c.lease_deadline, base + 20)
+        self.assertEqual(d.lease_deadline, base + 20)
+
+    def test_jamais_raccourci(self):
+        a = _W("a", reste=30)
+        self._once([a], {"a": a.clock.t + 10})
+        self.assertEqual(a.lease_deadline, a.clock.t + 30)
+
+    def test_panne_sans_effet(self):
+        a = _W("a", reste=30)
+
+        def answer(leases):
+            raise OSError("base")
+
+        self._once([a], answer)
+        self.assertEqual(a.lease_deadline, a.clock.t + 30)
+        self.assertEqual(a.lease_held_until, 42.0)  # l'appel a pu valider
+
+    def test_executeur_medie_sans_battement_groupe(self):
+        runner = self._runner([])
+        runner.db = types.SimpleNamespace(cfg=types.SimpleNamespace(backend="mediated"))
+        with mock.patch("ameesh.runner.storage.is_remote", return_value=False), \
+                mock.patch("ameesh.runner.threading.Thread") as thread:
+            runner.start_group_beat()
+        thread.assert_not_called()
+        self.assertFalse(runner.group_beat_alive())
+
+
+class FilDuWorkerCouvert(unittest.TestCase):
+    TTL = 60.0
+
+    def _worker(self, *, resting=True, reste=50.0, vivant=True):
+        worker = AgentWorker.__new__(AgentWorker)
+        worker.clock = _Clock()
+        worker.clock.time = lambda: worker.clock.t
+        worker._resting = resting
+        worker.lease_deadline = worker.clock.t + reste
+        worker.runner = types.SimpleNamespace(group_beat_alive=lambda: vivant)
+        patcher = mock.patch.object(AgentWorker, "lease_ttl",
+                                    new_callable=mock.PropertyMock, return_value=self.TTL)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return worker
+
+    def test_couvert_au_repos(self):
+        self.assertAlmostEqual(self._worker()._group_beat_margin(), 30.0)
+
+    def test_reprend_au_tiers_restant(self):
+        self.assertIsNone(self._worker(reste=20.0)._group_beat_margin())
+
+    def test_pas_couvert_en_tour_ou_sans_battement(self):
+        self.assertIsNone(self._worker(resting=False)._group_beat_margin())
+        self.assertIsNone(self._worker(vivant=False)._group_beat_margin())
+        worker = self._worker()
+        worker.runner = types.SimpleNamespace()
+        self.assertIsNone(worker._group_beat_margin())
+
+
+
+class BattementGroupeReel(PgTestCase):
+    """Trois workers au repos, bail de 3 s : le battement groupé les tient
+    seul, sans renouvellement par worker."""
+
+    def test_baux_tenus_par_le_battement_groupe(self):
+        cfg = dataclasses.replace(self.cfg, idle_passes_per_s=0.01, lease_ttl=3.0)
+        runner = Runner(cfg, self.db)
+        runner.poll = 1.0
+        runner.listener = object()  # écoute établie : pas de repos long
+        names = ["beat8166-%d" % i for i in range(3)]
+        for name in names:
+            cwd = os.path.join(self.tmp, "work", name)
+            os.makedirs(cwd, exist_ok=True)
+            self.register(name, "claude", cwd=cwd)
+        par_worker, groupes = [], []
+        original_call = AgentWorker._renew_call
+        original_many = type(storage.of(self.db).leases).renew_many
+
+        def renew_call(self_):
+            par_worker.append((self_.name, self_._resting))
+            return original_call(self_)
+
+        def renew_many(self_, owner, leases):
+            groupes.append(len(leases))
+            return original_many(self_, owner, leases)
+
+        with mock.patch.object(AgentWorker, "_renew_call", renew_call), \
+                mock.patch.object(type(storage.of(self.db).leases), "renew_many", renew_many):
+            runner.start_group_beat()
+            workers = []
+            for name in names:  # prise et départ aussitôt : bail de 3 s
+                lease = registry.claim(self.db, name, runner.runner_id, 3)
+                worker = AgentWorker(runner, registry.get(self.db, name), lease)
+                runner.workers[name] = worker
+                workers.append(worker)
+                worker.start()
+            try:
+                deadline = time.monotonic() + 60
+                while not all(getattr(w, "_resting", False) for w in workers):
+                    self.assertLess(time.monotonic(), deadline, "workers never rested")
+                    time.sleep(0.05)
+                debut = len(par_worker)
+                time.sleep(8)  # plus de deux baux
+                au_repos = par_worker[debut:]
+                vivants = [registry.get(self.db, w.name) for w in workers]
+            finally:
+                runner.stop.set()
+                for worker in workers:
+                    worker.stopping.set()
+                    worker.wake.set()
+                for worker in workers:
+                    worker.join(30)
+        self.assertEqual(au_repos, [], "resting workers renew through the group beat")
+        self.assertGreaterEqual(len(groupes), 3)
+        for worker, row in zip(workers, vivants):
+            self.assertFalse(worker.lease_lost.is_set(), worker.name)
+            self.assertEqual(row.get("lease_owner"), runner.runner_id)
 
 
 if __name__ == "__main__":
