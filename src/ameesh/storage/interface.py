@@ -2914,6 +2914,10 @@ class WorkItems(Domain):
         """Set the first workflow pin and journal it under the caller's lot lock."""
 
     @abc.abstractmethod
+    def review_floor(self, item_id: int) -> dict | None:
+        """Read the effective review floor without exposing decision contents."""
+
+    @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
         """Un lot, ou None. #1922/B5 : le lot porte `workflow_ref` (la
         révision Process pinnée, '' quand il n'y en a pas — y compris sur une

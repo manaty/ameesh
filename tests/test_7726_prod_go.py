@@ -24,6 +24,18 @@ def question(now, *, hours=1):
 
 
 class ContractTest(unittest.TestCase):
+    def test_prod_op_requires_exact_line_and_matching_lot(self):
+        now = 1_800_000_000
+        until = datetime.fromtimestamp(now + 3600, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        line = 'prod-op/1 project=acme lot=123 sha=%s until=%s' % (SHA, until)
+        with mock.patch.object(mechanics, 'configured', return_value=SimpleNamespace(prod_go_max_hours=24)):
+            self.assertEqual(prod_go.validate_op_request(None, line, 'acme', 123, now=now)['sha'], SHA)
+            for value, project, lot in ((line + '\n' + line, 'acme', 123),
+                                        (line.replace(SHA, 'abc'), 'acme', 123),
+                                        (line, 'other', 123), (line, 'acme', 124)):
+                with self.subTest(value=value, project=project, lot=lot), self.assertRaises(prod_go.ProdGoError):
+                    prod_go.validate_op_request(None, value, project, lot, now=now)
+
     def test_parse_is_exact_and_each_operation_has_explicit_options(self):
         rule = prod_go.parse(question(1_800_000_000), OPTIONS)
         self.assertEqual(rule['allowed'], {'deploy': ('a',), 'migrate': ('a', 'c'), 'release': ('a',)})

@@ -928,6 +928,19 @@ class WorkItems(interface.WorkItems):
                 " coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
                 " AS workflow_version")
 
+    def review_floor(self, item_id: int) -> dict | None:
+        from ... import review_floor
+
+        if self.get(item_id) is None:
+            return None
+        manual = review_floor.of_lot(self.db, item_id)
+        production = review_floor.production_decision_floor(self.db, item_id)
+        codes = ["manual"] if manual["floor"] else []
+        if production:
+            codes.append("production")
+        return {"floor": max(int(manual["floor"]), 2 if production else 0),
+                "codes": codes}
+
     def get(self, item_id) -> dict | None:
         # #5993 : la tête du dernier gel et son instant, plus le dernier
         # passage en build, sont portés par cette lecture — comme
@@ -1272,6 +1285,9 @@ class WorkItems(interface.WorkItems):
                   + ((str(int(item_id)),) if held else ()))
         validation_item = self.get(item_id) if state == "validated" else None
         validation_marks = self.milestones(item_id, None) if state == "validated" else None
+        from ... import review_floor
+        production_floor = (review_floor.production_decision_floor(self.db, item_id)
+                            if state == "validated" else None)
         validation_gate = (self._validation_gate(item_id, validation_marks, item=validation_item)
                            if state == "validated" else None)
         with self.db.transaction() as tx:
@@ -1286,7 +1302,8 @@ class WorkItems(interface.WorkItems):
                 # porte se comparent ; une note concurrente ne change que
                 # `updated_at` et n'annule plus le quorum.
                 if (WorkItems(tx).milestones(item_id, None) != validation_marks
-                        or _gate_item(WorkItems(tx).get(item_id)) != _gate_item(validation_item)):
+                        or _gate_item(WorkItems(tx).get(item_id)) != _gate_item(validation_item)
+                        or review_floor.production_decision_floor(tx, item_id) != production_floor):
                     gate = None
                 if not gate or not gate.get("ok"):
                     from ...work import WorkError
@@ -2781,7 +2798,9 @@ class WorkItems(interface.WorkItems):
                      or plan_git.same_commit(mark.get("sha"), freeze.get("sha")))
                 for mark in marks):
             return
+        from ... import review_floor
         try:
+            production_floor = review_floor.production_decision_floor(self.db, item_id)
             gate = self._validation_gate(item_id, marks, item=item)
         except Exception as exc:
             gate = {"ok": False, "error": str(exc)}
@@ -2812,6 +2831,8 @@ class WorkItems(interface.WorkItems):
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                      (int(item_id),))
             if not self._validation_snapshot_matches(tx, item_id, item, marks):
+                return
+            if review_floor.production_decision_floor(tx, item_id) != production_floor:
                 return
             rows = tx.query("UPDATE work_items SET state = 'validated', updated_at = now()"
                             " WHERE id = %s AND state = 'qa' AND " + _UNPINNED + " RETURNING id",

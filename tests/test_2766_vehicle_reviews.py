@@ -338,7 +338,8 @@ class NeedTest(_Base):
 
     def need(self, rows, marks, head, gate=None, klass=None, base=None):
         db = self._Landings(rows)
-        with mock.patch.object(packet_reviews.work, "get",
+        with mock.patch("ameesh.review_floor.production_decision_floor", return_value=""), \
+             mock.patch.object(packet_reviews.work, "get",
                                side_effect=lambda _db, lot: {"id": lot, "app": "ameesh"}):
             with mock.patch.object(packet_reviews.work, "milestones",
                                    side_effect=lambda _db, lot: marks[lot]):

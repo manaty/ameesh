@@ -217,11 +217,30 @@ class Decisions(interface.Decisions):
         # one authority cannot both win. Existing answers remain immutable.
         request = self.get(decision_id)
         target = ((request or {}).get("payload") or {}).get("decision", {}).get("supersedes")
+        from ... import prod_go
+        view = decisions.view_of(request) if request else None
+        production = (view and status == "answered" and
+                      (prod_go.parse(view.get("question"), view.get("options") or ())
+                       or prod_go.parse_op(view.get("question"))))
+        if production and target is None:
+            with self.db.transaction() as tx:
+                from ... import storage
+                storage.of(tx).work.lock(int(view["lot"]))
+                closed = type(self)(tx)._close(decision_id, status=status, record=record)
+                if closed:
+                    signed = decisions.view_of(closed)
+                    if not decisions.verify_proof(tx, signed, live=True)[0]:
+                        raise decisions.DecisionError("production decision requires a valid signature")
+                    decisions._recheck_production_review(tx, getattr(tx, "cfg", None), int(view["lot"]))
+                return closed
         if status != "answered" or target is None:
             return self._close(decision_id, status=status, record=record)
         if type(target) is not int or not 0 < target < int(decision_id):
             raise decisions.DecisionError("supersedes must name an earlier answered decision")
         with self.db.transaction() as tx:
+            if production:
+                from ... import storage
+                storage.of(tx).work.lock(int(view["lot"]))
             tx.query("SELECT id FROM agent_mailbox WHERE id IN (%s, %s) ORDER BY id FOR UPDATE",
                      (target, int(decision_id)))
             repository = type(self)(tx)
@@ -237,6 +256,8 @@ class Decisions(interface.Decisions):
                     or view.get("needs_signature") is not True
                     or not decisions.verify_proof(tx, view, live=True)[0]):
                 raise decisions.DecisionError("supersession requires a valid signed answer")
+            if production:
+                decisions._recheck_production_review(tx, getattr(tx, "cfg", None), int(view["lot"]))
             if not decisions.supersession_approved(view):
                 return closed
             old = repository.get(target)

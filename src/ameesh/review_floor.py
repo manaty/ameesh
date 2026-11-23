@@ -33,6 +33,7 @@ from __future__ import annotations
 from ameesh import work_lifecycle as lifecycle
 
 import json
+import logging
 import re
 from typing import Optional
 
@@ -112,6 +113,23 @@ def _authentic(db, evidence, value: int, actor: str) -> bool:
                  or storage.of(db).agents.same_identity(evidence.get("actor"), actor)))
 
 
+def _remote_floor(db, lot: int) -> dict:
+    try:
+        result = storage.of(db).work.review_floor(int(lot))
+        if (not isinstance(result, dict) or type(result.get("floor")) is not int
+                or result["floor"] not in (0, 1, 2)
+                or not isinstance(result.get("codes"), list)
+                or any(code not in ("manual", "production") for code in result["codes"])
+                or ("production" in result["codes"] and result["floor"] != 2)):
+            raise ValueError("invalid or inaccessible review floor")
+        return result
+    except Exception as exc:  # noqa: BLE001 - old servers and errors fail closed
+        logging.getLogger(__name__).warning(
+            "review floor for lot %s unavailable; using two families: %s: %s",
+            lot, type(exc).__name__, str(exc)[:200])
+        return {"floor": 2, "codes": ["unavailable"]}
+
+
 def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
     """Pose le plancher du lot sur une classe lue (`reviews_floor`, et sa
     source `reviews_floor_by`). Sans base (lecture hors registre), rien.
@@ -120,11 +138,26 @@ def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
     if db is None:
         return klass
     try:
-        found = of_lot(db, lot, cfg=cfg)
+        if storage.is_remote(db):
+            remote = _remote_floor(db, lot)
+            found = {"floor": remote["floor"], "actor": "mediated floor"}
+            production = "production" if ("production" in remote["codes"]
+                                          or "unavailable" in remote["codes"]) else ""
+        else:
+            found = of_lot(db, lot, cfg=cfg)
+            production = production_decision_floor(db, lot)
     except Exception as exc:  # noqa: BLE001 - journal illisible : échec fermé
         klass["reviews_floor_unreadable"] = "%s: %s" % (type(exc).__name__,
                                                        str(exc)[:200])
+        # An unreadable decision must not become a waiver or a one-review
+        # fallback: we cannot establish that the production floor is absent.
+        klass["production_reviews_floor"] = 2
         return klass
+    if production:
+        klass["production_reviews_floor"] = 2
+        klass["distinct_families"] = True
+        klass["exclude_author_family"] = True
+        found = dict(found, floor=max(found["floor"], 2), actor=production)
     if found["floor"]:
         # #3554 : le plancher automatique d'une baisse du canon (posé par la
         # classe, `reviews_floor`) ne se perd pas sous un plancher de pilote
@@ -134,6 +167,46 @@ def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
             klass["reviews_floor"] = floor
             klass["reviews_floor_by"] = found["actor"]
     return klass
+
+
+def production_decision_floor(db, lot: int) -> str:
+    """A signed production decision raises the floor, independent of paths.
+
+    Read all linked decisions, including closed ones. A malformed declaration
+    or unreadable signature is an error, so callers fail closed.
+    """
+    if storage.is_remote(db):
+        remote = _remote_floor(db, lot)
+        return "mediated floor" if remote["floor"] >= 2 else ""
+    from . import decisions, prod_go
+
+    for row in storage.of(db).decisions.for_work_item(str(int(lot))):
+        view = decisions.view_of(row)
+        question = view.get("question") or ""
+        if "prod-go/" not in question and "prod-op/" not in question:
+            continue
+        go = prod_go.parse(question, view.get("options") or ())
+        op = prod_go.parse_op(question)
+        rule = op or go
+        if (not rule or rule["project"] != view.get("project") or
+                (op and op["lot"] != int(lot)) or int(view.get("lot") or 0) != int(lot)):
+            raise ValueError("production decision does not match its lot or project")
+        if view.get("state") != "answered":
+            continue
+        if not view.get("needs_signature"):
+            raise ValueError("production decision does not require a signature")
+        valid, reason = decisions.verify_proof(db, view)
+        if not valid:
+            raise ValueError("production decision signature: " + reason)
+        return "decision #%s" % view["id"]
+    return ""
+
+
+def production_decision_verified(db, lot: int) -> bool:
+    """Only proven production may remove a pilot's durable waiver."""
+    if storage.is_remote(db):
+        return "production" in _remote_floor(db, lot)["codes"]
+    return bool(production_decision_floor(db, lot))
 
 
 def _complete_designation(cfg, db, lot: int, floor: int):
