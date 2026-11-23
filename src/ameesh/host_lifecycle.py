@@ -66,7 +66,7 @@ def closed_hosts(db, *, readings=None, holds=None) -> dict:
 
 
 def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
-          automatic=False):
+          automatic=False, force_short_reason=None):
     """`actor`: the human the API authenticated (L87); otherwise the session's
     corrector (a human, an orchestrator or a design agent)."""
     if not isinstance(host, str) or not NAME_RE.fullmatch(host):
@@ -111,25 +111,34 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
         hook = host_release.hook_for(cfg, canons, host)
     except ValueError:
         hook = True  # ambiguous adapter config: fail closed
+    if force_short_reason is not None:
+        if not isinstance(force_short_reason, str) or not force_short_reason.strip():
+            raise ValueError('--force-court requires a non-empty reason')
+        force_short_reason = force_short_reason.strip()
+        if len(force_short_reason) > 500:
+            raise ValueError('--force-court reason must be at most 500 characters')
+        if duration is None:
+            raise ValueError('--force-court requires --for')
     if hook and duration is not None:
         from .storage.postgres.vm_adapter import Queue
-        policy = Queue(db).drain_policy(host)
-        if policy is None:
-            raise ValueError('drain refused: adapter timing unavailable or stale; '
-                             'start the VM adapter worker and retry')
-        wake = policy['wake_delay_s']
-        quiet = max(policy['idle_after_s'], policy['min_on_s'], 2 * wake)
-        minimum = quiet + wake + policy['min_off_s']
-        if duration < minimum:
-            raise ValueError('drain refused: minimum %.0f seconds = quiet %.0f '
-                             '(max idle_after, min_on, 2*wake_delay) + wake_delay %.0f '
-                             '+ min_off %.0f' % (minimum, quiet, wake, policy['min_off_s']))
+        from . import resources
+        wake = resources.finite_float(Queue(db).observed_wake_delay(host))
+        if wake is None or wake <= 0:
+            wake = 900.0
+        quiet = max(cfg.idle_after_s, 2 * wake)
+        minimum = quiet + wake
+        if duration < minimum and force_short_reason is None:
+            raise ValueError('drain refused: minimum %.0f seconds = max(idle_after %.0f, '
+                             '2 * wake_delay %.0f) + wake_delay %.0f; '
+                             'use --force-court REASON to override' %
+                             (minimum, cfg.idle_after_s, wake, wake))
     # A configured canon that did not load may hold the only Host card with
     # the hook: fail closed rather than reopen the gate.
     close_claims = bool(hook) or (configured and not canons)
+    kwargs = {} if force_short_reason is None else {'force_short_reason': force_short_reason}
     return storage.of(db).host_lifecycle.drain(
         host, actor=actor, duration=duration, critical=critical,
-        automatic=bool(automatic), close_claims=close_claims)
+        automatic=bool(automatic), close_claims=close_claims, **kwargs)
 
 
 def undrain(cfg, db, host, *, actor=None, runner=None, clock=None):
@@ -399,6 +408,7 @@ def main(argv=None):
     withdraw = commands.add_parser("drain", help="close new turns and prepare agents' evacuation")
     withdraw.add_argument("host")
     withdraw.add_argument("--for", dest="duration", help="request return after this duration, e.g. 8h")
+    withdraw.add_argument("--force-court", metavar="REASON", help="override the short-drain bound with a reason")
     withdraw.add_argument("--actor", help="who drains (human:<id>) from an unbound terminal")
     restore = commands.add_parser("undrain", help="reopen the host and request agents' return")
     restore.add_argument("host")
@@ -424,7 +434,8 @@ def main(argv=None):
             # An explicit --actor is authenticated like every other correction:
             # a bound agent session must not claim a human's name.
             actor = work.corrector(cfg, db, args.actor) if args.actor else None
-            result = drain(cfg, db, args.host, duration=duration, actor=actor)
+            result = drain(cfg, db, args.host, duration=duration, actor=actor,
+                           force_short_reason=args.force_court)
             # #4148: best-effort adapter acknowledgement; the runner scanner
             # retries, and a failure keeps the claims closed.
             result = enter_draining(cfg, db, args.host,

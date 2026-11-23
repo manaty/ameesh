@@ -5596,7 +5596,7 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = (), automatic: bool = False,
-              close_claims: bool = False) -> dict:
+              close_claims: bool = False, force_short_reason: str | None = None) -> dict:
         """Close claims/enable atomically and retain agents' original host.
 
         #3029: an elected role holding its lease on this host is returned in

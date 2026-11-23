@@ -163,6 +163,13 @@ class WaitStateTest(PgTestCase):
         self.assertEqual(alerts[0]["generation"], self.generation)
         self.assertFalse(self.api.get("vm")["claims_open"])
 
+    def test_completed_short_drain_raises_immediate_alert(self):
+        self.queue(state='draining', result='drain too short for halt: needs 4500 s')
+        self.db.execute("UPDATE vm_adapter_requests SET status='done' WHERE state='draining'")
+        alerts = self.alerts()
+        self.assertEqual([a['reason'] for a in alerts], ['drain_too_short'])
+        self.assertIn('needs 4500 s', alerts[0]['detail'])
+
     def test_worker_canon_failure_alerts_immediately(self):
         self.queue(result='canon unavailable')
         alerts = self.alerts()

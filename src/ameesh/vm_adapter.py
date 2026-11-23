@@ -635,6 +635,31 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
         state = provider.state(target)
         observed = q.observe(host, state, policy['observation_gap_s'])
         delay = observed['wake_delay_s'] or policy['wake_delay_s']
+        # Assess the first worker tick of each drain, not the dwindling time
+        # on every subsequent tick. The draining request is the durable marker.
+        drain_status = q.status(host, control['generation'], control['release_epoch'], 'draining')
+        if (control['mode'] == 'draining' and control.get('return_ts') is not None
+                and drain_status is None):
+            q.request(host, control['generation'], control['release_epoch'], 'draining')
+            required = max(cfg.idle_after_s, policy['min_on_s'], 2 * delay) + delay
+            deadline = control.get('return_ts')
+            result = ('drain too short for halt: needs %d s' % math.ceil(required)
+                      if deadline is not None and deadline - now < required
+                      else 'drain timing checked')
+            # This state has no cloud effect. The native hook acknowledges it
+            # when it next observes the completed request.
+            row = next(row for row in q.pending_all(host)
+                       if row['state'] == 'draining' and current(control, row))
+            q.finish(row, 'done', result)
+        elif (control['mode'] == 'draining' and control.get('return_ts') is not None
+              and drain_status == 'pending'):
+            row = next((row for row in q.pending_all(host)
+                        if row['state'] == 'draining' and current(control, row)), None)
+            if row is not None and not row.get('result'):
+                required = max(cfg.idle_after_s, policy['min_on_s'], 2 * delay) + delay
+                deadline = control.get('return_ts')
+                if deadline is not None and deadline - now < required:
+                    q.finish(row, 'pending', 'drain too short for halt: needs %d s' % math.ceil(required))
         listing = store.operations.listing()
         lots = store.operations.open_lots_activity(None)
         holds = {h['host']: h for h in store.hosts.holds()}
@@ -680,7 +705,8 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
                 if current(control, row) and row.get('result') in (ARCHIVE_INTENT, POWEROFF_SENT):
                     q.touch(row)
         if verb == 'draining':
-            q.complete(request, 'claims closed; no cloud effect')
+            result = request.get('result') or 'claims closed; no cloud effect'
+            q.complete(request, result)
             return 'draining'
         if verb == 'idle-drained':
             if (due or control.get('return_requested_ts') is not None
@@ -893,7 +919,6 @@ def main(argv=None):
         provider = Scaleway(credentials['secret_key'], timeout=policy['io_timeout_s'])
         for host in policy['targets']:
             try:
-                Queue(db).publish_drain_policy(host, cfg.idle_after_s, policy)
                 result = tick_host(cfg, db, policy, host, provider)
                 print(host + ': ' + result)
             except Exception as error:

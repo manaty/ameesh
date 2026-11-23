@@ -690,18 +690,32 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      (`inventory:ValueError`, R1 du 22/11), et un retour prises fermées le
      laisserait rouge faute de bail des autres runners. Retirer `units` de
      la carte reste facultatif ; ce geste est au bureau.
-Avant le feu R1, vérifier aussi sur l'hôte du contrôleur VM que son canon est
-synchronisé et lisible par la version réellement lancée du worker (`ameesh
-canon check` avec sa configuration). Un canon périmé bloque le halt.
+Avant le feu R1, sur l'hôte du contrôleur, lancer `_canon_read` avec le
+venv et la configuration réellement utilisés par le worker ; consigner la
+sortie `1 canon, unknown False` ainsi que le SHA du canon local. La lecture
+par un autre venv ou un autre hôte ne prouve pas celle du worker.
+Avec le compte et l'environnement du service (en particulier `AMEESH_CONFIG`),
+renseigner `CANON_DIR` avec le chemin du clone configuré, puis utiliser son
+interpréteur et relever le SHA :
+
+```sh
+/opt/ameesh-vm-adapter/venv/bin/python - <<'PYCODE'
+from ameesh import config, host_release
+canons, unknown = host_release._canon_read(config.load())
+print(len(canons), 'canon, unknown', unknown)
+PYCODE
+git -C "$CANON_DIR" rev-parse HEAD
+```
+
 
 La fenêtre doit couvrir le repos `max(idle_after_s, min_on_s, 2 ×
-wake_delay_s)`, puis l'archivage, la restauration et la santé. Le drainage
-avec retour programmé doit couvrir au moins ce repos plus le délai de réveil
-et, si l'arrêt doit être observé, `min_off_s`. Le worker publie les seules
-temporisations, sans secret, à chaque passage ; un drainage temporisé avec
-hook est refusé si cette politique manque ou date de plus de cinq minutes.
-Démarrer le worker et vérifier sa connexion à la base avant le drainage. Relever les durées mesurées
-dès le premier cycle réel ; elles déterminent la largeur des cycles suivants.
+wake_delay_s)`, puis l'archivage, la restauration et la santé. La borne
+au drainage est `max(idle_after_s, 2 × wake_delay_s) + wake_delay_s` : elle
+ne connaît pas `min_on_s`, privé au worker. Celui-ci contrôle la durée exacte
+au premier passage et signale en base une durée insuffisante. Un opérateur
+peut passer outre la borne avec `--force-court REASON`, avec motif enregistré.
+Relever les durées mesurées dès le premier cycle réel ; elles déterminent la
+largeur des cycles suivants.
 
 2. Le bureau active l'inscription (`enabled: true`, copie avant) et démarre
    le timer (R1 de D1). Avant l'étape 3, vérifier ses passes dans le journal :

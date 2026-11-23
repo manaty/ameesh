@@ -229,7 +229,7 @@ class HostLifecycle(interface.HostLifecycle):
         return bool(rows and rows[0]["claims_open"])
 
     def drain(self, host, *, actor, duration=None, critical=(), automatic=False,
-              close_claims=False):
+              close_claims=False, force_short_reason=None):
         if not isinstance(automatic, bool):
             raise ValueError("automatic: a boolean expected")
         if not isinstance(close_claims, bool):
@@ -293,6 +293,12 @@ class HostLifecycle(interface.HostLifecycle):
                            "VALUES (%s,%s,%s,%s)",
                            (host, row["generation"], agent["name"], agent["name"] in critical))
             _release_elected(tx, host)
+            if force_short_reason is not None:
+                tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
+                           "VALUES ('host.drain_short_forced',%s,NULL,%s::jsonb)",
+                           ('host:' + host, json.dumps({'actor': actor, 'reason': force_short_reason,
+                                                       'generation': row['generation'],
+                                                       'duration_s': duration})))
             return row
 
     def undrain(self, host, *, actor, claims_open=True, generation=None,

@@ -1114,6 +1114,21 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
         # (auditeur B1 on #5932).
         gate_closed = (control.get("mode") in ("draining", "returning")
                        and not control.get("claims_open"))
+        if gate_closed and control.get('mode') == 'draining':
+            try:
+                from .storage.postgres.vm_adapter import Queue
+                short = Queue(db).short_drain(host, generation, epoch)
+            except Exception:
+                short = None
+            if short:
+                since = resources.finite_float(short.get('updated_ts')) or now
+                out.append(_alert('host_release_adapter_stalled', None, since,
+                                  max(0.0, now - since), 0.0,
+                                  'Host %s: VM adapter reports %s; the scheduled return '
+                                  'prevents halt. Extend the drain if a halt is needed.' %
+                                  (host, short['result']), host=host, state='draining',
+                                  generation=generation, release_epoch=epoch,
+                                  reason='drain_too_short', orchestrators=list(orchestrators)))
         pending = _pending_adapter_requests(db, host) if gate_closed else []
         live = [row for row in pending
                 if row.get("generation") == generation
