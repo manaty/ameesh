@@ -900,20 +900,20 @@ class Mailbox(interface.Mailbox):
             (recipient, str(lot)),
         )
 
-    def review_seat_pending(self, recipient, lot) -> bool:
-        """#8118 : voir `interface.Mailbox.review_seat_pending`.
+    def review_notice_passive(self, sender, recipient, lot) -> bool:
+        """#8118 : voir `interface.Mailbox.review_notice_passive`.
 
-        Un `verdict` d'un autre relecteur sur la tête gelée peut être
-        `blocked` : le cycle de correctif est ouvert et un nouveau gel est
-        attendu, donc l'avis de l'auteur ne doit pas rouvrir un tour lui
-        aussi. La tête est le dernier jalon `frozen` du lot, jamais un
-        argument d'appelant."""
+        Seul l'auteur du contenu gelé (acteur du jalon `frozen` ou assigné du
+        lot) est concerné : une consigne du pilote ou de mesh-design garde son
+        réveil. Le verdict doit être encore dû sur la tête — un relecteur qui a
+        déjà rendu `ok` ou `blocked` garde le dialogue avec l'auteur. La tête
+        est le dernier jalon `frozen` du lot, jamais un argument d'appelant."""
         rows = self.db.query(
             """
             SELECT 1
               FROM work_items w
               JOIN LATERAL (
-                    SELECT m.sha
+                    SELECT m.sha, m.actor
                       FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.kind = 'frozen'
                      ORDER BY m.id DESC
@@ -921,22 +921,16 @@ class Mailbox(interface.Mailbox):
              WHERE w.id = %s
                AND w.state = 'qa'
                AND %s = ANY(coalesce(w.reviewers, ARRAY[]::text[]))
-               AND (EXISTS (
-                        SELECT 1
-                          FROM work_item_milestones b
-                         WHERE b.work_item_id = w.id
-                           AND b.kind = 'verdict'
-                           AND b.verdict = 'blocked'
-                           AND lower(coalesce(b.sha, '')) = lower(coalesce(f.sha, '')))
-                    OR NOT EXISTS (
-                        SELECT 1
-                          FROM work_item_milestones v
-                         WHERE v.work_item_id = w.id
-                           AND v.kind = 'verdict'
-                           AND v.actor = %s
-                           AND lower(coalesce(v.sha, '')) = lower(coalesce(f.sha, ''))))
+               AND (%s = f.actor OR %s = w.assignee)
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM work_item_milestones v
+                     WHERE v.work_item_id = w.id
+                       AND v.kind = 'verdict'
+                       AND v.actor = %s
+                       AND lower(coalesce(v.sha, '')) = lower(coalesce(f.sha, '')))
              LIMIT 1
-            """, (int(lot), recipient, recipient))
+            """, (int(lot), recipient, sender, sender, recipient))
         return bool(rows)
 
     def delivered_for_lot(self, recipient, lot, limit) -> list[dict]:

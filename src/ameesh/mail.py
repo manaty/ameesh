@@ -201,14 +201,14 @@ def _review_notice_passive(db: Db, sender: str, recipient: str, kind: str,
                            work_item_id: str | None) -> bool:
     """#8118 : un avis d'auteur ne double pas le réveil d'une demande de relecture.
 
-    Sur un lot gelé (`qa`) dont `recipient` est un relecteur désigné, un simple
-    `notify` d'un pair n'ouvre pas de tour tant qu'un verdict est dû sur la
-    tête gelée ou qu'un `blocked` y engage un nouveau gel : la demande de
-    désignation du siège est le seul réveil de cette tête. L'avis n'est ni
-    perdu ni retiré : il devient passif (lu au tour suivant, comme une copie),
-    et la porte (#2442) ne change pas.
-    Un humain, le système, un urgent et un `reply`/`decision` réveillent
-    toujours ; une erreur de lecture laisse le message actif, jamais perdu.
+    Sur un lot gelé (`qa`) dont `recipient` est un relecteur désigné au verdict
+    encore dû sur la tête, un simple `notify` de l'auteur du contenu gelé
+    n'ouvre pas de tour : la demande de désignation du siège est le réveil en
+    attente. L'avis n'est ni perdu ni retiré : il devient passif (lu au tour
+    suivant, comme une copie), et la porte (#2442) ne change pas.
+    Un humain, le système, un urgent, un `reply`/`decision`, une consigne d'un
+    autre agent et tout avis après un verdict rendu réveillent toujours ; une
+    erreur de lecture laisse le message actif, jamais perdu.
     """
     if kind != "notify":
         return False
@@ -223,8 +223,8 @@ def _review_notice_passive(db: Db, sender: str, recipient: str, kind: str,
     try:
         # #8118 : la lecture du siège est dans le stockage ; un pilote qui ne
         # la sert pas rend False, et l'avis reste actif.
-        return bool(storage.of(db).mailbox.review_seat_pending(
-            recipient, int(work_item_id)))
+        return bool(storage.of(db).mailbox.review_notice_passive(
+            sender, recipient, int(work_item_id)))
     except Exception:  # noqa: BLE001 - un avis reste actif plutôt que perdu
         return False
 

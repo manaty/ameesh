@@ -58,6 +58,7 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
     # -- witnesses --------------------------------------------------------
     def test_three_regels_wake_each_reviewer_once_per_head(self):
         for index in range(3):
+            previous = self.frozen
             if index:
                 self._advance("head%d" % (index + 1))
             _mark, out = self.freeze()
@@ -73,7 +74,16 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
                 self.assertEqual(len(notes), index + 1, notes)
                 self.assertTrue(all(mail.passive_reason(m) for m in notes),
                                 [(m["kind"], mail.passive_reason(m)) for m in notes])
-                self.assertEqual(len(self._requests(name)), index + 1)
+                requests = self._requests(name)
+                self.assertEqual(len(requests), index + 1)
+                # Le courrier du regel donne bien la nouvelle tête et, dès le
+                # deuxième regel, le delta depuis la tête du verdict précédent.
+                newest = requests[-1]
+                self.assertIn("--sha " + self.frozen, newest["body"])
+                if index:
+                    self.assertIn("git diff %s..%s"
+                                  % (previous[:12], self.frozen[:12]),
+                                  newest["body"])
             # Le siège est réveillé (demande lue) puis rend son verdict : la
             # tête suivante aura sa propre demande.
             self.db.execute(
@@ -119,25 +129,36 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
 
     def test_after_an_ok_verdict_the_authors_notice_wakes_again(self):
         # Frontière de la règle : le réveil unique couvre le temps où le
-        # verdict est dû ou qu'un B engage un nouveau gel. Une fois le verdict
-        # `ok` rendu sur la tête gelée, un avis ordinaire de l'auteur réveille
-        # de nouveau.
+        # verdict est dû. Une fois le verdict `ok` rendu sur la tête gelée, un
+        # avis ordinaire de l'auteur réveille de nouveau.
         self.freeze()
         self._verdict("r1", "claude", self.frozen)
         before = len(self._wakes("r1"))
         self._author_note("r1")
         self.assertEqual(len(self._wakes("r1")), before + 1)
 
-    def test_a_blocked_verdict_keeps_the_fix_cycle_notice_passive(self):
-        # Avant même le gel suivant, l'auteur annonce le correctif : le B rendu
-        # engage un nouveau gel, donc l'avis attend le tour suivant et la
-        # demande de désignation reste le seul réveil de la tête à venir.
+    def test_after_a_blocked_verdict_the_authors_question_wakes(self):
+        # B P2 auditeur : entre un B et le regel, la désignation ne réveille
+        # personne ; c'est le moment où l'auteur questionne le bloqueur sur
+        # son B. Le verdict déjà rendu sur la tête garde ce dialogue actif.
         self.freeze()
         self._verdict("r1", "claude", self.frozen, verdict="blocked")
         before = len(self._wakes("r1"))
         self._author_note("r1")
-        self.assertEqual(len(self._wakes("r1")), before)
-        self.assertTrue(mail.passive_reason(self._notifies("r1")[0]))
+        self.assertEqual(len(self._wakes("r1")), before + 1)
+        self.assertEqual(mail.passive_reason(self._notifies("r1")[0]), "")
+
+    def test_a_consigne_from_another_agent_always_wakes(self):
+        # B P2 auditeur : une consigne du pilote ou de mesh-design à un
+        # relecteur (retrait, priorité avant une coupure) n'est pas l'avis de
+        # l'auteur du contenu gelé : elle réveille.
+        self.freeze()
+        before = len(self._wakes("r1"))
+        mail.send(self.db, "pilot", "r1", "#%d : priorité avant la coupure" % self.lot,
+                  kind="notify", work_item_id=str(self.lot))
+        mail.send(self.db, "mesh-design", "r1", "#%d : B à reconsidérer" % self.lot,
+                  kind="notify", work_item_id=str(self.lot))
+        self.assertEqual(len(self._wakes("r1")), before + 2)
 
 
 if __name__ == "__main__":

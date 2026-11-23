@@ -1848,10 +1848,14 @@ class Mailbox(Domain):
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis marqués `payload.urgent`."""
 
-    def review_seat_pending(self, recipient: str, lot: int) -> bool:
-        """#8118 : le destinataire est-il un relecteur désigné du lot dont le
-        verdict est encore dû sur la dernière tête gelée, ou qu'un `blocked` y
-        engage un nouveau gel ?
+    def review_notice_passive(self, sender: str, recipient: str, lot: int) -> bool:
+        """#8118 : l'avis de `sender` double-t-il le réveil de la désignation ?
+
+        Vrai quand `sender` est l'auteur du contenu gelé (acteur du jalon
+        `frozen` ou assigné du lot), que `recipient` est un relecteur désigné
+        dont le verdict est encore dû sur la dernière tête gelée, et que le lot
+        est en `qa` : la demande de désignation du siège est le réveil en
+        attente, l'avis attend le tour suivant.
 
         Lecture locale au pilote Postgres : un stockage qui ne la sert pas
         (exécuteur médié) rend False, et l'avis reste actif."""
