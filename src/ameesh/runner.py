@@ -7082,16 +7082,21 @@ class AgentWorker(threading.Thread):
         # 200 lignes sans décalage) laisse peut-être un humain au-delà du
         # préfixe, même si peu de lignes y sont remisables (lots retenus).
         page_pleine = page_tronquee or len(page) >= mail.UNREAD_LIMIT
-        messages = self._live_mail(page)
-        if page_pleine and all(mail.passive_reason(m) for m in messages):
-            # L125 : boîte pleine de courrier passif — les messages qui
-            # réveillent, plus récents, ne doivent pas y rester invisibles
-            reveil_page = lot_workdir.deliverable_unread(
+        if page_pleine:
+            # #8112 : la page FIFO est pleine — un stock ancien de passifs
+            # peut cacher le courrier du jour lié à un lot et un actif
+            # au-delà d'elle. On lit la priorité à part et on la met devant
+            # (`priority_first` écarte les doublons d'id). Le mode priorité
+            # rend aussi tous les actifs : il remplace le repli L125
+            # `mode="active"` de #8040.
+            priority = lot_workdir.deliverable_unread(
                 cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
-                mode="active", deferred=self._lot_deferred)
-            page_pleine = page_pleine or len(reveil_page) >= mail.UNREAD_LIMIT
-            reveil = self._live_mail(reveil_page)
-            messages = reveil + messages
+                mode="priority", deferred=self._lot_deferred)
+            page = mail.priority_first(priority, page)
+        messages = self._live_mail(page)
+        # #8112 : même sans page pleine, le budget de 20 Ko peut s'épuiser
+        # avant le courrier du jour situé en fin de page : priorité stable.
+        messages = mail.priority_order(messages, mail.day_start())
         humans = [m for m in messages
                   if self._from_human(m) and not mail.passive_reason(m)]
         if not humans and page_pleine:
