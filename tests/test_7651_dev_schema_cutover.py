@@ -31,7 +31,10 @@ ROLLBACK = (FOLDER / 'rollback/0001_module_schema_cutover.sql').read_text()
 def cutover_modules():
     """Activation ONLY for isolated-copy proofs; runtime remains code-only."""
     with mock.patch.object(dev, 'MIGRATIONS', 'migrations'):
-        return registry.discover()
+        found = registry.discover()
+    return replace(found, modules=tuple(
+        replace(module, migrations=tuple(m for m in module.migrations if m.version == 1))
+        if module.name == 'dev' else module for module in found.modules))
 
 
 class CutoverDeclarationTest(unittest.TestCase):
