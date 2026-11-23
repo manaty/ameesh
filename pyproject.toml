@@ -59,7 +59,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json",
           "consignes/*.md", "deepseek_cgroup.cjs", "ui/static/*"]
-"ameesh.modules.dev" = ["migrations/*.sql", "migrations/rollback/*.sql"]
+"ameesh.modules.dev" = ["migrations/*.sql", "migrations/rollback/*.sql",
+                        "pending/*.sql", "pending/rollback/*.sql"]
 "ameesh.mediated_executor" = ["contract.json"]
 "ameesh.approve" = ["static/*.js", "static/*.css"]
 

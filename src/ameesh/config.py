@@ -348,6 +348,14 @@ class Config:
     max_preparation: float = 900.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
+    #: #8152 : passes de repos par seconde pour l'exécuteur entier, réglées par
+    #: l'hôte (0 = défaut `Runner.IDLE_PASSES_PER_S`, plafonné à 45 s de pas).
+    #: Réglé, le pas vaut `agents / débit` sans plafond de 45 s ni tiers du
+    #: bail, sauf `idle_poll_max` : la relève élue est vue un pas plus tard.
+    idle_passes_per_s: float = 0.0
+    #: #8152 : plafond du pas au repos (s) ; 0 = 45 s par défaut, sans plafond
+    #: si `idle_passes_per_s` est réglé.
+    idle_poll_max: float = 0.0
     runner_liveness_interval: float = 60.0  # #508 : écriture groupée, au moins 60 s
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
@@ -1254,6 +1262,11 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
         max_preparation=_as_float(pick("AMEESH_MAX_PREPARATION"), cfg.max_preparation),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
+        # #8152 : réel fini > 0, sinon le défaut (0) ; jamais un pas nul
+        idle_passes_per_s=_positive_float(pick(
+            "AMEESH_IDLE_PASSES_PER_S", default=cfg.idle_passes_per_s)) or 0.0,
+        idle_poll_max=_positive_float(pick(
+            "AMEESH_IDLE_POLL_MAX", default=cfg.idle_poll_max)) or 0.0,
         runner_liveness_interval=max(60.0, _as_float(
             pick("AMEESH_RUNNER_LIVENESS_INTERVAL", "AGENT_MESH_RUNNER_LIVENESS_INTERVAL"),
             cfg.runner_liveness_interval)),

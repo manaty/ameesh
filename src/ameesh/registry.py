@@ -20,7 +20,7 @@ import sys
 
 from typing import Sequence
 
-from . import persona_sessions, storage
+from . import agent_names, persona_sessions, storage
 from .config import NAME_RE
 from .db import Db
 from .storage.postgres import registry as _pg
@@ -112,7 +112,9 @@ def upsert_unleased(db: Db, name: str, *, chantier: str | None = None,
 
 
 def get(db: Db, name: str) -> dict | None:
-    return storage.of(db).agents.get(name)
+    row = storage.of(db).agents.get(name)
+    agent_names.note_row(row)  # #8152 : primaire confirmé pour la passe
+    return row
 
 
 def live_harness(row: dict | None) -> str:

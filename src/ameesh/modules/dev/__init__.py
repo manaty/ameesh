@@ -39,6 +39,9 @@ NAME = "dev"
 #: Garder MIGRATIONS=None jusqu'au go d'application par base : déclarer la
 #: migration non additive ici bloquerait tout préflight de staging (§11 bis).
 #: Les tests activent explicitement le dossier sur leurs copies isolées.
+#: P3 (#7652) stays outside that folder, in pending/: activating P2 must
+#: retain its views. A separate activation change moves P3 into migrations/
+#: only after Q6 and the per-database P3 approval.
 SCHEMA = "dev"
 MIGRATIONS = None
 REQUIRES = ()
