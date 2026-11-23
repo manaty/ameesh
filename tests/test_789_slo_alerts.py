@@ -1097,13 +1097,13 @@ class PaquetTest(_Base):
                                 workflow="mobile-android-release.yml")
         self._packet_ci_on_head(carrier, composed, status="failure", run_id=700102,
                                 workflow="host-rust.yml")
-        # L'ascendance lue dans le dépôt du porteur : `composed` descend de `head`.
+        # La tête actuelle de la branche du porteur, lue à la forge.
         seen = []
 
-        def descends(db, cfg, row, *, cache):
+        def reader(db, cfg, row, *, cache):
             seen.append(int(row["id"]))
-            return lambda a, b: (a, b) == (head, composed)
-        with mock.patch.object(exploitation, "_carrier_descends", descends):
+            return lambda branch: ("sha", composed)
+        with mock.patch.object(exploitation, "_carrier_head_reader", reader):
             alerts = self.slo()
         self.assertIn(int(carrier["id"]), seen)
         self.assertEqual([a["step"] for a in alerts], ["verdict_merge"])

@@ -636,6 +636,13 @@ def _packet_ci_text(ci: dict) -> str:
             run, on, ": %s" % running if running else "")
     if state == "pending":
         return " (its full CI has not started yet%s)" % on
+    if state == "uncertain":
+        # #8155 : la tête actuelle de la branche n'a pas pu être lue ; des runs
+        # existent sur d'autres têtes, aucune n'est présentée comme courante.
+        seen = ", ".join(str(sha)[:8] for sha in (ci or {}).get("seen_heads") or ())
+        return (" (its CI state is unproven: no run on the recorded head%s, runs "
+                "seen on %s, and the branch's current head could not be read; "
+                "check the packet PR before acting)" % (on, seen or "other heads"))
     if state == "green":
         return " (%s%s is green; the packet merge is pending)" % (run, on)
     if state == "red":
