@@ -356,14 +356,14 @@ def _quota_probe():
         plan_github.Gh(timeout=15.0), "rate_limit")
 
 
-def _quota_wait_until(cfg, text: str, now: float) -> float | None:
+def _quota_wait_until(cfg, text: str, now: float, refusal=None) -> float | None:
     """When the shared detector says GitHub is recharged, else None (#8182).
 
-    The rejection text says "rate limit"; the instant comes from the same
-    `plan_github.SharedReads.note` the CI and GitHub readers use, fed by the
-    `/rate_limit` headers (or its `resources` body), never by a new parser.
-    `SharedReads.note` is also what turns `X-RateLimit-Reset`/`Retry-After`
-    into an epoch, and what the next ticks read without any network call.
+    The original refusal (status, headers, body, when the wrapper could keep
+    it) is graded first: only it carries a secondary limit's `Retry-After`.
+    Then the `/rate_limit` probe covers a primary budget. Both go through
+    `plan_github.SharedReads.note`, the detector the CI and GitHub readers
+    already use; nothing here parses quota headers by hand.
     """
     from . import plan_github
     resource = _quota_probe_resource(text)
@@ -377,6 +377,16 @@ def _quota_wait_until(cfg, text: str, now: float) -> float | None:
         until = reads.blocked(now, resource)
         if until is not None:
             return float(until)
+        if refusal is not None:
+            try:
+                status, headers, body = refusal
+            except (TypeError, ValueError):
+                status = None
+            else:
+                until = reads.note(headers, status=status, now=now,
+                                   resource=resource, body=body)
+                if until is not None:
+                    return float(until)
         status, headers, body = _quota_probe()
         if status == 200 and body:
             # The body names each bucket; the response headers only describe
@@ -484,7 +494,8 @@ def _report_error(cfg, db, project, exc, now: float) -> bool:
             # A missing calendar can itself be the failure being reported.
             # Keep the previous once-per-error behavior until it is readable.
             cutoff_at, _label = None, ""
-        quota_reset = _quota_wait_until(cfg, text, now)
+        quota_reset = _quota_wait_until(
+            cfg, text, now, getattr(exc, "github_refusal", None))
         if quota_reset is not None:
             _report_quota_wait(cfg, db, project, slot, state, text,
                                cutoff_at, _label, now, quota_reset)
@@ -732,8 +743,10 @@ def _release_tick(cfg, args, declared) -> int:
                 print("%s: %s" % (name, exc), file=sys.stderr)
                 # #6014: a transient failure is still a cutoff not done; say
                 # it once per cutoff instead of leaving it in the journal.
-                # #8182: a quota wait is scheduled, not a failed cutoff.
-                status = 0 if _report_error(cfg, db, project, exc, now) else 1
+                # #8182: a quota wait is scheduled, not a failed cutoff, but
+                # it never clears a failure an earlier project recorded.
+                if not _report_error(cfg, db, project, exc, now):
+                    status = 1
                 continue
             except release_cutoff.ReleaseError as exc:
                 print("%s: %s" % (name, exc), file=sys.stderr)

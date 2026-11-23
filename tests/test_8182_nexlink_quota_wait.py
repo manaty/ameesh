@@ -24,6 +24,7 @@ from tests import support  # isolate host config before product imports
 from ameesh import config
 from ameesh import release
 from ameesh import release_cutoff as rc
+from ameesh.modules.nexlink import release as nx
 
 QUOTA = ("Nexlink GitHub operation failed: HTTP 403: API rate limit exceeded "
          "for user ID 16659140. If you reach out to GitHub Support for help, "
@@ -31,6 +32,23 @@ QUOTA = ("Nexlink GitHub operation failed: HTTP 403: API rate limit exceeded "
          "and timestamp 2026-11-23 22:48:40 UTC.")
 RIGHTS = ("Nexlink GitHub operation failed: HTTP 403: Resource not accessible "
           "by integration")
+#: A secondary limit as `GH_DEBUG=api` writes it: the only place carrying
+#: `Retry-After`; `/rate_limit` would answer 200 with the core budget intact.
+GH_DEBUG_429 = """* Request at 2026-11-23 23:09:23.221874575 +0000 UTC
+* Request to https://api.github.com/repos/acme/nexlink/actions/runs
+> GET /repos/acme/nexlink/actions/runs HTTP/1.1
+> Authorization: token ████████████████████
+
+< HTTP/2.0 429 Too Many Requests
+< Content-Type: application/json
+< X-Ratelimit-Limit: 5000
+< X-Ratelimit-Remaining: 4900
+< X-Ratelimit-Reset: 1200
+< Retry-After: 30
+
+{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}
+gh: You have exceeded a secondary rate limit (HTTP 429)
+"""
 
 
 def quota_probe(reset: float):
@@ -105,6 +123,55 @@ class QuotaDetectorTest(unittest.TestCase):
                     self.cfg, "gh: HTTP 429: Too Many Requests", 1000.0),
                 1300.0)
 
+    def test_the_original_refusal_is_graded_before_the_probe(self):
+        refusal = (429, {"Retry-After": "30"},
+                   "You have exceeded a secondary rate limit")
+        with mock.patch.object(release, "_quota_probe") as probe:
+            until = release._quota_wait_until(
+                self.cfg, "gh: HTTP 429: Too Many Requests", 1000.0,
+                refusal=refusal)
+        self.assertEqual(until, 1030.0)
+        probe.assert_not_called()
+
+
+class DebugRefusalTest(unittest.TestCase):
+    def test_the_original_429_headers_are_recovered(self):
+        status, headers, body = rc.plan_github.debug_refusal(GH_DEBUG_429)
+        self.assertEqual(status, 429)
+        self.assertEqual(headers["Retry-After"], "30")
+        self.assertEqual(headers["X-Ratelimit-Remaining"], "4900")
+        self.assertIn("secondary rate limit", body.lower())
+        self.assertEqual(rc.plan_github.gh_error_line(GH_DEBUG_429),
+                         "You have exceeded a secondary rate limit (HTTP 429)")
+
+    def test_a_trace_without_a_response_is_not_a_refusal(self):
+        self.assertIsNone(rc.plan_github.debug_refusal("* Request took 10ms\n"))
+        self.assertEqual(rc.plan_github.gh_error_line("GitHub quota deferred"),
+                         "GitHub quota deferred")
+
+
+class NexlinkGhRefusalTest(unittest.TestCase):
+    def test_the_wrapper_keeps_the_refusal_and_a_readable_error(self):
+        seen = []
+
+        class FakeGh:
+            def __init__(self, *args, **kwargs):
+                seen.append(kwargs)
+
+            def run(self, args, stdin=None):
+                return 1, "", GH_DEBUG_429
+
+        project = rc.ProjectRelease("nexlink", "/unused", target="develop",
+                                    github="acme/nexlink", model="nexlink")
+        with mock.patch.object(rc.plan_github, "Gh", FakeGh):
+            with self.assertRaises(rc.TransientReleaseError) as caught:
+                nx.gh(project, ["run", "list"])
+        self.assertEqual(seen[0]["env"]["GH_DEBUG"], "api")
+        status, headers, body = caught.exception.github_refusal
+        self.assertEqual((status, headers["Retry-After"]), (429, "30"))
+        self.assertIn("secondary rate limit", str(caught.exception).lower())
+        self.assertNotIn("< HTTP", str(caught.exception))
+
 
 class QuotaReportTest(unittest.TestCase):
     def setUp(self):
@@ -116,15 +183,17 @@ class QuotaReportTest(unittest.TestCase):
             model="nexlink")
         rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {"nexlink": {}}})
 
-    def _report(self, text, now, probe):
+    def _report(self, text, now, probe, refusal=None):
+        error = rc.TransientReleaseError(text)
+        if refusal is not None:
+            error.github_refusal = refusal
         with mock.patch.object(rc, "compiled_rules",
                                return_value=(None, types.SimpleNamespace(commit="d" * 40))), \
                 mock.patch.object(rc, "cutoff_slot", return_value=(1000.0, "23:00")), \
                 mock.patch.object(release, "_quota_probe", side_effect=probe), \
                 mock.patch.object(rc, "send_report") as send:
             waited = release._report_error(
-                self.cfg, object(), self.project,
-                rc.TransientReleaseError(text), now)
+                self.cfg, object(), self.project, error, now)
         return waited, send
 
     def test_quota_403_waits_and_alerts_once_without_urgency(self):
@@ -142,6 +211,29 @@ class QuotaReportTest(unittest.TestCase):
         # second alert, even if it is reported again.
         waited, second = self._report(QUOTA.replace("995A", "ABCD"),
                                       1010.0, lambda: quota_probe(1200.0))
+        self.assertTrue(waited)
+        second.assert_not_called()
+
+    def test_a_retry_after_refusal_alerts_once_without_urgency(self):
+        refusal = (429, {"Retry-After": "30"},
+                   "You have exceeded a secondary rate limit")
+        text = ("Nexlink GitHub operation failed: HTTP 429: You have exceeded "
+                "a secondary rate limit (HTTP 429)")
+        # The probe would answer "healthy": the refusal's Retry-After is the
+        # only witness. It must decide alone, before that healthy answer.
+        probe = mock.Mock(return_value=healthy_probe())
+        waited, first = self._report(text, 1000.0, probe, refusal=refusal)
+        self.assertTrue(waited)
+        probe.assert_not_called()
+        self.assertEqual(first.call_count, 1)
+        self.assertFalse(first.call_args.kwargs["urgent"])
+        slot = rc.load_state(self.cfg)["projects"]["nexlink"]
+        self.assertEqual(slot["quota_wait_reset"], 1030.0)
+        self.assertEqual(slot["quota_wait_until"], 1090.0)
+        self.assertIn("00:18:10Z", first.call_args.args[3])
+
+        waited, second = self._report(
+            text + " request ID ABCD", 1005.0, probe, refusal=refusal)
         self.assertTrue(waited)
         second.assert_not_called()
 
@@ -228,6 +320,31 @@ class QuotaTickTest(unittest.TestCase):
                                       {"nexlink": self._project()}),
                 0)
         report.assert_called_once()
+
+    def test_a_quota_wait_never_clears_an_earlier_failure(self):
+        projects = {
+            "ameesh": rc.ProjectRelease("ameesh", "/unused", target="main"),
+            "nexlink": self._project()}
+
+        def execute(cfg, db, project, **kwargs):
+            if project.name == "ameesh":
+                raise rc.TransientReleaseError("boom")
+            raise rc.TransientReleaseError(QUOTA)
+
+        for outcomes, expected in (([True, True], 0),
+                                   ([False, True], 1),
+                                   ([True, False], 1)):
+            with self.subTest(outcomes=outcomes), \
+                    mock.patch.object(release, "_project_names",
+                                      return_value=["ameesh", "nexlink"]), \
+                    mock.patch("ameesh.db.open_db"), \
+                    mock.patch.object(rc, "execute", side_effect=execute), \
+                    mock.patch.object(release, "_report_error",
+                                      side_effect=outcomes), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(
+                    release._release_tick(None, self._args(), projects),
+                    expected)
 
     def test_a_non_quota_transient_failure_still_fails_the_tick(self):
         with mock.patch.object(release, "_project_names",

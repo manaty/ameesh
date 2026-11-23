@@ -586,10 +586,19 @@ def ensure_ref(project, ref, sha):
 
 
 def gh(project, args):
-    code, out, err = rc.plan_github.Gh().run(args)
+    # #8182: GH_DEBUG=api makes gh print the refusal's status, headers and
+    # body on stderr. The shared quota detector needs the original response
+    # (a secondary limit's Retry-After is not replayed by /rate_limit).
+    code, out, err = rc.plan_github.Gh(
+        env=dict(os.environ, GH_DEBUG="api")).run(args)
     if code:
-        raise rc.TransientReleaseError("Nexlink GitHub operation failed: %s" %
-                                       " ".join((err or out).split())[:300])
+        detail = rc.plan_github.gh_error_line(err, out)
+        error = rc.TransientReleaseError(
+            "Nexlink GitHub operation failed: %s" % detail)
+        refusal = rc.plan_github.debug_refusal(err)
+        if refusal is not None:
+            error.github_refusal = refusal
+        raise error
     return out
 
 

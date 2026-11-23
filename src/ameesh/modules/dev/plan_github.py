@@ -240,6 +240,60 @@ def gh_api_response(gh, path: str, *, etag: str | None = None) -> tuple[int, dic
     return int(match.group(1)), _http_headers(head), body
 
 
+def debug_refusal(text: str) -> tuple[int, dict, str] | None:
+    """The last HTTP response in `GH_DEBUG=api` stderr, else None (#8182).
+
+    `gh` writes `> ` request lines, `< HTTP/2.0 403 …` status, `< Header: value`
+    response headers and the body to stderr. The release engine uses this to
+    hand the *original* refusal (not a later `/rate_limit` probe) to
+    `SharedReads.note`: a secondary limit's `Retry-After` only exists there.
+    The body is bounded; the caller never persists the trace.
+    """
+    lines = str(text or "").splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.startswith("< ") and _HTTP_STATUS_RE.match(line[2:]):
+            start = index
+    if start is None:
+        return None
+    status = int(_HTTP_STATUS_RE.match(lines[start][2:]).group(1))
+    headers: dict = {}
+    index = start + 1
+    while index < len(lines) and lines[index].startswith("< "):
+        name, sep, value = lines[index][2:].partition(":")
+        if sep and name.strip():
+            headers[name.strip()] = value.strip()
+        index += 1
+    body_lines = []
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("* Request took"):
+            break
+        if "gh: " in line:
+            # gh appends its final error to the body line without a newline.
+            body_lines.append(line.split("gh: ", 1)[0])
+            break
+        body_lines.append(line)
+        index += 1
+    body = "\n".join(body_lines).strip()
+    return status, headers, body[:4096]
+
+
+def gh_error_line(text: str, out: str = "") -> str:
+    """The actionable line of a `gh` failure, without its debug trace (#8182)."""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("gh: "):
+            return " ".join(line[4:].split())[:300]
+        if "gh: " in line:  # body and error concatenated under GH_DEBUG
+            return " ".join(line.split("gh: ", 1)[1].split())[:300]
+    plain = [line for line in lines
+             if not line.startswith(("* ", "> ", "< "))]
+    if plain:
+        return " ".join(plain[-1].split())[:300]
+    return " ".join(str(out or "—").split())[:300]
+
+
 # --------------------------------------------------------------------------
 # lectures GitHub par jeton (L160f) : le client d'ameesh, sans sous-processus
 # --------------------------------------------------------------------------
