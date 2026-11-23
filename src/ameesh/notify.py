@@ -3054,6 +3054,17 @@ class Notifier:
                                 "correction": "correction proposée"}.get(
                                     take.get("kind"), "file d'amélioration")}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
+        # #8119 : le journal des refus de L165, une note par élément et par
+        # heure ; le pilote est alerté quand un élément démarrable reste sans
+        # preneur. En a-blanc, le journal n'écrit rien.
+        if not self.dry_run:
+            from . import take_refusals
+            try:
+                take_refusals.journal(self.cfg, db, now=now)
+            except db_mod.DbError:
+                raise
+            except Exception as exc:  # le journal ne fait pas tomber les alertes
+                self.log("take refusal journal failed: %s" % _clean(exc, 200))
 
     def _queue_fill(self, db, now: float) -> None:
         """#3256 A : le lot de découpage d'un projet dont la file est vide alors

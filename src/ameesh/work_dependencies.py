@@ -53,12 +53,14 @@ def grouped(db, item_ids):
 # --------------------------------------------------------------------------
 
 #: `duplicates`, `supersedes`, `part_of` sont orientés (le lot édité est le
-#: doublon, le remplaçant, la part) ; `conflicts_with` est symétrique.
-LINK_KINDS = ("duplicates", "supersedes", "part_of", "conflicts_with")
+#: doublon, le remplaçant, la part) ; `conflicts_with` et `see_also` (la
+#: relation non bloquante de #8119) sont symétriques.
+LINK_KINDS = ("duplicates", "supersedes", "part_of", "conflicts_with", "see_also")
 
 #: lecture inverse d'un lien orienté, vu depuis sa cible
 _INVERSE = {"duplicates": "duplicated by", "supersedes": "superseded by",
-            "part_of": "has part", "conflicts_with": "conflicts with"}
+            "part_of": "has part", "conflicts_with": "conflicts with",
+            "see_also": "see also"}
 
 _LINK_ERRORS = {"self_link": "a lot cannot be linked to itself",
                 "unknown_lot": "link endpoints must be existing lots",
@@ -129,7 +131,8 @@ def links(db, item_ids):
             if lot not in wanted:
                 continue
             out.setdefault(lot, []).append({
-                "kind": kind, "label": label, "forward": forward or kind == "conflicts_with",
+                "kind": kind, "label": label,
+                "forward": forward or kind in ("conflicts_with", "see_also"),
                 "lot": peer, "state": state, "open": bool(row["open"]),
                 "created_by": row["created_by"], "created_ts": row["created_ts"],
                 "decision": row.get("decision"), "decided_by": row.get("decided_by"),

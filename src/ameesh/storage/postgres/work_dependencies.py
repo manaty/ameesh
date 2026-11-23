@@ -298,8 +298,9 @@ class WorkDependencies(Contract):
 
     @staticmethod
     def _link_ends(item_id, other_id, kind):
-        """`conflicts_with` est symétrique : rangé plus petit id d'abord."""
-        if kind == "conflicts_with" and item_id > other_id:
+        """`conflicts_with` et `see_also` sont symétriques : rangé plus petit
+        id d'abord."""
+        if kind in ("conflicts_with", "see_also") and item_id > other_id:
             return other_id, item_id
         return item_id, other_id
 
@@ -323,6 +324,10 @@ class WorkDependencies(Contract):
                 # un conflit avec un lot fini n'a plus rien à trancher
                 if states[item_id] in _DONE or states[other_id] in _DONE:
                     return {"error": "finished_lot"}
+            elif kind == "see_also":
+                # relation informative : ni conflit à trancher ni cycle à
+                # refuser (deux lots peuvent se voir mutuellement)
+                pass
             elif tx.query("""
                     WITH RECURSIVE reach(id) AS (
                         SELECT other_id FROM work_item_links

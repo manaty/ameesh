@@ -2243,6 +2243,22 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             creator = binding.name if binding.ok else args.actor
             if args.new_project and args.app is None:
                 raise work.WorkError("--new-project goes with --app <project>")
+            see_also = getattr(args, "see_also", None)
+            if args.parent_lot is not None and see_also is not None:
+                raise work.WorkError("--parent-lot and --see-also are exclusive: one is "
+                                     "a blocking prerequisite, the other a non-blocking "
+                                     "relation")
+            if see_also is not None:
+                if int(see_also) <= 0:
+                    raise work.WorkError("--see-also: a positive lot number")
+                if work.get(db, int(see_also)) is None:
+                    raise work.WorkError("see-also lot #%d not found" % int(see_also))
+            if args.parent_lot is not None:
+                print("warning: --parent-lot #%d makes it a BLOCKING prerequisite: the new "
+                      "%s stays untakeable until #%d is merged or closed. For a mere "
+                      "'see also' relation, use --see-also %d (non-blocking)."
+                      % (int(args.parent_lot), v.noun, int(args.parent_lot),
+                         int(args.parent_lot)), file=sys.stderr)
             if args.body == "-":
                 # #3744 : comme `work note <lot> -` (#3683), le corps vient de
                 # l'entrée standard (heredoc `<<'EOF'`), jamais « - » tel quel ;
@@ -2315,6 +2331,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # doit plus s'afficher (`_print_assignment` plus bas).
                 check = None
             args.created_item = item
+            if see_also is not None and not item.get("existing"):
+                from . import work_dependencies
+                try:
+                    work_dependencies.add_link(
+                        db, int(item["id"]), int(see_also), "see_also",
+                        actor=creator or args.actor or "ameesh")
+                    print("see also: #%d (non-blocking)" % int(see_also))
+                except Exception as exc:  # noqa: BLE001 - le lot existe, le lien se répare
+                    print("warning: see-also #%d not linked: %s"
+                          % (int(see_also), exc), file=sys.stderr)
             if item.get("existing"):
                 # B/P2 ameesh-cx2 (#6090) : un premier appel concurrent a gagné
                 # entre la prélecture et l'écriture. Le magasin rend le gagnant ;
@@ -4504,8 +4530,12 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_add.add_argument("--actor", default="")
     pw_add.add_argument("--package", default=None, help=("WorkPackage card of the %s (L29)") % v.noun)
     pw_add.add_argument("--parent-lot", type=int, default=None, metavar="LOT",
-                        help=("#1193: parent of a suite %s: its blocking prerequisite, linked "
-                             "with the creation (unknown parent refused)") % v.noun)
+                        help=("#1193: parent of a suite %s: its BLOCKING prerequisite, linked "
+                             "with the creation (unknown parent refused); a mere "
+                             "'see also' relation is --see-also (#8119)") % v.noun)
+    pw_add.add_argument("--see-also", type=int, default=None, metavar="LOT",
+                        help=("#8119: record a non-blocking 'see also' link to LOT; the %s "
+                             "is takeable at once, unlike --parent-lot (exclusive with it)") % v.noun)
     pw_add.add_argument("--externe", action="store_true",
                         help="force assignment to an external agent that has a human "
                              "responsible (L37, 0030)")
