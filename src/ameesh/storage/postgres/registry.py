@@ -1486,6 +1486,11 @@ class Leases(interface.Leases):
                      "runner_seen_host", "runner_seen_owner", "lease_wait_since",
                      "last_event_at", "status_since", "status_reason_since")
 
+    #: Cycle de vie des hôtes : seules les colonnes que juge
+    #: `host_claims_closed` (mode, génération, prises, retrait) ; sondes et
+    #: tentatives de crochet (`hook_attempt_at`, `return_probe`) bougent en
+    #: transition sans rien décider. Lues par `to_jsonb` : une colonne absente
+    #: (schéma en retard) vaut null au lieu de lever 42703.
     def idle_signatures(self, names) -> dict | None:
         from .lot_sessions import _CLOSED
         from .work import has_wake_at
@@ -1515,13 +1520,23 @@ class Leases(interface.Leases):
                  WHERE r.name = ANY(%s::text[])
             )
             SELECT a.name, a.sig, a.pending, a.wake_ts,
-                   (SELECT md5(coalesce(string_agg(to_jsonb(c)::text, ',' ORDER BY c.host), ''))
-                      FROM host_lifecycle c) AS host_sig
+                   (SELECT md5(coalesce(string_agg(
+                               jsonb_build_object('h', j->'host', 'm', j->'mode',
+                                   'g', j->'generation', 'c', j->'claims_open',
+                                   's', j->'release_state', 'e', j->'release_epoch',
+                                   'r', j->'release_generation')::text,
+                               ',' ORDER BY j->>'host'), ''))
+                      FROM host_lifecycle c CROSS JOIN LATERAL to_jsonb(c) AS j) AS host_sig
               FROM agents a
              UNION ALL
             SELECT NULL, NULL, NULL, NULL,
-                   (SELECT md5(coalesce(string_agg(to_jsonb(c)::text, ',' ORDER BY c.host), ''))
-                      FROM host_lifecycle c)
+                   (SELECT md5(coalesce(string_agg(
+                               jsonb_build_object('h', j->'host', 'm', j->'mode',
+                                   'g', j->'generation', 'c', j->'claims_open',
+                                   's', j->'release_state', 'e', j->'release_epoch',
+                                   'r', j->'release_generation')::text,
+                               ',' ORDER BY j->>'host'), ''))
+                      FROM host_lifecycle c CROSS JOIN LATERAL to_jsonb(c) AS j)
              WHERE NOT EXISTS (SELECT 1 FROM agents)
             """,
             (names, list(self.IDLE_VOLATILE), names),

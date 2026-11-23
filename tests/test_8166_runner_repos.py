@@ -593,6 +593,20 @@ class EmpreintesEnBase(PgTestCase):
         self.assertTrue(leases.idle_signatures(["s2"])["agents"]["s2"]["pending"])
         self.assertEqual(leases.idle_signatures([]), {"host": "", "agents": {}})
 
+    def test_cycle_de_vie_des_hotes(self):
+        self.register("s1", "claude")
+        lu = lambda: storage.of(self.db).leases.idle_signatures(["s1"])["host"]
+        a = lu()
+        self.db.execute("INSERT INTO host_lifecycle (host, mode, actor)"
+                        " VALUES ('h8166', 'available', 'test')")
+        b = lu()
+        self.assertNotEqual(a, b)
+        # une tentative de crochet ne décide rien : pas de réveil général
+        self.db.execute("UPDATE host_lifecycle SET hook_attempt_at = now() WHERE host='h8166'")
+        self.assertEqual(lu(), b)
+        self.db.execute("UPDATE host_lifecycle SET mode = 'draining' WHERE host='h8166'")
+        self.assertNotEqual(lu(), b)
+
 
 class PasseGroupeeReelle(PgTestCase):
     """Un worker au repos ne refait plus sa passe ; un changement de sa ligne
