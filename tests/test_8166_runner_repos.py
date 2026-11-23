@@ -544,6 +544,17 @@ class PasDuWorkerCouvert(unittest.TestCase):
             self.assertEqual(worker._idle_pace(), 45.0, nom)
             self.assertFalse(getattr(worker, "_idle_gated", False), nom)
 
+    def test_travail_local_en_attente(self):
+        # B P2 dev3 : suite après plafond retenue par le budget : pas court
+        for nom in AgentWorker.LOCAL_PENDING:
+            worker = self._worker(row=dict(self.ROW))
+            setattr(worker, nom, "plafond" if nom == "suite" else True)
+            self.assertEqual(worker._idle_pace(), 45.0, nom)
+            self.assertFalse(getattr(worker, "_idle_gated", False), nom)
+        worker = self._worker(row=dict(self.ROW))
+        worker.suite, worker._retenue, worker._reprise_attach = None, None, False
+        self.assertEqual(worker._idle_pace(), 900.0)
+
     def test_echeances_connues(self):
         worker = self._worker(row=dict(self.ROW, wake_ts=time.time() + 100))
         self.assertAlmostEqual(worker._idle_pace(), 100.0, delta=1)

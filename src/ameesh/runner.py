@@ -12046,7 +12046,7 @@ class AgentWorker(threading.Thread):
         """#8166 : le pas de repos ; couvert par la passe groupée, le filet.
 
         Couvert : passe groupée vivante, rien en attente pour l'agent
-        (courrier actif, consigne), empreinte inchangée depuis le début de la
+        (courrier actif, consigne, ni état local de `LOCAL_PENDING`), empreinte inchangée depuis le début de la
         passe, rôle non élu (sa relève est vue au pas ordinaire, §11 : moins
         de cinq minutes). Le pas est alors `IDLE_SAFETY_S`, raccourci aux
         échéances connues sans requête : réveil programmé, relance au repos,
@@ -12058,6 +12058,8 @@ class AgentWorker(threading.Thread):
             return pas
         if (self.agent or {}).get("releve") == "election":
             return pas
+        if self._local_work_pending():
+            return pas  # B P2 dev3 : travail en attente hors de la base
         self._idle_gated = True  # avant le contrôle : un changement ensuite réveille
         row = runner.idle_row(self.name)
         mark = getattr(self, "_idle_mark", None)
@@ -12065,6 +12067,16 @@ class AgentWorker(threading.Thread):
             self._idle_gated = False
             return pas
         return min(max(pas, float(runner.IDLE_SAFETY_S)), self._idle_deadlines(row))
+
+    #: #8166 (B P2 dev3) : états locaux d'un travail en attente, absents de
+    #: la base donc de l'empreinte — suite après plafond, tour retenu (budget,
+    #: fenêtre courte), reprise d'attach, consigne à restaurer, réveil
+    #: programmé réclamé, session à enregistrer.
+    LOCAL_PENDING = ("suite", "_retenue", "_reprise_attach", "_consigne_a_restaurer",
+                     "_wake_claim", "_session_en_attente")
+
+    def _local_work_pending(self) -> bool:
+        return any(getattr(self, nom, None) for nom in self.LOCAL_PENDING)
 
     def _sweep_covers(self) -> bool:
         """#8166 : la passe groupée a-t-elle réussi récemment ? (sans requête)"""
