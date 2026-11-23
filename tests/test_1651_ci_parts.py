@@ -22,6 +22,7 @@ import os
 import shutil
 import signal
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -852,12 +853,36 @@ with open(out, "w", encoding="utf-8") as handle:
 '''
 
 
-@unittest.skipUnless(shutil.which("bwrap"), "bwrap is not installed on this host")
+def real_sandbox_skip_reason() -> str | None:
+    """#8146 : la raison de sauter les témoins du bac à sable réel sur cet
+    hôte, ou None quand il isole réellement.
+
+    Un `bwrap` installé mais incapable d'isoler (noyau sans espaces de noms
+    réseau, `RTM_NEWADDR` refusé) n'est pas un échec du test : c'est un défaut
+    d'environnement, et `ci_parts.sandbox_ready` porte déjà la raison que la
+    production refuse. Sans `bwrap`, la raison le dit aussi."""
+    bwrap = ci_parts.sandbox_binary()
+    if bwrap is None:
+        return "bwrap is not installed on this host"
+    return ci_parts.sandbox_ready(bwrap)
+
+
 class RealSandboxTest(_Contract):
     """N3 de #1666 : le bac à sable réel — le plan est prouvé et le sélecteur
-    ne voit ni les fichiers de l'hôte ni le réseau (sauté sans `bwrap`)."""
+    ne voit ni les fichiers de l'hôte ni le réseau.
+
+    #8146 : dépendant de l'hôte, le test est sauté sans `bwrap` **et** quand
+    `bwrap` ne peut pas isoler (raison de `ci_parts.sandbox_ready`, celle que
+    la production refuse) ; un bac à sable qui isole le joue."""
 
     FAKE_SANDBOX = False
+
+    @classmethod
+    def setUpClass(cls):
+        reason = real_sandbox_skip_reason()
+        if reason is not None:
+            raise unittest.SkipTest(reason)
+        super().setUpClass()
 
     def test_a_relocated_runtime_does_not_expose_its_parent_directory(self):
         runtime = os.path.join(self.tmp, "runtime")
@@ -889,6 +914,51 @@ class RealSandboxTest(_Contract):
         proof = ci_parts.due(self.project, tip, self.base(), self.repo)
         self.assertEqual(proof["due"], ("lot/backend-suite",))
         self.assertEqual(proof["schema"], "test-lot-plan/1")
+
+
+class RealSandboxSkipTest(unittest.TestCase):
+    """#8146 : le bac à sable réel dépend de l'hôte. Un `bwrap` simulé qui
+    refuse saute les témoins avec la raison de production ; un `bwrap`
+    fonctionnel les joue — le test ne devient jamais vert sans preuve."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="test-1651-sandbox-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def sandbox_on_path(self):
+        """Le `bwrap` du bac à sable simulé passe en tête du PATH ; l'hôte
+        reste derrière pour le témoin de démarrage (`true`)."""
+        patch = mock.patch.dict(
+            os.environ, {"PATH": self.tmp + os.pathsep + os.environ.get("PATH", "")})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_without_bwrap_the_tests_are_skipped(self):
+        with mock.patch.object(ci_parts, "sandbox_binary", lambda: None):
+            self.assertEqual(real_sandbox_skip_reason(),
+                             "bwrap is not installed on this host")
+            with self.assertRaisesRegex(unittest.SkipTest, "not installed"):
+                RealSandboxTest.setUpClass()
+
+    def test_a_bwrap_that_cannot_isolate_is_skipped_with_the_reason(self):
+        fake_bwrap(
+            os.path.join(self.tmp, "bwrap"),
+            fail="bwrap: loopback: Failed RTM_NEWADDR: Address family not supported "
+                 "by protocol")
+        self.sandbox_on_path()
+        reason = real_sandbox_skip_reason()
+        self.assertIsNotNone(reason)
+        self.assertIn("cannot isolate this host", reason)
+        self.assertIn("RTM_NEWADDR", reason)
+        with self.assertRaisesRegex(unittest.SkipTest, "RTM_NEWADDR"):
+            RealSandboxTest.setUpClass()
+
+    def test_a_working_bwrap_plays_the_real_sandbox(self):
+        fake_bwrap(os.path.join(self.tmp, "bwrap"),
+                   os.path.join(self.tmp, "bwrap.argv"))
+        self.sandbox_on_path()
+        self.assertIsNone(real_sandbox_skip_reason())
+        RealSandboxTest.setUpClass()     # ne saute pas : les témoins sont joués
 
 
 class PlanFileTest(unittest.TestCase):
