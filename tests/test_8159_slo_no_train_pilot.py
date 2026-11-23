@@ -153,13 +153,15 @@ class SloNoTrainTest(PgTestCase):
         self.assertEqual(waiting.get("no_train"), "nexlink")
         self.assertEqual(alert["targets"][0], "pilot")
         self.assertNotIn("assignee", alert["targets"])
-        self.assertIn(PHRASE, alert["detail"])
+        # #8172 : ce porteur est un véhicule `integration/**` ; son texte est
+        # celui du véhicule, que le train ne prend jamais.
+        self.assertIn(alert_briefs.PACKET_VEHICLE_MERGE, alert["detail"])
+        self.assertNotIn(PHRASE, alert["detail"])
         briefs = self.briefs(alert)
         self.assertIn("orch-nx", briefs)
         self.assertNotIn("dev1", briefs)
         self.assertNotIn("orch-amh", briefs)
-        self.assertIn(PHRASE, briefs["orch-nx"])
-        self.assertIn("dispatch the full CI yourself", briefs["orch-nx"])
+        self.assertIn(alert_briefs.PACKET_VEHICLE_MERGE, briefs["orch-nx"])
 
     def test_le_pilote_est_celui_du_projet_pas_celui_de_l_equipe_du_porteur(self):
         # B2 de ameesh-dev3 : l'assigné du porteur n'est pas du projet du lot
@@ -221,8 +223,15 @@ class SloNoTrainTest(PgTestCase):
         cfg = dataclasses.replace(self.cfg, train={}, radar={})
         alert = dict(self.alerts(cfg)[0], level=3)
         text = alert_briefs._slo_breach(alert)
-        self.assertIn(PHRASE, text)
+        self.assertIn(alert_briefs.PACKET_VEHICLE_MERGE, text)
         self.assertIn("push the pilot of nexlink", text)
+        # #8159 : une unité de paquet ordinaire (exception déclarée) sans
+        # train garde le texte de composition manuelle.
+        waiting = {key: value for key, value in alert["waiting"].items()
+                   if key not in ("self", "packet_vehicle")}
+        text = alert_briefs._slo_breach(dict(alert, waiting=waiting))
+        self.assertIn(PHRASE, text)
+        self.assertIn("push the pilot of nexlink to compose", text)
 
     def test_un_projet_avec_train_garde_le_comportement_actuel(self):
         for block in ({"train": {"projects": {"nexlink": {}}}},
