@@ -116,14 +116,8 @@ GET_SQL = """
             FROM agent_mailbox m
            WHERE m.sender = agent_registry.name
            ORDER BY m.id DESC LIMIT 1) presence ON true
-     WHERE name = coalesce(
-           (SELECT r0.name FROM agent_registry r0 WHERE r0.name = %%s),
-           (SELECT ameesh_resolve_agent_name(%%s, %%s)))
+     WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
     """ % GET_COLUMNS
-#: #8166 (N impl-01 sur #8152) : un nom primaire est trouvé par la clé ;
-#: `ameesh_resolve_agent_name` (parcours de `aliases`, audit) n'est évaluée
-#: que pour un alias ou un nom inconnu — `COALESCE` n'évalue pas le
-#: sous-plan suivant une valeur non nulle.
 
 
 def check_name(name: str) -> str:
@@ -749,7 +743,7 @@ class Agents(interface.Agents):
     def get(self, name) -> dict | None:
         # #3729 : le dernier message déposé et son hôte, comme `overview`
         # (#3337) — `ameesh show` lit la même preuve de vie que `list`.
-        rows = self.db.query(GET_SQL, (name, name, "agents.get"))
+        rows = self.db.query(GET_SQL, (name, "agents.get"))
         return {key: rows[0].get(key) for key in _GET_NAMES} if rows else None
 
     def resolve_name(self, name, *, operation="lookup") -> str:

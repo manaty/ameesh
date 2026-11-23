@@ -12029,7 +12029,7 @@ class AgentWorker(threading.Thread):
         return idle_poll() if callable(idle_poll) else self.runner.poll
 
     def _idle_wait(self) -> float:
-        """#8152 : l'attente au repos, bornée au tiers du bail sauf débit ou plafond réglé
+        """#8152 : l'attente au repos, bornée au tiers du bail sauf débit réglé
         par l'hôte. Le battement (#5806) renouvelle seul le bail ; l'attente
         reste bornée par son échéance (`wait_timeout`)."""
         pas = self._idle_poll()
@@ -12408,10 +12408,6 @@ RELOADABLE_FIELDS = frozenset({
     # sans redémarrer évite de laisser un hôte fraîchement routé en `notify_ok`
     # faux jusqu'au prochain redémarrage de l'exécuteur.
     "notify",
-    # #8166 (N impl-01 sur #8152) : le rythme de repos réglé par l'hôte n'est
-    # lu qu'au calcul de l'attente suivante (`Runner.idle_pace`) ; aucun bail
-    # ni connexion n'en dépend.
-    "idle_passes_per_s", "idle_poll_max",
 })
 
 
@@ -14458,13 +14454,8 @@ class Runner:
         return self.IDLE_PASSES_PER_S, (cap if cap > 0 else self.IDLE_POLL_MAX_S)
 
     def idle_pace_set(self) -> bool:
-        """#8152 : l'hôte a réglé le débit ou le plafond de repos (voir
-        `idle_pace`) : le pas n'est plus ramené au tiers du bail. #8166 (N
-        impl-01) : `AMEESH_IDLE_POLL_MAX` seul compte aussi ; le battement
-        renouvelle et `_idle_sleep` dort par tranches."""
-        cfg = getattr(self, "cfg", None)
-        return ((getattr(cfg, "idle_passes_per_s", 0.0) or 0.0) > 0
-                or (getattr(cfg, "idle_poll_max", 0.0) or 0.0) > 0)
+        """#8152 : l'hôte a réglé le débit de repos (voir `idle_pace`)."""
+        return (getattr(getattr(self, "cfg", None), "idle_passes_per_s", 0.0) or 0.0) > 0
 
     # -- passe de repos groupée (#8166) -------------------------------------
     #: Pas de la passe de repos de l'exécuteur : une requête pour tous ses

@@ -19,10 +19,7 @@ Témoins :
 * passe de repos groupée : une requête pour tous les workers ; un worker sans
   travail en attente, au rôle non élu, ne refait sa passe complète que si
   son empreinte change (registre, courrier actif, réveil programmé, cycle de
-  vie des hôtes), à une échéance connue ou au filet `IDLE_SAFETY_S` ;
-* N de impl-01 sur #8152 : rythme de repos relu à chaud ;
-  `AMEESH_IDLE_POLL_MAX` seul lève aussi le tiers du bail ; `registry.get`
-  d'un nom primaire n'évalue plus `ameesh_resolve_agent_name`.
+  vie des hôtes), à une échéance connue ou au filet `IDLE_SAFETY_S`.
 """
 from __future__ import annotations
 
@@ -654,53 +651,6 @@ class PasseGroupeeReelle(PgTestCase):
                 worker.wake.set()
                 worker.join(30)
         self.assertEqual(calme, 0)
-
-
-
-class SuitesDe8152(unittest.TestCase):
-    def test_rythme_relu_a_chaud(self):
-        from ameesh.runner import RELOADABLE_FIELDS
-        self.assertLessEqual({"idle_passes_per_s", "idle_poll_max"}, RELOADABLE_FIELDS)
-
-    def test_plafond_seul_leve_le_tiers_du_bail(self):
-        runner = Runner.__new__(Runner)
-        runner.poll, runner.lock, runner.listener = 5.0, threading.Lock(), object()
-        runner.workers = {"a%03d" % i: object() for i in range(128)}
-        runner.cfg = types.SimpleNamespace(idle_passes_per_s=0.0, idle_poll_max=120.0)
-        self.assertTrue(runner.idle_pace_set())
-        worker = AgentWorker.__new__(AgentWorker)
-        worker.runner = runner
-        with mock.patch.object(AgentWorker, "lease_ttl", new_callable=mock.PropertyMock,
-                               return_value=180.0):
-            self.assertEqual(worker._idle_wait(), 120.0)
-        runner.cfg = types.SimpleNamespace(idle_passes_per_s=0.0, idle_poll_max=0.0)
-        self.assertFalse(runner.idle_pace_set())
-
-
-class LectureDuRegistre(PgTestCase):
-    def test_primaire_sans_resolution_alias_resolu(self):
-        self.register("prim8166", "claude")
-        self.db.execute("UPDATE agent_registry SET aliases = ARRAY['ancien8166']"
-                        " WHERE name = 'prim8166'")
-        # schéma propre au test : la fonction compte ses appels
-        self.db.execute(
-            "CREATE TABLE appels8166 (supplied text);"
-            " ALTER FUNCTION ameesh_resolve_agent_name(text, text)"
-            "   RENAME TO resolve8166_reelle;"
-            " CREATE FUNCTION ameesh_resolve_agent_name(supplied text, context text)"
-            " RETURNS text LANGUAGE plpgsql VOLATILE AS $$ BEGIN"
-            "   INSERT INTO appels8166 VALUES (supplied);"
-            "   RETURN resolve8166_reelle(supplied, context); END $$;")
-        appels = lambda: [r["supplied"] for r in self.db.query(
-            "SELECT supplied FROM appels8166 ORDER BY supplied")]
-        self.assertEqual(storage.of(self.db).agents.get("prim8166")["name"], "prim8166")
-        self.assertEqual(appels(), [])
-        self.assertEqual(storage.of(self.db).agents.get("ancien8166")["name"], "prim8166")
-        self.assertIsNone(storage.of(self.db).agents.get("inconnu8166"))
-        self.assertEqual(appels(), ["ancien8166", "inconnu8166"])
-        audits = self.db.query("SELECT supplied_name FROM agent_name_resolutions"
-                               " WHERE primary_name = 'prim8166'")
-        self.assertEqual([a["supplied_name"] for a in audits], ["ancien8166"])
 
 if __name__ == "__main__":
     unittest.main()
