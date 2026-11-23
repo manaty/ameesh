@@ -102,9 +102,33 @@ class PacketCiCurrentHeadTest(unittest.TestCase):
             self.assertNotIn("still running", text)
 
     def test_forge_illisible_runs_sur_la_tete_relevee(self):
-        ci = self.ci([_run(RECORDED, "running", "backend-suite.yml", 11),
-                      _run(RUN_HEAD, "failure", "backend-suite.yml", 12)])
+        # Avis B #45810 : des runs sur A et sur B, branche illisible — la
+        # branche peut être en B ou C ; la CI de A n'est pas présentée comme
+        # celle du paquet.
+        rows = [_run(RECORDED, "running", "backend-suite.yml", 11),
+                _run(RUN_HEAD, "failure", "backend-suite.yml", 12)]
+        for reader in (None, lambda b: ("error", None)):
+            ci = self.ci(rows, current_head=reader)
+            self.assertEqual((ci["state"], ci["head_sha"], ci["seen_heads"],
+                              ci["recorded_state"]),
+                             ("uncertain", RECORDED, [RUN_HEAD], "running"))
+            self.assertNotIn("run_id", ci)
+            text = alert_briefs._packet_ci_text(ci)
+            self.assertIn("unproven", text)
+            self.assertIn("recorded head on 42e3a5a7 is running", text)
+            self.assertIn("b6f18dcc", text)
+            self.assertNotIn("still running", text)
+
+    def test_forge_illisible_seuls_runs_de_la_tete_relevee(self):
+        # Aucune autre tête vue sur la branche : rien ne contredit le relevé.
+        ci = self.ci([_run(RECORDED, "running", "backend-suite.yml", 11)])
         self.assertEqual((ci["state"], ci["head_sha"]), ("running", RECORDED))
+
+    def test_tete_prouvee_avec_runs_sur_d_autres_tetes(self):
+        ci = self.ci([_run(RECORDED, "success", "backend-suite.yml", 11),
+                      _run(RUN_HEAD, "running", "backend-suite.yml", 12)],
+                     current_head=forge(RECORDED))
+        self.assertEqual((ci["state"], ci["head_sha"]), ("green", RECORDED))
 
     def test_lecteur_en_exception_aucune_preuve(self):
         def boom(branch):
