@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""A dated manual drain can halt while ordinary active mail waits."""
+"""A dated manual drain can halt while ordinary active or passive mail waits."""
 import dataclasses
 import unittest
 from unittest import mock
@@ -42,8 +42,11 @@ class HaltMailTest(unittest.TestCase):
                      passive_unread=0, status_since_ts=7000)
         self.assertEqual(self.check_stop(control, agent)['state'], 'idle')
         self.assertEqual(agent['unread'], 1)
+        passive = dict(agent, unread=0, passive_unread=1)
+        self.assertEqual(self.check_stop(control, passive)['state'], 'idle')
+        self.assertEqual(passive['passive_unread'], 1)
         for changes in (dict(urgent_unread=1), dict(actionable_lots=1),
-                        dict(has_pending_prompt=True), dict(passive_unread=1),
+                        dict(has_pending_prompt=True),
                         dict(restart_requested_ts=9001), dict(lease_live=True),
                         dict(urgent_unread=None)):
             with self.subTest(changes=changes), self.assertRaises(vm.Refused):
@@ -52,3 +55,5 @@ class HaltMailTest(unittest.TestCase):
                         dict(mode='returning')):
             with self.subTest(changes=changes), self.assertRaises(vm.Refused):
                 self.check_stop(dict(control, **changes), agent)
+            with self.subTest(changes=changes, mail='passive'), self.assertRaises(vm.Refused):
+                self.check_stop(dict(control, **changes), passive)

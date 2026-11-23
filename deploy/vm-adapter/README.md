@@ -680,7 +680,7 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      redémarrage demandé rappellent toujours l'hôte ; un drainage
      automatique se réveille sur tout courrier). La ligne « réveil immédiat »
      de la commande nomme les agents qui déclencheraient ce retour ;
-     pour ce même drainage manuel daté, le courrier ordinaire seul ne bloque
+     pour ce même drainage manuel daté, le courrier ordinaire, passif compris, ne bloque
      pas non plus le halt ; le courrier urgent, une demande de redémarrage et
      les autres preuves d'activité restent bloquants. Si la preuve du courrier
      urgent manque, l'arrêt reste non concluant (#8145) ;
