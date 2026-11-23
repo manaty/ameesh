@@ -883,6 +883,8 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         try:
             if prod_go.validate_request(cfg, question, opts, project, now=now):
                 signature_required = True
+            if prod_go.validate_op_request(cfg, question, project, item["id"], now=now):
+                signature_required = True
         except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError) as exc:
             raise DecisionError(str(exc)) from exc
         try:
@@ -1422,7 +1424,8 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
                        "reservation": int(reserved["reservation_id"]),
                        "key": proposal["action_id"]}
     from . import prod_go
-    production = prod_go.parse(view.get("question"), view.get("options") or ())
+    production = (prod_go.parse(view.get("question"), view.get("options") or ())
+                  or prod_go.parse_op(view.get("question")))
     ttl = max(SIGN_TTL_S, production["until"] - time.time() + 1) if production else SIGN_TTL_S
     meta = dict({"decision": int(view["id"]), "by": human,
                  "signed_by": signer["by"],
@@ -1627,6 +1630,14 @@ def _release_lot(db, view: dict, *, actor: str, note: str, replay: bool = False)
     if replay and (item["state"] != "waiting_human" or others):
         return {"lot": int(lot), "state": item["state"], "moved": False, "others": len(others)}
     target = view.get("previous_state")
+    if target == "validated":
+        from . import review_floor, merge_queue
+        if review_floor.production_decision_floor(db, int(lot)):
+            gate = merge_queue.review_gate_for_item(
+                db, getattr(db, "cfg", None), item, work.milestones(db, int(lot)),
+                refresh_target=False)
+            if not gate or not gate.get("ok"):
+                target = "qa"
     # #4957 : au profil nu, aucune transition n'est connue ; le lot reste en
     # `waiting_human` et la note le dit (même repli qu'un déplacement refusé).
     allowed = work.development_transitions().get("waiting_human", ())
@@ -1790,6 +1801,25 @@ def _replay_answer(cfg: Config, db, view: dict, *, text: str, option: str | None
             "warning": warning, "replayed": True, "mail_sent": sent}
 
 
+def _recheck_production_review(db, cfg, lot: int) -> None:
+    """Recheck under the lot lock in the transaction that signs the decision."""
+    from . import merge_queue
+    item = work.get(db, lot)
+    if not item or item.get("state") != "validated":
+        return
+    gate = merge_queue.review_gate_for_item(
+        db, cfg, item, work.milestones(db, lot), refresh_target=False)
+    if gate and gate.get("ok"):
+        return
+    rows = db.query("UPDATE work_items SET state = 'qa', updated_at = now() "
+                    "WHERE id = %s AND state = 'validated' RETURNING id", (lot,))
+    if rows:
+        db.execute("INSERT INTO work_item_events (work_item_id, state, note, actor) "
+                   "VALUES (%s, 'qa', %s, %s)",
+                   (lot, "validated → qa — signed production decision requires two families (#8101)",
+                    work.SYSTEM_SENDER))
+
+
 def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel: str,
            key_path: str | None = None, approver: str | None = None, signed: bool = False,
            now: float | None = None, signer: dict | None = None) -> dict:
@@ -1832,6 +1862,9 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         if prod_go.validate_request(cfg, view["question"], view["options"], view["project"], now=now):
             if not (key_path or signed):
                 raise DecisionError("prod-go/1 requires the owner's signed answer")
+        if prod_go.validate_op_request(cfg, view["question"], view["project"], view["lot"], now=now):
+            if not (key_path or signed):
+                raise DecisionError("prod-op/1 requires the owner's signed answer")
     except (prod_go.ProdGoError, prod_go.mechanics.MechanicsError) as exc:
         raise DecisionError(str(exc)) from exc
     if view["state"] != "pending":
@@ -1887,6 +1920,8 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         return "\"%s\"" % fil.excerpt(text, 160)
 
     if storage.is_remote(db):
+        if prod_go.parse(view["question"], view["options"]) or prod_go.parse_op(view["question"]):
+            raise DecisionError("production decision signing requires a direct transactional session")
         # Pas de transaction sur un exécuteur médié : la clôture est déjà UNE
         # écriture conditionnelle ; le courrier garde sa clé d'idempotence et
         # la re-saisie identique est un rejeu.
@@ -1914,6 +1949,10 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     after: list = []
     try:
         with db.transaction() as tx:
+            production = (prod_go.parse(view["question"], view["options"])
+                          or prod_go.parse_op(view["question"]))
+            if production:
+                storage.of(tx).work.lock(int(view["lot"]))
             proof = _sign(tx, view, text, option, human, key_path=key_path,
                           approver=approver, signer=signer,
                           standing=standing_signature) if signed_requested else None
@@ -1924,6 +1963,8 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
                 # compris une approbation consommée), puis on relit.
                 raise _DecisionRace()
             view = view_of(closed, now)
+            if production:
+                _recheck_production_review(tx, cfg, int(view["lot"]))
             validations.response(tx, view, human=human, text=text, now=now)
             lot = _release_lot(
                 tx, view, actor=human,
@@ -1945,6 +1986,13 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
                             "decision #%s not found" % decision_id)
     for record in after:
         record(cfg, db)
+    if production:
+        from . import review_floor
+        try:
+            review_floor._complete_designation(cfg, db, int(view["lot"]), 2)
+        except Exception as exc:  # noqa: BLE001 - the signed answer is already committed
+            warning = (warning + "; " if warning else "") + (
+                "production review designation needs retry: %s" % exc)
     return {"decision": view, "lot": lot, "message_id": message_id,
             "warning": warning, "replayed": False}
 

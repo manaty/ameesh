@@ -121,10 +121,19 @@ def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
         return klass
     try:
         found = of_lot(db, lot, cfg=cfg)
+        production = production_decision_floor(db, lot)
     except Exception as exc:  # noqa: BLE001 - journal illisible : échec fermé
         klass["reviews_floor_unreadable"] = "%s: %s" % (type(exc).__name__,
                                                        str(exc)[:200])
+        # An unreadable decision must not become a waiver or a one-review
+        # fallback: we cannot establish that the production floor is absent.
+        klass["production_reviews_floor"] = 2
         return klass
+    if production:
+        klass["production_reviews_floor"] = 2
+        klass["distinct_families"] = True
+        klass["exclude_author_family"] = True
+        found = dict(found, floor=max(found["floor"], 2), actor=production)
     if found["floor"]:
         # #3554 : le plancher automatique d'une baisse du canon (posé par la
         # classe, `reviews_floor`) ne se perd pas sous un plancher de pilote
@@ -134,6 +143,36 @@ def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
             klass["reviews_floor"] = floor
             klass["reviews_floor_by"] = found["actor"]
     return klass
+
+
+def production_decision_floor(db, lot: int) -> str:
+    """A signed production decision raises the floor, independent of paths.
+
+    Read all linked decisions, including closed ones. A malformed declaration
+    or unreadable signature is an error, so callers fail closed.
+    """
+    from . import decisions, prod_go
+
+    for row in storage.of(db).decisions.for_work_item(str(int(lot))):
+        view = decisions.view_of(row)
+        question = view.get("question") or ""
+        if "prod-go/" not in question and "prod-op/" not in question:
+            continue
+        go = prod_go.parse(question, view.get("options") or ())
+        op = prod_go.parse_op(question)
+        rule = op or go
+        if (not rule or rule["project"] != view.get("project") or
+                (op and op["lot"] != int(lot)) or int(view.get("lot") or 0) != int(lot)):
+            raise ValueError("production decision does not match its lot or project")
+        if view.get("state") != "answered":
+            continue
+        if not view.get("needs_signature"):
+            raise ValueError("production decision does not require a signature")
+        valid, reason = decisions.verify_proof(db, view)
+        if not valid:
+            raise ValueError("production decision signature: " + reason)
+        return "decision #%s" % view["id"]
+    return ""
 
 
 def _complete_designation(cfg, db, lot: int, floor: int):

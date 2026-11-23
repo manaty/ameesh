@@ -1769,7 +1769,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
           advances: Optional[Mapping] = None, held: Iterable = (),
           answered: Iterable = (), doubts: Iterable = (),
-          deltas=None, global_families=()) -> dict:
+          deltas=None, global_families=(), production_floor=False) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -1876,8 +1876,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     # #5690 : un diff gelé qui porte du SQL peut ajouter une colonne lue par le
     # nouveau code ; le courrier de relecture pose alors la question N-1.
     migration = sql_migration(paths)
-    # Sans chemin changé il n'y a rien à relire, quel que soit le plancher.
-    if not paths:
+    # A production authorization can require review even with no changed path.
+    if not paths and not production_floor:
         required = 0
     elif required is None:
         required = required_count(rules, paths)

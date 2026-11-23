@@ -14,10 +14,41 @@ LINE = re.compile(
     r"version=(release-[A-Za-z0-9.-]+) deploy=([a-z0-9,-]+) "
     r"migrations=([a-z0-9,-]+) merge=([a-z0-9,-]+) "
     r"until=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.M)
+OP_LINE = re.compile(
+    r"^prod-op/1 project=([a-z][a-z0-9-]*) lot=([1-9][0-9]*) "
+    r"sha=([0-9a-f]{40}) until=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.M)
 
 
 class ProdGoError(RuntimeError):
     pass
+
+
+def parse_op(question):
+    """Parse one explicit production data operation, never prose."""
+    text = str(question or "")
+    if "prod-op/" not in text:
+        return None
+    matches = list(OP_LINE.finditer(text))
+    if len(matches) != 1 or text.count("prod-op/") != 1:
+        raise ProdGoError("one exact prod-op/1 declaration required")
+    project, lot, sha, until = matches[0].groups()
+    try:
+        expiry = datetime.strptime(until, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError as exc:
+        raise ProdGoError("prod-op/1 until is not a UTC date") from exc
+    return {"project": project, "lot": int(lot), "sha": sha, "until": expiry}
+
+
+def validate_op_request(cfg, question, project, lot, *, now=None):
+    rule = parse_op(question)
+    if rule is None:
+        return None
+    if rule["project"] != project or str(rule["lot"]) != str(lot):
+        raise ProdGoError("prod-op/1 project or lot differs from the decision")
+    now = time.time() if now is None else now
+    if not now < rule["until"] <= now + max_hours(cfg) * 3600:
+        raise ProdGoError("prod-op/1 until is expired or exceeds canon prod_go_max_hours")
+    return rule
 
 
 def parse(question, options=()):
@@ -63,7 +94,8 @@ def validate_request(cfg, question, options, project, *, now=None):
 
 def require_unlocked(view, *, now=None):
     """Called under the supersession row locks too; no replacement in-window."""
-    rule = parse(view.get("question"), view.get("options") or ())
+    rule = (parse(view.get("question"), view.get("options") or ())
+            or parse_op(view.get("question")))
     now = time.time() if now is None else now
     if rule and view.get("state") == "answered" and now < rule["until"]:
         raise ProdGoError("prod-go/1 decision #%s cannot be withdrawn or replaced before until; cancel the production run and hold prod-deploy" % view.get("id"))
