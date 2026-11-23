@@ -119,6 +119,13 @@ GET_SQL = """
      WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
     """ % GET_COLUMNS
 
+#: #8168 : même lecture pour un nom DÉJÀ résolu primaire (cache de passe de
+#: `agent_names`) : pas d'appel à `ameesh_resolve_agent_name`, donc pas
+#: d'audit d'alias ni de fonction SQL par lecture.
+GET_EXACT_SQL = GET_SQL.replace(
+    "WHERE name = (SELECT ameesh_resolve_agent_name(%s, %s))",
+    "WHERE name = %s")
+
 
 def check_name(name: str) -> str:
     """Nom d'agent sûr (NAME_RE) : seul un nom contrôlé entre dans un littéral."""
@@ -744,6 +751,11 @@ class Agents(interface.Agents):
         # #3729 : le dernier message déposé et son hôte, comme `overview`
         # (#3337) — `ameesh show` lit la même preuve de vie que `list`.
         rows = self.db.query(GET_SQL, (name, "agents.get"))
+        return {key: rows[0].get(key) for key in _GET_NAMES} if rows else None
+
+    def get_exact(self, name) -> dict | None:
+        """#8168 : primaire déjà confirmé (cache de passe), sans résolveur."""
+        rows = self.db.query(GET_EXACT_SQL, (name,))
         return {key: rows[0].get(key) for key in _GET_NAMES} if rows else None
 
     def resolve_name(self, name, *, operation="lookup") -> str:

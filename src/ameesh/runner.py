@@ -12014,9 +12014,9 @@ class AgentWorker(threading.Thread):
         return idle_poll() if callable(idle_poll) else self.runner.poll
 
     def _idle_wait(self) -> float:
-        """#8152 : l'attente au repos, bornée au tiers du bail sauf débit réglé
-        par l'hôte. Le battement (#5806) renouvelle seul le bail ; l'attente
-        reste bornée par son échéance (`wait_timeout`)."""
+        """#8152/#8168 : l'attente au repos, bornée au tiers du bail sauf débit
+        ou plafond réglé par l'hôte. Le battement (#5806) renouvelle seul le
+        bail ; l'attente reste bornée par son échéance (`wait_timeout`)."""
         pas = self._idle_poll()
         pace_set = getattr(self.runner, "idle_pace_set", None)
         if callable(pace_set) and pace_set():
@@ -12294,9 +12294,10 @@ class AgentWorker(threading.Thread):
 
 #: #1466 : les seuls champs qu'une relecture à chaud reprend du fichier. Liste
 #: explicite, et non « tout sauf » : un champ nouveau reste figé tant qu'on ne
-#: l'ajoute pas ici. Sont rechargeables ce qui décide une pause budget et la
-#: lecture des comptes ; le reste (hôte, bail, dsn, schéma, dossier d'état,
-#: cadences, porte d'hôte) a décidé des baux et des connexions en cours : le
+#: l'ajoute pas ici. Sont rechargeables ce qui décide une pause budget, la
+#: lecture des comptes et le rythme du sondage au repos (lu à chaque appel,
+#: #8168) ; le reste (hôte, bail, dsn, schéma, dossier d'état, cadence de tour
+#: `poll`, porte d'hôte) a décidé des baux et des connexions en cours : le
 #: changer sous un tour actif romprait ce qui tourne (R1 cx2 et dev2 sur #1466 :
 #: schéma et `state_dir` appliqués aux workers sans reconnexion).
 RELOADABLE_FIELDS = frozenset({
@@ -12306,6 +12307,10 @@ RELOADABLE_FIELDS = frozenset({
     "accounts", "budget_usd_per_hour", "budget_usd_per_day", "budget_explicit",
     "critical_agents", "idle_after_s", "baseline_hosts",
     "noncritical_hourly_share", "critical_fallback_harnesses",
+    # #8168 (N de #8152) : `idle_pace` lit ces deux champs à chaque appel et
+    # n'a décidé aucun bail : les changer à chaud règle le pas au repos sans
+    # redémarrer, comme la docstring d'`idle_pace` le promettait déjà.
+    "idle_passes_per_s", "idle_poll_max",
     # #2571 (suite de #313/#2580) : le partage des comptes est relu au tour
     # suivant et à la passe de revendications suivante ; un passage `report` →
     # `refuse`/`strict` (ou un registre déplacé) ne demande pas de redémarrage.
@@ -14351,10 +14356,12 @@ class Runner:
         agents, les passes recroissent avec le nombre d'agents (128 agents :
         2,8 passes/s, manaty/ameesh#6379). L'hôte peut régler le débit
         (`AMEESH_IDLE_PASSES_PER_S`) : il vaut alors à toute taille, sans
-        plafond ni tiers du bail (`idle_pace_set`), sauf `AMEESH_IDLE_POLL_MAX`.
-        Contrepartie : ce qui n'est vu qu'en passe (relève élue, réveil de lot
-        inactif ou programmé) l'est au plus un pas plus tard. Relu à chaque
-        appel : une config relue s'applique sans redémarrer."""
+        plafond de 45 s ni tiers du bail, sauf `AMEESH_IDLE_POLL_MAX`. Le
+        plafond peut aussi être réglé seul : il s'applique et lève lui aussi
+        le tiers du bail (`idle_pace_set`). Contrepartie : ce qui n'est vu
+        qu'en passe (relève élue, réveil de lot inactif ou programmé) l'est au
+        plus un pas plus tard. Relu à chaque appel : une config relue
+        s'applique sans redémarrer."""
         cfg = getattr(self, "cfg", None)
         rate = getattr(cfg, "idle_passes_per_s", 0.0) or 0.0
         cap = getattr(cfg, "idle_poll_max", 0.0) or 0.0
@@ -14363,8 +14370,14 @@ class Runner:
         return self.IDLE_PASSES_PER_S, (cap if cap > 0 else self.IDLE_POLL_MAX_S)
 
     def idle_pace_set(self) -> bool:
-        """#8152 : l'hôte a réglé le débit de repos (voir `idle_pace`)."""
-        return (getattr(getattr(self, "cfg", None), "idle_passes_per_s", 0.0) or 0.0) > 0
+        """#8152/#8168 : l'hôte a réglé le débit de repos ou son plafond.
+
+        Le tiers du bail ne borne l'attente que si ni l'un ni l'autre n'est
+        réglé : le battement renouvelle seul le bail (#5806) et `_idle_sleep`
+        découpe de toute façon l'attente en tranches d'un tiers de bail."""
+        cfg = getattr(self, "cfg", None)
+        return bool((getattr(cfg, "idle_passes_per_s", 0.0) or 0.0) > 0
+                    or (getattr(cfg, "idle_poll_max", 0.0) or 0.0) > 0)
 
     def _wake_workers(self) -> None:
         """#4515 : réveille chaque worker (écoute rétablie, porte fermée)."""

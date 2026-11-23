@@ -281,6 +281,14 @@ class Agents(Domain):
         dernier message déposé et l'hôte qui l'a déposé — le signe de vie que
         `ameesh show` affiche comme `ameesh list` depuis #3337."""
 
+    def get_exact(self, name: str) -> dict | None:
+        """#8168 : lecture d'un nom DÉJÀ confirmé primaire, sans résolveur.
+
+        Le pilote Postgres la sert sans `ameesh_resolve_agent_name` (cache de
+        passe de `agent_names`) ; les autres, dont l'exécuteur médié dont le
+        contrat ne connaît que `name`, retombent sur `get`, qui résout."""
+        return self.get(name)
+
     @abc.abstractmethod
     def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
         """Resolve a spelling and audit aliases; unknown names stay unchanged."""
