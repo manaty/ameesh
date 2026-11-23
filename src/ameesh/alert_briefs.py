@@ -735,7 +735,9 @@ def _slo_breach(alert: dict, *, level: int | None = None,
     #3447 : un lot réservé à un exécutant externe n'est pas « unassigned » —
     le texte nomme l'exécutant (bureau, owner) et le fait que ce n'est pas une
     attribution. #6105 : pour un `system:…` déclaré, il nomme le responsable
-    humain ; retiré, il dit que le pilote doit lever la réservation."""
+    humain ; retiré, il dit que le pilote doit lever la réservation.
+    #8163 : une réservation levée après une note de travail fait ne rend pas le
+    lot « unassigned » : il est à clore, et le geste est sa clôture."""
     lot = int(alert["lot"])
     title = alert.get("title")
     level = int(alert.get("level") or 1) if level is None else int(level)
@@ -752,6 +754,7 @@ def _slo_breach(alert: dict, *, level: int | None = None,
                 else ", fix owed by %s" % who if alert.get("step") == "blocked_freeze"
                 else ", assigned to %s" % who if who
                 else ", reserved to %s" % _reserved_label(alert) if external
+                else ", external work done, to close" if alert.get("external_done")
                 else ", unassigned")))
     # #2016 : quand la commande est proposée, elle porte le titulaire lu
     # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
@@ -987,6 +990,29 @@ def _slo_breach(alert: dict, *, level: int | None = None,
                     "build, re-enter qa (`ameesh work move %d qa`); if you cannot, say "
                     "so (`ameesh work note %d \"hold: <reason>\"`) so the pilot hands "
                     "the fix over" % (reason, lot, v.noun, lot, lot))
+    elif alert.get("external_done"):
+        # #8163 : le travail est fait et la réservation levée : le lot est à
+        # clore. Aucun rôle ne le réassigne comme s'il n'avait pas de preneur ;
+        # le palier ne change que le destinataire du même geste.
+        was = str(alert.get("external_was") or "").strip() or "the external executor"
+        close = ("ameesh work close %d --delivered --sha <reviewed head> if it was "
+                 "delivered outside the target, or ameesh work close %d --done "
+                 "without a branch" % (lot, lot))
+        if level >= 3:
+            move = ("avatar or auditor: %s is to close — its external executor %s "
+                    "reported the work done (verification/delivery note) and cleared "
+                    "the reservation; close it now (%s); do not reassign it"
+                    % (v.label(lot), was, close))
+        elif level >= 2:
+            move = ("pilot: %s is to close — its external executor %s reported the work "
+                    "done (verification/delivery note) and cleared the reservation; "
+                    "close it now (%s); do not reassign it"
+                    % (v.label(lot), was, close))
+        else:
+            move = ("pilot: %s is to close — its external executor %s reported the work "
+                    "done (verification/delivery note) and cleared the reservation; "
+                    "close it now (%s); a reassignment would hand finished work to an "
+                    "agent" % (v.label(lot), was, close))
     elif external:
         # #3447 : le lot est réservé, pas assigné — le geste n'est ni une
         # relance d'assigné ni une réassignation directe (refusée par
