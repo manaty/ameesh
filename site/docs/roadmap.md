@@ -535,6 +535,7 @@ version.
 <!-- generated releases: begin -->
 - **v1.69.0** (2026-11-22): Migrations 0604; +11 internal lots.
 - **v1.70.0** (2026-11-23): +13 internal lots.
+- **v1.71.0** (2026-11-23): +23 internal lots.
 <!-- generated releases: end -->
 
 ## In progress
