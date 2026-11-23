@@ -3666,7 +3666,23 @@ def _continued_seats(db, item: Mapping, inputs: "Inputs",
         return []
     if set(column) & rd.names_of(inputs.correctors):
         return []
-    families = {str(row.get("family") or "").strip() for row in prior.values()} - {""}
+    # #2447/#8118 : la famille se relit sur les candidats **actuels**, pas sur
+    # la désignation précédente. Un agent réenregistré sous une autre famille
+    # change l'ensemble (et peut perdre l'indépendance ou le quorum) : la
+    # continuation ne garde pas des sièges dont la preuve a changé.
+    current = {str(getattr(row, "name", "") or "").strip(): row
+               for row in inputs.candidates or ()
+               if getattr(row, "available", True)}
+    families = set()
+    for name in column:
+        row = current.get(name)
+        if row is None:
+            return []
+        family = str(getattr(row, "family", "") or "").strip()
+        if family.lower() != str(prior[name].get("family") or "").strip().lower():
+            return []
+        if family:
+            families.add(family)
     if len(families) < required:
         return []
     allowed = {str(family or "").strip() for family in inputs.policy.families or ()}
@@ -3676,12 +3692,8 @@ def _continued_seats(db, item: Mapping, inputs: "Inputs",
                 for row in inputs.authors or () if isinstance(row, Mapping)}
     if families & authored:
         return []
-    live = {str(getattr(row, "name", "") or "").strip()
-            for row in inputs.candidates or ()
-            if getattr(row, "available", True)}
-    if not set(column) <= live:
-        return []
-    return [{"name": name, "family": str(prior[name].get("family") or "")}
+    return [{"name": name,
+             "family": str(getattr(current[name], "family", "") or "").strip()}
             for name in column]
 
 

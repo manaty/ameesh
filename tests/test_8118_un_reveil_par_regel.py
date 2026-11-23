@@ -387,8 +387,10 @@ class ContinuedSeatsCorrectorTest(unittest.TestCase):
             answered=(), authors=[{"name": "author", "family": "deepseek"}],
             correctors=[{"name": "cx3", "family": "",
                          "unresolved": "afd35c55"}],
-            candidates=[types.SimpleNamespace(name="cx3", available=True),
-                        types.SimpleNamespace(name="r1", available=True)])
+            candidates=[types.SimpleNamespace(name="cx3", family="codex",
+                                              available=True),
+                        types.SimpleNamespace(name="r1", family="claude",
+                                              available=True)])
         context = {"freeze": {"id": 11},
                    "reviewers": [{"name": "cx3", "family": "codex"},
                                  {"name": "r1", "family": "claude"}]}
@@ -396,6 +398,55 @@ class ContinuedSeatsCorrectorTest(unittest.TestCase):
             port.return_value.previous_review.return_value = context
             seats = act._continued_seats(
                 None, {"id": 7, "reviewers": ["cx3", "r1"]},
+                inputs, {"id": 12})
+        self.assertEqual(seats, [])
+
+    def test_a_changed_family_breaks_the_continuation(self):
+        """#2447 : r1 et r2 réenregistrés en deepseek ne sont plus indépendants.
+
+        La continuation lisait la famille dans la désignation précédente et
+        gardait deux sièges devenus de la famille de l'auteur, au lieu de
+        laisser la désignation complète constater le quorum perdu (#8118).
+        """
+        inputs = types.SimpleNamespace(
+            manual=[], waiver=False, unknown_authors=[], doubts=[],
+            policy=types.SimpleNamespace(required=2,
+                                         families=["claude", "codex"]),
+            answered=(), authors=[{"name": "author", "family": "deepseek"}],
+            correctors=[],
+            candidates=[types.SimpleNamespace(name="r1", family="deepseek",
+                                              available=True),
+                        types.SimpleNamespace(name="r2", family="deepseek",
+                                              available=True)])
+        context = {"freeze": {"id": 11},
+                   "reviewers": [{"name": "r1", "family": "claude"},
+                                 {"name": "r2", "family": "codex"}]}
+        with mock.patch.object(act.pg, "PgPort") as port:
+            port.return_value.previous_review.return_value = context
+            seats = act._continued_seats(
+                None, {"id": 7, "reviewers": ["r1", "r2"]},
+                inputs, {"id": 12})
+        self.assertEqual(seats, [])
+
+    def test_a_swapped_family_breaks_the_continuation_even_with_quorum(self):
+        """Même quorum de familles, mais les sièges ont changé de famille."""
+        inputs = types.SimpleNamespace(
+            manual=[], waiver=False, unknown_authors=[], doubts=[],
+            policy=types.SimpleNamespace(required=2,
+                                         families=["claude", "codex"]),
+            answered=(), authors=[{"name": "author", "family": "deepseek"}],
+            correctors=[],
+            candidates=[types.SimpleNamespace(name="r1", family="codex",
+                                              available=True),
+                        types.SimpleNamespace(name="r2", family="claude",
+                                              available=True)])
+        context = {"freeze": {"id": 11},
+                   "reviewers": [{"name": "r1", "family": "claude"},
+                                 {"name": "r2", "family": "codex"}]}
+        with mock.patch.object(act.pg, "PgPort") as port:
+            port.return_value.previous_review.return_value = context
+            seats = act._continued_seats(
+                None, {"id": 7, "reviewers": ["r1", "r2"]},
                 inputs, {"id": 12})
         self.assertEqual(seats, [])
 
