@@ -92,10 +92,67 @@ class NexlinkContractTest(unittest.TestCase):
             with self.assertRaisesRegex(train.TrainError, "malformed due part"):
                 self.contract.resolve(self.plan, repo="/nonexistent")
 
-    def test_resolve_refuses_an_empty_due_list(self):
-        with self.audit_base(), self.due():
+    def changes(self, *rows):
+        return mock.patch.object(train_contracts.ci_parts, "raw_changes",
+                                 return_value=list(rows))
+
+    def test_resolve_refuses_an_empty_due_list_without_a_doc_only_proof(self):
+        with self.audit_base(), self.due(), \
+                self.changes(("100644", "100644", "src/app.py")):
             with self.assertRaisesRegex(train.TrainError, "no due part"):
                 self.contract.resolve(self.plan, repo="/nonexistent")
+
+    def test_resolve_accepts_a_proven_doc_only_packet_without_ci(self):
+        """#8175 (canon §3) : un diff doc seule prouvé n'attend aucune CI."""
+        with self.audit_base(), self.due(), self.changes(
+                ("100644", "100644", "docs/roadmap.md"),
+                ("000000", "100644", "docs/new.md")):
+            self.assertEqual(self.contract.resolve(self.plan, repo="/nonexistent"), ())
+            self.assertTrue(self.contract.doc_only(self.plan))
+            # La preuve reste locale : les sources auditées sont inchangées.
+            self.assertEqual(set(self.contract.sources_for(self.plan, repo="/nonexistent")),
+                             set(train_contracts._NEXLINK_SOURCES))
+
+    def test_doc_only_never_excuses_a_due_part(self):
+        """Un paquet doc seule mêlé à du code garde sa CI due."""
+        with self.audit_base(), self.declared(), self.due("lot/backend-suite"), \
+                self.changes(("100644", "100644", "docs/a.md"),
+                             ("100644", "100644", "src/a.py")):
+            found = self.contract.resolve(self.plan, repo="/nonexistent")
+        self.assertEqual([workflow.context for workflow in found], ["lot/backend-suite"])
+        self.assertFalse(self.contract.doc_only(self.plan))
+
+    def test_doc_only_refuses_symlink_executable_and_unreadable_diffs(self):
+        for row in (("120000", "120000", "docs/link.md"),
+                    ("100755", "100755", "docs/run.md")):
+            with self.subTest(row=row):
+                contract = train_contracts.nexlink()
+                with self.audit_base(), self.due(), self.changes(row):
+                    with self.assertRaisesRegex(train.TrainError, "no due part"):
+                        contract.resolve(self.plan, repo="/nonexistent")
+        with self.audit_base(), self.due(), mock.patch.object(
+                train_contracts.ci_parts, "raw_changes",
+                side_effect=train_contracts.ci_parts.PartsError("git diff failed")):
+            with self.assertRaisesRegex(train.TrainError, "doc-only proof"):
+                self.contract.resolve(self.plan, repo="/nonexistent")
+
+    def test_github_read_marks_a_doc_only_packet_green_without_ci(self):
+        """#8175 : la preuve doc seule se lit verte, sans run ni dispatch."""
+        contract = mock.Mock()
+        contract.verified_heads = set()
+        contract.resolve.return_value = ()
+        contract.sources_for.return_value = {}
+        contract.doc_only.return_value = True
+        gh = mock.Mock()
+        adapter = train_ci.GitHub("o/r", contract, gh=gh, repo="/nonexistent")
+        plan = dict(self.plan, tree="c" * 40)
+        proof = adapter.read(plan)
+        self.assertEqual((proof["status"], proof["complete"], proof.get("doc_only")),
+                         ("green", True, True))
+        self.assertEqual(proof["workflows"], [])
+        gh.assert_not_called()
+        adapter.start(plan)
+        gh.assert_not_called()
 
     def test_resolve_names_the_selector_refusal(self):
         def refuse(*_args, **_kwargs):
@@ -170,8 +227,9 @@ class NexlinkContractTest(unittest.TestCase):
         self.assertRegex(self.contract.digest(), r"^[0-9a-f]{64}$")
         self.assertEqual(train_ci.contract_digest(self.contract), self.contract.digest())
 
-    def test_sources_for_still_refuses_an_empty_plan(self):
-        with self.audit_base(), self.due():
+    def test_sources_for_still_refuses_an_unproven_empty_plan(self):
+        with self.audit_base(), self.due(), \
+                self.changes(("100644", "100644", "src/app.py")):
             with self.assertRaisesRegex(train.TrainError, "no due part"):
                 self.contract.sources_for(self.plan, repo="/nonexistent")
 
@@ -733,6 +791,57 @@ class DynamicGitHubTest(unittest.TestCase):
 def git(repo, *args):
     return subprocess.run(["git", "-C", repo, *args], check=True,
                           capture_output=True, text=True).stdout.strip()
+
+
+class DocOnlyDiffTest(unittest.TestCase):
+    """#8175 : la preuve doc seule lit le diff réel, jamais une déclaration."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = self.tmp.name
+        git(self.repo, "init", "-q")
+        git(self.repo, "config", "user.email", "test@example.invalid")
+        git(self.repo, "config", "user.name", "test")
+        self.write("docs/roadmap.md", "base\n")
+        self.base = self.commit("base")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, path, text):
+        full = os.path.join(self.repo, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def commit(self, message):
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def resolve(self, head):
+        contract = train_contracts.nexlink()
+        plan = dict(base=self.base, head=head)
+        with mock.patch.object(train_contracts.Nexlink, "_audit_base", return_value=None), \
+                mock.patch.object(train_contracts.ci_parts, "due",
+                                  return_value={"schema": "nexlink-lot-plan/1", "due": []}):
+            return contract, contract.resolve(plan, repo=self.repo), plan
+
+    def test_a_real_docs_diff_is_accepted_without_ci(self):
+        self.write("docs/roadmap.md", "changed\n")
+        contract, due, plan = self.resolve(self.commit("docs"))
+        self.assertEqual(due, ())
+        self.assertTrue(contract.doc_only(plan))
+
+    def test_a_real_code_diff_is_refused(self):
+        self.write("src/app.py", "print('x')\n")
+        with self.assertRaisesRegex(train.TrainError, "no due part"):
+            self.resolve(self.commit("code"))
+
+    def test_a_symlinked_markdown_is_not_doc_only(self):
+        os.symlink("roadmap.md", os.path.join(self.repo, "docs/link.md"))
+        with self.assertRaisesRegex(train.TrainError, "no due part"):
+            self.resolve(self.commit("link"))
 
 
 class VerifyLocalTest(unittest.TestCase):

@@ -11,7 +11,7 @@ The core reaches this contract only through the Module interface
 import re
 import types
 
-from ... import ci_parts, radar, resolutions, train_ci
+from ... import ci_parts, merge_queue, radar, resolutions, train_ci
 from ...train import PublicationRefused, TrainError, digest
 
 
@@ -58,7 +58,8 @@ class Nexlink:
     dispatches those suites with `expected_sha`. The suite workflow itself
     must exist at the head; its own jobs, minus the identified plumbing jobs
     and the skip-by-design jobs of that suite, are the proof. An empty due
-    list is refused: a doc-only packet is not a train proof.
+    list is accepted only when the real diff proves a documentation-only
+    packet (canon §3, #5428, #8175); any other empty selection is refused.
     """
 
     ci_parts = radar.CiParts(
@@ -70,6 +71,8 @@ class Nexlink:
     def __init__(self):
         self._resolved_key = None
         self._resolved = ()
+        #: #8175: (head, base) of a packet accepted on a proven doc-only diff.
+        self._doc_only_key = None
         #: #2503: successful remote source checks by exact (head, base); the
         #: due set and the sources are resolved against the base, so a changed
         #: base is a new proof. A long packet CI is re-read at each service
@@ -115,6 +118,23 @@ class Nexlink:
                 "the target selector differs from the audited Nexlink contract: %s"
                 % _NEXLINK_LOT_SELECTOR[0])
 
+    def _doc_only(self, plan, repo):
+        """#8175: le paquet ne change que la documentation sans CI.
+
+        Une liste due vide n'est une preuve que si le diff réel `base..head`
+        ne touche que la liste blanche de `merge_queue.doc_only_changes`,
+        la même que #5428 / land.py:1529. Sinon le refus reste terminal :
+        une sélection vide peut aussi venir d'un sélecteur ou d'un change set
+        qui ne prouve rien. Lecture locale, jamais une déclaration.
+        """
+        try:
+            changes = ci_parts.raw_changes(repo, plan["base"], plan["head"])
+        except ci_parts.PartsError as exc:
+            raise PublicationRefused(
+                "the change set of the packet cannot be read for a doc-only proof: %s"
+                % exc) from exc
+        return merge_queue.doc_only_changes(changes)
+
     def _proof(self, plan, *, repo, cache, declarations_sha=None):
         """One due-parts proof: the audited selector over base or head tree."""
         try:
@@ -144,8 +164,16 @@ class Nexlink:
         due = tuple(base_proof["due"]) + tuple(
             context for context in head_proof["due"] if context not in base_proof["due"])
         if not due:
-            raise PublicationRefused(
-                "no due part: a packet CI cannot be proven (doc-only packet?)")
+            # #8175 (canon §3): a packet whose real diff only touches the
+            # documentation whitelist awaits no CI, like a doc-only queue
+            # packet (#5428). Any other empty selection stays a refusal.
+            if not self._doc_only(plan, repo):
+                raise PublicationRefused(
+                    "no due part: a packet CI cannot be proven (doc-only packet?)")
+            self._doc_only_key = key
+            self._resolved_key = key
+            self._resolved = ()
+            return ()
         workflows = []
         for context in due:
             match = re.fullmatch(r"lot/([A-Za-z0-9_-]+)", context)
@@ -171,6 +199,10 @@ class Nexlink:
     def due_for(self, plan, *, repo, cache=None):
         """The due suites, for the local existence check before publication."""
         return self.resolve(plan, repo=repo, cache=cache)
+
+    def doc_only(self, plan):
+        """#8175: ce plan a été accepté sur un diff doc seule prouvé."""
+        return self._doc_only_key == (plan["head"], plan["base"])
 
     def sources_for(self, plan, *, repo, cache=None):
         """The shared sources pinned by this contract, for one valid plan."""
