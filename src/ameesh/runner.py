@@ -7905,19 +7905,9 @@ class AgentWorker(threading.Thread):
         cadence déclarée ? Oui si l'un des messages est d'une nature
         immédiate (l'humain toujours ; un événement urgent seulement d'un
         expéditeur habilité, comme `_events_due`), sinon à la fin de la
-        fenêtre adaptative dont la fenêtre déclarée est la base (#8117).
-
-        #8117 : une réponse de décision n'est pas immédiate par ses marques
-        (humaine, urgente) ; si la cadence déclare sa nature immédiate, elle
-        est regroupée par la fenêtre adaptative de base (`mail_batch`), au
-        plus tard la fenêtre déclarée."""
-        reponses = []
+        fenêtre, comptée comme celle de `_mail_due`."""
         for row in rows:
             human = self._from_human(row)
-            if mail.is_decision_answer(row):
-                if reveil_mod.immediate(policy, row, human=human):
-                    reponses.append(row)
-                continue
             if mail.is_event(row) and mail.is_urgent(row) and not human \
                     and not self.interrupt_allowed(row):
                 found = reveil_mod.natures(row) - {"urgent"}
@@ -7925,14 +7915,7 @@ class AgentWorker(threading.Thread):
                     return True
             elif reveil_mod.immediate(policy, row, human=human):
                 return True
-        # #8117 (B impl-11, gel e753f725) : la fenêtre déclarée est la BASE de
-        # la fenêtre adaptative — un message seul attend la fenêtre déclarée,
-        # une rafale d'un même expéditeur sur un même lot l'allonge jusqu'à
-        # `max(BURST_CAP_S, fenêtre)`. À 30 min (défaut), rien ne change.
-        if self._bursts_elapsed(rows, float(policy["fenetre_s"])):
-            return True
-        return bool(reponses) and self._bursts_elapsed(
-            reponses, self.mail_batch(), remember=False)
+        return self._window_elapsed(rows, float(policy["fenetre_s"]))
 
     def _events_due(self, events: list[dict]) -> bool:
         """Les événements en attente ouvrent-ils un tour ? (C9)"""
@@ -8066,8 +8049,7 @@ class AgentWorker(threading.Thread):
         cap = max(float(self.BURST_CAP_S), base)
         return min(base * (2 ** max(n - 1, 0)), cap)
 
-    def _bursts_elapsed(self, rows: list[dict], base: float, *,
-                        remember: bool = True) -> bool:
+    def _bursts_elapsed(self, rows: list[dict], base: float) -> bool:
         """#8117 : le courrier ordinaire attendu ouvre-t-il un tour ?
 
         Les messages sont groupés par expéditeur et par lot. Un groupe est dû
@@ -8078,8 +8060,8 @@ class AgentWorker(threading.Thread):
         par cet exécuteur (horloge monotone), la plus longue des deux,
         et la fin du dernier tour retient toujours `base` (#3451). Sinon,
         l'échéance la plus proche est retenue pour le réveil (#3218).
-        `remember=False` : `rows` n'est qu'une partie du courrier en attente,
-        les premières lectures retenues ne sont pas réécrites."""
+        Une cadence `reveil` déclarée (#7632) garde sa fenêtre fixe
+        (`_window_elapsed`, arbitrage du pilote du 23/11 16:18Z)."""
         if base <= 0:
             return True
         self._note_bursts(rows)
@@ -8093,8 +8075,7 @@ class AgentWorker(threading.Thread):
             created = float(row.get("created_ts") or now)
             age = max(now - created, mono - first)
             groups.setdefault(self._burst_key(row), []).append((age, created))
-        if remember:
-            self._batch_seen = kept  # les messages remis entre-temps sont oubliés
+        self._batch_seen = kept  # les messages remis entre-temps sont oubliés
         cap = max(float(self.BURST_CAP_S), base)
         reste = float("inf")
         for key, ages in groups.items():
@@ -8113,6 +8094,37 @@ class AgentWorker(threading.Thread):
             log_async("[%s] mail batched: %d message(s) from %d sender/lot group(s), "
                       "turn in %ds at most (window %gs, adaptive up to %gs)"
                       % (self.name, len(rows), len(groups), int(reste) + 1, base, cap))
+        return False
+
+    def _window_elapsed(self, rows: list[dict], window: float) -> bool:
+        """L125/#3451 : le plus ancien de `rows` attend-il depuis au moins
+        `window` (depuis son arrivée et depuis la fin du dernier tour) ?
+        Sinon, l'échéance est retenue pour le réveil (#3218)."""
+        if window <= 0:
+            return True
+        now, mono = time.time(), time.monotonic()
+        seen = getattr(self, "_batch_seen", {})
+        kept: dict[int, float] = {}
+        waited = 0.0
+        for row in rows:
+            first = seen.get(int(row["id"]), mono)
+            kept[int(row["id"])] = first
+            waited = max(waited, now - float(row.get("created_ts") or now), mono - first)
+        self._batch_seen = kept  # les messages remis entre-temps sont oubliés
+        fin_tour = getattr(self, "_turn_end_mono", None)
+        if fin_tour is not None:
+            waited = min(waited, mono - fin_tour)
+        if waited >= window:
+            return True
+        # #3218 : le worker se réveille à la fin de la fenêtre, pas au sondage
+        # qui la suit (jusqu'à `poll` de plus)
+        self.note_due_at(now + (window - waited))
+        oldest = min(kept)
+        if getattr(self, "_batch_logged", None) != oldest:
+            self._batch_logged = oldest
+            log_async("[%s] mail batched: %d message(s), turn in %ds at most "
+                      "(window %gs)" % (self.name, len(rows), int(window - waited) + 1,
+                                         window))
         return False
 
     # -- #3218 : échéance de réveil et reçu d'étapes ------------------------

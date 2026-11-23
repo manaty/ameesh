@@ -156,8 +156,8 @@ class FenetreAdaptativeTest(unittest.TestCase):
 
 
 class CheminsCompletsTest(unittest.TestCase):
-    """B de mty-amh-impl-11 (gel 43f204d1) : le retard #7976 et la cadence
-    `reveil` ne contournent plus le regroupement."""
+    """B de mty-amh-impl-11 (gel 43f204d1) : le retard #7976 ne contourne
+    plus le regroupement."""
 
     def _a(self, t: float):
         horloge = _Horloge()
@@ -187,66 +187,45 @@ class CheminsCompletsTest(unittest.TestCase):
             vus = [m for t, m in arrivees if t <= horloge.t]
             self.assertFalse(worker._mail_overdue(vus))
 
-    def test_reponse_de_decision_sous_cadence_regroupee(self):
-        worker = _ouvrier()
-        reponses = [_reponse(i + 1, 7000 + i, T0 + i * 2.0) for i in range(12)]
-        with self._a(30.0):
-            self.assertFalse(worker._reveil_due({"immediat": ["humain", "urgent",
-                                                              "decision"],
-                                                 "fenetre_s": 1800}, reponses))
-        with self._a(120.0):
-            self.assertTrue(worker._reveil_due({"immediat": ["humain", "urgent",
-                                                             "decision"],
-                                                "fenetre_s": 1800}, reponses))
-        # un humain ordinaire reste immédiat sous la cadence
-        humain = dict(_etat(50, T0, sender="human:smichea"), payload={"human": True})
-        with self._a(1.0):
-            self.assertTrue(_ouvrier()._reveil_due({"immediat": ["humain"],
-                                                    "fenetre_s": 1800}, [humain]))
-
-    def test_cadence_minimale_regroupe_aussi(self):
-        # « humain » reste toujours immédiat (décision owner du 17/11) : la
-        # réponse n'est pas ouverte sur-le-champ, mais à la fin de la fenêtre
-        # adaptative de base, sans attendre les 30 min déclarées
-        politique = {"immediat": ["humain"], "fenetre_s": 1800}
-        with self._a(30.0):
-            self.assertFalse(_ouvrier()._reveil_due(politique, [_reponse(1, 7000, T0)]))
-        with self._a(91.0):
-            self.assertTrue(_ouvrier()._reveil_due(politique, [_reponse(1, 7000, T0)]))
-
-
 class CadenceDeclareeTest(unittest.TestCase):
-    """B de mty-amh-impl-11 (gel e753f725) : sous une cadence `reveil`, la
-    fenêtre déclarée est la base de la fenêtre adaptative ; les natures
-    immédiates restent immédiates."""
+    """Arbitrage du pilote (mesh-design, 23/11 16:18Z) : une cadence `reveil`
+    déclarée (#7632, décision owner du 17/11) garde sa fenêtre fixe, sans
+    regroupement adaptatif ; ses natures immédiates, réponse de décision
+    comprise, réveillent tout de suite un agent au repos ; aucune
+    n'interrompt un tour en cours (`interrupt_allowed`)."""
 
-    def test_rafale_sous_cadence_courte_adaptative(self):
+    def _a(self, t: float):
+        horloge = _Horloge()
+        horloge.t = t
+        return mock.patch.object(runner_mod, "time", horloge.module())
+
+    def test_fenetre_fixe_sans_adaptatif(self):
+        # fenêtre 90 s, deux messages du même expéditeur et lot à 0 et 30 s :
+        # dus à 90 s (l'adaptatif les aurait retardés)
         politique = {"immediat": ["humain", "urgent"], "fenetre_s": 90}
-        instants = [0.0]
-        for ecart in [112.5] * 8:
-            instants.append(instants[-1] + ecart)
-        arrivees = [(t, _etat(i + 1, T0 + t)) for i, t in enumerate(instants)]
-        reveils = [t for t in _simuler(arrivees, fin=1800, politique=politique)
-                   if t <= 900]
-        self.assertLessEqual(len(reveils), 2, reveils)
+        arrivees = [(0.0, _etat(1, T0)), (30.0, _etat(2, T0 + 30))]
+        self.assertEqual(_simuler(arrivees, fin=400, politique=politique), [90.0])
 
     def test_message_seul_attend_la_fenetre_declaree(self):
         politique = {"immediat": ["humain"], "fenetre_s": 1800}
         self.assertEqual(_simuler([(0.0, _etat(1, T0))], fin=2000, politique=politique),
                          [1800.0])
 
-    def test_cadence_par_defaut_inchangee(self):
-        # 100 courriers ordinaires en une heure, 3 expéditeurs sur 3 lots :
-        # au plus deux tours (témoin #7632), la rafale ne recule rien au-delà
-        politique = {"immediat": ["humain", "urgent"], "fenetre_s": 1800}
-        arrivees = [(i * 36.0, _etat(i + 1, T0 + i * 36.0, lot=1 + i % 3,
-                                     sender="pair%d" % (i % 3))) for i in range(100)]
-        reveils = _simuler(arrivees, fin=3600, pas=10.0, politique=politique)
-        self.assertLessEqual(len(reveils), 2, reveils)
-        self.assertEqual(reveils[0], 1800.0)  # comme la fenêtre fixe
+    def test_reponse_de_decision_immediate_au_repos(self):
+        for immediat in (["humain"], ["decision"], ["humain", "urgent", "decision"]):
+            with self._a(1.0):
+                self.assertTrue(_ouvrier()._reveil_due(
+                    {"immediat": immediat, "fenetre_s": 1800}, [_reponse(1, 7000, T0)]),
+                    immediat)
+
+    def test_reponse_de_decision_n_interrompt_pas_sous_cadence(self):
+        worker = _ouvrier()
+        worker.agent = {"reveil": {"immediat": ["humain", "decision"], "fenetre_s": 1800}}
+        worker.cfg.interrupt_senders = ("orch",)
+        self.assertFalse(worker.interrupt_allowed(_reponse(1, 7000, T0, sender="orch")))
 
     def test_natures_immediates_preservees(self):
-        politique = {"immediat": ["humain", "urgent"], "fenetre_s": 90}
+        politique = {"immediat": ["humain", "urgent"], "fenetre_s": 1800}
         arrivees = [(i * 60.0, _etat(i + 1, T0 + i * 60.0)) for i in range(5)]
         arrivees.append((300.0, _etat(99, T0 + 300, payload={"urgent": True})))
         self.assertIn(300.0, _simuler(arrivees, fin=400, politique=politique))
