@@ -3,8 +3,9 @@
 from pathlib import Path
 from unittest import mock
 
-from ameesh import db as db_mod, migrations
+from ameesh import db as db_mod, migrations, work
 from ameesh.modules import dev, registry
+from ameesh.modules.dev.storage import schema as dev_schema
 from ameesh.modules.dev.tables import TABLES
 from . import support
 from .test_7651_dev_schema_cutover import DevCutoverTest, cutover_modules, ROLLBACK
@@ -21,6 +22,10 @@ class RemoveViewsTest(support.PgTestCase):
         self.populate()
         before = self.snapshot(self.schema)
         migrations.migrate(self.db, modules=cutover_modules())
+        # P2 requires stopped writers; simulate a fresh executor connection.
+        connection = dev_schema._connection(self.db)
+        if hasattr(connection, '_ameesh_dev_schema'):
+            delattr(connection, '_ameesh_dev_schema')
         with mock.patch.object(dev, 'MIGRATIONS', 'migrations'):
             modules = registry.discover()
         functions = ('work_items_migration_slot_sync', 'work_migration_reservation_guard',
@@ -43,6 +48,12 @@ class RemoveViewsTest(support.PgTestCase):
         self.assertEqual(self.db.query(
             'SELECT number FROM %s.work_migration_reservations WHERE work_item_id=%%s'
             % db_mod.quote_ident(physical), (self.lot,))[0]['number'], 9123)
+        other = work.add(self.db, title='conflicting slot', actor='human:alice', cfg=self.cfg)['id']
+        with self.assertRaisesRegex(db_mod.DbError, 'already reserved'):
+            self.db.execute('INSERT INTO %s.work_migration_reservations '
+                            "(work_item_id,slot,number,project,target_repo,target_branch,status) "
+                            "VALUES (%%s,'default',9123,'','github.com/acme/demo','main','reserved')"
+                            % db_mod.quote_ident(physical), (other,))
         self.db.execute("UPDATE work_items SET reviewers=ARRAY['reviewer'] WHERE id=%s", (self.lot,))
         self.db.execute("UPDATE work_items SET reviewers=ARRAY[]::text[] WHERE id=%s", (self.lot,))
         with self.assertRaisesRegex(db_mod.DbError, 'was withdrawn'):
