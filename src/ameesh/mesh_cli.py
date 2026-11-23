@@ -2332,14 +2332,21 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 check = None
             args.created_item = item
             if see_also is not None and not item.get("existing"):
-                from . import work_dependencies
+                # #8119 : relation informative seulement, JAMAIS un lien typé.
+                # Un genre neuf dans `work_item_links` casse un lecteur N-1 :
+                # `links()` indexe `_INVERSE[kind]` sans garde, donc `work show`
+                # et la replanification du projet tombent tant qu'un hôte est
+                # resté sur la version précédente (auditeur #231314). La note
+                # porte la relation ; un lien typé demandera d'abord un lecteur
+                # tolérant déployé partout.
                 try:
-                    work_dependencies.add_link(
-                        db, int(item["id"]), int(see_also), "see_also",
+                    work.note(
+                        db, int(item["id"]),
+                        "see also: #%d (non-blocking; no dependency)" % int(see_also),
                         actor=creator or args.actor or "ameesh")
                     print("see also: #%d (non-blocking)" % int(see_also))
-                except Exception as exc:  # noqa: BLE001 - le lot existe, le lien se répare
-                    print("warning: see-also #%d not linked: %s"
+                except Exception as exc:  # noqa: BLE001 - le lot existe, la note se répare
+                    print("warning: see-also #%d not noted: %s"
                           % (int(see_also), exc), file=sys.stderr)
             if item.get("existing"):
                 # B/P2 ameesh-cx2 (#6090) : un premier appel concurrent a gagné
@@ -4534,8 +4541,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                              "with the creation (unknown parent refused); a mere "
                              "'see also' relation is --see-also (#8119)") % v.noun)
     pw_add.add_argument("--see-also", type=int, default=None, metavar="LOT",
-                        help=("#8119: record a non-blocking 'see also' link to LOT; the %s "
-                             "is takeable at once, unlike --parent-lot (exclusive with it)") % v.noun)
+                        help=("#8119: note a non-blocking 'see also' relation to LOT (no "
+                             "dependency, no typed link); the %s is takeable at once, unlike "
+                             "--parent-lot (exclusive with it)") % v.noun)
     pw_add.add_argument("--externe", action="store_true",
                         help="force assignment to an external agent that has a human "
                              "responsible (L37, 0030)")

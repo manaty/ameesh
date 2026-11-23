@@ -145,6 +145,91 @@ class JournalTest(Base):
                              for note in notes))
 
 
+class HistoryTest(Base):
+    def age_events(self, ident, seconds):
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = created_at"
+            " - make_interval(secs => %s) WHERE work_item_id = %s",
+            (float(seconds), int(ident)))
+
+    def test_an_assigned_lot_is_reconstructed_from_the_journal(self):
+        self.agent("dev0")
+        item = self.lot("attente sans motif", age_s=6 * HEURE)
+        self.age_events(item["id"], 6 * HEURE)
+        work.assign(self.db, int(item["id"]), "dev0", actor="test")
+        rows = take_refusals.history(
+            self.cfg, self.db, since=self.now - 12 * HEURE, until=self.now)
+        row = next(row for row in rows if row["id"] == int(item["id"]))
+        self.assertEqual(row["kind"], "lot")
+        self.assertEqual(row["reason"], "indeterminate")
+        self.assertEqual(row["certainty"], "indeterminate")
+        self.assertGreater(row["wait_s"], 5 * HEURE)
+
+    def test_a_prerequisite_named_by_the_journal_is_reconstructed(self):
+        self.agent("dev0")
+        parent = self.lot("parent")
+        item = self.lot("attend le parent", age_s=6 * HEURE)
+        work_dependencies.add(self.db, int(item["id"]), int(parent["id"]),
+                              actor="test")
+        self.age_events(item["id"], 6 * HEURE)
+        work.assign(self.db, int(item["id"]), "dev0", actor="test")
+        rows = take_refusals.history(
+            self.cfg, self.db, since=self.now - 12 * HEURE, until=self.now)
+        row = next(row for row in rows if row["id"] == int(item["id"]))
+        self.assertEqual(row["reason"], "prerequisite")
+        self.assertEqual(row["certainty"], "observed")
+        self.assertIn("#%d" % int(parent["id"]), row["detail"])
+
+    def test_a_footprint_wait_named_by_the_journal_is_reconstructed(self):
+        self.agent("dev0")
+        item = self.lot("attend une empreinte", age_s=6 * HEURE)
+        self.age_events(item["id"], 6 * HEURE)
+        self.db.execute(
+            "INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
+            " VALUES (%s, 'intake', %s, 'test', now() - interval '5 hours')",
+            (int(item["id"]), "en attente d'empreinte : #4242 (2026-11-22T03:04:15Z)"))
+        work.assign(self.db, int(item["id"]), "dev0", actor="test")
+        rows = take_refusals.history(
+            self.cfg, self.db, since=self.now - 12 * HEURE, until=self.now)
+        row = next(row for row in rows if row["id"] == int(item["id"]))
+        self.assertEqual(row["reason"], "footprint")
+        self.assertIn("#4242", row["detail"])
+
+    def test_a_basket_waiting_behind_a_lot_is_named_roadmap(self):
+        lot = self.lot("lot de roadmap", age_s=6 * HEURE)
+        self.age_events(lot["id"], 6 * HEURE)
+        basket = backlog.add(self.db, title="panier", expected_value="gain",
+                             value_score=10, team="ameesh", actor="test",
+                             estimate="30m")
+        self.db.execute(
+            "UPDATE work_items SET created_at = now() - interval '6 hours'"
+            " WHERE id = %s", (int(basket["id"]),))
+        self.age_events(basket["id"], 6 * HEURE)
+        rows = take_refusals.history(
+            self.cfg, self.db, since=self.now - 12 * HEURE, until=self.now)
+        row = next(row for row in rows if row["id"] == int(basket["id"]))
+        self.assertEqual(row["reason"], "roadmap")
+        self.assertEqual(row["certainty"], "inferred")
+        self.assertIn("#%d" % int(lot["id"]), row["detail"])
+
+    def test_the_history_journal_notes_a_finished_wait_once(self):
+        self.agent("dev0")
+        item = self.lot("attente finie", age_s=6 * HEURE)
+        self.age_events(item["id"], 6 * HEURE)
+        work.assign(self.db, int(item["id"]), "dev0", actor="test")
+        now = time.time() + 1.0
+        written = take_refusals.journal_history(self.cfg, self.db, now=now)
+        self.assertEqual([row["id"] for row in written], [int(item["id"])])
+        notes = [row["note"] for row in work.events(self.db, int(item["id"]))]
+        self.assertEqual(sum(note.startswith(take_refusals.HISTORY_PREFIX)
+                             for note in notes), 1)
+        self.assertEqual(take_refusals.journal_history(
+            self.cfg, self.db, now=now), [])
+        notes = [row["note"] for row in work.events(self.db, int(item["id"]))]
+        self.assertEqual(sum(note.startswith(take_refusals.HISTORY_PREFIX)
+                             for note in notes), 1)
+
+
 class DecoupageBasketTest(Base):
     def test_a_ready_basket_keeps_the_queue_awake(self):
         listing = [{"name": "dev0", "mode": "execute", "status": "idle",
@@ -164,27 +249,8 @@ class DecoupageBasketTest(Base):
 
 
 class SeeAlsoTest(Base):
-    def test_see_also_is_a_non_blocking_typed_link(self):
+    def test_see_also_is_a_note_without_link_or_dependency(self):
         parent = self.lot("parent")
-        suite = self.lot("suite")
-        self.assertTrue(work_dependencies.add_link(
-            self.db, int(suite["id"]), int(parent["id"]), "see_also",
-            actor="test"))
-        links = work_dependencies.links(self.db, [int(suite["id"])])
-        row = links[int(suite["id"])][0]
-        self.assertEqual((row["kind"], row["lot"]), ("see_also", int(parent["id"])))
-        # aucun prérequis bloquant n'est créé
-        waits = work_dependencies.grouped(self.db, [int(suite["id"])])
-        self.assertEqual(waits.get(int(suite["id"]), []), [])
-
-    def test_work_add_warns_on_parent_lot_and_links_see_also(self):
-        parent = self.lot("parent")
-        out = self.mesh("work", "add", "--title", "suite bloquante",
-                       "--app", "ameesh", "--new-project",
-                       "--parent-lot", str(int(parent["id"])),
-                       "--estimate", "30m", "--actor", "test")
-        self.assertEqual(out.returncode, 0, (out.stdout, out.stderr))
-        self.assertIn("BLOCKING", out.stderr)
         out = self.mesh("work", "add", "--title", "suite voir aussi",
                        "--app", "ameesh", "--new-project",
                        "--see-also", str(int(parent["id"])),
@@ -194,8 +260,38 @@ class SeeAlsoTest(Base):
         rows = self.db.query(
             "SELECT id FROM work_items WHERE title = %s ORDER BY id DESC LIMIT 1",
             ("suite voir aussi",))
-        links = work_dependencies.links(self.db, [int(rows[0]["id"])])
-        self.assertEqual(links[int(rows[0]["id"])][0]["kind"], "see_also")
+        ident = int(rows[0]["id"])
+        notes = [row["note"] for row in work.events(self.db, ident, limit=None)]
+        self.assertTrue(any(note.startswith(
+            "see also: #%d (non-blocking" % int(parent["id"])) for note in notes))
+        # ni lien typé ni prérequis : la relation est informative seulement
+        self.assertEqual(work_dependencies.links(self.db, [ident]).get(ident, []), [])
+        self.assertEqual(work_dependencies.grouped(self.db, [ident]).get(ident, []), [])
+
+    def test_work_add_warns_on_parent_lot_and_keeps_n1_readers_safe(self):
+        parent = self.lot("parent")
+        out = self.mesh("work", "add", "--title", "suite bloquante",
+                       "--app", "ameesh", "--new-project",
+                       "--parent-lot", str(int(parent["id"])),
+                       "--estimate", "30m", "--actor", "test")
+        self.assertEqual(out.returncode, 0, (out.stdout, out.stderr))
+        self.assertIn("BLOCKING", out.stderr)
+        rows = self.db.query(
+            "SELECT id FROM work_items WHERE title = %s ORDER BY id DESC LIMIT 1",
+            ("suite bloquante",))
+        ident = int(rows[0]["id"])
+        self.assertEqual([edge["blocker_id"] for edge in
+                          work_dependencies.grouped(self.db, [ident])[ident]],
+                         [int(parent["id"])])
+        # auditeur #231314 : un lecteur N-1 indexe _INVERSE[kind] sans garde.
+        # Aucun genre de lien nouveau ne doit exister en base.
+        old_inverse = {"duplicates": "duplicated by", "supersedes": "superseded by",
+                       "part_of": "has part", "conflicts_with": "conflicts with"}
+        kinds = {row["kind"] for row in self.db.query(
+            "SELECT DISTINCT kind FROM work_item_links")}
+        self.assertLessEqual(kinds, set(old_inverse))
+        for row in storage.of(self.db).work_dependencies.links_for([ident, int(parent["id"])]):
+            self.assertIn(row["kind"], old_inverse)
 
 
 if __name__ == "__main__":

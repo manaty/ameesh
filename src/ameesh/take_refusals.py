@@ -499,6 +499,312 @@ def _alert_pilot(db, orchestras, row: dict, label: str, text: str) -> None:
             continue
 
 
+#: préfixe des notes de rattrapage historique (distinct de REFUSAL_PREFIX :
+#: le journal courant ne doit pas prendre une note d'histoire pour sa note
+#: horaire)
+HISTORY_PREFIX = "historique des refus L165:"
+#: fenêtre du rattrapage au démarrage d'un service de notification
+HISTORY_WINDOW_S = 48 * 3600.0
+
+
+def _is_assignment_note(note) -> bool:
+    from .storage.interface import ASSIGN_NOTE_PREFIXES
+    return str(note or "").strip().startswith(ASSIGN_NOTE_PREFIXES)
+
+
+def _is_return_note(note) -> bool:
+    from .storage.interface import RETURNED_NOTE
+    text = str(note or "").strip()
+    return (text.startswith(RETURNED_NOTE)
+            or text.startswith("pause budget (reprise) : lot rendu à la file"))
+
+
+def _ids_after(note: str, marker: str) -> set[int]:
+    """Les `#N` d'une note de journal, après `marker` (ex. empreinte)."""
+    tail = note.split(marker, 1)[1] if marker in note else ""
+    out = set()
+    for token in tail.replace(",", " ").split():
+        token = token.strip("();[]")
+        if token.startswith("#") and token[1:].isdigit():
+            out.add(int(token[1:]))
+    return out
+
+
+def _history_episodes(db, since: float, until: float) -> list[dict]:
+    """Les épisodes sans assigné d'éléments dont la vie croise la fenêtre.
+
+    Un épisode commence à la création (ou à un retour à la file) et finit à
+    la première attribution ou fermeture ; il est coupé à `until`. Les
+    événements sont la seule source : `work_items` ne garde que l'état courant.
+    """
+    from . import backlog, storage
+    st = storage.of(db)
+    items = db.query(
+        "SELECT id, type, app, workstream, team, title, state, assignee,"
+        " external_executor, created_at, closed_at,"
+        " extract(epoch from created_at)::float8 AS created_ts,"
+        " extract(epoch from closed_at)::float8 AS closed_ts"
+        " FROM work_items"
+        " WHERE created_at <= to_timestamp(%s)"
+        " AND (closed_at IS NULL OR closed_at >= to_timestamp(%s))"
+        " ORDER BY id", (float(until), float(since)))
+    by_item: dict[int, list] = {}
+    ids = [int(item["id"]) for item in items]
+    if ids:
+        marks = ", ".join(["%s"] * len(ids))
+        try:
+            rows = db.query(
+                "SELECT work_item_id, state, note, actor,"
+                " extract(epoch from created_at)::float8 AS created_ts"
+                " FROM work_item_events"
+                " WHERE work_item_id IN (" + marks + ")"
+                " AND created_at <= to_timestamp(%s)"
+                " ORDER BY work_item_id, id", tuple(ids) + (float(until),))
+        except Exception:  # noqa: BLE001 - un journal illisible rend l'épisode indéterminé
+            rows = []
+        for row in rows:
+            by_item.setdefault(int(row["work_item_id"]), []).append(row)
+    out = []
+    for item in items:
+        ident = int(item["id"])
+        events = by_item.get(ident, [])
+        start = float(item.get("created_ts") or since)
+        for event in events:
+            ts = float(event.get("created_ts") or 0.0)
+            note = str(event.get("note") or "")
+            if ts > until:
+                break
+            if _is_return_note(note):
+                start = ts
+                continue
+            if _is_assignment_note(note):
+                if start is not None:
+                    _append_episode(out, item, events, start, ts, since, until,
+                                    "assigned", note=note)
+                start = None
+                continue
+            if event.get("state") in lifecycle.COMPLETED and start is not None:
+                _append_episode(out, item, events, start, ts, since, until,
+                                "closed")
+                start = None
+        if start is not None:
+            _append_episode(out, item, events, start, until, since, until, "open")
+    return out
+
+
+def _append_episode(out, item, events, start, end, since, until, ended, *,
+                    note="") -> None:
+    start = max(float(start), float(since))
+    end = min(float(end), float(until))
+    if end <= start:
+        return
+    out.append({"item": item, "events": events, "start": start, "end": end,
+                "ended": ended, "assign_note": note})
+
+
+def _state_before(events, moment: float) -> tuple[set, set, bool]:
+    """(prérequis, empreintes, hold) au début d'un épisode, d'après le journal."""
+    from . import planned_waits
+    deps: set[int] = set()
+    footprints: set[int] = set()
+    held = False
+    for event in events:
+        ts = float(event.get("created_ts") or 0.0)
+        if ts > moment:
+            break
+        note = str(event.get("note") or "")
+        if note.startswith("Dependency added: lot #"):
+            deps |= _ids_after(note, "Dependency added:")
+        elif note.startswith("Dependency removed: lot #"):
+            deps -= _ids_after(note, "Dependency removed:")
+        elif note.startswith("en attente d'empreinte"):
+            footprints |= _ids_after(note, "en attente d'empreinte")
+        elif note.startswith("empreinte libérée"):
+            footprints -= _ids_after(note, "empreinte libérée")
+        elif planned_waits.is_hold_note(note):
+            held = True
+        elif planned_waits.is_lift_note(note):
+            held = False
+    return deps, footprints, held
+
+
+def _episode_evidence(episode: dict) -> tuple[dict, dict, float]:
+    """(couverture des prérequis, couverture des empreintes, durée du hold).
+
+    Chaque bloqueur est chronométré sur l'épisode : un prérequis ou une
+    empreinte nommé au début, ou apparu en route, ne compte que s'il couvre au
+    moins la moitié de l'attente. Une libération juste avant la prise (empreinte
+    rendue, prérequis retiré) ne doit pas effacer la cause de l'attente ; un
+    blocage d'une minute avant la fin ne doit pas la résumer non plus.
+    """
+    from . import planned_waits
+    start, end = float(episode["start"]), float(episode["end"])
+    deps, footprints, held = _state_before(episode["events"], start)
+    dep_since = {ident: start for ident in deps}
+    fp_since = {ident: start for ident in footprints}
+    dep_cov: dict[int, float] = {}
+    fp_cov: dict[int, float] = {}
+    held_since = start if held else None
+    held_total = 0.0
+    for event in episode["events"]:
+        ts = float(event.get("created_ts") or 0.0)
+        if ts <= start or ts > end:
+            continue
+        note = str(event.get("note") or "")
+        if note.startswith("Dependency added: lot #"):
+            for ident in _ids_after(note, "Dependency added:"):
+                dep_since.setdefault(ident, ts)
+        elif note.startswith("Dependency removed: lot #"):
+            for ident in _ids_after(note, "Dependency removed:"):
+                if ident in dep_since:
+                    dep_cov[ident] = dep_cov.get(ident, 0.0) + ts - dep_since.pop(ident)
+        elif note.startswith("en attente d'empreinte"):
+            for ident in _ids_after(note, "en attente d'empreinte"):
+                fp_since.setdefault(ident, ts)
+        elif note.startswith("empreinte libérée"):
+            for ident in _ids_after(note, "empreinte libérée"):
+                if ident in fp_since:
+                    fp_cov[ident] = fp_cov.get(ident, 0.0) + ts - fp_since.pop(ident)
+        elif planned_waits.is_hold_note(note):
+            if held_since is None:
+                held_since = ts
+        elif planned_waits.is_lift_note(note):
+            if held_since is not None:
+                held_total += ts - held_since
+                held_since = None
+    for ident, since in dep_since.items():
+        dep_cov[ident] = dep_cov.get(ident, 0.0) + end - since
+    for ident, since in fp_since.items():
+        fp_cov[ident] = fp_cov.get(ident, 0.0) + end - since
+    if held_since is not None:
+        held_total += end - held_since
+    return dep_cov, fp_cov, held_total
+
+
+def _episode_reason(item: dict, episode: dict, lots: list[dict]) -> tuple[str, str, str]:
+    """`(raison, détail, certitude)` d'un épisode, d'après les seules preuves."""
+    from . import file_decoupage
+    ident = int(item["id"])
+    if file_decoupage.is_split_lot(item):
+        return "split", "lot de découpage (geste du pilote)", "observed"
+    if (item.get("external_executor") or "").strip():
+        return ("external", "réservé à %s" % item["external_executor"], "observed")
+    start, end = float(episode["start"]), float(episode["end"])
+    wait = end - start
+    dep_cov, fp_cov, held_total = _episode_evidence(episode)
+    if held_total >= wait / 2.0:
+        return "hold", "hold de pilote vivant pendant l'attente", "observed"
+    deps = sorted((ident for ident, cover in dep_cov.items() if cover >= wait / 2.0))
+    if deps:
+        return ("prerequisite", "prérequis ouvert(s) : %s" % ", ".join(
+            "#%d" % i for i in deps), "observed")
+    footprints = sorted(ident for ident, cover in fp_cov.items()
+                        if cover >= wait / 2.0)
+    if footprints:
+        return ("footprint", "empreinte tenue par %s" % ", ".join(
+            "#%d" % i for i in footprints), "observed")
+    if item.get("type") == "improvement":
+        overlapping = [lot for lot in lots
+                       if int(lot["item"]["id"]) != ident
+                       and lot["project"] == episode["project"]
+                       and lot["start"] < end and lot["end"] > start]
+        if overlapping:
+            return ("roadmap", "lot(s) de l'équipe sans preneur : %s" % ", ".join(
+                "#%d" % int(lot["item"]["id"]) for lot in overlapping[:5]), "inferred")
+        return ("indeterminate", "aucun motif daté pour ce panier ; aucun lot "
+                "de l'équipe sans preneur pendant l'attente", "indeterminate")
+    return ("indeterminate", "aucun prérequis, empreinte ou hold ne couvre la "
+            "moitié de l'attente dans le journal (%d événement(s))"
+            % len(episode["events"]), "indeterminate")
+
+
+def history(cfg, db, *, since: float, until: float | None = None,
+            min_wait: float = TAKE_DEADLINE_S) -> list[dict]:
+    """Les attentes sans assigné d'une période, reconstituées depuis le journal.
+
+    Le journal vivant (`explain`) ne voit que l'état courant : un lot resté
+    sans assigné le 22/11 puis pris ou clos avant le déploiement en disparaît.
+    `history` relit les événements conservés (création, attribution, retours à
+    la file, prérequis, empreintes, holds) et rend, pour chaque épisode d'au
+    moins `min_wait`, la raison prouvée ou `indeterminate` quand le journal ne
+    la porte pas. La certitude dit laquelle des deux : `observed` (un
+    événement nomme le motif), `inferred` (un lot de l'équipe sans preneur
+    explique le panier), `indeterminate`.
+    """
+    from . import backlog
+    until = time.time() if until is None else float(until)
+    episodes = _history_episodes(db, float(since), until)
+    for episode in episodes:
+        episode["project"] = backlog._lot_project(episode["item"])
+    lots = [episode for episode in episodes
+            if episode["item"].get("type") != "improvement"]
+    rows = []
+    for episode in episodes:
+        item = episode["item"]
+        wait = float(episode["end"]) - float(episode["start"])
+        if wait < float(min_wait):
+            continue
+        reason, detail, certainty = _episode_reason(item, episode, lots)
+        rows.append({
+            "id": int(item["id"]),
+            "kind": "basket" if item.get("type") == "improvement" else "lot",
+            "title": item.get("title") or "",
+            "team": episode["project"],
+            "state": item.get("state") or "",
+            "assignee": item.get("assignee") or "",
+            "from_ts": float(episode["start"]),
+            "to_ts": float(episode["end"]),
+            "wait_s": wait,
+            "reason": reason,
+            "detail": detail,
+            "certainty": certainty,
+            "ended": episode["ended"] != "open",
+            "closed": item.get("state") in lifecycle.COMPLETED,
+        })
+    rows.sort(key=lambda row: (-row["wait_s"], row["id"]))
+    return rows
+
+
+def _moment(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(float(ts)))
+
+
+def journal_history(cfg, db, *, now: float | None = None,
+                    window: float = HISTORY_WINDOW_S,
+                    min_wait: float = TAKE_DEADLINE_S) -> list[dict]:
+    """Rattrapage au démarrage : note les attentes historiques une fois.
+
+    Un élément encore sans assigné est déjà couvert par `journal` ; seuls les
+    épisodes finis (pris ou clos) reçoivent la note `HISTORY_PREFIX`. Une note
+    par élément au plus, quel que soit le nombre d'épisodes : le journal du lot
+    garde la première attente reconstituée, les suivantes se lisent dans
+    `history`.
+    """
+    from . import work
+    from .backlog import SENDER
+    now = time.time() if now is None else float(now)
+    rows = history(cfg, db, since=now - float(window), until=now,
+                   min_wait=min_wait)
+    written = []
+    for row in rows:
+        if not row["ended"]:
+            continue
+        ident = int(row["id"])
+        try:
+            if work.events_noted(db, ident, HISTORY_PREFIX, 0.0):
+                continue
+            text = ("%s %s (du %s au %s, %s) — %s : %s [%s]"
+                    % (HISTORY_PREFIX, _LABELS.get(row["reason"], row["reason"]),
+                       _moment(row["from_ts"]), _moment(row["to_ts"]),
+                       _duration(row["wait_s"]), row["reason"], row["detail"],
+                       row["certainty"]))
+            work.note(db, ident, text, actor=SENDER)
+        except Exception:  # noqa: BLE001 - le rattrapage ne bloque pas la passe
+            continue
+        written.append(row)
+    return written
+
+
 def orchestration_names(orchestras) -> list[str]:
     """Les destinataires d'une alerte : des noms, sans doublon."""
     if not orchestras:

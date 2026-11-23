@@ -2376,6 +2376,9 @@ class Notifier:
         self._github_watcher = None
         #: L161c : relevé de la CI, échecs au courrier de l'agent du lot
         self._ci_watcher = None
+        #: #8119 : le rattrapage des refus historiques se fait une fois par
+        #: processus (les notes sont idempotentes, pas le balayage).
+        self._take_history_done = False
 
     # -- passage --------------------------------------------------------------
     def _delivery_open(self) -> bool:
@@ -3061,6 +3064,9 @@ class Notifier:
             from . import take_refusals
             try:
                 take_refusals.journal(self.cfg, db, now=now)
+                if not self._take_history_done:
+                    self._take_history_done = True
+                    take_refusals.journal_history(self.cfg, db, now=now)
             except db_mod.DbError:
                 raise
             except Exception as exc:  # le journal ne fait pas tomber les alertes
