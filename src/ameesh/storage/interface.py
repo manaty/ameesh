@@ -573,6 +573,17 @@ class Leases(Domain):
         worker garde le sien)."""
         return None
 
+    def idle_signatures(self, names: list[str]) -> dict | None:
+        """#8166 : la passe de repos de l'exécuteur, en une requête.
+
+        Rend {"host": empreinte du cycle de vie des hôtes, "agents": {nom:
+        {"sig": empreinte, "pending": travail en attente, "wake_ts":
+        prochain réveil programmé ou None}}}. L'empreinte d'un agent change
+        avec sa ligne du registre (hors horodatages de bail et de présence),
+        son courrier actif non remis et ses réveils programmés. None : pas de
+        passe groupée ici (chaque worker garde son pas)."""
+        return None
+
     @abc.abstractmethod
     def release(self, name: str, owner: str, epoch: int) -> bool:
         """Rend le bail ; l'epoch avance."""

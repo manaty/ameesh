@@ -15,7 +15,14 @@ Témoins :
 * battement groupé : un seul renouvellement (une connexion, un contrôle, un
   UPDATE) pour les baux des workers au repos, avec les gardes de `renew`
   (époque, détenteur, échéance sous verrou, jamais raccourcie) ; le fil du
-  worker s'efface tant qu'il est couvert et reprend au tiers du bail restant.
+  worker s'efface tant qu'il est couvert et reprend au tiers du bail restant ;
+* passe de repos groupée : une requête pour tous les workers ; un worker sans
+  travail en attente, au rôle non élu, ne refait sa passe complète que si
+  son empreinte change (registre, courrier actif, réveil programmé, cycle de
+  vie des hôtes), à une échéance connue ou au filet `IDLE_SAFETY_S` ;
+* N de impl-01 sur #8152 : rythme de repos relu à chaud ;
+  `AMEESH_IDLE_POLL_MAX` seul lève aussi le tiers du bail ; `registry.get`
+  d'un nom primaire n'évalue plus `ameesh_resolve_agent_name`.
 """
 from __future__ import annotations
 
@@ -424,6 +431,262 @@ class BattementGroupeReel(PgTestCase):
             self.assertFalse(worker.lease_lost.is_set(), worker.name)
             self.assertEqual(row.get("lease_owner"), runner.runner_id)
 
+
+
+class _Sweep:
+    """Worker minimal pour `idle_sweep_once`."""
+
+    def __init__(self, name, *, gated=True, mark=0):
+        self.name, self._idle_gated, self._idle_mark = name, gated, mark
+        self.wake = threading.Event()
+
+
+class PasseGroupee(unittest.TestCase):
+    def _runner(self, workers, answers):
+        runner = Runner.__new__(Runner)
+        runner.lock = threading.Lock()
+        runner.workers = {w.name: w for w in workers}
+        runner.db = object()
+        leases = types.SimpleNamespace(idle_signatures=mock.Mock(side_effect=answers))
+        patcher = mock.patch("ameesh.runner.storage.of",
+                             return_value=types.SimpleNamespace(leases=leases))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return runner, leases.idle_signatures
+
+    @staticmethod
+    def _lu(host="h", **sigs):
+        return {"host": host, "agents": {n: {"sig": v, "pending": False, "wake_ts": None}
+                                         for n, v in sigs.items()}}
+
+    def test_une_requete_pour_tous(self):
+        workers = [_Sweep("a"), _Sweep("b"), _Sweep("c")]
+        runner, query = self._runner(workers, [self._lu(a="1", b="1", c="1")])
+        runner.idle_sweep_once()
+        self.assertEqual(query.call_count, 1)
+        self.assertEqual(sorted(query.call_args.args[0]), ["a", "b", "c"])
+        self.assertEqual(runner.idle_generation("a"), 0)
+        self.assertTrue(runner.idle_sweep_alive())
+        self.assertFalse(any(w.wake.is_set() for w in workers))  # première lecture
+
+    def test_reveille_seulement_ce_qui_change(self):
+        a, b, c = _Sweep("a"), _Sweep("b"), _Sweep("c", gated=False)
+        runner, _ = self._runner([a, b, c], [self._lu(a="1", b="1", c="1"),
+                                             self._lu(a="2", b="1", c="2")])
+        runner.idle_sweep_once()
+        runner.idle_sweep_once()
+        self.assertEqual((runner.idle_generation("a"), runner.idle_generation("b")), (1, 0))
+        self.assertTrue(a.wake.is_set())
+        self.assertFalse(b.wake.is_set())
+        self.assertFalse(c.wake.is_set())  # en tour ou au pas ordinaire : pas concerné
+
+    def test_cycle_de_vie_des_hotes_reveille_tout(self):
+        a, b = _Sweep("a"), _Sweep("b")
+        runner, _ = self._runner([a, b], [self._lu(a="1", b="1"),
+                                          self._lu(host="h2", a="1", b="1")])
+        runner.idle_sweep_once()
+        runner.idle_sweep_once()
+        self.assertTrue(a.wake.is_set() and b.wake.is_set())
+
+    def test_changement_pendant_la_passe(self):
+        # marque prise avant un changement déjà vu : réveil au balayage suivant
+        a = _Sweep("a", mark=0)
+        runner, _ = self._runner([a], [self._lu(a="1"), self._lu(a="2"), self._lu(a="2")])
+        runner.idle_sweep_once()
+        a._idle_gated = False
+        runner.idle_sweep_once()  # gen 1, le worker est en passe
+        a._idle_gated = True
+        runner.idle_sweep_once()
+        self.assertTrue(a.wake.is_set())
+
+    def test_stockage_sans_passe_groupee(self):
+        runner, _ = self._runner([_Sweep("a")], [None])
+        runner.idle_sweep_once()
+        self.assertFalse(runner.idle_sweep_alive())
+
+    def test_executeur_medie(self):
+        runner = Runner.__new__(Runner)
+        runner.db = types.SimpleNamespace(cfg=types.SimpleNamespace(backend="mediated"))
+        with mock.patch("ameesh.runner.threading.Thread") as thread:
+            runner.start_idle_sweep()
+        thread.assert_not_called()
+
+
+class PasDuWorkerCouvert(unittest.TestCase):
+    def _worker(self, *, row=None, gen=0, mark=0, alive=True, releve="", nudged=True,
+                lot_wake=False):
+        runner = types.SimpleNamespace(
+            idle_sweep_alive=lambda: alive, idle_generation=lambda n: gen,
+            idle_row=lambda n: row, IDLE_SAFETY_S=900.0, idle_nudge=3600.0)
+        worker = AgentWorker.__new__(AgentWorker)
+        threading.Thread.__init__(worker, name="a")
+        worker.runner, worker.agent = runner, {"releve": releve}
+        worker._idle_mark, worker.nudged = mark, nudged
+        worker.last_activity = time.monotonic()
+        worker.cfg = types.SimpleNamespace(lot_wake=lot_wake, lot_wake_margin=60.0)
+        worker.mail_batch = lambda: 30.0
+        worker._idle_wait = lambda: 45.0
+        return worker
+
+    ROW = {"sig": "x", "pending": False, "wake_ts": None}
+
+    def test_couvert_filet(self):
+        worker = self._worker(row=dict(self.ROW))
+        self.assertEqual(worker._idle_pace(), 900.0)
+        self.assertTrue(worker._idle_gated)
+
+    def test_pas_ordinaire(self):
+        cas = {"sans passe": dict(alive=False, row=dict(self.ROW)),
+               "pas lu": dict(row=None),
+               "travail en attente": dict(row=dict(self.ROW, pending=True)),
+               "changé pendant la passe": dict(row=dict(self.ROW), gen=1),
+               "marque absente": dict(row=dict(self.ROW), mark=None),
+               "rôle élu": dict(row=dict(self.ROW), releve="election")}
+        for nom, kw in cas.items():
+            worker = self._worker(**kw)
+            self.assertEqual(worker._idle_pace(), 45.0, nom)
+            self.assertFalse(getattr(worker, "_idle_gated", False), nom)
+
+    def test_echeances_connues(self):
+        worker = self._worker(row=dict(self.ROW, wake_ts=time.time() + 100))
+        self.assertAlmostEqual(worker._idle_pace(), 100.0, delta=1)
+        worker = self._worker(row=dict(self.ROW), nudged=False)
+        worker.last_activity -= 3600 - 200
+        self.assertAlmostEqual(worker._idle_pace(), 200.0, delta=1)
+        worker = self._worker(row=dict(self.ROW), lot_wake=True)
+        self.assertAlmostEqual(worker._idle_pace(), 90.0, delta=1)  # 30 + 60
+        # échéance passée : le filet
+        worker = self._worker(row=dict(self.ROW, wake_ts=time.time() - 5))
+        self.assertEqual(worker._idle_pace(), 900.0)
+
+    def test_pas_regle_plus_long_que_le_filet(self):
+        worker = self._worker(row=dict(self.ROW))
+        worker._idle_wait = lambda: 1200.0
+        self.assertEqual(worker._idle_pace(), 1200.0)
+
+
+class EmpreintesEnBase(PgTestCase):
+    def test_empreintes(self):
+        self.register("s1", "claude")
+        self.register("s2", "claude")
+        leases = storage.of(self.db).leases
+        a = leases.idle_signatures(["s1", "s2", "absent"])
+        self.assertEqual(set(a["agents"]), {"s1", "s2"})
+        self.assertFalse(a["agents"]["s1"]["pending"])
+        epoch = int(registry.claim(self.db, "s1", "r", 60)["lease_epoch"])
+        b = leases.idle_signatures(["s1", "s2"])
+        self.assertEqual(b["agents"]["s2"], a["agents"]["s2"])
+        # le battement ne change pas l'empreinte
+        leases.renew("s1", "r", epoch, 120)
+        leases.renew_many("r", [("s1", epoch, 120)])
+        self.assertEqual(leases.idle_signatures(["s1", "s2"]), b)
+        # courrier actif : changé et en attente ; passif : rien
+        from ameesh import mail
+        mail.send(self.db, "s2", "s1", "info", payload={"info": True})
+        self.assertEqual(leases.idle_signatures(["s1"])["agents"]["s1"], b["agents"]["s1"])
+        mail.send(self.db, "s2", "s1", "à faire")
+        c = leases.idle_signatures(["s1"])["agents"]["s1"]
+        self.assertNotEqual(c["sig"], b["agents"]["s1"]["sig"])
+        self.assertTrue(c["pending"])
+        # consigne en attente
+        self.db.execute("UPDATE agent_registry SET pending_prompt='go' WHERE name='s2'")
+        self.assertTrue(leases.idle_signatures(["s2"])["agents"]["s2"]["pending"])
+        self.assertEqual(leases.idle_signatures([]), {"host": "", "agents": {}})
+
+
+class PasseGroupeeReelle(PgTestCase):
+    """Un worker au repos ne refait plus sa passe ; un changement de sa ligne
+    du registre la relance au balayage suivant."""
+
+    def test_reveil_sur_changement_seulement(self):
+        name = "sweep8166"
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        self.register(name, "claude", cwd=cwd)
+        runner = Runner(self.cfg, self.db)
+        runner.poll = 1.0
+        runner.listener = object()  # pas ordinaire : max(1 s, 1 agent / 1 passe/s)
+        passes = []
+        original_pick = AgentWorker._pick_for_turn
+
+        def pick(self_):
+            passes.append(time.monotonic())
+            return original_pick(self_)
+
+        with mock.patch.object(Runner, "IDLE_SWEEP_S", 0.5), \
+                mock.patch.object(AgentWorker, "_pick_for_turn", pick):
+            runner.start_idle_sweep()
+            lease = registry.claim(self.db, name, runner.runner_id, 180)
+            worker = AgentWorker(runner, registry.get(self.db, name), lease)
+            runner.workers[name] = worker
+            worker.start()
+            try:
+                deadline = time.monotonic() + 60
+                while not worker._idle_gated:
+                    self.assertLess(time.monotonic(), deadline, "never covered by the sweep")
+                    time.sleep(0.05)
+                avant = len(passes)
+                time.sleep(4)  # au pas ordinaire : quatre passes
+                calme = len(passes) - avant
+                self.db.execute("UPDATE agent_registry SET effort='high' WHERE name=%s",
+                                (name,))
+                deadline = time.monotonic() + 10
+                while len(passes) == avant + calme:
+                    self.assertLess(time.monotonic(), deadline, "change not seen")
+                    time.sleep(0.05)
+            finally:
+                runner.stop.set()
+                worker.stopping.set()
+                worker.wake.set()
+                worker.join(30)
+        self.assertEqual(calme, 0)
+
+
+
+class SuitesDe8152(unittest.TestCase):
+    def test_rythme_relu_a_chaud(self):
+        from ameesh.runner import RELOADABLE_FIELDS
+        self.assertLessEqual({"idle_passes_per_s", "idle_poll_max"}, RELOADABLE_FIELDS)
+
+    def test_plafond_seul_leve_le_tiers_du_bail(self):
+        runner = Runner.__new__(Runner)
+        runner.poll, runner.lock, runner.listener = 5.0, threading.Lock(), object()
+        runner.workers = {"a%03d" % i: object() for i in range(128)}
+        runner.cfg = types.SimpleNamespace(idle_passes_per_s=0.0, idle_poll_max=120.0)
+        self.assertTrue(runner.idle_pace_set())
+        worker = AgentWorker.__new__(AgentWorker)
+        worker.runner = runner
+        with mock.patch.object(AgentWorker, "lease_ttl", new_callable=mock.PropertyMock,
+                               return_value=180.0):
+            self.assertEqual(worker._idle_wait(), 120.0)
+        runner.cfg = types.SimpleNamespace(idle_passes_per_s=0.0, idle_poll_max=0.0)
+        self.assertFalse(runner.idle_pace_set())
+
+
+class LectureDuRegistre(PgTestCase):
+    def test_primaire_sans_resolution_alias_resolu(self):
+        self.register("prim8166", "claude")
+        self.db.execute("UPDATE agent_registry SET aliases = ARRAY['ancien8166']"
+                        " WHERE name = 'prim8166'")
+        # schéma propre au test : la fonction compte ses appels
+        self.db.execute(
+            "CREATE TABLE appels8166 (supplied text);"
+            " ALTER FUNCTION ameesh_resolve_agent_name(text, text)"
+            "   RENAME TO resolve8166_reelle;"
+            " CREATE FUNCTION ameesh_resolve_agent_name(supplied text, context text)"
+            " RETURNS text LANGUAGE plpgsql VOLATILE AS $$ BEGIN"
+            "   INSERT INTO appels8166 VALUES (supplied);"
+            "   RETURN resolve8166_reelle(supplied, context); END $$;")
+        appels = lambda: [r["supplied"] for r in self.db.query(
+            "SELECT supplied FROM appels8166 ORDER BY supplied")]
+        self.assertEqual(storage.of(self.db).agents.get("prim8166")["name"], "prim8166")
+        self.assertEqual(appels(), [])
+        self.assertEqual(storage.of(self.db).agents.get("ancien8166")["name"], "prim8166")
+        self.assertIsNone(storage.of(self.db).agents.get("inconnu8166"))
+        self.assertEqual(appels(), ["ancien8166", "inconnu8166"])
+        audits = self.db.query("SELECT supplied_name FROM agent_name_resolutions"
+                               " WHERE primary_name = 'prim8166'")
+        self.assertEqual([a["supplied_name"] for a in audits], ["ancien8166"])
 
 if __name__ == "__main__":
     unittest.main()

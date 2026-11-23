@@ -116,8 +116,14 @@ GET_SQL = """
             FROM agent_mailbox m
            WHERE m.sender = agent_registry.name
            ORDER BY m.id DESC LIMIT 1) presence ON true
-     WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
+     WHERE name = coalesce(
+           (SELECT r0.name FROM agent_registry r0 WHERE r0.name = %%s),
+           (SELECT ameesh_resolve_agent_name(%%s, %%s)))
     """ % GET_COLUMNS
+#: #8166 (N impl-01 sur #8152) : un nom primaire est trouvé par la clé ;
+#: `ameesh_resolve_agent_name` (parcours de `aliases`, audit) n'est évaluée
+#: que pour un alias ou un nom inconnu — `COALESCE` n'évalue pas le
+#: sous-plan suivant une valeur non nulle.
 
 
 def check_name(name: str) -> str:
@@ -743,7 +749,7 @@ class Agents(interface.Agents):
     def get(self, name) -> dict | None:
         # #3729 : le dernier message déposé et son hôte, comme `overview`
         # (#3337) — `ameesh show` lit la même preuve de vie que `list`.
-        rows = self.db.query(GET_SQL, (name, "agents.get"))
+        rows = self.db.query(GET_SQL, (name, name, "agents.get"))
         return {key: rows[0].get(key) for key in _GET_NAMES} if rows else None
 
     def resolve_name(self, name, *, operation="lookup") -> str:
@@ -1473,6 +1479,58 @@ class Leases(interface.Leases):
              [float(ttl) for _, _, ttl in leases], names, owner),
         )
         return {row["name"]: row["lease_expires_ts"] for row in rows}
+
+    #: #8166 : colonnes du registre écrites sans changer ce qu'une passe au
+    #: repos décide (bail, présence, horodatages) : hors de l'empreinte.
+    IDLE_VOLATILE = ("lease_expires_at", "last_seen", "updated_at", "runner_seen_at",
+                     "runner_seen_host", "runner_seen_owner", "lease_wait_since",
+                     "last_event_at", "status_since", "status_reason_since")
+
+    def idle_signatures(self, names) -> dict | None:
+        from .lot_sessions import _CLOSED
+        from .work import has_wake_at
+        names = sorted({str(n) for n in names})
+        if not names:
+            return {"host": "", "agents": {}}
+        wake = ("(SELECT extract(epoch from min(w.wake_at))::float8 FROM work_items w"
+                "  WHERE w.assignee = r.name AND w.wake_at IS NOT NULL"
+                "    AND w.state NOT IN " + _CLOSED + ")"
+                if has_wake_at(self.db) else "NULL::float8")
+        rows = self.db.query(
+            """
+            WITH actif AS (
+                SELECT m.recipient, count(*)::bigint AS n, max(m.id) AS dernier
+                  FROM agent_mailbox m
+                 WHERE m.recipient = ANY(%s::text[]) AND m.delivered_at IS NULL
+                   AND NOT """ + PASSIVE_SQL.format(t="m") + """
+                 GROUP BY m.recipient
+            ), agents AS (
+                SELECT r.name,
+                       md5((to_jsonb(r) - %s::text[])::text
+                           || ':' || coalesce(a.n, 0) || ':' || coalesce(a.dernier, 0)
+                           || ':' || coalesce(""" + wake + """::text, '')) AS sig,
+                       (coalesce(a.n, 0) > 0 OR r.pending_prompt IS NOT NULL) AS pending,
+                       """ + wake + """ AS wake_ts
+                  FROM agent_registry r LEFT JOIN actif a ON a.recipient = r.name
+                 WHERE r.name = ANY(%s::text[])
+            )
+            SELECT a.name, a.sig, a.pending, a.wake_ts,
+                   (SELECT md5(coalesce(string_agg(to_jsonb(c)::text, ',' ORDER BY c.host), ''))
+                      FROM host_lifecycle c) AS host_sig
+              FROM agents a
+             UNION ALL
+            SELECT NULL, NULL, NULL, NULL,
+                   (SELECT md5(coalesce(string_agg(to_jsonb(c)::text, ',' ORDER BY c.host), ''))
+                      FROM host_lifecycle c)
+             WHERE NOT EXISTS (SELECT 1 FROM agents)
+            """,
+            (names, list(self.IDLE_VOLATILE), names),
+        )
+        host_sig = rows[0]["host_sig"] if rows else ""
+        return {"host": host_sig or "",
+                "agents": {row["name"]: {"sig": row["sig"], "pending": bool(row["pending"]),
+                                         "wake_ts": row["wake_ts"]}
+                           for row in rows if row.get("name")}}
 
     def release(self, name, owner, epoch) -> bool:
         rows = self.db.query(
