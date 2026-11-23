@@ -20,9 +20,11 @@ Témoins :
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -93,6 +95,70 @@ class DebitDeRepos(unittest.TestCase):
     def test_doublure_sans_reglage(self):
         worker = self._worker(types.SimpleNamespace(poll=3.0), 180)
         self.assertEqual(worker._idle_wait(), 3.0)
+
+
+class AttenteMalgreLesRenouvellements(unittest.TestCase):
+    """B impl-11 : le pas réglé est tenu même s'il dépasse le bail."""
+
+    TTL = 0.3
+
+    def _worker(self):
+        worker = AgentWorker.__new__(AgentWorker)
+        worker.runner = types.SimpleNamespace(stop=threading.Event(),
+                                              draining=threading.Event())
+        worker.wake, worker.stopping = threading.Event(), threading.Event()
+        worker.lease_lost = threading.Event()
+        worker.lease_deadline = time.time() + self.TTL
+        patcher = mock.patch.object(AgentWorker, "lease_ttl",
+                                    new_callable=mock.PropertyMock, return_value=self.TTL)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return worker
+
+    def _renew(self, worker, stop):
+        # le battement : repousse l'échéance sans toucher l'attente du worker
+        def battement():
+            while not stop.wait(self.TTL / 3):
+                worker.lease_deadline = time.time() + self.TTL
+        thread = threading.Thread(target=battement, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(stop.set)
+
+    def test_le_pas_entier_malgre_un_bail_plus_court(self):
+        worker, stop = self._worker(), threading.Event()
+        self._renew(worker, stop)
+        debut = time.monotonic()
+        self.assertFalse(worker._idle_sleep(1.5))
+        # ni coupé à l'échéance du premier bail (0,3 s), ni rejoué
+        self.assertGreaterEqual(time.monotonic() - debut, 1.45)
+
+    def test_un_reveil_interrompt(self):
+        worker, stop = self._worker(), threading.Event()
+        self._renew(worker, stop)
+        threading.Timer(0.2, worker.wake.set).start()
+        debut = time.monotonic()
+        self.assertTrue(worker._idle_sleep(5.0))
+        self.assertLess(time.monotonic() - debut, 1.0)
+
+    def test_bail_echu_sans_battement(self):
+        worker = self._worker()  # personne ne renouvelle
+        debut = time.monotonic()
+        self.assertFalse(worker._idle_sleep(5.0))
+        self.assertLess(time.monotonic() - debut, 1.0)
+
+    def test_arret_drainage_perte_de_bail(self):
+        for drapeau in ("stop", "draining", "lease_lost", "stopping"):
+            worker, stop = self._worker(), threading.Event()
+            self._renew(worker, stop)
+            event = (getattr(worker.runner, drapeau) if drapeau in ("stop", "draining")
+                     else getattr(worker, drapeau))
+            threading.Timer(0.1, event.set).start()
+            debut = time.monotonic()
+            self.assertFalse(worker._idle_sleep(5.0), drapeau)
+            # vu à la fin de la tranche en cours (bornée par le bail)
+            self.assertLess(time.monotonic() - debut, 2.0, drapeau)
+            stop.set()
 
 
 class ConfigDuDebit(unittest.TestCase):
@@ -208,6 +274,42 @@ class PasseAuReposReelle(PgTestCase):
             sum("schema_non_additive_migrations" in sql for sql in steady), 1,
             "the idle pass shares the runner's schema admission (5 s)")
         self.assertEqual([sql for sql in steady if _RESOLVE.search(sql)], [])
+
+    def test_debit_regle_tenu_par_la_boucle_reelle(self):
+        """B impl-11 : bail de 3 s renouvelé par le vrai battement, pas réglé à
+        100 s : une seule passe en 8 s (avant : une passe par bail au moins)."""
+        name = "debit8152"
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        self.register(name, "claude", cwd=cwd)
+        cfg = dataclasses.replace(self.cfg, idle_passes_per_s=0.01, lease_ttl=3.0)
+        runner = Runner(cfg, self.db)
+        runner.poll = 1.0
+        runner.listener = object()  # écoute établie : le pas réglé s'applique
+        lease = registry.claim(self.db, name, runner.runner_id, 3)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        runner.workers[name] = worker
+        passes = []
+        original_pick = AgentWorker._pick_for_turn
+
+        def pick(self_):
+            passes.append(time.monotonic())
+            return original_pick(self_)
+
+        with mock.patch.object(AgentWorker, "_pick_for_turn", pick):
+            worker.start()
+            try:
+                time.sleep(8)
+                vivant = registry.get(self.db, name)
+            finally:
+                runner.stop.set()
+                worker.stopping.set()
+                worker.wake.set()
+                worker.join(30)
+                runner.listener = None
+        self.assertEqual(len(passes), 1, passes)
+        # le bail a bien été renouvelé pendant l'attente (battement)
+        self.assertEqual(vivant.get("lease_owner"), runner.runner_id)
 
 
 if __name__ == "__main__":

@@ -779,6 +779,10 @@ def preference_lease_ttl(agent, host_ttl) -> float:
     return min(ttl, short) if ttl > 0 else short
 
 
+#: #8152 : un événement jamais posé (doublures d'exécuteur sans drapeau).
+_NEVER = threading.Event()
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -12019,6 +12023,32 @@ class AgentWorker(threading.Thread):
             return pas
         return min(pas, max(1.0, self.lease_ttl / 3.0))
 
+    def _idle_sleep(self, pas: float) -> bool:
+        """#8152 (B impl-11) : dort `pas` en entier, renouvellements compris.
+
+        `wait_timeout` borne chaque attente à l'échéance du bail courant ; le
+        battement la repousse sans prolonger l'attente déjà programmée, et un
+        débit réglé au-delà du bail rejouait la passe complète à chaque bail.
+        L'attente se fait donc par tranches d'au plus un tiers du bail, chacune
+        bornée par l'échéance relue ; entre deux tranches, seuls des drapeaux
+        en mémoire sont relus (aucune requête). Sortie anticipée : réveil
+        (NOTIFY, échéance métier), arrêt, drainage, bail perdu ou échu — la
+        passe qui suit les traite. Rend vrai si un réveil l'a interrompue."""
+        fin = time.monotonic() + max(0.0, pas)
+        tranche = max(1.0, self.lease_ttl / 3.0)
+        runner = self.runner
+        while True:
+            reste = fin - time.monotonic()
+            if reste <= 0:
+                return False
+            if self.wake.wait(timeout=self.wait_timeout(min(reste, tranche))):
+                return True
+            if (self.stopping.is_set() or self.lease_lost.is_set()
+                    or self.deadline_passed()
+                    or getattr(runner, "stop", _NEVER).is_set()
+                    or getattr(runner, "draining", _NEVER).is_set()):
+                return False
+
     def _admission_priority(self) -> None:
         """#4602 : applique au fil la classe de la passe qui commence.
 
@@ -12181,8 +12211,7 @@ class AgentWorker(threading.Thread):
                     self._deferral_over()  # #1914 : plus rien à prendre
                     self._resident_between_turns()  # L76 : mort, sommeil
                     admission_lock.reset()  # #4602 : la passe prioritaire est finie
-                    self.wake.wait(timeout=self.wait_timeout(self._until_due(
-                        self._idle_wait())))
+                    self._idle_sleep(self._until_due(self._idle_wait()))
                     self.wake.clear()
                     continue
                 try:
