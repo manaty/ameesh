@@ -16,6 +16,41 @@ from .support import hold_for_owner
 from .test_l119_backlog import HEURE, _Base, _seuils
 
 
+#: #8139 : borne de secours seulement. L'attente s'arrête dès que la
+#: sélection aboutit, que le fil meurt ou qu'il bloque derrière l'édition.
+SELECTION_DEADLINE_S = 300
+
+
+def _attendre_selection(test, tx, pid, selected, worker, errors):
+    """#8139 : attend que la sélection du fil aboutisse, sans horloge courte.
+
+    Avant `check_assignee`, la sélection ne doit attendre aucun verrou de la
+    transaction `pid` (non commitée) : un fil bloqué derrière elle à ce stade
+    est un défaut de `auto_take`, pas une lenteur du runner. Chaque échec dit
+    ce que faisait le fil (requête bloquée, exception, pile)."""
+    import sys
+    import traceback
+
+    deadline = time.monotonic() + SELECTION_DEADLINE_S
+    while not selected.wait(0.1):
+        if not worker.is_alive():
+            test.fail("le fil de prise a terminé sans sélection ; erreurs : %r" % (errors,))
+        # Le cliché d'activité est figé dans la transaction : on le relâche.
+        tx.query("SELECT pg_stat_clear_snapshot()")
+        blocked = tx.query(
+            "SELECT pid, wait_event_type, wait_event, query FROM pg_stat_activity"
+            " WHERE %s = ANY(pg_blocking_pids(pid))", (pid,))
+        # La sélection précède l'attente attendue : relue APRÈS la requête,
+        # elle distingue la prise (légitimement bloquée) de la sélection.
+        if blocked and not selected.is_set():
+            test.fail("la sélection attend l'édition non commitée : %r" % (blocked,))
+        if time.monotonic() > deadline:
+            frame = sys._current_frames().get(worker.ident)
+            stack = "".join(traceback.format_stack(frame)) if frame else "?"
+            test.fail("la sélection concurrente n'a pas abouti en %d s ; erreurs : %r\n%s"
+                      % (SELECTION_DEADLINE_S, errors, stack))
+
+
 class _Lots(_Base):
     def lot(self, title, *, app="nexlink", age_s=HEURE, **kw):
         item = work.add(self.db, title=title, app=app, **kw)
@@ -162,11 +197,12 @@ class PriseDeLotTest(_Lots):
         try:
             with self.db.transaction() as tx:
                 storage.of(tx).work_dependencies.add(bloque["id"], amont["id"], actor="test")
+                pid = tx.query("SELECT pg_backend_pid() AS pid")[0]["pid"]
                 worker.start()
-                self.assertTrue(selected.wait(15), "la sélection concurrente n'a pas abouti")
+                _attendre_selection(self, tx, pid, selected, worker, errors)
         finally:
             if worker.ident is not None:
-                worker.join(15)
+                worker.join(SELECTION_DEADLINE_S)
         self.assertFalse(worker.is_alive(), "la prise concurrente n'a pas terminé")
         self.assertEqual(errors, [])
         self.assertEqual([t["item"]["id"] for t in result], [pret["id"]])

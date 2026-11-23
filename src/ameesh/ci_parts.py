@@ -209,6 +209,12 @@ def extract(repo: str, commit: str, dest: str) -> None:
     top = git_toplevel(repo)
     if top and os.path.realpath(repo) != top:
         repo = top
+    # #8141 : `dest` peut être un lien — le TMPDIR d'une session (#8128) pointe
+    # hors de son répertoire court. `_member_path` compare le realpath de chaque
+    # entrée à `dest` : résolu une seule fois ici, sinon la première entrée
+    # d'archive (`.ameesh/`) se lit hors de l'arbre. Résolu avant la création :
+    # l'arbre est écrit à sa place réelle, jamais à travers le lien.
+    dest = os.path.realpath(dest)
     if not os.path.isdir(dest):
         os.makedirs(dest)
     argv = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",

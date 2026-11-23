@@ -868,7 +868,10 @@ def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list
 
 
 def executor_canons(db) -> list[tuple[str, dict]]:
-    """The newest executor record carrying `canon_ref`, per request key."""
+    """The newest executor record carrying `canon_ref`, per request key.
+
+    #8138: the event row is kept, not only its data: its `id` orders that
+    pass against a candidate's tick, which may have read a newer canon."""
     events = storage.of(db).events
     out = []
     for row in events.latest_type("staging.request", 60, LIMIT):
@@ -882,15 +885,17 @@ def executor_canons(db) -> list[tuple[str, dict]]:
             if not (isinstance(data, dict) and data.get("canon_ref")):
                 continue
             if found is None:
-                found = data
+                found = item
                 if "canon_refresh" in data:
                     break
             elif "canon_refresh" in data:
                 # #7053: a later failed or blocked pass carries no refresh;
                 # the refusal of the last completed one on the same copy
                 # still speaks for it.
-                if data["canon_ref"] == found["canon_ref"]:
-                    found = dict(found, canon_refresh=data["canon_refresh"])
+                current = found.get("data") or {}
+                if data["canon_ref"] == current.get("canon_ref"):
+                    found = dict(found, data=dict(
+                        current, canon_refresh=data["canon_refresh"]))
                 break
         if found is not None:
             out.append((key.split(":", 1)[-1], found))
@@ -908,6 +913,24 @@ def _first_ahead(repo: str):
         line = (out or "").splitlines()[:1]
         return float(line[0]) if line and line[0].isdigit() else None
     return first
+
+
+def _newer_record(candidate: dict, held: dict) -> bool:
+    """#8138: whether a shared-log record was inserted after another.
+
+    `id` orders the journal; `ts` only speaks when a record carries no id
+    (a fixture, or an older read)."""
+    try:
+        new_id = int(candidate.get("id") or 0)
+        old_id = int(held.get("id") or 0)
+    except (TypeError, ValueError):
+        new_id = old_id = 0
+    if new_id and old_id:
+        return new_id > old_id
+    try:
+        return float(candidate.get("ts") or 0) > float(held.get("ts") or 0)
+    except (TypeError, ValueError):
+        return False
 
 
 def canon_alerts(db, *, now: float, cfg) -> list[dict]:
@@ -928,23 +951,39 @@ def canon_alerts(db, *, now: float, cfg) -> list[dict]:
             break
     if not head:
         return []
-    records = executor_canons(db)
+    reads = {}
+    for key, row in executor_canons(db):
+        data = row.get("data") or {}
+        reads[(key, data.get("host"))] = (row, data)
     # #7750: a candidate that never completed a pass has no record carrying
     # its `canon_ref`; its tick does, and the same drift rule applies.
-    covered = {(key, (data or {}).get("host")) for key, data in records}
-    extra = []
+    # #8138: for the same (key, host), the newest reading wins. A pass reads
+    # its `canon_ref` at the start, before the canon-executant step that may
+    # have advanced the pin (#8109); a fresher tick carries the new reading.
+    # An older tick never masks a newer pass.
     for (key, host), tick in executor_ticks(db).items():
-        if (key, host) in covered:
-            continue
         data = tick.get("data") or {}
         if not isinstance(data, dict) or not data.get("canon_ref"):
             continue
         if not _tick_fresh(tick, data, host, now):
             continue
-        extra.append((key, dict(data, host=host,
-                                notify=data.get("role") or "")))
-    return canon_drift_findings(records + extra, head=head,
-                                first_ahead=_first_ahead(repo), now=now)
+        pair = (key, host)
+        held_row, held_data = reads.get(pair) or (None, {})
+        if held_row is not None and not _newer_record(tick, held_row):
+            continue
+        fresh = dict(data, host=host, notify=data.get("role") or "")
+        # #7053: a refusal of an unchanged copy still speaks even when the
+        # newer tick carries no refresh of its own; it would otherwise delay
+        # the alert until the one-day threshold.
+        if (held_row is not None
+                and held_data.get("canon_ref") == fresh["canon_ref"]
+                and "canon_refresh" not in fresh
+                and isinstance(held_data.get("canon_refresh"), dict)):
+            fresh["canon_refresh"] = held_data["canon_refresh"]
+        reads[pair] = (tick, fresh)
+    return canon_drift_findings(
+        [(key, data) for (key, _host), (_row, data) in reads.items()],
+        head=head, first_ahead=_first_ahead(repo), now=now)
 
 
 #: #7164 review B2: a venv refresh marked under way in the terminal record
