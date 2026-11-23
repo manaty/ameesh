@@ -355,6 +355,71 @@ class AdapterTest(PgTestCase):
         self.assertFalse(self.q.control('burst')['claims_open'])
         self.assertIsNotNone(self.db.query('SELECT wake_delay_s FROM vm_adapter_observations')[0]['wake_delay_s'])
 
+    def test_first_tick_reports_exact_short_drain_without_blocking_ack(self):
+        self.db.execute("UPDATE host_lifecycle SET return_at=clock_timestamp()+interval '40 minutes' "
+                        "WHERE host='burst'")
+        self.assertEqual(self.tick(), 'no request')
+        control = self.q.control('burst')
+        short = self.q.short_drain('burst', control['generation'], control['release_epoch'])
+        self.assertEqual(short['result'], 'drain too short for halt: needs 4500 s')
+        self.assertEqual(self.q.status('burst', control['generation'], control['release_epoch'],
+                                       'draining'), 'done')
+        self.assertEqual(self.tick(), 'no request')
+        self.assertEqual(self.q.short_drain('burst', control['generation'],
+                                            control['release_epoch'])['result'], short['result'])
+        self.provider.action.assert_not_called()
+
+    def test_existing_draining_request_keeps_short_warning_when_acknowledged(self):
+        self.db.execute("UPDATE host_lifecycle SET return_at=clock_timestamp()+interval '40 minutes' "
+                        "WHERE host='burst'")
+        self.request('draining')
+        self.assertEqual(self.tick(), 'draining')
+        control = self.q.control('burst')
+        self.assertEqual(self.q.short_drain('burst', control['generation'],
+                                            control['release_epoch'])['result'],
+                         'drain too short for halt: needs 4500 s')
+
+    def test_forced_drain_records_reason(self):
+        row = storage.of(self.db).host_lifecycle.drain(
+            'another', actor='human:op', duration=1800, force_short_reason='incident')
+        event = self.db.query("SELECT data FROM ameesh_events WHERE type='host.drain_short_forced' "
+                              "AND object='host:another' ORDER BY id DESC LIMIT 1")[0]['data']
+        self.assertEqual(event['reason'], 'incident')
+        self.assertEqual(event['generation'], row['generation'])
+
+    def test_first_tick_accepts_exact_worker_policy(self):
+        self.db.execute("UPDATE host_lifecycle SET return_at=clock_timestamp()+interval '2 hours' "
+                        "WHERE host='burst'")
+        self.assertEqual(self.tick(), 'no request')
+        control = self.q.control('burst')
+        self.assertIsNone(self.q.short_drain('burst', control['generation'], control['release_epoch']))
+
+    def test_canon_failure_is_recorded_and_cleared_on_recovery(self):
+        self.request()
+        self.observe_old()
+        with mock.patch('ameesh.vm_adapter.storage.of', return_value=self.store):
+            self.assertEqual(vm.tick_host(
+                self.cfg, self.db, policy(), 'burst', self.provider,
+                probe=self.probe, evidence=mock.Mock(side_effect=vm.Refused('canon unavailable'))),
+                'canon unavailable')
+        self.assertEqual(self.q.pending('burst')[0]['result'], 'canon unavailable')
+        self.provider.action.assert_not_called()
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertNotEqual(self.q.pending('burst')[0]['result'], 'canon unavailable')
+
+    def test_deadline_records_why_stop_was_superseded(self):
+        self.request()
+        self.db.execute("UPDATE host_lifecycle SET return_at=clock_timestamp()+interval '5 minutes' "
+                        "WHERE host='burst'")
+        self.operations.listing.return_value = [dict(name='worker', admitted_hosts=['burst'],
+                                                      releve=None, mode='execute', status='idle')]
+        with mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value=None):
+            self.tick()
+        rows = self.db.query("SELECT status,result FROM vm_adapter_requests WHERE state='idle-drained'")
+        self.assertEqual(rows[0]['status'], 'obsolete')
+        self.assertEqual(rows[0]['result'], 'return deadline within wake horizon')
+        self.provider.action.assert_not_called()
+
     def test_operator_return_supersedes_queued_stop(self):
         self.request()
         self.observe_old()

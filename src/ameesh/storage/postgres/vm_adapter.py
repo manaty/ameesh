@@ -181,6 +181,18 @@ class Queue:
                         (status, result, request['host'], request['generation'],
                          request['release_epoch'], request['state']))
 
+    def observed_wake_delay(self, host):
+        rows = self.db.query("SELECT wake_delay_s FROM vm_adapter_observations WHERE host=%s", (host,))
+        return rows[0]['wake_delay_s'] if rows else None
+
+    def short_drain(self, host, generation, epoch):
+        rows = self.db.query("SELECT result,extract(epoch from updated_at)::float8 AS updated_ts "
+                             "FROM vm_adapter_requests WHERE host=%s AND generation=%s "
+                             "AND release_epoch=%s AND state='draining' "
+                             "AND result LIKE 'drain too short for halt: needs %% s'",
+                             (host, generation, epoch))
+        return rows[0] if rows else None
+
     def observe(self, host, state, max_gap_s):
         return self.db.query("""
             INSERT INTO vm_adapter_observations(host,provider_state,on_since,off_since)
