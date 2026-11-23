@@ -36,14 +36,32 @@ def _write(path: str, size: int = 10) -> None:
 
 class _Base(unittest.TestCase):
     def setUp(self) -> None:
-        self.base = tempfile.mkdtemp(prefix="ameesh-8020-")
+        # #8128 : le banc doit avoir un chemin assez court pour la racine
+        # courte (`len(TMPDIR) + 40 <= 107`) ; `$TMPDIR` d'une session de lot
+        # est justement le chemin long que ce lot corrige.
+        try:
+            self.base = tempfile.mkdtemp(prefix=".ameesh-8020-",
+                                         dir=os.path.expanduser("~"))
+        except OSError:
+            self.skipTest("no writable home for a short temporary root")
         self.addCleanup(subprocess.run, ["rm", "-rf", self.base], check=False)
+        self.home = os.path.join(self.base, "home")
+        os.makedirs(self.home)
+        # #8128 : la racine courte vit sous le home ; le test ne doit jamais
+        # écrire dans celui de l'utilisateur qui lance la suite.
+        patcher = mock.patch.dict(os.environ, {"HOME": self.home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cfg = _Cfg(os.path.join(self.base, "state"))
         self.pol = menage.Policy()
         self.agent_dir = os.path.join(self.cfg.state_dir, ".menage", "tmp", "a1")
 
     def lot_dir(self, lot) -> str:
         return os.path.join(self.agent_dir, "ameesh-lot-%s" % lot)
+
+    def alias(self, lot, agent: str = "a1") -> str:
+        return os.path.join(menage.lot_tmp_link_roots(self.cfg)[0],
+                            menage.lot_tmp_link_name(agent, str(lot)))
 
 
 class NomDuDossierTest(unittest.TestCase):
@@ -60,10 +78,11 @@ class TmpDirParLotTest(_Base):
     def test_tmpdir_pointe_le_sous_dossier_du_lot(self):
         env = menage.turn_env(self.cfg, self.pol, "a1", {}, lot=8020)
         attendu = self.lot_dir(8020)
-        self.assertEqual(env["TMPDIR"], attendu)
-        self.assertEqual(env["TMP"], attendu)
-        self.assertEqual(env["TEMP"], attendu)
-        self.assertEqual(env["AMEESH_TMPDIR"], attendu)
+        # #8128 : `TMPDIR` est l'alias court, qui pointe le dossier géré.
+        self.assertTrue(os.path.islink(env["TMPDIR"]))
+        self.assertEqual(os.path.realpath(env["TMPDIR"]), attendu)
+        for key in ("TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR"):
+            self.assertEqual(env[key], env["TMPDIR"])
         self.assertTrue(os.path.isdir(attendu))
         self.assertEqual(os.stat(attendu).st_mode & 0o777, 0o700)
 
@@ -109,7 +128,9 @@ class NettoyageDesLotsTest(_Base):
         out = menage.cleanup_lot_dirs(self.cfg, self.pol, agents=["a1"],
                                       host="pc", lot_state=self.etat)
         self.assertFalse(os.path.exists(self.lot_dir(10)))
+        self.assertFalse(os.path.lexists(self.alias(10)))
         self.assertTrue(os.path.exists(self.lot_dir(11)))
+        self.assertTrue(os.path.lexists(self.alias(11)))
         self.assertEqual([d["lot"] for d in out["dirs"]], ["10"])
         self.assertTrue(out["entries"])
         self.assertEqual(out["entries"][0]["kind"], "tmp")
@@ -119,6 +140,8 @@ class NettoyageDesLotsTest(_Base):
                                       lot_state=lambda ident: "closed", dry_run=True)
         self.assertTrue(os.path.exists(self.lot_dir(10)))
         self.assertTrue(os.path.exists(self.lot_dir(11)))
+        self.assertTrue(os.path.lexists(self.alias(10)))
+        self.assertTrue(os.path.lexists(self.alias(11)))
         self.assertEqual({p["path"] for p in out["plan"]},
                          {self.lot_dir(10), self.lot_dir(11)})
         self.assertEqual(out["dirs"], [])
@@ -128,7 +151,9 @@ class NettoyageDesLotsTest(_Base):
                                       lot_state=self.etat, ended_only=True,
                                       reason="runner stopped")
         self.assertFalse(os.path.exists(self.lot_dir(10)))
+        self.assertFalse(os.path.lexists(self.alias(10)))
         self.assertTrue(os.path.exists(self.lot_dir(11)))
+        self.assertTrue(os.path.lexists(self.alias(11)))
         self.assertEqual([d["lot"] for d in out["dirs"]], ["10"])
 
     def _copie_git_avec_commit_non_pousse(self, path: str) -> None:
@@ -183,6 +208,7 @@ class NettoyageDesLotsTest(_Base):
                                       lot_state=lambda ident: "closed",
                                       ended_only=False)
         self.assertTrue(os.path.exists(self.lot_dir(11)))
+        self.assertTrue(os.path.lexists(self.alias(11)))
         self.assertTrue(any("in turn (lock held)" in note for note in out["skipped"]))
 
     def test_un_autre_agent_n_est_pas_touche(self):
@@ -193,6 +219,8 @@ class NettoyageDesLotsTest(_Base):
         self.assertFalse(os.path.exists(self.lot_dir(10)))
         self.assertTrue(os.path.exists(os.path.join(
             self.cfg.state_dir, ".menage", "tmp", "a2", "ameesh-lot-10")))
+        self.assertTrue(os.path.lexists(self.alias(10, "a2")))
+        self.assertFalse(os.path.lexists(self.alias(10)))
         self.assertEqual([d["lot"] for d in out["dirs"]], ["10", "11"])
 
 
