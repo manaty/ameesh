@@ -63,6 +63,7 @@ import time
 import uuid
 
 from . import account_budget, account_rotation, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
+from . import agent_names
 from . import cost as cost_mod
 from . import cost_attribution
 from . import context_metrics, context_profile
@@ -776,6 +777,10 @@ def preference_lease_ttl(agent, host_ttl) -> float:
     from . import election
     short = float(election.PREFERENCE_LEASE_TTL_S)
     return min(ttl, short) if ttl > 0 else short
+
+
+#: #8152 : un événement jamais posé (doublures d'exécuteur sans drapeau).
+_NEVER = threading.Event()
 
 
 class AgentWorker(threading.Thread):
@@ -12008,6 +12013,43 @@ class AgentWorker(threading.Thread):
         idle_poll = getattr(self.runner, "idle_poll", None)
         return idle_poll() if callable(idle_poll) else self.runner.poll
 
+    def _idle_wait(self) -> float:
+        """#8152 : l'attente au repos, bornée au tiers du bail sauf débit réglé
+        par l'hôte. Le battement (#5806) renouvelle seul le bail ; l'attente
+        reste bornée par son échéance (`wait_timeout`)."""
+        pas = self._idle_poll()
+        pace_set = getattr(self.runner, "idle_pace_set", None)
+        if callable(pace_set) and pace_set():
+            return pas
+        return min(pas, max(1.0, self.lease_ttl / 3.0))
+
+    def _idle_sleep(self, pas: float) -> bool:
+        """#8152 (B impl-11) : dort `pas` en entier, renouvellements compris.
+
+        `wait_timeout` borne chaque attente à l'échéance du bail courant ; le
+        battement la repousse sans prolonger l'attente déjà programmée, et un
+        débit réglé au-delà du bail rejouait la passe complète à chaque bail.
+        L'attente se fait donc par tranches d'au plus un tiers du bail, chacune
+        bornée par l'échéance relue ; entre deux tranches, seuls des drapeaux
+        en mémoire sont relus (aucune requête). Sortie anticipée : réveil
+        (NOTIFY, échéance métier), arrêt, drainage, bail perdu ou échu — la
+        passe qui suit les traite. Rend vrai si un réveil l'a interrompue."""
+        horloge = _clock_of(self)
+        fin = horloge.monotonic() + max(0.0, pas)
+        tranche = max(1.0, self.lease_ttl / 3.0)
+        runner = self.runner
+        while True:
+            reste = fin - horloge.monotonic()
+            if reste <= 0:
+                return False
+            if self.wake.wait(timeout=self.wait_timeout(min(reste, tranche))):
+                return True
+            if (self.stopping.is_set() or self.lease_lost.is_set()
+                    or self.deadline_passed()
+                    or getattr(runner, "stop", _NEVER).is_set()
+                    or getattr(runner, "draining", _NEVER).is_set()):
+                return False
+
     def _admission_priority(self) -> None:
         """#4602 : applique au fil la classe de la passe qui commence.
 
@@ -12041,7 +12083,12 @@ class AgentWorker(threading.Thread):
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 try:
-                    migrations.require_compatible_writer(self.db)
+                    # #8152 : une passe au repos partage le dernier contrôle
+                    # réussi de l'exécuteur (5 s, #5980) au lieu de relire
+                    # `schema_non_additive_migrations` à chaque passe (14 M
+                    # lectures chez IMA). Le tour garde son contrôle frais
+                    # (`run_turn`, `writer_tick`) ; un refus invalide le partage.
+                    migrations.admit_writer_connection(self.db)
                 except migrations.IncompatibleSchema as exc:
                     log_async("[%s] %s" % (self.name, exc))
                     break
@@ -12077,84 +12124,86 @@ class AgentWorker(threading.Thread):
                 # mourait sur l'exception) : tours suspendus, attente
                 # croissante, reprise d'elle-même au retour de la base.
                 try:
-                    if self._consigne_a_restaurer:
-                        self._restaure_consigne()
-                    ailleurs = self.placed_elsewhere()
-                    if ailleurs:
-                        # L147 : the agent was placed on another host (canon)
-                        # while this worker held its lease: between two turns,
-                        # the lease is released so that host can claim it
-                        log("[%s] placed on host %s, not %s: lease released after the "
-                            "current turn" % (self.name, ailleurs, self.runner.host))
-                        break
-                    retrait = self.admission_withdrawn()
-                    if retrait:
-                        # #3925 : plus admis (liste d'admission, fiche ou
-                        # placement retirés) : entre deux tours, le bail est
-                        # rendu et l'agent n'est plus réclamé
-                        log("[%s] %s: lease released after the current turn"
-                            % (self.name, retrait))
-                        break
-                    if self.host_claims_closed():
-                        # #7799 : hôte retiré (draining/lost, retour fermé ou
-                        # verrou de release) — entre deux tours, le runner au
-                        # repos cesse de renouveler et rend son bail ; sinon
-                        # `release_blocker` refuse `idle-drained` tant que ce
-                        # bail vit et la vidange d'un hôte où des agents sont
-                        # placés ne converge jamais. Un tour en cours n'est
-                        # jamais interrompu ici (contrôle après lui) et
-                        # `begin_turn` refuse déjà les tours suivants ; l'agent
-                        # est réclamé de nouveau à la réouverture des prises.
-                        log("[%s] host %s claims closed: lease released between turns"
-                            % (self.name, self.runner.host))
-                        self._leave_for_host(
-                            "host claims closed (draining or returning)")
-                        break
-                    self.apply_restart_if_requested()
-                    with self._preparing("session rotation"):
-                        self.maybe_rotate()
-                    if self.rotation_stopped:
-                        break  # #5503 : arrêté par le disjoncteur L48, bail rendu
-                    # L165 (EP2) : bascule planifiée — le détenteur rend le bail
-                    # en fin de tour, le challenger le réclame à son rang.
-                    handover = self._election_handover()
-                    if handover:
-                        if handover.get("health_reason"):
-                            message = ("Elected role handed over to %s: holder unready "
-                                       "for %.0fs (%s); lease released at end of turn."
-                                       % (handover["challenger"], handover["seconds"],
-                                          handover["health_reason"]))
-                        else:
-                            message = ("Elected role handed over to %s: %.1f availability "
-                                       "points ahead for %d min; lease released at end of turn."
-                                       % (handover["challenger"], handover["gap"],
-                                          max(1, int(handover["seconds"] // 60))))
-                        log("[%s] %s" % (self.name, message))
-                        self._fil_note(message, meta={"action": "election-handover",
-                            "challenger": handover["challenger"],
-                            "ahead_s": round(handover["seconds"], 1),
-                            "health_reason": handover.get("health_reason")})
-                        self.runner.note_handover_release(
-                            self.name, handover["challenger"],
-                            float(handover.get("delay_s") or 0.0))
-                        break
-                    # #1270 B1 : l'échéance de reprise durable garde le
-                    # lancement du tour ; un courrier, un reset ou le budget
-                    # ne la court-circuitent pas — l'attente consomme les
-                    # réveils et renouvelle le bail. Aucune consigne n'est
-                    # consommée avant l'échéance (`pick` est après).
-                    attente_reprise = self.retry_remaining()
-                    if attente_reprise > 0:
-                        self._attendre_reprise(attente_reprise)
-                        continue
-                    # #4602 : une notification a pu arriver pendant les
-                    # lectures de cette passe ; le choix du tour passe alors
-                    # en CONTROL sans attendre la passe suivante — et sans
-                    # jamais redescendre s'il était déjà CONTROL.
-                    self._admission_control()
-                    spec = self._pick_for_turn()
-                    if spec is not None and self._moved_before_turn(spec):
-                        break
+                    # #8152 : les primaires lus du registre servent toute la passe
+                    with agent_names.pass_scope():
+                        if self._consigne_a_restaurer:
+                            self._restaure_consigne()
+                        ailleurs = self.placed_elsewhere()
+                        if ailleurs:
+                            # L147 : the agent was placed on another host (canon)
+                            # while this worker held its lease: between two turns,
+                            # the lease is released so that host can claim it
+                            log("[%s] placed on host %s, not %s: lease released after the "
+                                "current turn" % (self.name, ailleurs, self.runner.host))
+                            break
+                        retrait = self.admission_withdrawn()
+                        if retrait:
+                            # #3925 : plus admis (liste d'admission, fiche ou
+                            # placement retirés) : entre deux tours, le bail est
+                            # rendu et l'agent n'est plus réclamé
+                            log("[%s] %s: lease released after the current turn"
+                                % (self.name, retrait))
+                            break
+                        if self.host_claims_closed():
+                            # #7799 : hôte retiré (draining/lost, retour fermé ou
+                            # verrou de release) — entre deux tours, le runner au
+                            # repos cesse de renouveler et rend son bail ; sinon
+                            # `release_blocker` refuse `idle-drained` tant que ce
+                            # bail vit et la vidange d'un hôte où des agents sont
+                            # placés ne converge jamais. Un tour en cours n'est
+                            # jamais interrompu ici (contrôle après lui) et
+                            # `begin_turn` refuse déjà les tours suivants ; l'agent
+                            # est réclamé de nouveau à la réouverture des prises.
+                            log("[%s] host %s claims closed: lease released between turns"
+                                % (self.name, self.runner.host))
+                            self._leave_for_host(
+                                "host claims closed (draining or returning)")
+                            break
+                        self.apply_restart_if_requested()
+                        with self._preparing("session rotation"):
+                            self.maybe_rotate()
+                        if self.rotation_stopped:
+                            break  # #5503 : arrêté par le disjoncteur L48, bail rendu
+                        # L165 (EP2) : bascule planifiée — le détenteur rend le bail
+                        # en fin de tour, le challenger le réclame à son rang.
+                        handover = self._election_handover()
+                        if handover:
+                            if handover.get("health_reason"):
+                                message = ("Elected role handed over to %s: holder unready "
+                                           "for %.0fs (%s); lease released at end of turn."
+                                           % (handover["challenger"], handover["seconds"],
+                                              handover["health_reason"]))
+                            else:
+                                message = ("Elected role handed over to %s: %.1f availability "
+                                           "points ahead for %d min; lease released at end of turn."
+                                           % (handover["challenger"], handover["gap"],
+                                              max(1, int(handover["seconds"] // 60))))
+                            log("[%s] %s" % (self.name, message))
+                            self._fil_note(message, meta={"action": "election-handover",
+                                "challenger": handover["challenger"],
+                                "ahead_s": round(handover["seconds"], 1),
+                                "health_reason": handover.get("health_reason")})
+                            self.runner.note_handover_release(
+                                self.name, handover["challenger"],
+                                float(handover.get("delay_s") or 0.0))
+                            break
+                        # #1270 B1 : l'échéance de reprise durable garde le
+                        # lancement du tour ; un courrier, un reset ou le budget
+                        # ne la court-circuitent pas — l'attente consomme les
+                        # réveils et renouvelle le bail. Aucune consigne n'est
+                        # consommée avant l'échéance (`pick` est après).
+                        attente_reprise = self.retry_remaining()
+                        if attente_reprise > 0:
+                            self._attendre_reprise(attente_reprise)
+                            continue
+                        # #4602 : une notification a pu arriver pendant les
+                        # lectures de cette passe ; le choix du tour passe alors
+                        # en CONTROL sans attendre la passe suivante — et sans
+                        # jamais redescendre s'il était déjà CONTROL.
+                        self._admission_control()
+                        spec = self._pick_for_turn()
+                        if spec is not None and self._moved_before_turn(spec):
+                            break
                 except db_mod.Unavailable as exc:
                     self._panne_de_base(exc, "choosing the turn")
                     continue
@@ -12163,8 +12212,7 @@ class AgentWorker(threading.Thread):
                     self._deferral_over()  # #1914 : plus rien à prendre
                     self._resident_between_turns()  # L76 : mort, sommeil
                     admission_lock.reset()  # #4602 : la passe prioritaire est finie
-                    self.wake.wait(timeout=self.wait_timeout(self._until_due(
-                        min(self._idle_poll(), max(1.0, self.lease_ttl / 3.0)))))
+                    self._idle_sleep(self._until_due(self._idle_wait()))
                     self.wake.clear()
                     continue
                 try:
@@ -14293,7 +14341,30 @@ class Runner:
             return self.poll
         with self.lock:
             agents = len(self.workers)
-        return max(self.poll, min(self.IDLE_POLL_MAX_S, agents / self.IDLE_PASSES_PER_S))
+        rate, cap = self.idle_pace()
+        return max(self.poll, min(cap, agents / rate))
+
+    def idle_pace(self) -> tuple[float, float]:
+        """#8152 : (passes de repos par seconde, plafond du pas) de l'exécuteur.
+
+        Par défaut `IDLE_PASSES_PER_S` et `IDLE_POLL_MAX_S` : au-delà de 45
+        agents, les passes recroissent avec le nombre d'agents (128 agents :
+        2,8 passes/s, manaty/ameesh#6379). L'hôte peut régler le débit
+        (`AMEESH_IDLE_PASSES_PER_S`) : il vaut alors à toute taille, sans
+        plafond ni tiers du bail (`idle_pace_set`), sauf `AMEESH_IDLE_POLL_MAX`.
+        Contrepartie : ce qui n'est vu qu'en passe (relève élue, réveil de lot
+        inactif ou programmé) l'est au plus un pas plus tard. Relu à chaque
+        appel : une config relue s'applique sans redémarrer."""
+        cfg = getattr(self, "cfg", None)
+        rate = getattr(cfg, "idle_passes_per_s", 0.0) or 0.0
+        cap = getattr(cfg, "idle_poll_max", 0.0) or 0.0
+        if rate > 0:
+            return rate, (cap if cap > 0 else float("inf"))
+        return self.IDLE_PASSES_PER_S, (cap if cap > 0 else self.IDLE_POLL_MAX_S)
+
+    def idle_pace_set(self) -> bool:
+        """#8152 : l'hôte a réglé le débit de repos (voir `idle_pace`)."""
+        return (getattr(getattr(self, "cfg", None), "idle_passes_per_s", 0.0) or 0.0) > 0
 
     def _wake_workers(self) -> None:
         """#4515 : réveille chaque worker (écoute rétablie, porte fermée)."""

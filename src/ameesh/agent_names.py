@@ -7,9 +7,36 @@ Unknown names are returned unchanged so each caller keeps its existing refusal.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 
 from . import storage
+
+#: #8152 : noms primaires confirmés pendant la passe courante d'un worker
+#: (None hors passe). Une ligne lue du registre confirme son nom à cet instant ;
+#: une passe au repos appelait sinon `ameesh_resolve_agent_name` quatre fois
+#: pour le même nom (43 M appels chez IMA, manaty/ameesh#6379). Propre au fil,
+#: oublié à la fin de la passe : un renommage est vu à la passe suivante.
+_PASS_PRIMARIES: contextvars.ContextVar = contextvars.ContextVar(
+    "ameesh_pass_primaries", default=None)
+
+
+@contextlib.contextmanager
+def pass_scope():
+    """#8152 : la portée d'une passe ; `resolve` y garde les primaires vus."""
+    token = _PASS_PRIMARIES.set(set())
+    try:
+        yield
+    finally:
+        _PASS_PRIMARIES.reset(token)
+
+
+def note_row(row) -> None:
+    """#8152 : une ligne `agent_registry` lue dans la passe confirme son nom."""
+    known = _PASS_PRIMARIES.get()
+    if known is not None and row and row.get("name"):
+        known.add(row["name"])
 
 
 def resolve(name: str, *, db=None, canon=None, cfg=None, operation: str = "lookup", row=None) -> str:
@@ -20,6 +47,9 @@ def resolve(name: str, *, db=None, canon=None, cfg=None, operation: str = "looku
     choosing the first card. Human references and broadcast stay untouched.
     """
     if not name or name == "all" or name.startswith("human:"):
+        return name
+    in_pass = _PASS_PRIMARIES.get()
+    if row is None and in_pass is not None and name in in_pass:
         return name
     known = getattr(db, "_agent_primary_names", None) if db is not None else None
     if row is not None:

@@ -1594,7 +1594,8 @@ def admit_writer_connection(db, directory: str = MIGRATIONS_DIR) -> None:
 
     Portée : processus, DSN exact (identité comprise), schéma et inventaire
     du code. Aucun cache interprocessus. Les contrôles explicites des passes
-    ne sont jamais sautés. Le verrou empêche qu'un succès concurrent ancien
+    (`writer_tick`, tours) ne sont jamais sautés ; seule la tête de passe au
+    repos d'un worker partage ce succès (#8152). Le verrou empêche qu'un succès concurrent ancien
     réarme le cache après un refus détecté par un autre fil.
 
     N = 5 s borne la fenêtre d'admission d'une nouvelle connexion écrivaine
