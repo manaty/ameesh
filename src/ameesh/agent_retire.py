@@ -116,11 +116,21 @@ def _single_lot(rows: list[dict]) -> str | None:
     return next(iter(lots)) if len(lots) == 1 and next(iter(lots)) else None
 
 
+def _messages_digest(rows: list[dict]) -> str:
+    """L'identité stable des messages EFFECTIVEMENT envoyés dans un avis.
+
+    Deux clôtures dans la même seconde, ou une même clôture lue par pages,
+    portent des ensembles de messages différents : leur empreinte diffère, donc
+    chacune a son avis. Un rejeu du même ensemble rend la même empreinte."""
+    ids = ",".join(str(int(row["id"])) for row in sorted(rows, key=lambda r: int(r["id"])))
+    return hashlib.sha1(ids.encode()).hexdigest()[:16]
+
+
 def _return_key(agent: str, part: str) -> str:
     """Une clé d'idempotence stable : rejouer un retour ne double jamais l'avis.
 
-    La clé ne dépend que du retiré, de l'expéditeur (ou du relais pilote) et
-    de l'instant du lot de fermeture, pas du passage qui l'envoie."""
+    La clé dépend du retiré, du destinataire (expéditeur ou pilote) et de
+    l'empreinte des messages couverts, jamais du passage qui l'envoie."""
     digest = hashlib.sha1(("%s\0%s" % (agent, part)).encode()).hexdigest()[:16]
     return "retire-return-%s" % digest
 
@@ -188,9 +198,9 @@ def _unreachable_body(agent: str, rows: list[dict], *,
     return "\n".join(lines)
 
 
-def _deliver_batch(db, cfg, agent: str, closed_ts: float, rows: list[dict], *,
+def _deliver_batch(db, cfg, agent: str, rows: list[dict], *,
                    actor: str, reason: str) -> dict:
-    """#8113 : rend UN lot de fermeture (retiré, instant, messages).
+    """#8113 : rend UN lot de fermeture (retiré, messages d'un même passage).
 
     Chaque expéditeur vivant reçoit son avis ; un expéditeur sans boîte lue
     (ou dont l'envoi échoue) part au pilote du projet. Le lot n'est marqué
@@ -206,14 +216,16 @@ def _deliver_batch(db, cfg, agent: str, closed_ts: float, rows: list[dict], *,
         groups.setdefault(str(row.get("sender") or "").strip(), []).append(row)
     summary["senders"] = sorted(groups)
     unreachable_rows: list[dict] = []
-    batch = "batch:%d" % int(float(closed_ts or 0.0))
     for sender, messages in sorted(groups.items()):
         state = _sender_state(db, agent, sender)
         if state:
             summary["unreachable"].append(sender or "?")
             unreachable_rows.extend(messages)
             continue
-        key = _return_key(agent, "%s:%s" % (batch, sender))
+        # L'empreinte couvre les messages de CET avis : une page de 500 puis
+        # le reliquat, ou deux clôtures dans la même seconde, ne partagent
+        # jamais une clé et ne se déduplisent donc pas à tort.
+        key = _return_key(agent, "%s:%s" % (sender, _messages_digest(messages)))
         try:
             mail.send(db, "ameesh", sender,
                       _returned_body(agent, messages, actor=actor, reason=reason),
@@ -237,13 +249,14 @@ def _deliver_batch(db, cfg, agent: str, closed_ts: float, rows: list[dict], *,
             "recipient": agent,
             "messages": [int(row["id"]) for row in unreachable_rows],
             "by": actor, "reason": reason}}
+        pilot_key = _return_key(
+            agent, "pilot:%s" % _messages_digest(unreachable_rows))
         for pilot in _pilots(cfg, db, agent):
             try:
                 mail.send(db, "ameesh", pilot, body, kind="event",
                           payload=payload,
                           work_item_id=_single_lot(unreachable_rows),
-                          idempotency_key=_return_key(agent, "%s:pilot:%s"
-                                                      % (batch, pilot)))
+                          idempotency_key=pilot_key)
             except Exception as exc:  # noqa: BLE001 - le lot reste en file
                 summary["warnings"].append("pilot relay to %s not sent (%s)"
                                            % (pilot, type(exc).__name__))
@@ -258,35 +271,43 @@ def _deliver_batch(db, cfg, agent: str, closed_ts: float, rows: list[dict], *,
 
 
 def replay_returns(cfg: Config, db, *, agent: str | None = None,
-                   limit: int = 500) -> dict:
+                   limit: int = 500, max_passes: int = 20) -> dict:
     """#8113 : rejoue la file durable des retours de courrier.
 
-    Lit `returns_pending` (courrier clos au retrait, non encore rendu) et
-    refait chaque lot : avis directs aux expéditeurs vivants, relais au pilote
-    pour les injoignables. Les clés d'idempotence sont stables : un rejeu
-    après un envoi réussi ne dépose aucun doublon. Rend le compte agrégé
-    (`closed`, `batches`, `senders`, `informed`, `unreachable`, `pilots`,
-    `marked`, `warnings`)."""
+    Lit `returns_pending` (courrier clos au retrait, non encore rendu) page
+    par page et draine la file : `limit` borne une lecture, jamais le lot —
+    plus de `limit` messages d'un même retrait partent en plusieurs avis,
+    chacun sous l'empreinte de SES messages. Un rejeu après un envoi réussi
+    ne dépose aucun doublon. `max_passes` borne la boucle (une passe sans
+    progrès s'arrête d'elle-même). Rend le compte agrégé (`closed`, `batches`,
+    `senders`, `informed`, `unreachable`, `pilots`, `marked`, `warnings`)."""
     out: dict = {"closed": 0, "batches": 0, "senders": [], "informed": [],
                  "unreachable": [], "pilots": [], "marked": 0, "warnings": []}
-    rows = storage.of(db).mailbox.returns_pending(agent, limit=limit)
-    batches: dict[tuple[str, float], list[dict]] = {}
-    for row in rows:
-        batches.setdefault(
-            (str(row.get("recipient") or ""), float(row.get("closed_ts") or 0.0)),
-            []).append(row)
-    for (retired, closed_ts), batch_rows in sorted(
-            batches.items(), key=lambda item: (item[0][1], item[0][0])):
-        delivered = _deliver_batch(
-            db, cfg, retired, closed_ts, batch_rows,
-            actor=str(batch_rows[0].get("retired_by") or "?"),
-            reason=str(batch_rows[0].get("retired_reason") or ""))
-        out["batches"] += 1
-        out["closed"] += delivered["closed"]
-        out["marked"] += delivered["marked"]
-        for key in ("senders", "informed", "unreachable", "pilots"):
-            out[key].extend(delivered[key])
-        out["warnings"].extend(delivered["warnings"])
+    for _pass in range(max(1, int(max_passes))):
+        rows = storage.of(db).mailbox.returns_pending(agent, limit=limit)
+        if not rows:
+            break
+        batches: dict[tuple[str, float], list[dict]] = {}
+        for row in rows:
+            batches.setdefault(
+                (str(row.get("recipient") or ""), float(row.get("closed_ts") or 0.0)),
+                []).append(row)
+        progress = 0
+        for (retired, _closed_ts), batch_rows in sorted(
+                batches.items(), key=lambda item: (item[0][1], item[0][0])):
+            delivered = _deliver_batch(
+                db, cfg, retired, batch_rows,
+                actor=str(batch_rows[0].get("retired_by") or "?"),
+                reason=str(batch_rows[0].get("retired_reason") or ""))
+            out["batches"] += 1
+            out["closed"] += delivered["closed"]
+            out["marked"] += delivered["marked"]
+            progress += delivered["marked"]
+            for key in ("senders", "informed", "unreachable", "pilots"):
+                out[key].extend(delivered[key])
+            out["warnings"].extend(delivered["warnings"])
+        if not progress:
+            break          # un envoi échoue : la file attend le prochain rejeu
     for key in ("senders", "informed", "unreachable", "pilots"):
         out[key] = sorted(set(out[key]))
     return out

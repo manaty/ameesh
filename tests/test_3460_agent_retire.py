@@ -399,6 +399,33 @@ class RetireTest(PgTestCase):
         self.assertEqual(again["closed"], 0)
         self.assertEqual(len(self.unread("other")), 1)
 
+    def test_the_return_queue_is_drained_beyond_the_read_page(self):
+        """#8113 (second avis B) : `limit` borne une lecture, pas le lot ; une
+        clôture de plus de `limit` messages part en plusieurs avis, chacun
+        couvrant SES messages (la clé ne peut pas dédupliquer à tort)."""
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        sent = [mail.send(self.db, "other", "worker", "envoi %d" % i)
+                for i in range(3)]
+        with mock.patch.object(agent_retire, "_deliver_batch",
+                               side_effect=RuntimeError("crash after commit")):
+            self.retire()
+        result = agent_retire.replay_returns(
+            self.cfg, self.db, agent="worker", limit=2)
+        self.assertEqual((result["closed"], result["marked"]), (3, 3))
+        notices = self.unread("other")
+        self.assertEqual(len(notices), 2)
+        covered = sorted(mid for notice in notices
+                         for mid in mail.message_payload(notice)["returned"]["messages"])
+        self.assertEqual(covered, sent)
+        self.assertEqual(storage.of(self.db).mailbox.returns_pending("worker"), [])
+        # l'empreinte est stable et distingue deux ensembles de messages
+        rows = [{"id": 7}, {"id": 3}]
+        self.assertEqual(agent_retire._messages_digest(rows),
+                         agent_retire._messages_digest([{"id": 3}, {"id": 7}]))
+        self.assertNotEqual(agent_retire._messages_digest(rows),
+                            agent_retire._messages_digest([{"id": 7}]))
+
     def test_mail_returns_lists_then_replays_the_durable_queue(self):
         """#8113 : `ameesh mail returns` montre la file, `--replay` la solde."""
         registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
