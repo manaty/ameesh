@@ -1243,8 +1243,9 @@ retiré ensuite. Le résultat est publié dans `staging.executor` avec
 minute. Une fois le nouveau venv lancé (le tick suivant), le canon de ce
 candidat suit son remote (`canon_refresh` dans le même événement), au plus
 toutes les cinq minutes ; un `canon_ref` épinglé n'est jamais déplacé par un
-tick — l'opérateur le monte après avoir rattrapé le venv (geste manuel,
-`bascule.py` du commit posé, puis `canon check`).
+tick — le déploiement staging le fait suivre (#8109), et à défaut l'opérateur
+le monte après avoir rattrapé le venv (geste manuel, `bascule.py` du commit
+posé, puis `canon check`).
 
 `staging_executor_stale` part quand la dernière passe `completed` d'un
 exécutant laisse `live` sur un autre commit que celui déployé, quand un
@@ -1490,6 +1491,26 @@ demande au contraire une clé de déploiement en lecture seule sur
 `manaty/home` pour ce compte (nouveau secret : deux familles de relecture,
 créée par le bureau) et `canon_ref` remis à `origin/main` ; tant qu'elle
 n'est pas décidée, l'épinglage et ce geste restent la règle.
+
+**Montée au déploiement (#8109).** La séquence staging, sur chaque VM
+d'agents, après les minuteries et avant les contrôles, fait suivre l'épingle
+de l'exécutant sans geste opérateur : le root de la séquence lit
+`refs/remotes/origin/main` du canon des agents de **cet** hôte
+(`/home/ameesh/canon`, ou la racine `canon` de leur configuration), en fait
+un bundle, l'ouvre dans la copie du compte d'exécution sous
+`refs/ameesh/staging-canon-candidate`, refuse une tête dont l'ancienne
+épingle n'est pas un ancêtre (pas d'avance rapide), la valide avec le
+`ameesh canon check` du venv de l'exécutant, avance
+`refs/remotes/origin/main` en avance rapide, puis déplace `canon_ref` d'une
+écriture atomique (ancien fichier gardé en `config.json.avant-8109`). Rien
+n'arrête l'exécutant : une passe concurrente lit un fichier complet, avant ou
+après le geste, et la suivante voit la nouvelle épingle. Un refus est tracé
+`canon-executant non-concluant` avec sa raison et **ne retient ni l'hôte ni
+la séquence** : l'alerte `staging_canon_stale` reste le témoin. La
+séquence tourne depuis l'arbre du commit demandé : l'étape est active dès
+la première séquence qui vise un commit la contenant. Le geste manuel
+ci-dessus reste pour un refus à lever et pour un candidat qu'aucune
+séquence ne déploie.
 
 Une fois la configuration et les accès approuvés, l'opérateur active les
 services sur les candidats et soumet un SHA complet :

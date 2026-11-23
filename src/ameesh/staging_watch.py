@@ -846,8 +846,10 @@ def canon_drift_findings(records, *, head: str, first_ahead, now: float) -> list
                        "the cause, or see the operator gesture in "
                        "DEPLOIEMENT-HOTE-AGENTS.md." % refused[:200])
         elif pinned:
-            detail += ("Its canon_ref is pinned (%s): no pass moves it; advance "
-                       "the pin by the operator bump in DEPLOIEMENT-HOTE-AGENTS.md "
+            detail += ("Its canon_ref is pinned (%s): no pass moves it; a staging "
+                       "deployment advances it on the host's validated canon "
+                       "(#8109). Without a deployment, or after a refusal, use the "
+                       "operator bump in DEPLOIEMENT-HOTE-AGENTS.md "
                        "(\"canon_ref épinglé\")."
                        % str(refresh.get("ref") or ref)[:40])
         else:

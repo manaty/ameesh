@@ -399,6 +399,44 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(self.attestations(), [])
         self.assertEqual(self.envois, [])
 
+    def test_etape_canon_non_concluante_ne_borne_pas_la_preuve(self):
+        """#8109 : un refus d'épingle canon est un témoin, pas un ko d'hôte.
+
+        `staging.sh` trace `canon-executant non-concluant` : l'étape n'est pas
+        dans `ETAPES_REQUISES`, et ce verdict ne borne pas les preuves de
+        l'hôte. Une attestation reste donc émise malgré le refus.
+        """
+        evenements = []
+        for item in journal_complet():
+            evenements.append(item)
+            if item.get('etape') == 'redemarrer':
+                evenements.append(evenement(
+                    item['hote'], 'canon-executant', verdict='non-concluant',
+                    detail='refused: canon check'))
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        self.assertEqual(len(self.attestations()), 1)
+
+    def test_etape_canon_ko_bornerait_la_preuve(self):
+        """#8109 : d'où le verdict non concluant — un `ko` couperait la preuve.
+
+        Ce témoin fige la raison du choix : `actif.py` traite tout `ko` comme
+        une borne, et l'hôte perdrait ses étapes antérieures.
+        """
+        evenements = []
+        for item in journal_complet():
+            evenements.append(item)
+            if item.get('etape') == 'redemarrer':
+                evenements.append(evenement(
+                    item['hote'], 'canon-executant', verdict='ko',
+                    detail='refused: canon check'))
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertNotEqual(code, 0)
+        self.assertIn('preuve(s) manquante(s)', erreur)
+        self.assertEqual(self.attestations(), [])
+
     def test_retour_puis_rejeu_sain_du_meme_hote_atteste(self):
         """#6289 : le retour n'invalide que son hote ; un rejeu sain du meme
         commit, posterieur, le rehabilite sans rejouer les autres hotes."""
