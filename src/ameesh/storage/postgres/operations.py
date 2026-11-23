@@ -222,6 +222,9 @@ class Operations(interface.Operations):
                    m.vm_wake_mail_id,
                    extract(epoch from m.oldest)::float8 AS oldest_unread_ts,
                    coalesce(m.n_passive, 0)::bigint AS passive_unread,
+                   -- #8129 : le non-lu `--urgent`, seul courrier qui rappelle
+                   -- un hôte drainé à la main avec un retour daté
+                   coalesce(m.n_urgent, 0)::bigint AS urgent_unread,
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
                    (coalesce(""" + start_defers("sw", "j.today") + """, false)
                        OR coalesce(sw.wake_at > clock_timestamp(), false)) AS session_lot_later,
@@ -250,8 +253,10 @@ class Operations(interface.Operations):
                   -- #3923 : deux index partiels disjoints (actif 0495, passif
                   -- 0489) au lieu d'un parcours du tas de tous les non-lus —
                   -- les 5 074 non-lus de l'agent de supervision coûtaient 443 ms à eux seuls.
-                  SELECT actif.n, actif.oldest, actif.vm_wake_mail_id, passif.n_passive
+                  SELECT actif.n, actif.oldest, actif.vm_wake_mail_id, actif.n_urgent,
+                         passif.n_passive
                     FROM (SELECT count(*) AS n,
+                                 count(*) FILTER (WHERE mb.payload @> '{"urgent": true}'::jsonb) AS n_urgent,
                                  min(mb.created_at) AS oldest,
                                  min(mb.id) FILTER (WHERE mb.kind <> 'event' OR mb.payload @> '{"urgent": true}'::jsonb) AS vm_wake_mail_id
                             FROM agent_mailbox mb

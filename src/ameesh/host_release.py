@@ -359,25 +359,38 @@ def _open_hosts(controls, known_hosts, holds):
     return set(known_hosts or ()) - closed
 
 
+def _dated_manual_drain(control):
+    """#8129: a manual drain (not `automatic`) still carrying its `return_at`
+    is a promise to come back at that time. The storage clears `return_at`
+    when it falls due (mode `returning`), so no clock is needed here."""
+    return (control.get("mode") == "draining" and not control.get("automatic")
+            and resources.finite_float(control.get("return_ts")) is not None)
+
+
 def return_targets(control, listing, controls, *, known_hosts, holds):
     """Agents whose pending work can only run on this withdrawn host.
 
     An elected role moves by election, never by waking a drained host. An
     agent admitted on another open host is left to the handoff/relocation
-    path; waking the host for it would defeat the release."""
+    path; waking the host for it would defeat the release.
+
+    #8129: during a dated manual drain, unread mail calls the host back only
+    when it is `--urgent`; ordinary mail waits for the announced return. An
+    automatic drain (#8029) keeps waking on any mail, that is its purpose."""
     if not control or control.get("mode") not in ("draining", "returning"):
         return []
     host = control.get("host")
     if host in (holds or {}):
         return []
     open_hosts = _open_hosts(controls, known_hosts, holds)
+    mail_key = "urgent_unread" if _dated_manual_drain(control) else "unread"
     out = []
     for row in listing or ():
         if row.get("host") != host or row.get("releve") in ("election", "preference"):
             continue
         if row.get("mode") not in (None, "execute") or row.get("status") == "stopped":
             continue
-        work = bool(row.get("actionable_lots") or row.get("unread")
+        work = bool(row.get("actionable_lots") or row.get(mail_key)
                     or row.get("has_pending_prompt")
                     or row.get("restart_requested_ts"))
         if not work:
