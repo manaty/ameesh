@@ -289,6 +289,170 @@ def _external_executor_ts(item: dict, events: Iterable[dict]) -> float | None:
     return base
 
 
+#: #8163 : mots d'une note qui attestent le travail fait par l'exécutant
+#: externe — relevé de vérification, commentaire de livraison. « FAIT » n'est
+#: reconnu qu'en majuscules (la forme du bureau) : « faites sous #8054 », un
+#: rappel de migrations antérieures, n'est pas une preuve de fin. Une négation
+#: proche (« pas fait », « not delivered »…) annule la preuve.
+_EXTERNAL_DONE_WORDS = re.compile(
+    r"(?:\btermin[ée]e?s?\b|\blivr[ée]e?s?\b|\bd[ée]ploy[ée]e?s?\b|"
+    r"\bdelivered\b|\bdeployed\b|\bverified\b|\bverification\b|"
+    r"\bv[ée]rification\b|\bdelivery\s+comment\b|"
+    r"\bcommentaire\s+de\s+livraison\b|"
+    r"\bwork\s+done\b|\bdone\b|\bcomplete[ds]?\b)", re.I)
+_EXTERNAL_DONE_UPPER = re.compile(r"\bFAIT\b")
+_EXTERNAL_UNDONE = re.compile(
+    r"(?:\bnot\s+(?:done|delivered|deployed|verified|complete)\b|"
+    r"\bpas\s+(?:fait|livr[ée]e?s?|d[ée]ploy[ée]e?s?|v[ée]rifi[ée]e?s?)\b|"
+    r"\bnon\s+(?:fait|livr[ée]e?s?|v[ée]rifi[ée]e?s?)\b|"
+    r"\breste\s+[àa]\s+faire\b|\bstill\s+to\s+do\b|\bpending\b|"
+    r"\bfail(?:ed|ure)\b|\b[ée]chec\b)", re.I)
+
+
+def _external_done_note(note: str) -> bool:
+    """#8163 : la note atteste-t-elle le travail fait (sans négation proche) ?"""
+    text = str(note or "")
+    match = _EXTERNAL_DONE_WORDS.search(text) or _EXTERNAL_DONE_UPPER.search(text)
+    if match is None:
+        return False
+    window = text[max(0, match.start() - 40):match.end()]
+    return _EXTERNAL_UNDONE.search(window) is None
+
+
+def _external_name(note: str, prefix: str) -> str | None:
+    """#8163 : le nom de l'exécutant porté par une note du journal, ou None."""
+    text = str(note or "").strip()
+    if prefix not in text:
+        return None
+    rest = text.split(prefix, 1)[1].strip()
+    for stop in (" (session", ";"):
+        rest = rest.split(stop, 1)[0].strip()
+    return rest or None
+
+
+def external_reservation_periods(item: dict,
+                                 events: Iterable[dict]) -> list[dict]:
+    """#8163 : les périodes de réservation à un exécutant externe, datées.
+
+    Le journal les écrit : un lot né réservé (`RESERVED_AT_CREATION` dans sa
+    note de création) ou une déclaration tardive (`EXTERNAL_EXECUTOR_NOTE`)
+    ouvre une période ; la levée (`EXTERNAL_EXECUTOR_CLEARED_NOTE`) la ferme.
+    Une nouvelle déclaration pendant la période (changement d'exécutant) ne la
+    ferme pas. `closed_ts` vaut None tant que la réservation tient ; un champ
+    courant sans note datée ouvre la période à `_external_executor_ts`.
+
+    Rend une liste de dicts `{executor, opened_ts, closed_ts}`, dans l'ordre
+    du journal. Aucune période inventée sans trace : un lot qui n'a jamais été
+    réservé rend `[]`.
+    """
+    from .storage.interface import (EXTERNAL_EXECUTOR_CLEARED_NOTE,
+                                    EXTERNAL_EXECUTOR_NOTE)
+
+    ordered = sorted(events or (),
+                     key=lambda ev: (float(ev.get("created_ts") or 0.0),
+                                     int(ev.get("id") or 0)))
+    out: list[dict] = []
+    opened = None
+    executor = None
+
+    def _open(stamp, name):
+        nonlocal opened, executor
+        if opened is None and stamp is not None:
+            opened = float(stamp)
+        if name:
+            executor = name
+
+    for event in ordered:
+        note = str(event.get("note") or "")
+        at = event.get("created_ts")
+        stamp = None if at is None else float(at)
+        if note.startswith(EXTERNAL_EXECUTOR_NOTE):
+            _open(stamp, _external_name(note, EXTERNAL_EXECUTOR_NOTE))
+        elif note.startswith(EXTERNAL_EXECUTOR_CLEARED_NOTE):
+            start = opened
+            if start is None and item.get("created_ts") is not None:
+                start = float(item["created_ts"])
+            if start is not None:
+                out.append({"executor": executor, "opened_ts": start,
+                            "closed_ts": stamp})
+            opened, executor = None, None
+        elif (opened is None and note.startswith("created")
+              and RESERVED_AT_CREATION in note):
+            _open(stamp if stamp is not None else item.get("created_ts"),
+                  _external_name(note, RESERVED_AT_CREATION))
+    if opened is not None:
+        out.append({"executor": executor, "opened_ts": opened,
+                    "closed_ts": None})
+    elif str(item.get("external_executor") or "").strip():
+        # Le champ courant est la seule trace (journal tronqué ou réservation
+        # antérieure à l'écriture des notes) : la période reste ouverte.
+        base = _external_executor_ts(item, events)
+        if base is not None:
+            out.append({"executor": str(item["external_executor"]).strip(),
+                        "opened_ts": float(base), "closed_ts": None})
+    return out
+
+
+def external_reservation_pause(periods: Iterable[dict], ready: float,
+                               end: float) -> float:
+    """#8163 : secondes de réservation externe DÉJÀ LEVÉES dans `[ready, end]`.
+
+    Le temps passé sous une réservation n'est pas un retard du lot : son
+    horloge s'arrête à la déclaration et repart à la levée, comme sous une
+    retenue (#2916) ou une fenêtre (#5735). La période encore ouverte n'est
+    pas comptée : la ligne reste mesurée mais sans escalade (#6255 A2), et
+    elle entrera dans le compte à sa levée.
+    """
+    low_edge, high_edge = float(ready), float(end)
+    if high_edge <= low_edge:
+        return 0.0
+    paused = 0.0
+    for period in periods or ():
+        closed = period.get("closed_ts")
+        if closed is None:
+            continue
+        low = max(float(period["opened_ts"]), low_edge)
+        high = min(float(closed), high_edge)
+        if high > low:
+            paused += high - low
+    return paused
+
+
+def external_done_evidence(periods: Iterable[dict],
+                           events: Iterable[dict]) -> dict | None:
+    """#8163 : la dernière note de travail fait DANS une réservation levée.
+
+    Rend `{done_ts, executor}` ou None. Seules les périodes fermées comptent :
+    une réservation qui tient encore n'escalade déjà pas. La note peut venir
+    de l'exécutant (son compte rendu) comme d'un vérificateur (relevé,
+    livraison) : c'est la preuve que le travail est fait, pas une attribution.
+    """
+    closed = [period for period in periods or ()
+              if period.get("closed_ts") is not None]
+    if not closed:
+        return None
+    # La DERNIÈRE réservation levée fait foi : une preuve de fin antérieure ne
+    # vaut pas pour une nouvelle réservation (un second geste aurait sa note).
+    period = max(closed, key=lambda candidate: float(candidate["closed_ts"]))
+    latest = None
+    for event in sorted(events or (),
+                        key=lambda ev: (float(ev.get("created_ts") or 0.0),
+                                        int(ev.get("id") or 0))):
+        note = str(event.get("note") or "")
+        at = event.get("created_ts")
+        if not note or at is None or not _external_done_note(note):
+            continue
+        stamp = float(at)
+        if not (float(period["opened_ts"]) <= stamp
+                <= float(period["closed_ts"])):
+            continue
+        if latest is None or stamp > latest["done_ts"]:
+            latest = {"done_ts": stamp,
+                      "executor": period.get("executor"),
+                      "released_ts": float(period["closed_ts"])}
+    return latest
+
+
 def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
     """L'instant où le lot a un exécutant.
 
@@ -1024,6 +1188,14 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     (#6105). A3 : un dossier d'acte sur branche `review/**` n'a pas d'horloge
     GO → fusion, sa livraison est l'acte (#6209). A4 : `assigned_ts` retient
     le début mesuré d'un porteur de paquet (#6156).
+
+    #8163 : une réservation à un exécutant externe est une attente comme une
+    retenue : le temps qu'elle a couvert ne compte pas dans « prêt →
+    démarré » (#5735), et l'horloge repart de sa levée
+    (`external_reservation_pause`). Quand l'exécutant a noté le travail fait
+    avant de lever (compte rendu, vérification, livraison), la ligne porte
+    `external_done` : le lot est **à clore**, pas « unassigned », et le brief
+    ne prescrit pas de le réassigner.
     """
     events = list(events)
     fixes = list(fixes or ())
@@ -1036,6 +1208,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     act_branch = is_act_branch(item.get("branch"))
     external = (bool(str(item.get("external_executor") or "").strip())
                 and not external_retired)
+    # #8163 : les périodes de réservation sont lues une fois ; seules les
+    # périodes déjà levées suspendent la mesure et peuvent porter une preuve
+    # de travail fait.
+    reservations = external_reservation_periods(item, events)
     out = []
 
     # #4561 : l'attente de la garde d'empreinte suspend les deux pas d'avant
@@ -1112,6 +1288,35 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             ready, fp_extra = _fp_start(float(ready), started)
         else:
             fp_extra = {}
+        # #8163 : le temps passé sous une réservation externe DÉJÀ LEVÉE ne
+        # compte pas dans « prêt → démarré » ; l'horloge repart de la levée,
+        # comme pour une retenue (#2916) ou une fenêtre (#5735). Une période
+        # encore ouverte n'est pas comptée (la ligne reste mesurée, sans
+        # escalade, #6255 A2) et entrera dans le compte à sa levée.
+        intake_extra = dict(fp_extra)
+        if ready is not None:
+            end = float(started) if started is not None else float(now)
+            paused = external_reservation_pause(reservations, float(ready), end)
+            if paused > 0:
+                ready = float(ready) + paused
+                intake_extra["external_reservation_paused_s"] = int(paused)
+        # #8163 (b) : une réservation levée après une note de travail fait
+        # (compte rendu, vérification, livraison) laisse un lot à clore, pas
+        # un lot sans preneur : la ligne le dit, sans le présenter comme
+        # « unassigned » ni prescrire une réassignation.
+        external_done = None
+        if (not str(item.get("external_executor") or "").strip()
+                and started is None and state == lifecycle.REQUESTED
+                and not str(item.get("assignee") or "").strip()):
+            external_done = external_done_evidence(reservations, events)
+        if external_done is not None:
+            intake_extra["external_done"] = True
+            if external_done.get("executor"):
+                intake_extra["external_was"] = external_done["executor"]
+            intake_extra["external_done_ts"] = round(
+                float(external_done["done_ts"]), 3)
+            intake_extra["external_released_ts"] = round(
+                float(external_done["released_ts"]), 3)
         if ready is None:
             # #2551 : dépendance bloquante ouverte — le lot n'est pas prêt,
             # aucun délai ne court : son porteur ne peut rien faire avant la
@@ -1121,7 +1326,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready))),
-                            **fp_extra))
+                            **intake_extra))
         elif begun(events, jalons):
             # #3162 : branche associée ou gel — le lot est commencé, mais son
             # début n'est pas daté : ni retard ni durée inventés (#1982).
@@ -1135,7 +1340,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             # système) reste mesuré, sans escalade — le §9 ne vise que des
             # agents, et l'exécutant agit sans changer l'état du lot (#6241).
             out.append(_row(step, ready, now=now, critical=critical,
-                            escalate=not external, **fp_extra))
+                            escalate=not external, **intake_extra))
 
     # #5214 : un lot validé dont une dépendance bloquante n'est pas levée ne
     # peut pas fusionner : son attente est celle du bloqueur, pas la sienne, et

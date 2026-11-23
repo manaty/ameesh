@@ -937,6 +937,98 @@ class ExecuteurExterneTest(unittest.TestCase):
         self.assertEqual(slo.assigned_ts(item, events), T0 + 600)
 
 
+class ReservationExterneLeveeTest(unittest.TestCase):
+    """#8163 : la durée sous réservation d'un exécutant externe ne compte plus
+    dans « prêt → démarré » une fois la réservation levée.
+
+    Le faux P1 du 23/11 : #8158, né réservé au bureau à 15:43Z, travail fait
+    et vérifié, réservation levée à 17:20Z. L'horloge repartait de la création
+    et escaladait au niveau 3 « unassigned » une minute plus tard."""
+
+    def _events(self, done=True):
+        events = [_ev("intake", T0,
+                      "created; estimate: 1 h; reserved to external executor bureau")]
+        if done:
+            events.append(_ev("intake", T0 + 1800,
+                              "FAIT. web and api deployed; to verify"))
+            events.append(_ev("intake", T0 + 3000,
+                              "VÉRIFICATION rel-01 : production healthy"))
+        events.append(_ev("intake", T0 + 5400,
+                          "external executor cleared (was bureau) "
+                          "(by the reserved executor, session abc)"))
+        return events
+
+    def _item(self):
+        # La réservation est levée : le champ courant est vide, le journal
+        # garde la trace (comme après `work external-executor --clear`).
+        return _item(state="intake", assignee="", external_executor="", priority=1)
+
+    def _row(self, rows, key="intake_started"):
+        got = [r for r in rows if r["step"] == key]
+        self.assertEqual(len(got), 1, "%s absent de %s" % (key, rows))
+        return got[0]
+
+    def test_reservation_de_1h30_levee_ne_court_pas_depuis_la_creation(self):
+        item = self._item()
+        events = self._events()
+        release = T0 + 5400
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=release + 14 * 60)
+        row = self._row(rows)
+        self.assertEqual(row["started_ts"], release)
+        self.assertEqual(row["elapsed_s"], 14 * 60)
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(slo.breaches(rows), [])
+        # (b) : le travail est fait, le lot est à clore — la ligne le porte.
+        self.assertTrue(row["external_done"])
+        self.assertEqual(row["external_was"], "bureau")
+        self.assertEqual(row["external_released_ts"], release)
+        self.assertEqual(row["external_reservation_paused_s"], 5400)
+
+    def test_reservation_levee_sans_travail_fait_reprend_l_horloge(self):
+        # Sans note de fin, la levée ne dit pas que le travail est fait : le
+        # lot redevient un lot ordinaire, à pourvoir, et l'horloge court depuis
+        # la levée (pas depuis la création).
+        item = self._item()
+        events = self._events(done=False)
+        release = T0 + 5400
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=release + 20 * 60)
+        row = self._row(rows)
+        self.assertEqual(row["started_ts"], release)
+        self.assertEqual(row["elapsed_s"], 20 * 60)
+        self.assertEqual(row["level"], 1)
+        self.assertNotIn("external_done", row)
+
+    def test_note_negative_ne_fait_pas_une_preuve_de_travail_fait(self):
+        # « pas livré » n'est pas une preuve de fin : la ligne reste un lot
+        # sans preneur, pas un lot à clore.
+        item = self._item()
+        events = [_ev("intake", T0,
+                      "created; estimate: 1 h; reserved to external executor bureau"),
+                  _ev("intake", T0 + 1800, "pas livré, relance en cours"),
+                  _ev("intake", T0 + 5400,
+                      "external executor cleared (was bureau)")]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 5400 + 20 * 60)
+        self.assertNotIn("external_done", self._row(rows))
+
+    def test_reservation_encore_ouverte_reste_mesuree_sans_escalade(self):
+        # #6255 A2 ne bouge pas : tant que la réservation tient, la ligne est
+        # mesurée mais sans escalade ; le temps de la période ouverte n'est pas
+        # déduit (il le sera à la levée).
+        item = _item(state="intake", external_executor="bureau", priority=1)
+        events = self._events(done=False)[:1]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 5400)
+        row = self._row(rows)
+        self.assertEqual(row["started_ts"], T0)
+        self.assertEqual(row["elapsed_s"], 5400)
+        self.assertEqual(row["level"], 0)
+        self.assertIs(row.get("escalation"), False)
+        self.assertNotIn("external_done", row)
+
+
 class FauxPositifsTest(unittest.TestCase):
     """#6255 : quatre alertes SLO à tort et la clé de dédoublonnage.
 
