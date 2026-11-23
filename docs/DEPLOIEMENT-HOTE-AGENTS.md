@@ -1259,7 +1259,11 @@ le texte de l'alerte nomme la source lue (tick ou passe), et « not recorded »
 ne reste que sans aucune lecture. #7750 : l'alerte lit également le tick d'un
 candidat qui n'a **jamais** complété de passe, par hôte, contre le commit de
 la dernière passe complétée de sa clé ; `staging_canon_stale` fait de même
-pour son `canon_ref`. Un exécutant en retard sur un candidat n'est donc plus
+pour son `canon_ref`. #8138 : pour une même (clé, hôte), c'est le relevé le
+plus récent qui fait foi — une passe lit son `canon_ref` à son début, avant
+l'étape canon-executant qui peut avancer l'épingle (#8109) ; la pulsation
+fraîche suivante le remplace, et une pulsation antérieure ne masque jamais
+une passe plus récente. Un exécutant en retard sur un candidat n'est donc plus
 invisible : il est nommé avec son hôte, sa version lancée et la cause
 (`unconfigured`, `refused`, etc.). Un tick écrit **avant** la passe
 complétée qui a nommé le déploiement n'est pas encore lu (#7818) : il ne
