@@ -626,15 +626,34 @@ def _packet_ci_text(ci: dict) -> str:
     """
     state = str((ci or {}).get("state") or "unknown")
     run = "run %s" % ci["run_id"] if (ci or {}).get("run_id") else "its CI"
+    # #8155 : la tête lue et les workflows rouges ou en cours sont nommés.
+    sha = str((ci or {}).get("head_sha") or "")[:8]
+    on = " on %s" % sha if sha else ""
+    red = ", ".join((ci or {}).get("red_workflows") or ())
+    running = ", ".join((ci or {}).get("running_workflows") or ())
     if state == "running":
-        return " (%s is still running)" % run
+        return " (%s%s is still running%s)" % (
+            run, on, ": %s" % running if running else "")
     if state == "pending":
-        return " (its full CI has not started yet)"
+        return " (its full CI has not started yet%s)" % on
+    if state == "uncertain":
+        # #8155 : la tête actuelle de la branche n'a pas pu être lue ; des runs
+        # existent sur d'autres têtes, aucune n'est présentée comme courante.
+        seen = ", ".join(str(sha)[:8] for sha in (ci or {}).get("seen_heads") or ())
+        recorded = (ci or {}).get("recorded_state")
+        mine = ("the recorded head%s is %s" % (on, recorded) if recorded
+                else "no run on the recorded head%s" % on)
+        return (" (its CI state is unproven: %s, runs seen on %s, and the "
+                "branch's current head could not be read; check the packet PR "
+                "before acting)" % (mine, seen or "other heads"))
     if state == "green":
-        return " (%s is green; the packet merge is pending)" % run
+        return " (%s%s is green; the packet merge is pending)" % (run, on)
     if state == "red":
-        return (" (%s is red: a unit must be fixed or removed before the packet "
-                "merges)" % run)
+        return (" (%s%s is red%s: a unit must be fixed or removed before the packet "
+                "merges; a red also present on the target is not the units' "
+                "fault%s)" % (
+                    run, on, " — %s" % red if red else "",
+                    "; still running: %s" % running if running else ""))
     if state in ("cancelled", "superseded"):
         return " (%s was %s; a new run is expected)" % (run, state)
     return " (its CI is not readable here)"
