@@ -111,6 +111,20 @@ class StaleCloneMuteForge(PgTestCase):
         else:
             storage.of(self.db).work.note(self.lot, "qa", text, actor)
 
+    def continued(self, base, *, freeze_id=2, evidence=True):
+        """#8118 : la marque d'un regel à relecteurs inchangés."""
+        text = pg.continued_mark_note(
+            self.lot, {"id": freeze_id, "sha": self.head},
+            reviewers=[{"name": "fixer", "family": "claude"}], required=1,
+            base=base, why="reviewers unchanged at re-freeze")
+        if evidence is True:
+            evidence = pg.base_evidence(self.lot, freeze_id, self.head, base)
+        if evidence:
+            storage.of(self.db).work.record_designation_mark(
+                self.lot, "qa", text, pg.SENDER, evidence)
+        else:
+            storage.of(self.db).work.note(self.lot, "qa", text, pg.SENDER)
+
     def authors(self):
         authors, _correctors = merge_queue._attribution_on_freeze(
             self.db, self.marks, self.head, repo=self.reader.root,
@@ -143,6 +157,42 @@ class GateReadsTheDesignatedDeltaTest(StaleCloneMuteForge):
         self.mark(self.base, evidence=False)
         self.assertEqual(merge_queue._designated_base(
             self.db, work.get(self.db, self.lot), self.marks[0],
+            self.reader.root, self.head), self.third)
+
+    def test_the_continued_mark_keeps_the_proven_base(self):
+        # B/P2 #231515 (auditeur) : un regel à relecteurs inchangés n'écrit
+        # pas de désignation ; la marque de continuation porte la même preuve
+        # de base que le port (#6365), et la porte la lit.
+        self.continued(self.third)
+        self.assertEqual(merge_queue._designated_base(
+            self.db, work.get(self.db, self.lot), {"id": 2},
+            self.reader.root, self.head), self.third)
+        self.marks = [{"id": 2, "kind": "frozen", "sha": self.head,
+                       "actor": "impl", "at_ts": 0.0}]
+        self.assertEqual(self.authors(), {"impl"})
+
+    def test_a_continued_mark_without_evidence_is_not_a_proof(self):
+        # Une continuation écrite à texte libre (`work note --actor ameesh`)
+        # ne pose aucune preuve : la porte garde sa lecture d'avant.
+        self.continued(self.third, evidence=False)
+        self.assertEqual(merge_queue._designated_base(
+            self.db, work.get(self.db, self.lot), {"id": 2},
+            self.reader.root, self.head), "")
+        self.marks = [{"id": 2, "kind": "frozen", "sha": self.head,
+                       "actor": "impl", "at_ts": 0.0}]
+        self.assertEqual(self.authors(), {"impl", "third"})
+
+    def test_the_latest_proven_mark_wins_across_both_prefixes(self):
+        # #8118 : les deux préfixes sont lus, la dernière preuve du journal
+        # l'emporte quel que soit le préfixe (comme `PgPort.recorded`).
+        self.mark(self.third, freeze_id=2)
+        self.continued(self.base, freeze_id=2)
+        self.assertEqual(merge_queue._designated_base(
+            self.db, work.get(self.db, self.lot), {"id": 2},
+            self.reader.root, self.head), self.base)
+        self.mark(self.third, freeze_id=2)
+        self.assertEqual(merge_queue._designated_base(
+            self.db, work.get(self.db, self.lot), {"id": 2},
             self.reader.root, self.head), self.third)
 
     def test_an_evidence_naming_another_base_is_not_a_proof(self):

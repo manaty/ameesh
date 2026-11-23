@@ -164,6 +164,32 @@ class Mailbox(interface.Mailbox):
                                         automatic=isinstance(review, dict))
         return self._insert(sender, recipient, body, **args)
 
+    def send_passive_notice(self, sender, recipient, body, *, passive_head,
+                            host, kind, payload, work_item_id, signature,
+                            signature_key, signed_payload, nonce, created_us,
+                            expires_us) -> dict:
+        """#8118 : voir `interface.Mailbox.send_passive_notice`.
+
+        B #231419 : la relecture de la demande et le dépôt sont dans la même
+        transaction, sous le verrou partagé du destinataire que `reserve` et
+        `deliver` prennent en exclusif. Une livraison committée avant la
+        relecture rend l'avis actif ; une livraison qui arrive ensuite attend
+        le dépôt, donc la demande ouvre le tour APRÈS que l'avis passif est en
+        boîte et le relecteur le lit."""
+        with self.db.transaction() as tx:
+            box = Mailbox(tx)
+            box.lock_recipient(recipient)
+            lot = str(work_item_id or "").strip()
+            if lot.isdigit():
+                head = box.review_notice_head(sender, recipient, int(lot))
+                if head and head.lower() == str(passive_head).strip().lower():
+                    payload = dict(payload or {}, info=True)
+            return box._insert(sender, recipient, body, host=host, kind=kind,
+                               payload=payload, work_item_id=work_item_id,
+                               signature=signature, signature_key=signature_key,
+                               signed_payload=signed_payload, nonce=nonce,
+                               created_us=created_us, expires_us=expires_us)
+
     def send_reply(self, sender, recipient, body, *, host, kind, payload,
                    work_item_id, signature, signature_key, signed_payload,
                    nonce, created_us, expires_us, in_reply_to) -> dict:
@@ -923,6 +949,57 @@ class Mailbox(interface.Mailbox):
                    " FOR UPDATE" if for_update else ""),
             (recipient, str(lot)),
         )
+
+    def review_notice_head(self, sender, recipient, lot) -> str:
+        """#8118 : voir `interface.Mailbox.review_notice_head`.
+
+        B #231383 : la demande de relecture doit encore attendre livraison
+        (`delivered_at IS NULL`) — une demande livrée n'est plus un réveil en
+        attente, et une réponse de l'auteur doit ouvrir le tour du relecteur.
+        B #231450 : une demande seulement RÉSERVÉE pour un tour
+        (`meta.consigne`, posée par `reserve` sous le verrou du registre)
+        attend encore — le tour déjà réservé ne contient pas l'avis déposé
+        maintenant. `release` retire la consigne : la demande redevient un
+        réveil en attente.
+        Seul l'auteur du contenu gelé (acteur du jalon `frozen` ou assigné du
+        lot) est concerné : une consigne du pilote ou de mesh-design garde son
+        réveil. Le verdict doit être encore dû sur la tête — un relecteur qui a
+        déjà rendu `ok` ou `blocked` garde le dialogue avec l'auteur. La tête
+        est le dernier jalon `frozen` du lot, jamais un argument d'appelant."""
+        rows = self.db.query(
+            """
+            SELECT f.sha
+              FROM work_items w
+              JOIN LATERAL (
+                    SELECT m.sha, m.actor
+                      FROM work_item_milestones m
+                     WHERE m.work_item_id = w.id AND m.kind = 'frozen'
+                     ORDER BY m.id DESC
+                     LIMIT 1) f ON true
+             WHERE w.id = %s
+               AND w.state = 'qa'
+               AND %s = ANY(coalesce(w.reviewers, ARRAY[]::text[]))
+               AND (%s = f.actor OR %s = w.assignee)
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM work_item_milestones v
+                     WHERE v.work_item_id = w.id
+                       AND v.kind = 'verdict'
+                       AND v.actor = %s
+                       AND lower(coalesce(v.sha, '')) = lower(coalesce(f.sha, '')))
+               AND EXISTS (
+                    SELECT 1
+                      FROM agent_mailbox r
+                     WHERE r.recipient = %s
+                       AND r.kind = 'request'
+                       AND btrim(r.work_item_id) = w.id::text
+                       AND r.delivered_at IS NULL
+                       AND r.meta->'consigne' IS NULL
+                       AND lower(coalesce(r.payload->'review_designation'->>'sha', ''))
+                           = lower(coalesce(f.sha, '')))
+             LIMIT 1
+            """, (int(lot), recipient, sender, sender, recipient, recipient))
+        return str(rows[0]["sha"] or "") if rows else ""
 
     def delivered_for_lot(self, recipient, lot, limit) -> list[dict]:
         """#2539 : les derniers messages déjà remis de CE lot, filtrés dans la

@@ -1812,6 +1812,26 @@ class Mailbox(Domain):
         """Dépose un message ; rend id, created_ts et les projets du fil
         (`sender_project`, `recipient_project`) des deux agents."""
 
+    def send_passive_notice(self, sender: str, recipient: str, body: str, *,
+                            passive_head: str, host: str | None, kind: str,
+                            payload: dict | None, work_item_id: str | None,
+                            signature: str | None, signature_key: str | None,
+                            signed_payload: str | None, nonce: str | None,
+                            created_us: int | None,
+                            expires_us: int | None) -> dict:
+        """#8118 : dépose un avis qui peut rester passif sans perdre son réveil.
+
+        `passive_head` est la tête gelée que `body` annonce et que l'appelant
+        a déjà reconnue. Le pilote Postgres relit la demande de relecture sous
+        le verrou du destinataire et ne rend l'avis passif que si elle attend
+        encore livraison (B #231419). Le dépôt par défaut reste **actif** : un
+        stockage qui ne sert pas ce couplage ne retire jamais un réveil."""
+        return self.send(sender, recipient, body, host=host, kind=kind,
+                         payload=payload, work_item_id=work_item_id,
+                         signature=signature, signature_key=signature_key,
+                         signed_payload=signed_payload, nonce=nonce,
+                         created_us=created_us, expires_us=expires_us)
+
     @abc.abstractmethod
     def send_reply(self, sender: str, recipient: str, body: str, *, host: str | None,
                    kind: str, payload: dict | None, work_item_id: str | None,
@@ -1862,6 +1882,23 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis marqués `payload.urgent`."""
+
+    def review_notice_head(self, sender: str, recipient: str, lot: int) -> str:
+        """#8118 : tête gelée dont la demande de relecture attend livraison.
+
+        Rend le SHA de la dernière tête gelée quand l'avis de `sender` peut
+        doubler un réveil encore en attente : `sender` est l'auteur du contenu
+        gelé (acteur du jalon `frozen` ou assigné du lot), le lot est en `qa`,
+        `recipient` est un relecteur désigné sans verdict sur cette tête, et
+        une demande de relecture de cette tête lui a été déposée **sans être
+        encore livrée** (`delivered_at IS NULL`). Une demande déjà livrée
+        n'est plus un réveil en attente : l'avis doit réveiller (B #231383).
+        Une demande seulement réservée pour un tour l'est aussi : le tour en
+        cours ne contient pas l'avis déposé maintenant (B #231450).
+
+        Lecture locale au pilote Postgres : un stockage qui ne la sert pas
+        (exécuteur médié) rend "", et l'avis reste actif."""
+        return ""
 
     @abc.abstractmethod
     def unread_human(self, recipient: str, limit: int, *,
@@ -3095,8 +3132,9 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def record_designation_mark(self, item_id: int, state: str, text: str, actor: str,
                                 evidence: dict) -> None:
-        """#6365 : journalise la marque de désignation avec sa preuve
-        structurée (`work_item_events.evidence`) et rafraîchit `updated_at`.
+        """#6365 : journalise la marque de désignation — ou, #8118, de
+        continuation à relecteurs inchangés — avec sa preuve structurée
+        (`work_item_events.evidence`) et rafraîchit `updated_at`.
 
         Écrivain système du port de désignation seul : hors du contrat de
         l'exécuteur médié (L107), aucune voie à texte libre (`note`,

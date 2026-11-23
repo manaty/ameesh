@@ -81,6 +81,78 @@ def mark_prefix(lot: int, freeze_id: int) -> str:
     return "%s%d:%d:" % (MARK_PREFIX, int(lot), int(freeze_id))
 
 
+#: #8118 : la marque d'un regel à relecteurs inchangés. Elle n'est **pas** une
+#: désignation : les sièges sont gardés, une seule demande de delta part par
+#: relecteur, et la marque dit qu'aucune sélection n'a été rejouée.
+CONTINUED_PREFIX = "review-designation-continued:"
+#: schéma de la charge de cette marque
+CONTINUED_SCHEMA = "ameesh-review-designation-continued/1"
+
+
+def continued_mark_prefix(lot: int, freeze_id: Optional[int] = None) -> str:
+    """Le préfixe des marques de continuation, pour un gel ou pour le lot."""
+    if freeze_id is None:
+        return "%s%d:" % (CONTINUED_PREFIX, int(lot))
+    return "%s%d:%d:" % (CONTINUED_PREFIX, int(lot), int(freeze_id))
+
+
+def continued_mark_note(lot: int, freeze: Mapping, *, reviewers,
+                        required: int, sent=(), previous: Optional[Mapping] = None,
+                        why: str = "", authors=(), policy_ref: str = "",
+                        base: str = "", unknown_authors=()) -> str:
+    """La ligne de journal d'un regel sans nouvelle désignation (#8118).
+
+    Elle nomme le gel, les sièges gardés, la tête précédente et les demandes
+    réellement déposées : un rejeu la relit au lieu de remailler."""
+    freeze = dict(freeze or {})
+    payload = {
+        "schema": CONTINUED_SCHEMA,
+        "state": DESIGNATED,
+        "lot": int(lot),
+        "freeze": {"id": int(freeze.get("id") or 0),
+                   "sha": str(freeze.get("sha") or "").strip().lower()},
+        "previous": {"id": int((previous or {}).get("id") or 0),
+                     "sha": str((previous or {}).get("sha") or "").strip().lower()},
+        "required": int(required),
+        "reviewers": [{"name": str((row or {}).get("name") or ""),
+                       "family": str((row or {}).get("family") or "")}
+                      for row in reviewers or ()],
+        "sent": [dict(entry or {}) for entry in sent or ()],
+        "missing": 0,
+        "continued": True,
+        "why": str(why or ""),
+        "authors": [dict(row) for row in authors or ()],
+        "policy_ref": str(policy_ref or ""),
+        "base": str(base or ""),
+        "unknown_authors": [str(name) for name in unknown_authors or ()],
+    }
+    return "%s%d:%d: %s" % (CONTINUED_PREFIX, int(lot),
+                            int(freeze.get("id") or 0),
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def continued_mark_of(note: str) -> Optional[dict]:
+    """La continuation portée par une ligne de journal, ou None.
+
+    Une marque illisible est refusée, jamais interprétée."""
+    text = str(note or "")
+    if not text.startswith(CONTINUED_PREFIX):
+        return None
+    _head, separator, payload = text.partition(": ")
+    if not separator:
+        raise DesignationError("unreadable review continuation mark: %r" % text[:120])
+    try:
+        found = json.loads(payload)
+    except ValueError as exc:
+        raise DesignationError(
+            "unreadable review continuation mark: %s" % exc) from exc
+    if (not isinstance(found, dict)
+            or not isinstance(found.get("freeze"), dict)
+            or not isinstance(found.get("reviewers"), list)):
+        raise DesignationError("incomplete review continuation mark: %r" % text[:120])
+    return found
+
+
 #: #6365 : la preuve structurée de la base d'une marque, écrite par le port
 #: dans `work_item_events.evidence` ; aucune écriture à texte libre ne la pose
 #: (`work note --actor ameesh` copie le texte, jamais la preuve).
@@ -538,6 +610,7 @@ class PgPort:
                 # freeze that is no longer the latest (`commit` refuses it).
                 return None
         found = None
+        found_id = -1
         for row in storage.of(db).work.events_noted(mark_prefix(lot, freeze_id), since_ts):
             noted = designation_of(row.get("note"))
             if noted is None:
@@ -547,6 +620,32 @@ class PgPort:
                     "review designation mark of lot #%d names freeze %r, not %d"
                     % (lot, noted["freeze"].get("id"), freeze_id))
             found = noted  # journal order (increasing id): the last one wins
+            found_id = int(row.get("id") or 0)
+        # #8118 : une marque de continuation est un gel déjà pourvu, pas une
+        # désignation à rejouer. La plus récente des deux marques décide, comme
+        # `_effective_mark`.
+        for row in storage.of(db).work.events_noted(
+                continued_mark_prefix(lot, freeze_id), since_ts):
+            noted = continued_mark_of(row.get("note"))
+            if noted is None:
+                continue
+            if int(noted["freeze"].get("id") or 0) != freeze_id:
+                raise DesignationError(
+                    "review continuation mark of lot #%d names freeze %r, not %d"
+                    % (lot, noted["freeze"].get("id"), freeze_id))
+            if int(row.get("id") or 0) > found_id:
+                found = {
+                    "state": DESIGNATED,
+                    "required": int(noted.get("required") or 0),
+                    "reviewers": [dict(reviewer) for reviewer in
+                                  noted.get("reviewers") or ()],
+                    "missing": int(noted.get("missing") or 0),
+                    "why": str(noted.get("why") or ""),
+                    "freeze": dict(noted.get("freeze") or {}),
+                    "sent": [dict(entry) for entry in noted.get("sent") or ()],
+                    "continued": True,
+                }
+                found_id = int(row.get("id") or 0)
         return found
 
     # -- writes -----------------------------------------------------------

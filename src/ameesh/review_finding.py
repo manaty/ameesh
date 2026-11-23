@@ -170,6 +170,24 @@ def _designation(db, lot: int, sha: str) -> Mapping[str, Any] | None:
         freeze = found.get("freeze") if isinstance(found.get("freeze"), Mapping) else {}
         if int(freeze.get("id") or 0) == int(freeze_id):
             return found
+    # #8118 : un regel à relecteurs inchangés n'écrit pas de désignation ; sa
+    # marque de continuation porte les mêmes auteurs prouvés.
+    try:
+        continued = storage.of(db).work.events_noted(
+            designation_pg.continued_mark_prefix(int(lot), freeze_id), 0.0,
+            ids=[int(lot)])
+    except Exception:  # noqa: BLE001 - journal illisible : pas de preuve
+        return None
+    for row in reversed(list(continued or ())):
+        try:
+            found = designation_pg.continued_mark_of((row or {}).get("note"))
+        except designation_pg.DesignationError:
+            continue
+        if not isinstance(found, Mapping):
+            continue
+        freeze = found.get("freeze") if isinstance(found.get("freeze"), Mapping) else {}
+        if int(freeze.get("id") or 0) == int(freeze_id):
+            return found
     return None
 
 

@@ -2304,8 +2304,9 @@ class WorkItems(interface.WorkItems):
                         (int(item_id),))
 
     def record_designation_mark(self, item_id, state, text, actor, evidence) -> None:
-        """#6365 : la marque et sa preuve structurée ; écrivain système hors
-        du contrat L107, appelé par le port de désignation seul."""
+        """#6365 : la marque de désignation — ou, #8118, de continuation — et
+        sa preuve structurée ; écrivain système hors du contrat L107, appelé
+        par le port de désignation seul."""
         if not isinstance(evidence, dict) or not evidence:
             raise DbError("designation mark without its structured evidence")
         self._event(int(item_id), state, text, actor, evidence=evidence)

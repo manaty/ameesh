@@ -1088,7 +1088,9 @@ def _mark_reviewers(note: str) -> Optional[list]:
     a valid mark prefix and invalid JSON is an unreadable mark, not a database
     error that aborts the freeze transaction (#3047). `designation_of` refuses
     an unreadable selection mark and `carried_mark_of` returns None; both are
-    the same refusal here, and the caller journals it.
+    the same refusal here, and the caller journals it. #8118 : une marque de
+    continuation nomme les sièges gardés — les ignorer retirerait du calcul
+    des avis dus les relecteurs d'un regel à relecteurs inchangés.
     """
     from . import verdict_carry
 
@@ -1100,6 +1102,11 @@ def _mark_reviewers(note: str) -> Optional[list]:
             return None
     elif text.startswith(verdict_carry.CARRIED_MARK_PREFIX):
         payload = verdict_carry.carried_mark_of(text)
+    elif text.startswith(pg.CONTINUED_PREFIX):
+        try:
+            payload = pg.continued_mark_of(text)
+        except rd.DesignationError:
+            return None
     else:
         return []
     if not isinstance(payload, dict):
@@ -1145,6 +1152,8 @@ _PENDING_FACTS_SQL = f"""
          WHERE e.work_item_id = ANY (ARRAY(SELECT lot FROM latest_freeze))
            AND (starts_with(e.note, 'review-designation:' || e.work_item_id || ':')
             OR starts_with(e.note, 'review-designation-carried:'
+                                   || e.work_item_id || ':')
+            OR starts_with(e.note, 'review-designation-continued:'
                                    || e.work_item_id || ':'))
          GROUP BY e.work_item_id
     ), manual AS (
@@ -1189,6 +1198,9 @@ _PENDING_FACTS_SQL = f"""
                               || ':' || f.freeze_id || ':')
                   OR starts_with(e.note,
                                  'review-designation-carried:' || f.lot
+                                 || ':' || f.freeze_id || ':')
+                  OR starts_with(e.note,
+                                 'review-designation-continued:' || f.lot
                                  || ':' || f.freeze_id || ':'))
            ORDER BY e.id DESC
            LIMIT 1
@@ -1220,9 +1232,10 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
     the current head:
 
     - a name of the **effective** mark of the latest freeze
-      (`review-designation:` selection or `review-designation-carried:`
-      report, the last one in journal order — the mark `_sync_reviewers`
-      derives the column from);
+      (`review-designation:` selection, `review-designation-carried:` report
+      or `review-designation-continued:` unchanged-seat re-freeze, the last
+      one in journal order — the mark `_sync_reviewers` derives the column
+      from);
     - a manual designation: a name that no automatic mark of the lot ever
       carried (kept across freezes by `_sync_reviewers`), or a name whose
       latest `reviewer X designated` line (`ameesh work reviewer`) follows
@@ -2627,20 +2640,23 @@ def _marks(db, lot: int, *, freeze_id: Optional[int] = None,
     """Les marques automatiques du lot, dans l'ordre du journal (#2487).
 
     Rend `[(row_id, kind, payload, created_ts)]`, `kind` valant
-    `"designation"` (une sélection, y compris `waiting`) ou `"carried"` (une
-    marque gardée par un report). `freeze_id` restreint à un gel. None quand le
-    journal est illisible : l'appelant ne retire alors aucun nom et ne devine
-    pas la marque effective.
+    `"designation"` (une sélection, y compris `waiting`), `"carried"` (une
+    marque gardée par un report) ou `"continued"` (un regel à relecteurs
+    inchangés, sans nouvelle désignation, #8118). `freeze_id` restreint à un
+    gel. None quand le journal est illisible : l'appelant ne retire alors
+    aucun nom et ne devine pas la marque effective.
     """
     from . import verdict_carry
     lot = int(lot)
     if freeze_id is None:
         prefixes = (("%s%d:" % (pg.MARK_PREFIX, lot), "designation"),
-                    (verdict_carry.carried_mark_prefix(lot), "carried"))
+                    (verdict_carry.carried_mark_prefix(lot), "carried"),
+                    (pg.continued_mark_prefix(lot), "continued"))
     else:
         prefixes = ((pg.mark_prefix(lot, int(freeze_id)), "designation"),
                     ("%s%d:" % (verdict_carry.carried_mark_prefix(lot), int(freeze_id)),
-                     "carried"))
+                     "carried"),
+                    (pg.continued_mark_prefix(lot, int(freeze_id)), "continued"))
     since = 0.0 if since_ts is None else float(since_ts or 0.0)
     found = []
     for prefix, kind in prefixes:
@@ -2653,6 +2669,11 @@ def _marks(db, lot: int, *, freeze_id: Optional[int] = None,
             if kind == "designation":
                 try:
                     payload = pg.designation_of(note)
+                except rd.DesignationError:
+                    continue
+            elif kind == "continued":
+                try:
+                    payload = pg.continued_mark_of(note)
                 except rd.DesignationError:
                     continue
             else:
@@ -3629,6 +3650,165 @@ def _carried_in_transaction(tx, item: Mapping, freeze: Mapping,
     return out
 
 
+def _continued_seats(db, item: Mapping, inputs: "Inputs",
+                     freeze: Mapping) -> list:
+    """#8118 : les sièges du gel précédent, quand l'ensemble ne change pas.
+
+    Un regel à relecteurs inchangés ne rejoue ni sélection ni désignation : les
+    mêmes sièges restent, une seule demande de delta part par relecteur. Rend
+    [] dès qu'un fait impose la désignation complète : sièges manuels, waiver,
+    auteurs inconnus, doute, verdict déjà rendu sur la tête, correcteur parmi
+    les sièges, famille qui a écrit la tête, famille retirée du canon, ou
+    siège absent des candidats vivants. La comparaison porte sur les marques
+    du **dernier gel effectif** (désignation, report ou continuation) : une
+    chaîne de regels garde les mêmes sièges.
+    """
+    if inputs.manual or inputs.waiver or inputs.unknown_authors or inputs.doubts:
+        return []
+    required = int(inputs.policy.required)
+    if required < 1:
+        return []
+    column = [str(name or "").strip() for name in (item or {}).get("reviewers") or ()]
+    column = [name for name in column if name]
+    if len(column) != required:
+        return []
+    context = pg.PgPort(db).previous_review(int(item["id"]), int(freeze.get("id") or 0))
+    if not context.get("freeze"):
+        return []
+    prior = {str(row.get("name") or "").strip(): row
+             for row in context.get("reviewers") or ()
+             if str(row.get("name") or "").strip()}
+    if set(prior) != set(column):
+        return []
+    answered = {str(name or "").strip() for name in inputs.answered or ()}
+    if set(column) & answered:
+        return []
+    if set(column) & rd.names_of(inputs.correctors):
+        return []
+    # #2447/#8118 : la famille se relit sur les candidats **actuels**, pas sur
+    # la désignation précédente. Un agent réenregistré sous une autre famille
+    # change l'ensemble (et peut perdre l'indépendance ou le quorum) : la
+    # continuation ne garde pas des sièges dont la preuve a changé.
+    current = {str(getattr(row, "name", "") or "").strip(): row
+               for row in inputs.candidates or ()
+               if getattr(row, "available", True)}
+    families = set()
+    for name in column:
+        row = current.get(name)
+        if row is None:
+            return []
+        family = str(getattr(row, "family", "") or "").strip()
+        if family.lower() != str(prior[name].get("family") or "").strip().lower():
+            return []
+        if family:
+            families.add(family)
+    if len(families) < required:
+        return []
+    allowed = {str(family or "").strip() for family in inputs.policy.families or ()}
+    if allowed and not families <= allowed:
+        return []
+    authored = {str(row.get("family") or "").strip()
+                for row in inputs.authors or () if isinstance(row, Mapping)}
+    if families & authored:
+        return []
+    return [{"name": name,
+             "family": str(getattr(current[name], "family", "") or "").strip()}
+            for name in column]
+
+
+def _continued_in_transaction(tx, item: Mapping, inputs: "Inputs",
+                              freeze: Mapping, seats: Sequence[Mapping]) -> dict:
+    """#8118 : un regel sans nouvelle désignation, avec une demande de delta.
+
+    Aucune sélection, aucune marque `review-designation`, aucun second
+    courrier système : une marque `review-designation-continued` dit le gel,
+    les sièges gardés et les demandes réellement déposées ; chaque relecteur
+    reçoit **une** demande qui nomme la nouvelle tête et le delta depuis son
+    dernier verdict. Un rejeu relit la marque et ne remaille pas ; une demande
+    qui couvre déjà cette tête n'est pas redéposée (#2495).
+    """
+    from . import mail
+
+    lot = int((item or {}).get("id") or 0)
+    freeze = dict(freeze or {})
+    freeze_id = int(freeze.get("id") or 0)
+    required = int(inputs.policy.required)
+    prefix = pg.continued_mark_prefix(lot, freeze_id)
+    since = float(freeze.get("at_ts") or 0.0)
+    try:
+        rows = storage.of(tx).work.events_noted(prefix, since, ids=[lot])
+    except Exception:  # noqa: BLE001 - illisible : on redépose, jamais perdu
+        rows = []
+    if rows:
+        try:
+            mark = pg.continued_mark_of(str(rows[-1].get("note") or ""))
+        except rd.DesignationError:
+            mark = None
+        if mark:
+            return {"state": rd.DESIGNATED,
+                    "required": int(mark.get("required") or required),
+                    "reviewers": [dict(row) for row in mark.get("reviewers") or ()],
+                    "missing": 0,
+                    "freeze": dict(mark.get("freeze") or freeze),
+                    "continued": True,
+                    "why": str(mark.get("why") or "")}
+    context = pg.PgPort(tx).previous_review(lot, freeze_id)
+    sha = plan_git.full_commit_id(freeze.get("sha"))
+    # #8118 : la continuation garde la base du delta lue à ce gel, avec la
+    # même preuve structurée que la désignation (#6365) : la porte ne retombe
+    # pas sur la ref `origin/<cible>` du clone qui lit, qui peut être en
+    # retard. Sans base complète, aucune preuve n'est posée (lecture d'avant).
+    base = plan_git.full_commit_id(inputs.base)
+    migration = rd.sql_migration(inputs.paths)
+    sent = []
+    for index, seat in enumerate(seats or ()):
+        name = str((seat or {}).get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            held = mail.review_requests(tx, name, lot)
+        except Exception:  # noqa: BLE001 - lecture prudente : on redépose
+            held = []
+        if rd.covering_request(held, lot=lot, reviewer=name, sha=sha):
+            continue
+        body = rd.reviewer_message(
+            inputs.item, freeze=freeze, required=required, rank=index + 1,
+            reviewer=seat, authors=inputs.authors, base=inputs.base,
+            risk=inputs.policy.risk, policy_ref=inputs.policy.ref,
+            eligible_families=len(seats or ()), correction=None,
+            sql_migration=migration, previous_review=context, continued=True)
+        mail.send(tx, SENDER, name, body, kind=rd.REQUEST_KIND,
+                  work_item_id=str(lot),
+                  payload={"review_designation": {
+                      "lot": lot, "freeze": freeze_id, "sha": sha,
+                      "required": required, "state": rd.DESIGNATED,
+                      "reviewer": str((seat or {}).get("family") or "")}})
+        sent.append({"to": name, "kind": rd.REQUEST_KIND})
+    note = pg.continued_mark_note(
+        lot, freeze, reviewers=seats, required=required, sent=sent,
+        previous=context.get("freeze") or {},
+        why="reviewers unchanged at re-freeze: seats continued, one delta"
+            " request each (#8118)",
+        authors=inputs.authors, policy_ref=inputs.policy.ref,
+        base=base, unknown_authors=inputs.unknown_authors)
+    state = str((item or {}).get("state") or "")
+    if base:
+        storage.of(tx).work.record_designation_mark(
+            lot, state, note, SENDER,
+            pg.base_evidence(lot, freeze_id, sha, base))
+    else:
+        storage.of(tx).work.note(lot, state, note, SENDER)
+    names = [str((seat or {}).get("name") or "").strip() for seat in seats or ()]
+    _sync_reviewers(
+        tx, item, freeze, names,
+        text="reviewers continued at re-freeze #%d: %s (#8118)"
+             % (freeze_id, ", ".join(name for name in names if name)))
+    return {"state": rd.DESIGNATED, "required": required,
+            "reviewers": [dict(seat) for seat in seats or ()], "missing": 0,
+            "freeze": dict(freeze), "continued": True,
+            "why": "reviewers unchanged at re-freeze: one delta request each"}
+
+
 def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *,
                     waiver: bool = False, unknown: str = "",
                     note: bool = True) -> dict:
@@ -3925,6 +4105,12 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
     # #3554 : la baisse du canon est un fait du gel, journalisée même quand la
     # couverture manuelle dispense de désigner.
     _note_canon_lowering(tx, item, freeze, inputs)
+    if not carried:
+        continued = _continued_seats(tx, item, inputs, freeze)
+        if continued:
+            # #8118 : relecteurs inchangés sur une nouvelle tête — ni sélection
+            # ni nouvelle désignation, une seule demande de delta par siège.
+            return _continued_in_transaction(tx, item, inputs, freeze, continued)
     if reading is not None:
         # #2812 : la même lecture que la désignation, réutilisée par la
         # notification des blocages levés (aucune lecture git redoublée).
@@ -4188,6 +4374,7 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                                        freezing=freezing, prepared=prepared,
                                        reported=reported)
     if (reading.get("excluded") is None
+            and not result.get("continued")
             and str(result.get("state") or "") not in ("unavailable", "stale")):
         # #3948 B cx3 : pas de lecture préparée sur ces chemins ; la
         # notification est au mieux et se rejoue hors transaction.
