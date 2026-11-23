@@ -87,7 +87,8 @@ class SelectionHelperTest(unittest.TestCase):
         self.git("commit", "-qm", message)
         return self.git("rev-parse", "HEAD")
 
-    def card(self, commit: str, blocs: dict | None = None) -> None:
+    def card(self, commit: str, blocs: dict | None = None,
+             modules: dict | None = None) -> None:
         card = {
             "schema": "ameesh-carte/1", "commit": commit,
             "genere": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -98,7 +99,7 @@ class SelectionHelperTest(unittest.TestCase):
                     "chaude": {"modules": ["test_chaud_lent", "test_chaud_rapide"]},
                     "froide": {"modules": ["test_froid"]},
                 }},
-            "modules": {
+            "modules": modules if modules is not None else {
                 "test_chaud_rapide": {"durations": {"psycopg": 1.0, "psql": 50.0}},
                 "test_chaud_lent": {"durations": {"psycopg": 40.0}},
                 "test_import_seul": {"durations": {"psycopg": 0.5}},
@@ -109,9 +110,10 @@ class SelectionHelperTest(unittest.TestCase):
         with gzip.open(path, "wt", encoding="utf-8") as stream:
             json.dump(card, stream)
 
-    def select(self, unit: str, budget: float) -> dict:
+    def select(self, unit: str, budget: float,
+               driver: str = "psycopg") -> dict:
         request = {"schema": "ameesh-paquet-selection-request/1",
-                   "base": self.base, "budget": budget,
+                   "base": self.base, "budget": budget, "driver": driver,
                    "units": [{"lot": 7, "unit_sha": unit}]}
         proc = subprocess.run(
             [sys.executable, str(HELPER), "--select", "--repo", str(self.repo),
@@ -307,6 +309,98 @@ class SelectionHelperTest(unittest.TestCase):
         self.assertFalse(report["card"].get("commit"))
         self.assertEqual({row["reason"] for row in report["units"][0]["added"]},
                          {"support"})
+
+    def test_8132_appel_direct_quand_la_carte_est_anterieure(self) -> None:
+        # #8132 : test_2766 (#8101) appelait merge_queue.review_gate, fonction
+        # changée ; la carte antérieure ne le portait pas dans son budget. Un
+        # test qui nomme `module.fonction` entre par `appel`, dans son budget.
+        self.write("tests/test_appel.py", "X = mod.chaude()\n")
+        old = self.commit("base avec appel")
+        self.write("README", "x\n")
+        self.base = self.commit("base suivante")
+        self.card(old, {"src/pkg/mod.py": {
+            "chaude": {"modules": ["test_appel"]}}},
+            {"test_appel": {"durations": {"psycopg": 1.0}}})
+        report = self.select(self.unit(), budget=1)
+        (unit,) = report["units"]
+        rows = [row for row in unit["added"]
+                if row["module"] == "tests.test_appel"]
+        self.assertEqual([row["reason"] for row in rows], ["appel"])
+        self.assertEqual(unit["direct"], 1.0)
+        self.assertEqual(unit["seconds"], 1.0)
+
+    def test_8132_plus_de_blocs_changes_avant_un_seul(self) -> None:
+        # #8132 : test_4679/test_4457 (#8118) couvraient 19 blocs changés ;
+        # l'ordre par prix seul prenait d'abord un test étroit. À budget égal,
+        # le test qui couvre plus de blocs changés passe avant.
+        self.write("tests/test_large.py", "X = 1\n")
+        self.write("tests/test_etroit.py", "X = 1\n")
+        self.base = self.commit("base avec les deux tests")
+        self.card(self.base, {"src/pkg/mod.py": {
+            "chaude": {"modules": ["test_etroit", "test_large"]},
+            "froide": {"modules": ["test_large"]}}},
+            {"test_large": {"durations": {"psycopg": 5.0}},
+             "test_etroit": {"durations": {"psycopg": 1.0}}})
+        self.write("src/pkg/mod.py",
+                   SOURCE_V1.replace("return 1", "return 10")
+                   .replace("return 2", "return 20"))
+        report = self.select(self.commit("unité deux blocs"), budget=5.5)
+        (unit,) = report["units"]
+        self.assertEqual([row["module"] for row in unit["added"]],
+                         ["tests.test_large"])
+
+    def test_8132_appel_direct_sous_psql(self) -> None:
+        # #8132 B de cx2 : paquet-auto choisit psql quand psycopg manque ; une
+        # carte antérieure doit déclencher les appels directs sous psql aussi.
+        # Ses durées psycopg ne valent pas sous psql : la table du pilote
+        # tranche (2 s ici, alors que la carte dit 150 s).
+        self.write("tests/test_appel.py", "X = mod.chaude()\n")
+        old = self.commit("base avec appel")
+        self.write("README", "x\n")
+        self.base = self.commit("base suivante")
+        self.card(old, {"src/pkg/mod.py": {
+            "chaude": {"modules": ["test_appel"]}}},
+            {"test_appel": {"durations": {"psycopg": 150.0}}})
+        self.write("tests/parts/durees.json", json.dumps(
+            {"psql": {"test_appel": 2.0}}))
+        # l'unité ne touche que `src/` : ni support ni voisin, la durée de
+        # l'unité est celle de l'appel direct
+        self.write("src/pkg/mod.py", SOURCE_V2)
+        report = self.select(self.commit("unité psql"), budget=60, driver="psql")
+        (unit,) = report["units"]
+        rows = [row for row in unit["added"]
+                if row["module"] == "tests.test_appel"]
+        self.assertEqual([row["reason"] for row in rows], ["appel"])
+        self.assertEqual(unit["direct"], 2.0)
+        self.assertEqual(unit["seconds"], 2.0)
+        self.assertFalse(report["durations"]["stale"])
+
+    def test_8132_forfait_ne_chasse_pas_le_mesure_d_un_autre_bloc(self) -> None:
+        # #8132 B1 de l'auditeur : le forfait de 60 s du bloc `chaude` ne doit
+        # pas passer avant les tests mesurés du bloc `froide`. Reproduction du
+        # verdict (budget 61) : la tête doit rendre les quatre tests ; la
+        # version fautive rendait test_ma et test_ua et laissait `froide`
+        # sans test, le mécanisme des deux rouges du 23/11.
+        self.write("tests/test_ma.py", "X = 1\n")
+        self.write("tests/test_ua.py", "X = 1\n")
+        for name in ("test_mb", "test_mb2", "test_mb3"):
+            self.write("tests/%s.py" % name, "X = 1\n")
+        self.base = self.commit("base des deux blocs")
+        self.card(self.base, {"src/pkg/mod.py": {
+            "chaude": {"modules": ["test_ma", "test_ua"]},
+            "froide": {"modules": ["test_mb", "test_mb2", "test_mb3"]}}},
+            {"test_ma": {"durations": {"psycopg": 1.0}},
+             "test_mb": {"durations": {"psycopg": 2.0}},
+             "test_mb2": {"durations": {"psycopg": 3.0}},
+             "test_mb3": {"durations": {"psycopg": 4.0}}})
+        self.write("src/pkg/mod.py",
+                   SOURCE_V1.replace("return 1", "return 10")
+                   .replace("return 2", "return 20"))
+        report = self.select(self.commit("unité deux blocs"), budget=61)
+        (unit,) = report["units"]
+        self.assertEqual([row["module"] for row in unit["added"]],
+                         ["tests.test_ma", "tests.test_mb",
+                          "tests.test_mb2", "tests.test_mb3"])
 
 
 def _red(label: str, modules, test: str) -> "paquet_auto.TestRun":

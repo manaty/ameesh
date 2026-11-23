@@ -58,6 +58,29 @@ si même ce bloc manque.
 
 Une carte absente ou antérieure à `base` est dite dans `card`, sans bloquer.
 
+#8132 — quand la carte est antérieure à `base`, deux preuves la complètent :
+
+* `appel` : les tests qui nomment `module.fonction` pour une fonction changée
+  d'un fichier `src/` changé (bloc simple de `scripts/map.py`) sont retenus
+  d'abord, quel que soit le pilote, groupés par fonction, la fonction la plus
+  appelée d'abord, puis le moins cher, dans `DIRECT_BUDGET_S` secondes **en
+  plus** du budget de la carte. Un test qui appelle la fonction changée est une
+  preuve directe que la carte périmée ne porte pas ;
+  `test_2766_vehicle_reviews` (#8101) appelait `merge_queue.review_gate` et
+  restait au 51e rang du bloc `review_gate` ; il entre à 128,4 s dans les 180 s
+  des appels directs ;
+* sous psycopg, une durée de carte n'est reprise, pour un module, que si son
+  fichier de test n'a pas changé entre le commit de la carte et `base` : un
+  test inchangé garde sa mesure, un test modifié retombe au forfait. Le
+  forfait de 60 s pour un support (`test_5202_debit_quorum` et quatre autres,
+  #8118) prenait toute la borne avant la carte. Sous psql, la carte ne mesure
+  pas ce pilote : seule `tests/parts/durees.json` tranche ;
+* à l'intérieur d'un bloc, un test qui couvre plus de blocs changés passe
+  avant un test plus étroit (le prix tranche) ; durées mesurées et forfaits
+  alternent, pour qu'un module sans mesure ne soit plus affamé par les tests
+  mesurés (`test_4679_rebased_corrector` et `test_4457_rewritten_corrector`,
+  #8118, étaient à 18,1 s et 29,2 s sur la carte).
+
 #4271 — la durée d'un module est celle de `tests/parts/durees.json` de l'arbre
 lu, **pour le pilote** (`driver`, `psycopg` par défaut) avec lequel paquet-auto
 joue les tests : la carte ne mesure que psycopg, et sous psql la suite est
@@ -92,6 +115,10 @@ SELECTION_REQUEST_SCHEMA = "ameesh-paquet-selection-request/1"
 TEST_FILE_RE = re.compile(r"tests/(test_[A-Za-z0-9_]+)\.py")
 #: la durée prêtée à un module que la carte ne mesure pas
 UNKNOWN_DURATION_S = 60.0
+#: #8132 : part des tests qui appellent une fonction changée, en plus du budget
+#: de la carte ; le même budget que la carte, une fonction changée très appelée
+#: ayant ~47 appelants directs (le témoin #8101 entre à 128,4 s)
+DIRECT_BUDGET_S = 180.0
 MAP_SCRIPT = "scripts/map.py"
 #: #4271 : les durées mesurées de la suite, par pilote (`test-parts.py durations`)
 DURATIONS_REL = "tests/parts/durees.json"
@@ -352,6 +379,20 @@ def changed_blocks(repo: Path, sha: str, path: str, blocks,
             != (after.get(name) or {}).get("empreinte")}
 
 
+def changed_blocks_by_file(repo: Path, sha: str, files, left: str = "") -> dict:
+    """#8132 : les blocs changés de chaque fichier `src/`, lus une seule fois.
+
+    `card_candidates` et `direct_callers` ont besoin des mêmes blocs ; le
+    découpage de `scripts/map.py` est coûteux, on ne le refait pas deux fois.
+    """
+    blocks = _map_blocks()
+    out = {}
+    for path in sorted(files):
+        if path.startswith("src/") and path.endswith(".py"):
+            out[path] = changed_blocks(repo, sha, path, blocks, left)
+    return out
+
+
 def read_durations(repo: Path, driver: str) -> dict[str, float]:
     """{module: secondes} de `tests/parts/durees.json` pour `driver`, ou {}."""
     try:
@@ -364,6 +405,20 @@ def read_durations(repo: Path, driver: str) -> dict[str, float]:
     return {str(module): float(value) for module, value in table.items()
             if isinstance(value, (int, float)) and not isinstance(value, bool)
             and value >= 0}
+
+
+def _card_seconds(card, module: str) -> float | None:
+    """La durée psycopg de la carte pour `module`, ou None."""
+    entry = ((card or {}).get("modules") or {}).get(module) or {}
+    table = entry.get("durations") or entry.get("durees") or {}
+    try:
+        if "psycopg" in table:
+            return float(table["psycopg"])
+        if table:
+            return float(max(table.values()))
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def _module_price(card, module: str, durations: dict | None = None,
@@ -379,22 +434,89 @@ def _module_price(card, module: str, durations: dict | None = None,
         return durations[module], True
     if not card_durations:
         return UNKNOWN_DURATION_S, False
-    entry = ((card or {}).get("modules") or {}).get(module) or {}
-    table = entry.get("durations") or entry.get("durees") or {}
-    try:
-        if "psycopg" in table:
-            return float(table["psycopg"]), True
-        if table:
-            return float(max(table.values())), True
-    except (TypeError, ValueError):
-        pass
+    seconds = _card_seconds(card, module)
+    if seconds is not None:
+        return seconds, True
     return UNKNOWN_DURATION_S, False
 
 
-def _module_seconds(card, module: str, durations: dict | None = None,
-                    card_durations: bool = True) -> float:
-    """#4271 : la durée prêtée à un module (voir `_module_price`)."""
-    return _module_price(card, module, durations, card_durations)[0]
+def _changed_test_modules(repo: Path, commit: str, base: str) -> set[str] | None:
+    """#8132 : les modules de test modifiés entre la carte et la base.
+
+    Une durée de carte n'est reprise que pour un module absent de cet
+    ensemble : un test inchangé garde sa mesure, un test modifié depuis la
+    carte retombe au forfait. None si le diff est illisible (pas de reprise).
+    """
+    if not commit or not base:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", "-z",
+             commit, base, "--", "tests"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = set()
+    for name in proc.stdout.split("\0"):
+        match = TEST_FILE_RE.fullmatch(_text(name))
+        if match:
+            out.add(match.group(1))
+    return out
+
+
+def direct_callers(repo: Path, files, left: str, sha: str,
+                   tests_dir: Path, texts: dict | None = None,
+                   changed: dict | None = None) -> dict[str, dict]:
+    """#8132 : les tests qui nomment `module.fonction` d'une fonction changée.
+
+    Rend `{"module.fonction": {"module", "function", "files", "tests"}}`.
+    Seuls les blocs simples (une fonction, pas `<module>` ni `Classe.methode`)
+    sont retenus : un test écrit `merge_queue.review_gate`, pas
+    `Classe.methode`. Un appel direct est une preuve que la carte périmée ne
+    porte pas, et passe avant ses voisins. `texts` évite de relire les tests
+    déjà lus pour les supports.
+    """
+    blocks = _map_blocks()
+    groups: dict[str, dict] = {}
+    for path in sorted(files):
+        if not (path.startswith("src/") and path.endswith(".py")):
+            continue
+        names = (changed_blocks(repo, sha, path, blocks, left)
+                 if changed is None else changed.get(path))
+        if names is None:
+            continue
+        short = Path(path).stem
+        for name in _leaf_blocks(names):
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                continue
+            key = "%s.%s" % (short, name)
+            groups.setdefault(key, {"module": short, "function": name,
+                                    "files": [path], "tests": []})
+    by_module: dict[str, list[tuple[str, re.Pattern]]] = {}
+    for key, row in groups.items():
+        pattern = re.compile(r"(?<![\w.])%s\.%s\b" % (
+            re.escape(row["module"]), re.escape(row["function"])))
+        by_module.setdefault(row["module"], []).append((key, pattern))
+    if texts is not None:
+        sources = sorted(texts.items())
+    else:
+        sources = []
+        for path in sorted(tests_dir.glob("test_*.py")):
+            try:
+                sources.append((path.stem, path.read_text(encoding="utf-8")))
+            except (OSError, UnicodeDecodeError):
+                continue
+    for module, text in sources:
+        for short, entries in by_module.items():
+            if short + "." not in text:
+                continue
+            for key, pattern in entries:
+                if pattern.search(text):
+                    groups[key]["tests"].append(module)
+    return {key: row for key, row in groups.items() if row["tests"]}
 
 
 def _leaf_blocks(names) -> list[str]:
@@ -435,7 +557,7 @@ def _resolve_entry(by_block: dict, name: str) -> tuple[str, dict | None]:
 
 
 def card_candidates(repo: Path, card, sha: str,
-                    files, left: str = "") -> tuple[dict, dict]:
+                    files, left: str = "", changed: dict | None = None) -> tuple[dict, dict]:
     """Les modules voisins d'une unité, et ce que la carte ne couvre pas.
 
     Rend `({module: {"blocks": [...], "files": [...]}}, couverture)` : chaque
@@ -459,7 +581,8 @@ def card_candidates(repo: Path, card, sha: str,
         if not isinstance(by_block, dict):
             coverage["unknown_paths"].append(path)
             continue
-        names = changed_blocks(repo, sha, path, blocks, left)
+        names = (changed_blocks(repo, sha, path, blocks, left)
+                 if changed is None else changed.get(path))
         if names is None:
             names = set(by_block)
         if not names:
@@ -490,23 +613,55 @@ def card_candidates(repo: Path, card, sha: str,
 
 def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
            slug: str, state_dir: Path, driver: str = "psycopg") -> dict:
-    """Les modules voisins de chaque unité (support, carte), avec leur raison."""
+    """Les modules voisins de chaque unité (support, appel, carte), avec leur
+    raison."""
     units = packet_red.unit_files(unit_rows, checkout=str(repo))
     tests_dir = repo / "tests"
     imports: dict[str, set] = {}
+    texts: dict[str, str] = {}
     for path in sorted(tests_dir.glob("test_*.py")):
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         imports[path.stem] = packet_red.imported_test_files(text)
+        texts[path.stem] = text
     card, card_prov = read_card(repo, slug, state_dir)
     card_prov = _card_against_base(repo, card_prov, base)
     durations = read_durations(repo, driver)
     # la carte mesure psycopg, à son commit : ni psql, ni une base plus récente
     card_durations = driver == "psycopg" and card_prov.get("base") == "à jour"
+    # #8132 : une carte antérieure à la base ne couvre plus le diff, quel que
+    # soit le pilote — paquet-auto prend psql quand psycopg manque, et une
+    # carte antérieure doit alors déclencher les mêmes appels directs. Ses
+    # durées, elles, ne valent que sous psycopg : sous psql, la table du
+    # pilote tranche (B de cx2).
+    card_old = card is not None and card_prov.get("base") == "antérieure"
+    card_stale = card_old and driver == "psycopg"
+    card_commit = _text(card_prov.get("commit"))
+    stale_changed: set[str] | None = None
+    if card_stale:
+        stale_changed = _changed_test_modules(repo, card_commit, base)
+        if stale_changed is None:
+            card_stale = False
     priced = {"driver": driver, "table": DURATIONS_REL if durations else "",
-              "measured": len(durations), "card": card_durations}
+              "measured": len(durations), "card": card_durations,
+              "stale": card_stale}
+
+    def price(module: str) -> tuple[float, bool]:
+        """#8132 : durée du module, carte antérieure seulement si test inchangé."""
+        if durations and module in durations:
+            return durations[module], True
+        if card_durations:
+            seconds = _card_seconds(card, module)
+            return (seconds, True) if seconds is not None else (
+                UNKNOWN_DURATION_S, False)
+        if card_stale and module not in (stale_changed or set()):
+            seconds = _card_seconds(card, module)
+            if seconds is not None:
+                return seconds, True
+        return UNKNOWN_DURATION_S, False
+
     out_units = []
     for unit in units:
         sha = _text(unit.get("unit_sha"))
@@ -519,6 +674,11 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
                if match and (repo / match.group(0)).is_file()}
         touched_tests = {path for path in files
                          if path.startswith("tests/") and path.endswith(".py")}
+        # #8132 N (auditeur) : le découpage de `scripts/map.py` ne sert qu'à la
+        # carte ou aux appels directs ; sans carte ni carte antérieure, on
+        # l'évite au lieu de découper tous les `src/` pour rien.
+        changed = (changed_blocks_by_file(repo, sha, files, left)
+                   if card is not None or card_old else None)
         added: list[dict] = []
         taken = set(own)
         supports = []
@@ -527,8 +687,7 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
                 continue
             hit = sorted(imports[module] & touched_tests)
             if hit:
-                supports.append((_module_seconds(card, module, durations,
-                                                 card_durations), module, hit))
+                supports.append((price(module)[0], module, hit))
                 taken.add(module)
         # #4814 : un support partagé (`tests/support.py`, importé par ~545
         # modules) ne fait plus de la série de l'unité la suite entière
@@ -542,15 +701,43 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
             added.append({"module": "tests." + module, "reason": "support",
                           "files": hit, "seconds": round(seconds, 1)})
         dropped = len(supports) - supported
-        found, coverage = (card_candidates(repo, card, sha, files, left)
+        # #8132 : quand la carte est antérieure à la base, un test qui nomme
+        # une fonction changée est une preuve directe. Les fonctions les plus
+        # appelées passent d'abord, dans leur propre budget : la carte ne peut
+        # pas les avoir vues, et sa borne ne doit pas les chasser.
+        direct_spent = 0.0
+        if card_old:
+            groups = direct_callers(repo, files, left, sha, tests_dir,
+                                    texts=texts, changed=changed)
+            for key in sorted(groups, key=lambda name: (
+                    -len(groups[name]["tests"]), name)):
+                row = groups[key]
+                offers = []
+                for module in row["tests"]:
+                    if module in taken:
+                        continue
+                    offers.append((price(module)[0], module))
+                offers.sort()
+                for seconds, module in offers:
+                    if module in taken:
+                        continue
+                    if direct_spent + seconds > DIRECT_BUDGET_S:
+                        continue
+                    direct_spent += seconds
+                    taken.add(module)
+                    added.append({"module": "tests." + module,
+                                  "reason": "appel",
+                                  "files": row["files"],
+                                  "seconds": round(seconds, 1)})
+        found, coverage = (card_candidates(repo, card, sha, files, left,
+                                           changed=changed)
                            if card is not None else ({}, {}))
         candidates: dict[str, dict] = {}
         for module, row in found.items():
             if module in taken or not re.fullmatch(r"test_[A-Za-z0-9_]+", module) \
                     or not (tests_dir / (module + ".py")).is_file():
                 continue
-            seconds, measured = _module_price(card, module, durations,
-                                              card_durations)
+            seconds, measured = price(module)
             candidates[module] = {"seconds": seconds, "measured": measured,
                                   "blocks": row["blocks"], "files": row["files"]}
         # #7195 : le budget se partage entre les blocs changés, pas seulement
@@ -558,8 +745,9 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
         # avant un bloc très couvert ; `<module>` passe en dernier. Chaque
         # bloc propose son test le moins cher à tour de rôle : un test ciblé
         # d'un bloc rare n'est plus doublé par des tests d'un bloc voisin.
-        # Les durées mesurées passent avant le forfait `UNKNOWN_DURATION_S` :
-        # un forfait ne doit pas chasser un test ciblé mesuré plus court.
+        # #8132 : à l'intérieur d'un bloc, un test qui couvre plus de blocs
+        # changés passe avant un test plus étroit ; les durées mesurées et le
+        # forfait alternent, pour qu'un module sans mesure ne soit plus affamé.
         by_block: dict[str, list[str]] = {}
         for module, row in candidates.items():
             for block in row["blocks"]:
@@ -572,8 +760,10 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
                         if candidates[name]["measured"]]
             unknown = [name for name in by_block[block]
                        if not candidates[name]["measured"]]
-            measured.sort(key=lambda name: (candidates[name]["seconds"], name))
-            unknown.sort(key=lambda name: (candidates[name]["seconds"], name))
+            measured.sort(key=lambda name: (-len(candidates[name]["blocks"]),
+                                            candidates[name]["seconds"], name))
+            unknown.sort(key=lambda name: (-len(candidates[name]["blocks"]),
+                                           candidates[name]["seconds"], name))
             queues.append((measured, unknown))
         selected: set[str] = set()
 
@@ -590,29 +780,39 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
                           "files": candidates[module]["files"],
                           "seconds": round(seconds, 1)})
 
-        def drain(known: bool) -> None:
-            pending = [entry for entry in queues
-                       if (entry[0] if known else entry[1])]
-            while pending:
-                still = []
-                for measured, unknown in pending:
-                    queue = measured if known else unknown
-                    while queue and queue[0] in selected:
-                        queue.pop(0)
-                    if not queue:
-                        continue
-                    still.append((measured, unknown))
-                    offer(queue.pop(0))
-                pending = still
+        def drain() -> None:
+            """#7195 : un forfait ne chasse pas le mesuré d'un autre bloc.
 
-        drain(True)
-        drain(False)
+            Chaque tour sert d'abord la tête mesurée de chaque bloc en
+            attente, puis les têtes au forfait. Un forfait de 60 s ne peut
+            donc pas épuiser le budget avant qu'un autre bloc ait proposé son
+            test mesuré (#8132 B1 de l'auditeur) ; il entre dès le premier
+            tour quand aucun mesuré ne le précède, pour qu'un module sans
+            mesure ne soit pas affamé (#8118).
+            """
+            pending = list(queues)
+
+            def advance(which: int) -> None:
+                for entry in pending:
+                    queue = entry[which]
+                    while queue and (queue[0] in selected
+                                     or queue[0] in taken):
+                        queue.pop(0)
+                    if queue:
+                        offer(queue.pop(0))
+
+            while pending:
+                advance(0)
+                advance(1)
+                pending = [entry for entry in pending if entry[0] or entry[1]]
+
+        drain()
         dropped += len(candidates) - len(selected)
         out_units.append({"lot": int(unit["lot"]),
                           "unit_sha": _text(unit.get("unit_sha")),
                           "added": added, "dropped": dropped,
-                          "coverage": coverage,
-                          "seconds": round(spent, 1)})
+                          "coverage": coverage, "direct": round(direct_spent, 1),
+                          "seconds": round(direct_spent + spent, 1)})
     return {"schema": SELECTION_SCHEMA, "status": "ok", "repo": str(repo),
             "slug": slug, "budget": budget, "card": card_prov,
             "durations": priced, "units": out_units, "why": ""}
