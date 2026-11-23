@@ -12095,8 +12095,10 @@ class AgentWorker(threading.Thread):
         now_wall, now = time.time(), time.monotonic()
         delais = [float("inf")]
         wake_ts = row.get("wake_ts")
-        if wake_ts is not None and float(wake_ts) > now_wall:
-            delais.append(float(wake_ts) - now_wall + 0.05)
+        if wake_ts is not None:
+            # B P2 cx2 : devenu dû depuis la garde de `_idle_pace` (deux
+            # lectures de l'horloge), il reste une échéance (plancher 50 ms)
+            delais.append(max(0.05, float(wake_ts) - now_wall + 0.05))
         nudge = getattr(self.runner, "idle_nudge", None)
         if not getattr(self, "nudged", True) and isinstance(nudge, (int, float)) and nudge > 0:
             reste = self.last_activity + float(nudge) - now

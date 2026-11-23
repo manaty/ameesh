@@ -568,6 +568,13 @@ class PasDuWorkerCouvert(unittest.TestCase):
         self.assertEqual(worker._idle_pace(), 45.0)
         self.assertFalse(worker._idle_gated)
 
+    def test_reveil_franchi_pendant_l_appel(self):
+        # B P2 cx2 : garde à 1004,999, calcul à 1005,001 : échéance immédiate
+        lectures = iter([1004.999, 1005.001])
+        worker = self._worker(row=dict(self.ROW, wake_ts=1005.0))
+        with mock.patch("ameesh.runner.time.time", lambda: next(lectures)):
+            self.assertLessEqual(worker._idle_pace(), 0.05)
+
     def test_reveil_du_entre_deux_lectures(self):
         # B P2 dev3 : passe à T-5 (dort 5 s), passe à T+0,05 sans réclamation
         # (lecture bridée à 10 s) : pas court, jamais le filet
