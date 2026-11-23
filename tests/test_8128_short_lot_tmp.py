@@ -32,6 +32,12 @@ class _Cfg:
 
 
 class _Base(unittest.TestCase):
+    # Les tests de mécanique ne dépendent pas de la longueur du chemin du
+    # guest ; ceux qui éprouvent la marge AF_UNIX réelle passent par
+    # `_RealBase`.
+    PATCH_SHORT = True
+    PATCH_MEMORY = True
+
     def setUp(self) -> None:
         # Le banc doit avoir un chemin court : `$TMPDIR` d'une session de lot
         # est justement le chemin long que ce lot corrige.
@@ -46,6 +52,19 @@ class _Base(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"HOME": self.home})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Les tests de mécanique ne dépendent ni du système de fichiers ni de
+        # la longueur du chemin du guest ; les tests réels passent par
+        # `_RealBase`, qui n'écarte que les racines en mémoire.
+        if self.PATCH_MEMORY:
+            patcher = mock.patch.object(menage, "in_memory",
+                                        lambda path: False)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        if self.PATCH_SHORT:
+            patcher = mock.patch.object(menage, "_short_path_ok",
+                                        lambda path: True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.cfg = _Cfg(os.path.join(self.base, "state"))
         self.pol = menage.Policy()
         self.agent = "a1"
@@ -64,70 +83,28 @@ class _Base(unittest.TestCase):
                                                            str(lot)))
 
 
+class _RealBase(_Base):
+    """Banc à marge réelle : l'alias n'est créé que si une racine du guest
+    laisse la marge AF_UNIX. Le guest de prévalidation a un HOME long ou en
+    tmpfs : ces tests sont alors sautés, la mécanique restant couverte par
+    `_Base`."""
+
+    PATCH_SHORT = False
+    PATCH_MEMORY = False
+
+    def require_short_root(self) -> None:
+        roots = menage.lot_tmp_link_roots(self.cfg)
+        candidates = [
+            (root, os.path.join(root,
+                                menage.lot_tmp_link_name(self.agent, "8128")))
+            for root in roots
+        ]
+        if not any(menage._short_path_ok(path) and not menage.in_memory(root)
+                   for root, path in candidates):
+            self.skipTest("guest without a short on-disk root for lot TMPDIR")
+
+
 class AliasCourtTest(_Base):
-    def test_le_plus_long_nom_du_registre_tient_la_marge_af_unix(self):
-        # Le plus long nom observé au registre le 2026-11-23 (25 caractères) ;
-        # la correction ne doit pas dépendre de la longueur du nom.
-        agent = "pilot-resident-3389-codex"
-        env = self.env(8128, agent)
-        tmpdir = env["TMPDIR"]
-        self.assertTrue(os.path.islink(tmpdir))
-        self.assertEqual(os.path.realpath(tmpdir), self.real(8128, agent))
-        self.assertTrue(os.path.isdir(os.path.realpath(tmpdir)))
-        self.assertLessEqual(len(os.fsencode(tmpdir)) + menage.LOT_TMP_SOCKET_MARGIN,
-                             menage.AF_UNIX_PATH_MAX)
-        self.assertFalse(menage.in_memory(tmpdir))
-        for key in ("TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR"):
-            self.assertEqual(env[key], tmpdir)
-        root = menage.lot_tmp_link_roots(self.cfg)[0]
-        self.assertTrue(tmpdir.startswith(root + os.sep))
-        self.assertEqual(os.stat(root).st_mode & 0o077, 0)
-
-    def test_compileall_j_0_passe_sous_le_tmpdir_court(self):
-        env = self.env(8128)
-        tmpdir = env["TMPDIR"]
-        real = os.path.realpath(tmpdir)
-        src = os.path.join(real, "src")
-        os.makedirs(src)
-        for index in range(6):
-            with open(os.path.join(src, "m%02d.py" % index), "w",
-                      encoding="utf-8") as fh:
-                fh.write("VALUE = %d\n" % index)
-        child_env = dict(os.environ, TMPDIR=tmpdir, TMP=tmpdir, TEMP=tmpdir)
-        proc = subprocess.run(
-            [sys.executable, "-m", "compileall", "-q", "-j", "0", src],
-            env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, timeout=120)
-        output = proc.stdout.decode("utf-8", "replace")
-        self.assertEqual(proc.returncode, 0, output[-2000:])
-        self.assertNotIn("AF_UNIX", output)
-
-    def test_socket_af_unix_du_forkserver_tient_sous_l_alias(self):
-        tmpdir = self.env(8128)["TMPDIR"]
-        directory = os.path.join(tmpdir, "pymp-abcdefgh")
-        os.makedirs(directory)
-        path = os.path.join(directory, "listener-abcdefghijklmnop")
-        self.assertLessEqual(len(os.fsencode(path)), menage.AF_UNIX_PATH_MAX)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.bind(path)
-        finally:
-            sock.close()
-
-    def test_longueur_independante_du_nom_d_agent_et_contenu_garde(self):
-        court = self.env(10, "a")["TMPDIR"]
-        long = self.env(10, "x" * 64)["TMPDIR"]
-        self.assertNotEqual(court, long)
-        self.assertEqual(len(os.fsencode(court)), len(os.fsencode(long)))
-        self.assertLessEqual(len(os.fsencode(long)) + menage.LOT_TMP_SOCKET_MARGIN,
-                             menage.AF_UNIX_PATH_MAX)
-        with open(os.path.join(court, "garde"), "w", encoding="utf-8") as fh:
-            fh.write("x")
-        # le même tour du même lot retrouve le même alias et son contenu
-        encore = self.env(10, "a")["TMPDIR"]
-        self.assertEqual(encore, court)
-        self.assertTrue(os.path.isfile(os.path.join(encore, "garde")))
-
     def test_racine_en_memoire_est_ecartee_au_profit_de_l_etat(self):
         roots = menage.lot_tmp_link_roots(self.cfg)
         maison = os.path.abspath(self.home)
@@ -180,6 +157,85 @@ class AliasCourtTest(_Base):
                   encoding="utf-8") as fh:
             fh.write("x")
         self.assertTrue(os.path.isfile(os.path.join(self.real(8128), "quota")))
+
+
+class MargeCheminTest(unittest.TestCase):
+    def test_marge_af_unix_borne_exactement_107_octets(self):
+        # 67 + marge 40 = 107 : la borne du noyau passe ; 68 la dépasse.
+        self.assertTrue(menage._short_path_ok("x" * 67))
+        self.assertFalse(menage._short_path_ok("x" * 68))
+
+
+class CheminReelTest(_RealBase):
+    """La marge est éprouvée sur le vrai chemin, socket AF_UNIX comprise ;
+    sauté quand le guest lui-même ne peut pas offrir de racine courte."""
+
+    def test_le_plus_long_nom_du_registre_tient_la_marge_af_unix(self):
+        self.require_short_root()
+        # Le plus long nom observé au registre le 2026-11-23 (25 caractères) ;
+        # la correction ne doit pas dépendre de la longueur du nom.
+        agent = "pilot-resident-3389-codex"
+        env = self.env(8128, agent)
+        tmpdir = env["TMPDIR"]
+        self.assertTrue(os.path.islink(tmpdir))
+        self.assertEqual(os.path.realpath(tmpdir), self.real(8128, agent))
+        self.assertTrue(os.path.isdir(os.path.realpath(tmpdir)))
+        self.assertLessEqual(len(os.fsencode(tmpdir)) + menage.LOT_TMP_SOCKET_MARGIN,
+                             menage.AF_UNIX_PATH_MAX)
+        self.assertFalse(menage.in_memory(tmpdir))
+        for key in ("TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR"):
+            self.assertEqual(env[key], tmpdir)
+        root = menage.lot_tmp_link_roots(self.cfg)[0]
+        self.assertTrue(tmpdir.startswith(root + os.sep))
+        self.assertEqual(os.stat(root).st_mode & 0o077, 0)
+
+    def test_compileall_j_0_passe_sous_le_tmpdir_court(self):
+        self.require_short_root()
+        env = self.env(8128)
+        tmpdir = env["TMPDIR"]
+        real = os.path.realpath(tmpdir)
+        src = os.path.join(real, "src")
+        os.makedirs(src)
+        for index in range(6):
+            with open(os.path.join(src, "m%02d.py" % index), "w",
+                      encoding="utf-8") as fh:
+                fh.write("VALUE = %d\n" % index)
+        child_env = dict(os.environ, TMPDIR=tmpdir, TMP=tmpdir, TEMP=tmpdir)
+        proc = subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", "-j", "0", src],
+            env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=120)
+        output = proc.stdout.decode("utf-8", "replace")
+        self.assertEqual(proc.returncode, 0, output[-2000:])
+        self.assertNotIn("AF_UNIX", output)
+
+    def test_socket_af_unix_du_forkserver_tient_sous_l_alias(self):
+        self.require_short_root()
+        tmpdir = self.env(8128)["TMPDIR"]
+        directory = os.path.join(tmpdir, "pymp-abcdefgh")
+        os.makedirs(directory)
+        path = os.path.join(directory, "listener-abcdefghijklmnop")
+        self.assertLessEqual(len(os.fsencode(path)), menage.AF_UNIX_PATH_MAX)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(path)
+        finally:
+            sock.close()
+
+    def test_longueur_independante_du_nom_d_agent_et_contenu_garde(self):
+        self.require_short_root()
+        court = self.env(10, "a")["TMPDIR"]
+        long = self.env(10, "x" * 64)["TMPDIR"]
+        self.assertNotEqual(court, long)
+        self.assertEqual(len(os.fsencode(court)), len(os.fsencode(long)))
+        self.assertLessEqual(len(os.fsencode(long)) + menage.LOT_TMP_SOCKET_MARGIN,
+                             menage.AF_UNIX_PATH_MAX)
+        with open(os.path.join(court, "garde"), "w", encoding="utf-8") as fh:
+            fh.write("x")
+        # le même tour du même lot retrouve le même alias et son contenu
+        encore = self.env(10, "a")["TMPDIR"]
+        self.assertEqual(encore, court)
+        self.assertTrue(os.path.isfile(os.path.join(encore, "garde")))
 
 
 class NettoyageAliasTest(_Base):

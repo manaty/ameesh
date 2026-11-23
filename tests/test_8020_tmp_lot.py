@@ -52,6 +52,14 @@ class _Base(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"HOME": self.home})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # #8128 : le banc vérifie l'alias, pas le type du système de fichiers
+        # ni la longueur du guest ; le repli et la marge ont leurs tests dédiés.
+        patcher = mock.patch.object(menage, "in_memory", lambda path: False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(menage, "_short_path_ok", lambda path: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cfg = _Cfg(os.path.join(self.base, "state"))
         self.pol = menage.Policy()
         self.agent_dir = os.path.join(self.cfg.state_dir, ".menage", "tmp", "a1")
