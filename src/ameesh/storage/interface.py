@@ -58,9 +58,10 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    pending_spend   put set_model set_resident_usage get clear
                    (Postgres optional: put_get clear_if)
    turn_costs      last_reading insert spent ledger correct last_before first_after
-   mailbox         send unread unread_active unread_urgent get mark_delivered reserve
-                   deliver release unread_counts history pending_recipients
-                   pending_recipients_sorted unread_total dead_letters forward
+   mailbox         send unread unread_active unread_priority unread_urgent get
+                   mark_delivered reserve deliver release unread_counts history
+                   pending_recipients pending_recipients_sorted unread_total
+                   dead_letters forward
    wakeups         subscribe notify
    keys            info register revoke registered
    approvals       create get recent candidates consume
@@ -1843,6 +1844,20 @@ class Mailbox(Domain):
         `since` une borne de création (epoch) ; les deux sont appliquées
         AVANT la limite, pour qu'un préfixe de plus de `limit` non-lus ne
         masque pas les messages suivants. None = pas de borne."""
+
+    @abc.abstractmethod
+    def unread_priority(self, recipient: str, limit: int, *,
+                        since: float) -> list[dict]:
+        """#8112 : les non-lus à servir avant le stock FIFO — le courrier du
+        jour (`created_at >= since`, epoch) lié à un lot (`work_item_id` non
+        vide) et le courrier actif (non passif, même règle que
+        `mail.passive_reason`) —, du plus ancien au plus récent.
+
+        La page de `unread` (les plus anciens) peut être saturée par un
+        stock de passifs : cette lecture rend le courrier du jour et les
+        actifs qu'elle masquerait. `since` est calculé une fois par l'appelant
+        (`mail.day_start`, minuit UTC) pour que les pages d'un même tour
+        partagent la même borne."""
 
     @abc.abstractmethod
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:

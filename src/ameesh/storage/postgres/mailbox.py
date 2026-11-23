@@ -344,6 +344,30 @@ class Mailbox(interface.Mailbox):
             tuple(params),
         )
 
+    def unread_priority(self, recipient, limit, *, since) -> list[dict]:
+        """#8112 : les non-lus à servir avant le stock FIFO.
+
+        Deux familles dans une seule lecture : le courrier du jour (`since`,
+        epoch de la borne) lié à un lot, et le courrier actif — négation de
+        `PASSIVE_SQL`, dont l'index partiel 0495 porte le prédicat au mot
+        près. `agent_mailbox_recent_idx` (recipient, created_at desc) sert la
+        première branche ; aucun index ni schéma changé. L'ordre des ids
+        garde le plus ancien d'abord dans chaque famille.
+        """
+        return self.db.query(
+            """
+            SELECT %s
+            FROM agent_mailbox
+            WHERE recipient = %%s AND delivered_at IS NULL
+              AND ((created_at >= to_timestamp(%%s)
+                    AND coalesce(btrim(work_item_id), '') <> '')
+                   OR NOT %s)
+            ORDER BY id
+            LIMIT %%s
+            """ % (MAIL_COLUMNS, PASSIVE_SQL.format(t="agent_mailbox")),
+            (recipient, float(since), int(limit)),
+        )
+
     def unread_urgent(self, recipient, limit) -> list[dict]:
         return self.db.query(
             """

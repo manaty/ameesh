@@ -23,6 +23,7 @@ import re
 import time
 import unicodedata
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from . import fastmail, fil, resident_queue, storage
@@ -402,6 +403,77 @@ def _created_ts(row) -> float:
         return float(row.get("created_ts") or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def day_start(now: float | None = None) -> float:
+    """#8112 : minuit UTC (epoch) de la journée de `now` (défaut : maintenant).
+
+    Sert de borne au « courrier du jour » : le jour est UTC, comme les
+    échéances du mesh, et non le fuseau de l'hôte."""
+    instant = datetime.fromtimestamp(
+        time.time() if now is None else float(now), timezone.utc)
+    return instant.replace(hour=0, minute=0, second=0,
+                           microsecond=0).timestamp()
+
+
+def _priority_row(row, since: float) -> bool:
+    """#8112 : ce non-lu passe-t-il avant le stock FIFO ?
+
+    Actif (non passif) quel que soit son âge, ou courrier du jour lié à un
+    lot (`work_item_id` non vide)."""
+    if not passive_reason(row):
+        return True
+    if _created_ts(row) < float(since):
+        return False
+    return bool(str(row.get("work_item_id") or "").strip())
+
+
+def unread_priority(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
+                    since: float | None = None) -> list[dict]:
+    """#8112 : les non-lus à servir avant le stock, du plus ancien au plus récent.
+
+    Deux familles : le courrier du jour (`created_at >= since`, minuit UTC par
+    défaut) lié à un lot (`work_item_id` non vide), et le courrier actif
+    (non passif) quel que soit son âge. La page FIFO de `unread` (les 200 plus
+    anciens) peut être saturée par un stock de passifs : sans cette lecture,
+    le courrier du jour et un actif au-delà de la page attendent la vidange
+    du stock (#8040, critère 2).
+
+    Chemin médié : `mailbox.unread_priority` n'est pas au contrat 1.1 ; on
+    relit la page admise (`unread`) et on applique la même règle ici, bornée
+    à cette page comme `unread_active`."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.unread_priority")
+    since = day_start() if since is None else float(since)
+    st = storage.of(db)
+    if getattr(st, "driver", None) == "mediated":
+        rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
+        return [row for row in rows if _priority_row(row, since)][:int(limit)]
+    return st.mailbox.unread_priority(recipient, limit, since=since)
+
+
+def priority_first(priority: Sequence[dict], rows: Sequence[dict]) -> list[dict]:
+    """#8112 : `priority` devant `rows`, sans doublon d'id (ordre stable)."""
+    out: list[dict] = []
+    seen = set()
+    for row in list(priority) + list(rows):
+        key = row.get("id")
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(row)
+    return out
+
+
+def priority_order(rows: Sequence[dict], since: float) -> list[dict]:
+    """#8112 : les non-lus prioritaires devant le stock, ordre stable.
+
+    Le courrier du jour lié à un lot et les actifs passent devant les autres,
+    sans changer l'ordre interne de chaque famille. Utile même quand la page
+    n'est pas pleine : le budget de la consigne (20 Ko) peut s'épuiser avant
+    un message du jour situé en fin de page."""
+    return sorted(rows, key=lambda row: not _priority_row(row, float(since)))
 
 
 def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:

@@ -132,8 +132,9 @@ externe côté mesh, pas une opération de l'appareil.
 
 The 46 operations added to the interface by main up to 1.9.0 are refused
 as well, so contract 1.1 is unchanged: `ci.*` (CI results, L161),
-`decisions.*` (owner decision requests, L124), `mailbox.unread_active`,
-`dead_letters`, `forward`, `withdraw`, `human_messages` (L125, undeliverable
+`decisions.*` (owner decision requests, L124), `mailbox.unread_active`
+and `mailbox.unread_priority` (#8112), `dead_letters`, `forward`,
+`withdraw`, `human_messages` (L125, undeliverable
 mail, unrecorded decisions), `turn_resources.begin_grace` and `churn`
 (background work of a turn, turn churn), `housekeeping.latest_by_path`
 (L222), and the `work.*` operations of estimates, measures, migration
