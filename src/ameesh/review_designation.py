@@ -994,6 +994,9 @@ def _by_delta_select(*, required: int, authors, candidates, families, already,
     if target is not None and review_deltas.covered(deltas, families_now, required):
         why = ("designated %d reviewer(s) covering %d author delta(s)"
                % (len(chosen), len(deltas)))
+        if seats:
+            why += " (manual seats retained: %s)" % ", ".join(
+                "%s/%s" % (seat["name"], seat["family"]) for seat in seats)
         if kept:
             why += " (kept %d already designated for this freeze)" % len(kept)
         if fixer_names or hypothetical_names:

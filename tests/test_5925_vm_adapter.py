@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from tests.support import PgTestCase
-from ameesh import config, host_release, storage, vm_adapter as vm
+from ameesh import config, host_release, registry, storage, vm_adapter as vm
 from ameesh.storage.postgres.vm_adapter import Queue
 
 
@@ -120,7 +120,7 @@ class DecisionTest(unittest.TestCase):
 
     def test_elected_wake_uses_one_admitted_candidate_for_active_work(self):
         role = dict(name='role', releve='election', lease_live=False, status='idle',
-                    admitted_hosts=['ag1', 'ag2'], unread=1)
+                    admitted_hosts=['ag1', 'ag2'], vm_wake_mail_id=17)
         candidates = [dict(host='ag2', declared=True, admitted=True, preference_rank=1),
                       dict(host='ag1', declared=True, admitted=True, preference_rank=0)]
         choose = lambda r, lots=(), holds={}: vm.elected_wake_target(
@@ -129,11 +129,12 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(choose(role, holds={'ag1': {}}), 'ag2')
         self.assertIsNone(choose(dict(role, lease_live=True)))
         self.assertIsNone(choose(dict(role, status='stopped')))
-        self.assertIsNone(choose(dict(role, unread=0, passive_unread=2)))
+        self.assertIsNone(choose(dict(role, retired_ts=1)))
+        self.assertIsNone(choose(dict(role, vm_wake_mail_id=None, passive_unread=2)))
         scheduled = [dict(assignee='role', state='build', wake_ts=1050)]
-        self.assertEqual(choose(dict(role, unread=0), scheduled), 'ag1')
-        self.assertIsNone(choose(dict(role, unread=0), [dict(scheduled[0], wake_ts=1061)]))
-        self.assertIsNone(choose(dict(role, unread=0), [dict(scheduled[0], state='closed')]))
+        self.assertEqual(choose(dict(role, vm_wake_mail_id=None), scheduled), 'ag1')
+        self.assertIsNone(choose(dict(role, vm_wake_mail_id=None), [dict(scheduled[0], wake_ts=1061)]))
+        self.assertIsNone(choose(dict(role, vm_wake_mail_id=None), [dict(scheduled[0], state='closed')]))
         self.assertEqual(vm.elected_wake_target(role, candidates, [],
                          {'ag1': {}, 'ag2': {}}, {}, now=1000, horizon=60,
                          stalled={'ag1'}), 'ag2')
@@ -209,7 +210,7 @@ class AdapterTest(PgTestCase):
     def test_active_mail_for_lease_free_role_starts_candidate(self):
         self.operations.listing.return_value = [dict(
             name='role', releve='election', lease_live=False, status='idle',
-            admitted_hosts=['burst'], unread=1)]
+            admitted_hosts=['burst'], vm_wake_mail_id=17)]
         self.provider.state.return_value = 'stopped'
         self.observe_old('stopped')
         status = dict(holder=None, candidates=[dict(host='burst', declared=True,
@@ -217,11 +218,32 @@ class AdapterTest(PgTestCase):
         with mock.patch('ameesh.vm_adapter.election.status', return_value=status):
             self.assertEqual(self.tick(), 'starting')
         self.provider.action.assert_called_once_with(TARGET, 'poweron')
+        event = self.db.query("SELECT data FROM ameesh_events WHERE type='vm.elected_wake' "
+                              "AND object='burst' ORDER BY id DESC LIMIT 1")[0]['data']
+        self.assertEqual((event['role'], event['mail_id']), ('role', 17))
+
+    def test_listing_ignores_passive_events_for_vm_wake(self):
+        registry.upsert(self.db, 'vm-wake-role', harness='claude', host='burst')
+        def deposit(kind, payload):
+            return self.db.query("INSERT INTO agent_mailbox(sender,recipient,body,kind,payload) "
+                                 "VALUES ('sender','vm-wake-role','test',%s,%s::jsonb) RETURNING id",
+                                 (kind, json.dumps(payload)))[0]['id']
+        def row():
+            return next(r for r in storage.of(self.db).operations.listing()
+                        if r['name'] == 'vm-wake-role')
+        deposit('event', {})
+        deposit('request', {'info': True})
+        self.assertIsNone(row()['vm_wake_mail_id'])
+        active = deposit('request', {})
+        self.assertEqual(row()['vm_wake_mail_id'], active)
+        self.db.execute("UPDATE agent_mailbox SET delivered_at=now() WHERE id=%s", (active,))
+        urgent = deposit('event', {'urgent': True})
+        self.assertEqual(row()['vm_wake_mail_id'], urgent)
 
     def test_role_return_is_recorded_before_provider_failure(self):
         self.operations.listing.return_value = [dict(
             name='role', releve='election', lease_live=False, status='idle',
-            admitted_hosts=['burst'], unread=1)]
+            admitted_hosts=['burst'], vm_wake_mail_id=17)]
         self.provider.state.side_effect = vm.Refused('provider unavailable')
         status = dict(holder=None, candidates=[dict(host='burst', declared=True,
                                                     admitted=True, preference_rank=0)])

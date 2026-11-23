@@ -45,6 +45,11 @@ RELOAD_RETRY_S = 60.0
 #: producer owed them. The retry re-enters `pass_once`, so it also applies the
 #: pending requests within this bound; it never polls CI or widens authority.
 PASSAGE_RETRY_S = 60.0
+#: #8096: a paused plan has no packet cutoff left to wake the service (its
+#: phase never composes again on its own). The passage revisits it within this
+#: bound so the "member left the validated set" rule is applied without a
+#: pilot gesture and without an external event; it neither polls CI nor merges.
+PAUSED_RECHECK_S = 600.0
 #: #3134: how long the runner's shutdown waits for a train effect still in
 #: flight (push, promotion, SQL write) before releasing the lease. Far below
 #: the runner units' `TimeoutStopSec`; past it the lease expires with its TTL.
@@ -397,7 +402,14 @@ class Passage:
                 or not math.isfinite(deadline) or deadline <= now:
             raise train.TrainError("compiled canon must provide a future packet cutoff")
         refused = self.canon_refusal(db, runtime)
-        return (refused if refused is not None else self._step(runtime, now)), deadline
+        result = refused if refused is not None else self._step(runtime, now)
+        if isinstance(result, dict) and result.get("result") == "paused":
+            # #8096 : un plan en pause ne repart jamais seul et aucun créneau
+            # ne le réveille. On le revoit dans l'heure pour appliquer la
+            # règle du membre parti (invalidation sans promotion), sans
+            # attendre un geste du pilote.
+            deadline = min(deadline, now + PAUSED_RECHECK_S)
+        return result, deadline
 
     def canon_refusal(self, db, runtime):
         """#2914: refuse by name to compose while the pin differs from the gate.
@@ -562,7 +574,7 @@ class Service:
         try:
             result, deadline = self.passages[index].scheduled_step(db, now)
             if isinstance(result, dict) and result.get("result") in (
-                    "landed", "invalidated"):
+                    "landed", "invalidated", "abandoned"):
                 # #2965: the target just freed. A cutoff the landed packet
                 # overran is composed at once, with the candidates admissible
                 # at that cutoff, instead of waiting for the next calendar
@@ -570,6 +582,9 @@ class Service:
                 # #7967: an expiry-invalidated plan also frees the target; the
                 # pass that invalidated it must compose the due cutoff itself,
                 # not wait for the next hourly event.
+                # #8096 (B cx2 #45448): an abandon applied under the service
+                # lease frees the target too; its `recompose` marker must be
+                # consumed at once, not at the next calendar wake.
                 with self.condition:
                     self.pending.add(index)
             return deadline

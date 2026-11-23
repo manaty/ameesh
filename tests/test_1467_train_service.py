@@ -46,6 +46,21 @@ class TrainServiceTest(unittest.TestCase):
         self.assertEqual([call.args[1] for call in passage.scheduled_step.call_args_list],
                          [100, 101])
 
+    def test_8096_an_applied_abandon_is_repassed_at_once(self):
+        """B cx2 #45448: l'abandon appliqué sous bail porte `recompose`."""
+        passage = mock.Mock()
+        passage.scheduled_step.side_effect = [({"result": "abandoned"}, 200),
+                                              ({"result": "ci"}, 300)]
+        service = self.service(passage)
+        service.pending.clear()
+        with mock.patch("ameesh.scoped_db.ScopedDb", return_value=mock.Mock()):
+            self.assertEqual(service.pass_once(0, 100), 200)
+        self.assertEqual(service.pending, {0})
+        service.pending.clear()
+        with mock.patch("ameesh.scoped_db.ScopedDb", return_value=mock.Mock()):
+            self.assertEqual(service.pass_once(0, 101), 300)
+        self.assertEqual(service.pending, set())
+
     def test_schedule_and_engine_share_the_same_compiled_object(self):
         passage = train_runner.Passage.__new__(train_runner.Passage)
         passage.policy = train.Policy(enabled=True)
@@ -64,6 +79,25 @@ class TrainServiceTest(unittest.TestCase):
             with self.assertRaises(train.TrainError):
                 passage.scheduled_step(db, 100)
         self.assertEqual(passage._step.call_count, 1)
+
+    def test_8096_a_paused_passage_is_revisited_within_the_recheck_bound(self):
+        """#8096 : aucun créneau ne réveille une pause ; le service la revoit."""
+        passage = train_runner.Passage.__new__(train_runner.Passage)
+        passage.policy = train.Policy(enabled=True)
+        runtime = mock.Mock()
+        runtime.policy.schedule.next_packet.return_value = 10_000
+        passage.runtime = mock.Mock(return_value=runtime)
+        passage._step = mock.Mock(return_value={"result": "paused"})
+        db = object()
+        self.assertEqual(passage.scheduled_step(db, 100),
+                         ({"result": "paused"}, 100 + train_runner.PAUSED_RECHECK_S))
+        # Un créneau compilé plus proche reste prioritaire.
+        runtime.policy.schedule.next_packet.return_value = 200
+        self.assertEqual(passage.scheduled_step(db, 100), ({"result": "paused"}, 200))
+        # Les autres issues gardent le créneau compilé.
+        passage._step.return_value = {"result": "ci"}
+        runtime.policy.schedule.next_packet.return_value = 1234
+        self.assertEqual(passage.scheduled_step(db, 100), ({"result": "ci"}, 1234))
 
     def test_standby_host_refreshes_pin_without_executing_a_passage(self):
         for role_held in (False, True):

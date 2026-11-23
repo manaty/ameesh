@@ -216,6 +216,216 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual([e[0] for e in self.ports.effects], ["publish", "ci"])
         self.assertTrue(self.ports.notices)
 
+    def test_8096_paused_plan_invalidates_when_a_proven_culprit_leaves(self):
+        """#8096: le retour en build du fautif NOMMÉ sort la pause sans pilote.
+
+        Le plan ne peut plus être promu ; le service l'invalide sous son bail
+        avec la trace du lot parti, puis la passe suivante recompose sans lui
+        au même créneau, sans seconde CI tant que la première n'est pas finie.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        self.ports.document["diagnosis"] = {"attribution": {
+            "status": "proven", "candidates": [], "proven_lots": [{"work_item_id": 2}]}}
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:10:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(result["invalidated"]["members"], [2])
+        self.assertEqual(result["invalidated"]["previous_phase"], "paused")
+        self.assertFalse(self.ports.held)
+        result = engine.step(stamp("2026-10-15T11:10:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+        self.assertNotEqual(result["plan"]["id"], first["id"])
+        self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
+
+    def test_8096_a_complete_declaration_attributes_the_removal(self):
+        """#231037 : la déclaration atomique du pilote est la preuve durable.
+
+        C'est le chemin réel : le journal d'un membre porte la note
+        `train-faults: <id> lots=[<lot>,...]; <motif>`, que `plan_faults` relit.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        self.ports.faults = {2}
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:10:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(result["invalidated"]["members"], [2])
+        result = engine.step(stamp("2026-10-15T11:10:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+
+    def test_8096_a_pass_before_the_complete_declaration_keeps_the_pause(self):
+        """B cx2 #231037 : une passe entre deux retours ne prouve pas l'ensemble.
+
+        A et B sont fautifs sans diagnostic. A revient en build et une passe a
+        lieu avant la déclaration complète : rien ne prouve encore que B n'est
+        pas fautif, donc la pause tient. La déclaration {A, B} arrive ensuite,
+        B encore présent : la pause tient. B part à son tour : tous les fautifs
+        déclarés ont quitté, la recomposition repart sans eux.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2), admitted(3)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        # A (2) est revenu en build ; aucune déclaration complète n'existe.
+        self.ports.rows = [admitted(1), admitted(3)]
+        self.assertEqual(engine.step(stamp("2026-10-15T11:10:00"))["result"], "paused")
+        # Déclaration atomique {2, 3} : 3 est encore dans le plan, pause.
+        self.ports.faults = {2, 3}
+        self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
+        # 3 part : tous les fautifs déclarés ont quitté.
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:12:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(sorted(result["invalidated"]["members"]), [2, 3])
+        result = engine.step(stamp("2026-10-15T11:12:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+
+    def test_8096_innocent_or_partial_declared_removal_keeps_the_pause(self):
+        """B cx2 #45468 : la déclaration lie les fautifs au plan, pas les voisins.
+
+        Le retrait d'un lot innocent, puis le départ d'un seul des deux
+        fautifs déclarés, ne prouvent pas la fin de la pause ; tous partis,
+        la recomposition repart sans eux.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2), admitted(3)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        # Seul le lot 3 est déclaré fautif : le retrait du lot 2, innocent,
+        # ne dit rien du lot 3 resté dans le plan.
+        self.ports.faults = {3}
+        self.ports.rows = [admitted(1), admitted(3)]
+        self.assertEqual(engine.step(stamp("2026-10-15T11:10:00"))["result"], "paused")
+        # Les deux fautifs sont déclarés : le départ d'un seul ne suffit pas.
+        self.ports.faults = {2, 3}
+        self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
+        # Tous les fautifs déclarés ont quitté : la pause tombe sans eux.
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:12:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(sorted(result["invalidated"]["members"]), [2, 3])
+        result = engine.step(stamp("2026-10-15T11:12:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+
+    def test_8096_removing_an_innocent_or_part_of_the_culprits_keeps_the_pause(self):
+        """B cx2 #45452: sans preuve que TOUS les fautifs sont partis, pause."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2), admitted(3)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        # Un rouge multi-lots sans diagnostic ne nomme aucun coupable : le
+        # retrait d'un membre ne prouve rien, même s'il est le vrai fautif.
+        self.ports.rows = [admitted(1), admitted(3)]
+        self.assertEqual(engine.step(stamp("2026-10-15T11:10:00"))["result"], "paused")
+        # Deux fautifs nommés : en retirer un seul ne suffit pas.
+        self.ports.document["diagnosis"] = {"attribution": {
+            "status": "proven", "candidates": [],
+            "proven_lots": [{"work_item_id": 2}, {"work_item_id": 3}]}}
+        self.ports.rows = [admitted(1), admitted(3)]
+        self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
+        # Tous les fautifs nommés sont partis : la pause tombe, sans le lot 1.
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:12:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(sorted(result["invalidated"]["members"]), [2, 3])
+        result = engine.step(stamp("2026-10-15T11:12:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+
+    def test_8096_a_plan_whose_members_all_left_is_invalidated_without_culprit(self):
+        engine = self.engine([admitted(1), admitted(2)])
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        self.ports.rows = []
+        result = engine.step(stamp("2026-10-15T11:10:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(sorted(result["invalidated"]["members"]), [1, 2])
+
+    def test_8096_an_isolated_singleton_red_names_its_culprit(self):
+        engine = self.engine([admitted(1), admitted(2)])
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        plan = self.ports.document["plan"]
+        plan["diagnostic"] = True
+        plan["suspects"] = [row for row in plan["members"] if row["work_item_id"] == 2]
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:10:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertEqual(result["invalidated"]["members"], [2])
+
+    def test_8096_recompose_takes_a_new_freeze_admitted_after_the_consumed_slot(self):
+        """B cx2 #45448: un nouveau gel après le créneau consommé n'est pas exclu.
+
+        Le marqueur dit la recomposition due ; filtrer sur le créneau
+        laisserait le train idle jusqu'au suivant quand c'est le seul
+        candidat.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+        self.ports.rows = [admitted(2, "2026-10-15T11:10:00")]
+        result = engine.step(stamp("2026-10-15T11:11:00"))
+        self.assertEqual(result["result"], "invalidated", result)
+        result = engine.step(stamp("2026-10-15T11:11:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [2])
+        self.assertNotEqual(result["plan"]["id"], first["id"])
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
+
+    def test_8096_paused_rule_never_recomposes_over_a_running_packet_ci(self):
+        """Un plan qui a déjà sa CI ne se recompose pas : il draine d'abord."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.rows = [admitted(1)]
+        result = engine.step(stamp("2026-10-15T11:05:00"))
+        self.assertEqual(result["result"], "refused", result)
+        self.assertEqual(self.ports.document["phase"], "draining")
+        self.assertEqual(self.ports.document["plan"]["id"], first["id"])
+        self.assertEqual(len(self.ports.probes), 1)
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 1)
+        self.assertEqual(engine.step(stamp("2026-10-15T11:06:00"))["result"], "draining")
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:07:00"))["result"], "invalidated")
+        self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 1)
+
+    def test_8096_unreadable_members_keep_the_paused_train_fail_closed(self):
+        """Sans preuve de lecture des membres, la pause n'est pas invalidée."""
+        engine = self.engine([admitted(1), admitted(2)])
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "paused")
+
+        def unreadable():
+            raise train.TrainError("connection closed")
+
+        self.ports.entries = unreadable
+        self.assertEqual(engine.step(stamp("2026-10-15T11:10:00"))["result"], "paused")
+        self.assertEqual(self.ports.document["phase"], "paused")
+        self.ports.entries = None
+        self.assertEqual(engine.step(stamp("2026-10-15T11:11:00"))["result"], "paused")
+        self.assertEqual(self.ports.document["phase"], "paused")
+
     def test_policy_without_compiled_calendar_refuses_a_cutoff(self):
         # #2451: no local 11:00/23:00 fallback survives in the engine
         self.assertFalse(hasattr(train, "cutoff"))

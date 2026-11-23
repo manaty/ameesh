@@ -75,6 +75,14 @@ class SelectByDeltaTest(unittest.TestCase):
         self.assertEqual(out["missing"], 1)
         self.assertIn("1 (author families: codex; 1 missing)", out["why"])
 
+    def test_manual_seat_is_named_when_no_reviewer_is_added(self):
+        out = self.select((), required=1, authors=[{"name": "author", "family": "claude"}],
+                          already=[{"name": "codex-r", "family": "codex"}],
+                          deltas=[{"claude"}, {"claude"}, {"claude"}])
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(out["reviewers"], [])
+        self.assertIn("manual seats retained: codex-r/codex", out["why"])
+
     def test_a_manual_seat_of_another_delta_counts(self):
         # codex1 a écrit le delta codex : son siège ne couvre pas ce delta,
         # mais il couvre le delta deepseek, qui demande pourtant deux autres

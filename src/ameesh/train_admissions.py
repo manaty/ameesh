@@ -14,6 +14,7 @@ provider, runner hook or configuration is enabled by importing this module.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+import re
 
 from . import (land, lot_class, merge_queue, packet_guard, review, review_floor,
                storage, work)
@@ -183,13 +184,80 @@ class Admissions:
     def entries(self):
         # Read all targets: filtering SQL on 'main' would hide 'origin/main'.
         # The runtime verifies their shared canonical target reservation.
+        # #8096 : une ligne de file ne vaut que pour un lot encore en qa ou
+        # validated. Un lot revenu en build (ou en intake) n'est pas un membre
+        # de paquet, même si une ligne de file périmée subsistait.
         return [row for row in self.ops.queue(None)
                 if row["state"] == "queued" and row["source"] == self.source
-                and row["item_state"] not in UNAVAILABLE]
+                and row["item_state"] in work.TO_VALIDATE]
 
     def dependencies(self, rows):
         return storage.of(self.db).work_dependencies.for_items(
             [int(row["work_item_id"]) for row in rows]) if rows else []
+
+    #: #8096 : déclaration COMPLÈTE et atomique des fautifs d'un plan paused,
+    #: en tête de la note d'un de ses membres :
+    #: `train-faults: <identifiant du plan> lots=[<id>,<id>...]; <motif libre>`.
+    #: Un marqueur posé lot par lot est partiel par construction : une passe
+    #: entre deux retours verrait un ensemble incomplet et lèverait la pause
+    #: alors qu'un fautif reste (B cx2 #231037). La déclaration donne d'un seul
+    #: geste l'ensemble clos ; la plus récente pour ce plan fait foi.
+    FAULT_PREFIX = "train-faults:"
+    _FAULTS = re.compile(
+        r"^\s*" + re.escape(FAULT_PREFIX)
+        + r"\s*([0-9a-f]{8,64})(?![0-9a-f])"
+        + r"\s+lots=\[([0-9]+(?:\s*,\s*[0-9]+)*)\]\s*;", re.I)
+
+    def plan_faults(self, plan) -> set:
+        """#8096 : ensemble complet des fautifs déclaré pour CE plan paused.
+
+        Le journal des membres est persistant ; seule une note commençant par
+        `train-faults: <plan> lots=[<id>,...]; <motif>` déclare l'ensemble,
+        atomiquement (la liste est close entre crochets et `;` : une liste
+        mal formée est ignorée, jamais interprétée partiellement).
+        Une note qui cite seulement l'identifiant (retrait pour dépendance,
+        note ordinaire) ou un marqueur par lot ne prouve rien : une passe entre
+        deux retours invoquerait la pause sur un ensemble incomplet (B cx2
+        #45468, #231037). La déclaration la plus récente pour ce plan fait foi.
+        L'ensemble rendu contient les fautifs déclarés, partis ou non : le
+        moteur n'invalide que si TOUS sont membres du plan et ont quitté.
+        """
+        if not isinstance(plan, dict) or not isinstance(plan.get("id"), str):
+            return set()
+        plan_id = plan["id"].lower()
+        if len(plan_id) < 12:
+            return set()
+        members = plan.get("members")
+        if not isinstance(members, list):
+            return set()
+        best = None
+        for row in members:
+            lot = row.get("work_item_id") if isinstance(row, dict) else None
+            if not isinstance(lot, int) or isinstance(lot, bool):
+                continue
+            try:
+                events = self.ops.events(lot, 200)
+            except Exception as exc:  # noqa: BLE001 - unreadable proof = no proof
+                raise TrainError("fault declaration unreadable: %s" % exc) from exc
+            for event in events:
+                note = str(event.get("note") or "")
+                if not note.lstrip().lower().startswith(self.FAULT_PREFIX.lower()):
+                    continue
+                key = int(event.get("id") or 0)
+                match = self._FAULTS.match(note)
+                if not match:
+                    # Une déclaration illisible qui nomme ce plan ne prouve
+                    # rien et ne retombe jamais sur une déclaration antérieure.
+                    if plan_id[:8] in note.lower() and (best is None or key > best[0]):
+                        best = (key, set())
+                    continue
+                if not plan_id.startswith(match.group(1).lower()):
+                    continue
+                declared = {int(part) for part in
+                            re.split(r"\s*,\s*", match.group(2))}
+                if declared and (best is None or key > best[0]):
+                    best = (key, declared)
+        return set() if best is None else set(best[1])
 
     # -- packet-cutoff admission (#2965) -------------------------------------
 

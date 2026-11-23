@@ -106,6 +106,14 @@ class TwoAuthorFamiliesTest(_Fixture):
         work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
                        actor="ds-author")
 
+    def test_no_verdict_and_one_verdict_never_satisfy_two_review_floor(self):
+        no_verdict = self.gate()
+        self.assertEqual(no_verdict["required"], 2)
+        self.assertFalse(no_verdict["ok"], no_verdict)
+        self.verdict("claude-r", "claude")
+        one_verdict = self.gate()
+        self.assertFalse(one_verdict["ok"], one_verdict)
+
     def test_the_head_is_valid_with_the_three_families(self):
         for actor, harness in (("claude-r", "claude"), ("codex-r", "codex"),
                                ("deepseek-r", "deepseek")):
