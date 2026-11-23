@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """P3 on an isolated populated schema, including P2 rollback and re-upgrade."""
+from dataclasses import replace
 from pathlib import Path
 import uuid
-from unittest import mock
 
 from ameesh import db as db_mod, migrations, work
-from ameesh.modules import dev, registry
+from ameesh.modules import dev
 from ameesh.modules.dev.storage import schema as dev_schema
 from ameesh.modules.dev.tables import TABLES
 from . import support
@@ -13,12 +13,16 @@ from . import test_7651_dev_schema_cutover as p2
 from .role_acl import serialize_role_acl
 
 P3_ROLLBACK = (Path(support.REPO) /
-               "src/ameesh/modules/dev/migrations/rollback/0002_remove_compatibility_views.sql").read_text()
+               "src/ameesh/modules/dev/pending/rollback/0002_remove_compatibility_views.sql").read_text()
 
 
 def removal_modules():
-    with mock.patch.object(dev, "MIGRATIONS", "migrations"):
-        return registry.discover()
+    # Explicit test-only P3 activation; production discovery sees P2 only.
+    found = p2.cutover_modules()
+    pending = migrations.discover(str(Path(dev.__file__).parent / 'pending'), module='dev')
+    return replace(found, modules=tuple(
+        replace(module, migrations=module.migrations + tuple(pending))
+        if module.name == 'dev' else module for module in found.modules))
 
 
 @support.needs_builtin_modules
@@ -177,3 +181,17 @@ class RemoveViewsTest(support.PgTestCase):
                 (self.schema,)), original)
         finally:
             self.db.execute('DROP VIEW p3_dependency')
+
+    def test_p2_activation_keeps_views_until_separate_p3_activation(self):
+        activated_p2 = p2.cutover_modules()
+        self.assertEqual([m.version for m in activated_p2.get('dev').migrations], [1])
+        self.assertEqual([m.version for m in migrations.migrate(self.db, modules=activated_p2)], [1])
+        for name in TABLES:
+            self.assertEqual(self.db.query(
+                'SELECT relkind FROM pg_class WHERE oid=to_regclass(%s)',
+                (self.schema + '.' + name,))[0]['relkind'], 'v')
+        self.assertEqual(migrations.migrate(self.db, modules=activated_p2), [])
+        self.assertEqual([m.version for m in migrations.migrate(self.db, modules=removal_modules())], [2])
+        for name in TABLES:
+            self.assertIsNone(self.db.query('SELECT to_regclass(%s) AS rel',
+                                           (self.schema + '.' + name,))[0]['rel'])
