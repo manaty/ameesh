@@ -117,6 +117,26 @@ class FonctionsTest(unittest.TestCase):
         self.assertIn("Close names: orchestrateur", text)
         self.assertEqual(undeliverable.orchestrator_briefs({"type": "idle_capacity"}), {})
 
+    def test_une_boite_retiree_n_est_jamais_a_relancer(self):
+        """#8113 : le brief d'une boîte retirée dit `restore`/`forward`, jamais
+        `ameesh resume` — un retrait ne se relance pas comme un arrêt."""
+        alerte = {"type": "mail_undeliverable", "agent": "avatar-essai", "value": 1,
+                  "threshold": 900, "reason": "retire", "retired_ts": NOW,
+                  "senders": ["ameesh"], "successor": "mesh-design",
+                  "orchestrators": ["orchestrateur"]}
+        self.assertEqual(undeliverable.brief_text(alerte),
+                         undeliverable.orchestrator_briefs(alerte)["orchestrateur"])
+        texte = undeliverable.brief_text(alerte)
+        self.assertIn("retired since", texte)
+        self.assertIn("ameesh agent restore avatar-essai", texte)
+        self.assertIn("ameesh mail forward avatar-essai mesh-design", texte)
+        self.assertNotIn("ameesh resume", texte)
+        self.assertNotIn("stopped", texte)
+        # même sans successeur ni date (alerte d'avant le correctif)
+        court = undeliverable.brief_text(dict(alerte, successor=None, retired_ts=None))
+        self.assertNotIn("ameesh resume", court)
+        self.assertIn("ameesh agent restore avatar-essai", court)
+
     def test_consigne_et_hook_disent_le_renvoi(self):
         row = {"id": 7, "sender": "claude1", "created_ts": NOW, "body": "SHA abc123 fusionné",
                "kind": "notify", "payload": {}, "forwarded_from": "claude3"}

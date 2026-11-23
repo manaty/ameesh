@@ -15521,6 +15521,23 @@ class Runner:
         self._dead_letters_next = tick + DEAD_LETTER_SWEEP_EVERY_S
         if getattr(self, "mediated", False) or db is None:
             return None               # exécuteur médié : pas de base, pas de balayage
+        # #8113 : la file durable des retours de retrait (courrier clos au
+        # retrait, avis ou relais non remis) se solde sans geste : un arrêt
+        # après le commit du retrait la reprend sous la même clé d'idempotence.
+        if not self.dry_run:
+            try:
+                from . import agent_retire
+                returned = agent_retire.replay_returns(self.cfg, db, limit=200)
+            except Exception as exc:  # jamais fatal pour l'exécuteur
+                log_async("return-notice replay failed (%s: %s)"
+                          % (type(exc).__name__, exc))
+            else:
+                if returned["marked"]:
+                    log_async("retired mail: %d return notice(s) for %d message(s)"
+                              % (len(returned["pilots"]) + len(returned["informed"]),
+                                 returned["marked"]))
+                for warning in returned["warnings"]:
+                    log_async("retired mail: %s" % warning)
         try:
             from . import undeliverable
             report = undeliverable.sweep(self.cfg, db, now=now, dry_run=self.dry_run)

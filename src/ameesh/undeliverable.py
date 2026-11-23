@@ -667,18 +667,37 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
             heirs = successor(db, row, bindings=bindings)
             heir_text = ", ".join(heirs)
             teams = {team_of(row)}
-            reason = "arrete"
             responsible = row.get("responsible") or None
-            detail = ("%d message(s) pending for %s for %s, stopped (%s): nobody will "
-                      "read them — from %s. Re-deliver: ameesh mail forward %s %s; or restart "
-                      "the agent: ameesh resume %s"
-                      % (group["count"], age, name, stop_facts(row, now), _senders(group),
-                         name, heirs[0] if heirs else "<live agent>", name))
-            if heirs:
-                detail += " (work taken over by %s)" % heir_text
-            detail += _retention_note(cfg)
-            extra.update(stop_reason=row.get("stop_reason") or None,
-                         successor=heir_text or None, host=row.get("host") or None)
+            if row.get("retired_ts") is not None:
+                # #8113 : un retiré n'est pas un arrêté qu'on relance. Le
+                # courrier est clos au retrait ; une boîte laissée en attente
+                # (retrait d'avant le correctif, ou course) le dit avec le
+                # geste inverse — jamais `ameesh resume`.
+                reason = "retire"
+                detail = ("%d message(s) pending for %s for %s, retired since %s "
+                          "(retired, not stopped: a restart would deliver nothing) — "
+                          "from %s. Re-deliver: ameesh mail forward %s %s; or bring it "
+                          "back: ameesh agent restore %s"
+                          % (group["count"], age, name, _moment(row["retired_ts"]),
+                             _senders(group), name,
+                             heirs[0] if heirs else "<live agent>", name))
+                if heirs:
+                    detail += " (work taken over by %s)" % heir_text
+                detail += _retention_note(cfg)
+                extra.update(retired_ts=row.get("retired_ts"),
+                             successor=heir_text or None, host=row.get("host") or None)
+            else:
+                reason = "arrete"
+                detail = ("%d message(s) pending for %s for %s, stopped (%s): nobody will "
+                          "read them — from %s. Re-deliver: ameesh mail forward %s %s; or restart "
+                          "the agent: ameesh resume %s"
+                          % (group["count"], age, name, stop_facts(row, now), _senders(group),
+                             name, heirs[0] if heirs else "<live agent>", name))
+                if heirs:
+                    detail += " (work taken over by %s)" % heir_text
+                detail += _retention_note(cfg)
+                extra.update(stop_reason=row.get("stop_reason") or None,
+                             successor=heir_text or None, host=row.get("host") or None)
         else:
             teams = {team_of(r) for r in senders if r}
             reason = "inconnu"
@@ -726,6 +745,17 @@ def brief_text(alert: dict) -> str:
                 "were meant for you), then tell the senders the right name."
                 % (count, name, _span(alert.get("threshold") or 0), senders,
                    "Close names: %s. " % ", ".join(near) if near else "", shlex.quote(name)))
+    elif alert.get("reason") == "retire":
+        # #8113 : jamais `ameesh resume` pour un retiré ; le geste inverse
+        # rend la boîte (restore), ou le courrier part à un vivant (forward).
+        heir = alert.get("successor")
+        since = (_moment(alert["retired_ts"]) if alert.get("retired_ts") else "?")
+        text = ("Undeliverable mail: %d message(s) addressed to %s, retired since %s, "
+                "waiting for more than %s, from %s; nobody will read them. Re-deliver them "
+                "to the agent carrying its work: ameesh mail forward %s %s; or bring it back: "
+                "ameesh agent restore %s (no restart: it is retired)."
+                % (count, name, since, _span(alert.get("threshold") or 0), senders, name,
+                   heir.split(", ")[0] if heir else "<agent>", name))
     else:
         heir = alert.get("successor")
         text = ("Undeliverable mail: %d message(s) addressed to %s, stopped, waiting "

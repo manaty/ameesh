@@ -2102,6 +2102,50 @@ class Mailbox(Domain):
         """Nombre de messages non remis, hors boîtes d'agents en mode `externe`
         (#6424 ; `doctor`)."""
 
+    def close_for_retired(self, recipient: str, note: dict) -> list[dict]:
+        """#8113 : ferme le courrier EN ATTENTE de `recipient` au moment de son
+        retrait, dans la transaction qui pose `retired_at`.
+
+        Les messages non remis (hors demande de décision, qui attend un
+        humain, et hors boîte `externe`, qui est une session humaine) passent
+        remis, `status = 'delivered'`, avec `note` sous `meta.retired`.
+        L'appelant fait le retrait sous le verrou de la ligne du registre : un
+        dépôt concurrent attend puis voit `retired_at` et refuse, donc rien ne
+        se glisse après la fermeture. Rend une ligne par message fermé : `id`,
+        `sender`, `kind`, `work_item_id`, `created_ts`, `excerpt`.
+
+        Lecture locale au pilote Postgres : un stockage qui ne la sert pas
+        (exécuteur médié) rend `[]` ; le retrait n'y ferme pas le courrier.
+
+        Le `note` reçu fixe l'instant du lot (`at`, l'heure de la transaction) :
+        toutes les lignes d'une même fermeture le partagent, et c'est lui qui
+        groupe le retour."""
+        return []
+
+    def returns_pending(self, agent: str | None = None,
+                        limit: int = 500) -> list[dict]:
+        """#8113 : le courrier clos au retrait dont le retour n'est pas encore
+        remis — la file durable du retour, écrite dans la transaction du
+        retrait (`meta.retired`), soldée par `meta.retired.notified`.
+
+        Rend une ligne par message non encore rendu (`id`, `recipient`,
+        `sender`, `kind`, `work_item_id`, `created_ts`, `excerpt`,
+        `closed_ts` = instant du lot de fermeture, `retired_by`,
+        `retired_reason`), du plus ancien lot au plus récent. `agent`
+        restreint la lecture au retiré nommé ; `limit` borne la passe. Un
+        stockage médié qui ne la sert pas rend `[]`."""
+        return []
+
+    def mark_returned(self, ids: Sequence[int], note: dict) -> int:
+        """#8113 : marque des messages d'un lot de retour comme rendus
+        (`meta.retired.notified = note`) ; rend le nombre de lignes marquées.
+
+        Le retour est dit rendu quand chaque expéditeur vivant a son avis et
+        que les injoignables ont leur relais au pilote. Appelée seulement
+        après un envoi réussi : une erreur laisse la ligne en file, et un
+        rejeu la reprend sous la même clé d'idempotence (jamais de doublon)."""
+        return 0
+
     @abc.abstractmethod
     def dead_letters(self) -> list[dict]:
         """Courrier en souffrance : non remis, dont le destinataire est absent du

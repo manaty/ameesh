@@ -59,6 +59,11 @@
                                                  agent to its successor, expires the rest past
                                                  `mail_dead_letter_days` (7; 0 = never), with
                                                  a thread trace; run daily by the runner
+  agent-mail returns [--replay] [--agent NAME] [--json]
+                                                 #8113: the durable return queue of mail closed
+                                                 at an agent's retirement; --replay re-sends the
+                                                 notices (live senders) and the pilot relay
+                                                 (unreachable ones), never twice
   agent-mail list                                agents, host, lease, unread,
                                                  last sign of life (seen/wrote)
   agent-mail inbox [--unread] [NAME]             unread messages of NAME (without marking them read)
@@ -2627,6 +2632,64 @@ def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
     return 1 if failed else 0
 
 
+_RETURNS_USAGE = ("usage: agent-mail returns [--replay] [--agent NAME] [--json]")
+
+
+def cmd_returns(bk, cfg: Config, rest: list[str]) -> int:
+    """#8113 : la file durable des retours de courrier clos au retrait.
+
+    Sans `--replay`, liste ce qui attend encore un retour. Avec, rejoue la
+    remise : avis aux expéditeurs vivants, relais au pilote pour les
+    injoignables — sous des clés d'idempotence stables, donc sans doublon."""
+    from . import agent_retire, storage
+    try:
+        opts, positional = _options(rest, ("--agent",), ("--replay", "--json"))
+    except ValueError as exc:
+        print("%s\n%s" % (exc, _RETURNS_USAGE), file=sys.stderr)
+        return 2
+    if positional:
+        print(_RETURNS_USAGE, file=sys.stderr)
+        return 2
+    agent = opts.get("--agent")
+    if opts.get("--replay"):
+        try:
+            result = agent_retire.replay_returns(cfg, bk.db, agent=agent)
+        except ValueError as exc:
+            print("returns refused — %s\n%s" % (exc, _RETURNS_USAGE), file=sys.stderr)
+            return 1
+        if opts.get("--json"):
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 1 if result["warnings"] else 0
+        if not result["closed"]:
+            print("no pending return notice")
+            return 0
+        print("%d message(s) in %d batch(es): %d sender(s) informed (%s); "
+              "%d unreachable relayed to the pilot (%s); %d marked returned"
+              % (result["closed"], result["batches"],
+                 len(result["informed"]), ", ".join(result["informed"]) or "none",
+                 len(result["unreachable"]), ", ".join(result["pilots"]) or "none",
+                 result["marked"]))
+        for warning in result["warnings"]:
+            print("  not returned: %s" % warning, file=sys.stderr)
+        return 1 if result["warnings"] else 0
+    rows = storage.of(bk.db).mailbox.returns_pending(agent)
+    if opts.get("--json"):
+        print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
+        return 0
+    if not rows:
+        print("no pending return notice")
+        return 0
+    print("%d message(s) closed at retirement, return not yet delivered:" % len(rows))
+    for row in rows:
+        print("  %s: #%s from %s, sent %s%s — %s" % (
+            row.get("recipient"), row.get("id"), row.get("sender") or "?",
+            time.strftime("%Y-%m-%d %H:%M UTC",
+                          time.gmtime(float(row.get("created_ts") or 0.0))),
+            ", lot #%s" % row["work_item_id"] if row.get("work_item_id") else "",
+            " ".join(str(row.get("excerpt") or "").split())[:100] or "(empty body)"))
+    return 0
+
+
 def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
     if len(rest) > 1 and rest[0] == "--cwd":
         # Diagnostic : le dossier ne donne aucune identité.
@@ -3493,6 +3556,12 @@ def main(argv: list[str] | None = None) -> int:
                       "fallback has no registry", file=sys.stderr)
                 return 1
             return cmd_sweep(bk, cfg, rest)
+        if command == "returns":
+            if bk.kind != "pg":
+                print("the return queue requires the database (AMEESH_DSN): the file "
+                      "fallback has no registry", file=sys.stderr)
+                return 1
+            return cmd_returns(bk, cfg, rest)
         if command in ("bind", "unbind", "bindings"):
             if bk.kind != "pg":
                 print("session bindings require the database (AMEESH_DSN): "

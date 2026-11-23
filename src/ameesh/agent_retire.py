@@ -11,6 +11,13 @@ son courrier restent lisibles. Statut, mode et bail ne changent pas : la
 restauration rend exactement l'état d'avant. Retrait et restauration sont
 journalisés (`agent.retired`, `agent.restored`) dans la transaction du geste.
 
+Le retrait ferme aussi le courrier encore EN ATTENTE de l'agent (#8113) :
+chaque message non remis — sauf une demande de décision, qui attend un
+humain — passe remis avec `meta.retired`, et chaque expéditeur qui a encore
+une boîte lue en reçoit un `event` qui le lui rend. Une boîte retirée n'est
+donc jamais annoncée comme un agent arrêté à relancer : l'alerte
+`mail_undeliverable` ne propose pas `ameesh resume` pour un retiré.
+
 Le retrait est refusé, avec chaque cause nommée, tant que l'agent tient un
 bail vivant, un lot ouvert assigné ou réservé comme exécutant externe, ou une
 veille `ameesh watch` qui lui écrit : l'agent les rend d'abord.
@@ -26,7 +33,9 @@ ou de l'auditeur (`work.corrector`, `auditor=True`).
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import time
 
 from . import storage, work
 from .config import Config
@@ -73,6 +82,237 @@ def legacy_units(env: dict | None = None) -> list[str]:
                   if n.startswith(watch.LEGACY_PREFIX) and n.endswith(".timer"))
 
 
+def _excerpt(row: dict, limit: int = 120) -> str:
+    """Une ligne du corps d'un message clos, pour le rendre à son expéditeur."""
+    from . import fil
+
+    text = " ".join(fil.clean_text(row.get("excerpt") or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _returned_body(agent: str, rows: list[dict], *, actor: str, reason: str) -> str:
+    """Le texte du retour : ce qui n'a pas été remis, quand, et les gestes."""
+    lines = [
+        "%d message(s) addressed to %s were not delivered: %s was retired by %s "
+        "(reason: %s), so nothing is delivered to it any more."
+        % (len(rows), agent, agent, actor, reason),
+    ]
+    for row in rows:
+        lot = str(row.get("work_item_id") or "").strip()
+        when = time.strftime("%Y-%m-%d %H:%M UTC",
+                             time.gmtime(float(row.get("created_ts") or 0.0)))
+        lines.append("  - #%s, sent %s%s: %s" % (
+            row.get("id"), when, ", lot #%s" % lot if lot else "",
+            _excerpt(row) or "(empty body)"))
+    lines.append(
+        "They are closed and stay readable in the thread. Re-address what still "
+        "matters to a live agent (`ameesh show %s` names who carries its work); "
+        "`ameesh agent restore %s` brings it back." % (agent, agent))
+    return "\n".join(lines)
+
+
+def _single_lot(rows: list[dict]) -> str | None:
+    lots = {str(row.get("work_item_id") or "").strip() for row in rows}
+    return next(iter(lots)) if len(lots) == 1 and next(iter(lots)) else None
+
+
+def _messages_digest(rows: list[dict]) -> str:
+    """L'identité stable des messages EFFECTIVEMENT envoyés dans un avis.
+
+    Deux clôtures dans la même seconde, ou une même clôture lue par pages,
+    portent des ensembles de messages différents : leur empreinte diffère, donc
+    chacune a son avis. Un rejeu du même ensemble rend la même empreinte."""
+    ids = ",".join(str(int(row["id"])) for row in sorted(rows, key=lambda r: int(r["id"])))
+    return hashlib.sha1(ids.encode()).hexdigest()[:16]
+
+
+def _return_key(agent: str, part: str) -> str:
+    """Une clé d'idempotence stable : rejouer un retour ne double jamais l'avis.
+
+    La clé dépend du retiré, du destinataire (expéditeur ou pilote) et de
+    l'empreinte des messages couverts, jamais du passage qui l'envoie."""
+    digest = hashlib.sha1(("%s\0%s" % (agent, part)).encode()).hexdigest()[:16]
+    return "retire-return-%s" % digest
+
+
+def _sender_state(db, agent: str, sender: str) -> str:
+    """`""` si l'expéditeur a une boîte lue, sinon la raison, en clair."""
+    from . import registry, undeliverable
+
+    if not sender:
+        return "no sender"
+    if sender in ("ameesh", agent):
+        return "system sender"
+    if sender.startswith("human:"):
+        return "human sender"
+    if undeliverable.watch_sender(sender):
+        return "watch sender"
+    try:
+        target = registry.get(db, sender)
+    except Exception as exc:  # noqa: BLE001 - la file durable garde le retour
+        return "registry unreadable (%s)" % type(exc).__name__
+    if target is None:
+        return "absent from the registry"
+    if target.get("retired_ts") is not None:
+        return "retired"
+    if target.get("status") == "stopped":
+        return "stopped"
+    return ""
+
+
+def _pilots(cfg, db, agent: str) -> list[str]:
+    """Les pilotes du projet (règle partagée des briefs), à défaut `ameesh`."""
+    from . import freeze_packet
+
+    try:
+        names = freeze_packet.pilot_names(
+            cfg, db, getattr(cfg, "project", "") or "")
+    except Exception:  # noqa: BLE001 - le relais retombe sur l'orchestrateur
+        names = []
+    live = sorted({str(name) for name in names or ()
+                   if name and str(name) != agent
+                   and not str(name).startswith("human:")})
+    return live or ["ameesh"]
+
+
+def _unreachable_body(agent: str, rows: list[dict], *,
+                      actor: str, reason: str) -> str:
+    """Le relais au pilote : le retour est dû, aucun expéditeur n'est joignable."""
+    lines = [
+        "%d message(s) addressed to %s were closed at its retirement, but their "
+        "sender(s) have no live mailbox: this relay is the durable return "
+        "(retired by %s; reason: %s)."
+        % (len(rows), agent, actor, reason),
+    ]
+    for row in rows:
+        when = time.strftime("%Y-%m-%d %H:%M UTC",
+                             time.gmtime(float(row.get("created_ts") or 0.0)))
+        lines.append("  - from %s, message #%s, sent %s%s: %s" % (
+            row.get("sender") or "?", row.get("id"), when,
+            ", lot #%s" % row["work_item_id"] if row.get("work_item_id") else "",
+            _excerpt(row) or "(empty body)"))
+    lines.append(
+        "The pilot holds this return; `ameesh mail forward %s <live-agent>` "
+        "hands the messages on. `ameesh mail returns --replay` retries a failed "
+        "notice or relay, never twice (stable idempotency key)." % agent)
+    return "\n".join(lines)
+
+
+def _deliver_batch(db, cfg, agent: str, rows: list[dict], *,
+                   actor: str, reason: str) -> dict:
+    """#8113 : rend UN lot de fermeture (retiré, messages d'un même passage).
+
+    Chaque expéditeur vivant reçoit son avis ; un expéditeur sans boîte lue
+    (ou dont l'envoi échoue) part au pilote du projet. Le lot n'est marqué
+    rendu (`meta.retired.notified`) que si aucun envoi n'a échoué : sinon il
+    reste dans la file durable, et un rejeu le reprend sous la même clé."""
+    from . import mail, storage
+
+    summary: dict = {"closed": len(rows), "senders": [], "informed": [],
+                     "unreachable": [], "pilots": [], "warnings": [],
+                     "marked": 0}
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(str(row.get("sender") or "").strip(), []).append(row)
+    summary["senders"] = sorted(groups)
+    unreachable_rows: list[dict] = []
+    for sender, messages in sorted(groups.items()):
+        state = _sender_state(db, agent, sender)
+        if state:
+            summary["unreachable"].append(sender or "?")
+            unreachable_rows.extend(messages)
+            continue
+        # L'empreinte couvre les messages de CET avis : une page de 500 puis
+        # le reliquat, ou deux clôtures dans la même seconde, ne partagent
+        # jamais une clé et ne se déduplisent donc pas à tort.
+        key = _return_key(agent, "%s:%s" % (sender, _messages_digest(messages)))
+        try:
+            mail.send(db, "ameesh", sender,
+                      _returned_body(agent, messages, actor=actor, reason=reason),
+                      kind="event",
+                      payload={"returned": {
+                          "recipient": agent,
+                          "messages": [int(row["id"]) for row in messages],
+                          "by": actor, "reason": reason}},
+                      work_item_id=_single_lot(messages),
+                      idempotency_key=key)
+        except Exception as exc:  # noqa: BLE001 - la file durable garde le retour
+            summary["warnings"].append("return notice to %s not sent (%s)"
+                                       % (sender, type(exc).__name__))
+            summary["unreachable"].append(sender)
+            unreachable_rows.extend(messages)
+        else:
+            summary["informed"].append(sender)
+    if unreachable_rows:
+        body = _unreachable_body(agent, unreachable_rows, actor=actor, reason=reason)
+        payload = {"returned_unreachable": {
+            "recipient": agent,
+            "messages": [int(row["id"]) for row in unreachable_rows],
+            "by": actor, "reason": reason}}
+        pilot_key = _return_key(
+            agent, "pilot:%s" % _messages_digest(unreachable_rows))
+        for pilot in _pilots(cfg, db, agent):
+            try:
+                mail.send(db, "ameesh", pilot, body, kind="event",
+                          payload=payload,
+                          work_item_id=_single_lot(unreachable_rows),
+                          idempotency_key=pilot_key)
+            except Exception as exc:  # noqa: BLE001 - le lot reste en file
+                summary["warnings"].append("pilot relay to %s not sent (%s)"
+                                           % (pilot, type(exc).__name__))
+            else:
+                summary["pilots"].append(pilot)
+    if not summary["warnings"]:
+        summary["marked"] = storage.of(db).mailbox.mark_returned(
+            [int(row["id"]) for row in rows],
+            {"at": time.time(), "by": actor,
+             "to": summary["informed"] + summary["pilots"]})
+    return summary
+
+
+def replay_returns(cfg: Config, db, *, agent: str | None = None,
+                   limit: int = 500, max_passes: int = 20) -> dict:
+    """#8113 : rejoue la file durable des retours de courrier.
+
+    Lit `returns_pending` (courrier clos au retrait, non encore rendu) page
+    par page et draine la file : `limit` borne une lecture, jamais le lot —
+    plus de `limit` messages d'un même retrait partent en plusieurs avis,
+    chacun sous l'empreinte de SES messages. Un rejeu après un envoi réussi
+    ne dépose aucun doublon. `max_passes` borne la boucle (une passe sans
+    progrès s'arrête d'elle-même). Rend le compte agrégé (`closed`, `batches`,
+    `senders`, `informed`, `unreachable`, `pilots`, `marked`, `warnings`)."""
+    out: dict = {"closed": 0, "batches": 0, "senders": [], "informed": [],
+                 "unreachable": [], "pilots": [], "marked": 0, "warnings": []}
+    for _pass in range(max(1, int(max_passes))):
+        rows = storage.of(db).mailbox.returns_pending(agent, limit=limit)
+        if not rows:
+            break
+        batches: dict[tuple[str, float], list[dict]] = {}
+        for row in rows:
+            batches.setdefault(
+                (str(row.get("recipient") or ""), float(row.get("closed_ts") or 0.0)),
+                []).append(row)
+        progress = 0
+        for (retired, _closed_ts), batch_rows in sorted(
+                batches.items(), key=lambda item: (item[0][1], item[0][0])):
+            delivered = _deliver_batch(
+                db, cfg, retired, batch_rows,
+                actor=str(batch_rows[0].get("retired_by") or "?"),
+                reason=str(batch_rows[0].get("retired_reason") or ""))
+            out["batches"] += 1
+            out["closed"] += delivered["closed"]
+            out["marked"] += delivered["marked"]
+            progress += delivered["marked"]
+            for key in ("senders", "informed", "unreachable", "pilots"):
+                out[key].extend(delivered[key])
+            out["warnings"].extend(delivered["warnings"])
+        if not progress:
+            break          # un envoi échoue : la file attend le prochain rejeu
+    for key in ("senders", "informed", "unreachable", "pilots"):
+        out[key] = sorted(set(out[key]))
+    return out
+
+
 def retire(cfg: Config, db, name: str, *, reason: str, actor: str | None = None,
            env: dict | None = None) -> dict:
     """Retire `name` ; RetireError si un bail, un lot ou une veille le retient."""
@@ -82,6 +322,7 @@ def retire(cfg: Config, db, name: str, *, reason: str, actor: str | None = None,
     if not reason:
         raise RetireError("agent retire: --reason is required (the decision or the lot)")
     who = work.corrector(cfg, db, actor, what="agent retire", auditor=True)
+    closed: list[dict] = []
     with db.transaction() as tx:
         result = storage.of(tx).agents.retire(name, actor=who, reason=reason)
         if result is None:
@@ -90,21 +331,45 @@ def retire(cfg: Config, db, name: str, *, reason: str, actor: str | None = None,
         if result["blockers"]:
             raise RetireError("agent retire refused: %s %s" % (
                 agent, "; ".join(_blocker_text(agent, b) for b in result["blockers"])))
+        # #8113 : la fermeture du courrier est DANS la transaction du retrait,
+        # sous le verrou exclusif de la ligne du registre. Elle vaut aussi
+        # pour un agent déjà retiré : une boîte laissée en attente par la
+        # version d'avant est soldée par le geste suivant.
+        closed = storage.of(tx).mailbox.close_for_retired(
+            agent, {"by": who, "reason": reason, "at": time.time()})
         event = None
         if result["changed"]:
             event = storage.of(tx).events.record(
-                RETIRED_EVENT, "agent:%s" % agent, None, {"agent": agent, "actor": who})
-    warnings = []
+                RETIRED_EVENT, "agent:%s" % agent, None,
+                {"agent": agent, "actor": who, "messages_closed": len(closed)})
+    warnings: list[str] = []
     if not result["changed"]:
-        warnings.append("%s was already retired: nothing changed" % agent)
+        warnings.append("%s was already retired: registry unchanged%s" % (
+            agent, ", %d pending message(s) closed" % len(closed) if closed else ""))
     if agent == watch.SENDER:
         units = legacy_units(env)
         if units:
             warnings.append(
                 "legacy units of this host still send as %s (they are not the agent; "
                 "their fate is another decision): %s" % (watch.SENDER, ", ".join(units)))
+    try:
+        # La file durable est écrite (meta.retired) ; ce passage la solde. Un
+        # échec laisse le lot en file : `ameesh mail returns --replay`, ou le
+        # prochain retrait du même agent, le reprend sous la même clé.
+        returned = replay_returns(cfg, db, agent=agent)
+    except Exception as exc:  # noqa: BLE001 - le retrait est déjà committé
+        returned = {"closed": len(closed), "batches": 0, "senders": [],
+                    "informed": [], "unreachable": [], "pilots": [],
+                    "marked": 0, "warnings": []}
+        warnings.append("return notices not sent (%s)" % type(exc).__name__)
+    warnings.extend(returned.pop("warnings", []))
+    if returned["unreachable"]:
+        warnings.append(
+            "%d pending message(s) closed; sender(s) with no live mailbox: %s "
+            "(relayed to the pilot)" % (
+                returned["closed"], ", ".join(returned["unreachable"])))
     return {"agent": agent, "changed": bool(result["changed"]), "actor": who,
-            "event": event, "warnings": warnings}
+            "event": event, "warnings": warnings, "mail": returned}
 
 
 def restore(cfg: Config, db, name: str, *, actor: str | None = None) -> dict:
