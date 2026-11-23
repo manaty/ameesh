@@ -14,17 +14,19 @@ un opérateur (`mail_undeliverable`) part en `info`, sauf critique.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 import threading
 import types
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, mail
+from ameesh import alert_briefs, mail, registry
 from ameesh import runner as runner_mod
-from ameesh.runner import AgentWorker
+from ameesh.runner import AgentWorker, Runner
 
-from .test_2810_preemption_servi import PropreMessageTest
+from .support import PgTestCase
 from .test_l125_courrier_regroupe import _Base
 
 T0 = 1_800_000_000.0
@@ -168,7 +170,19 @@ class ReponseDeDecisionTest(_Base):
         self.assertIsNotNone(worker.pick())
 
 
-class PasDePreemptionTest(PropreMessageTest):
+class PasDePreemptionTest(PgTestCase):
+    def _worker(self, name: str = "pre", *, senders=("orch",)):
+        cfg = dataclasses.replace(self.cfg, interrupt_senders=tuple(senders))
+        runner = Runner(cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        self.register(name, "claude", cwd=cwd)
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        runner.workers[name] = worker
+        self.addCleanup(worker.watchdog_stop.set)
+        return runner, worker
+
     def test_notify_d_une_reponse_de_decision_ne_preempte_pas(self):
         runner, worker = self._worker(senders=("orch",))
         mail.send(self.db, "orch", "pre", "réponse : a", kind="reply",
