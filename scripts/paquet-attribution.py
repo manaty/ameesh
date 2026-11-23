@@ -62,17 +62,19 @@ Une carte absente ou antérieure à `base` est dite dans `card`, sans bloquer.
 
 * `appel` : les tests qui nomment `module.fonction` pour une fonction changée
   d'un fichier `src/` changé (bloc simple de `scripts/map.py`) sont retenus
-  d'abord, groupés par fonction, la fonction la plus appelée d'abord, puis le
-  moins cher, dans `DIRECT_BUDGET_S` secondes **en plus** du budget de la
-  carte. Un test qui appelle la fonction changée est une preuve directe que la
-  carte périmée ne porte pas ; `test_2766_vehicle_reviews` (#8101) appelait
-  `merge_queue.review_gate` et restait au 51e rang du bloc `review_gate` ; il
-  entre à 128,4 s dans les 180 s des appels directs ;
-* une durée de carte n'est reprise, pour un module, que si son fichier de
-  test n'a pas changé entre le commit de la carte et `base` : un test inchangé
-  garde sa mesure, un test modifié retombe au forfait. Le forfait de 60 s
-  pour un support (`test_5202_debit_quorum` et quatre autres, #8118) prenait
-  toute la borne avant la carte ;
+  d'abord, quel que soit le pilote, groupés par fonction, la fonction la plus
+  appelée d'abord, puis le moins cher, dans `DIRECT_BUDGET_S` secondes **en
+  plus** du budget de la carte. Un test qui appelle la fonction changée est une
+  preuve directe que la carte périmée ne porte pas ;
+  `test_2766_vehicle_reviews` (#8101) appelait `merge_queue.review_gate` et
+  restait au 51e rang du bloc `review_gate` ; il entre à 128,4 s dans les 180 s
+  des appels directs ;
+* sous psycopg, une durée de carte n'est reprise, pour un module, que si son
+  fichier de test n'a pas changé entre le commit de la carte et `base` : un
+  test inchangé garde sa mesure, un test modifié retombe au forfait. Le
+  forfait de 60 s pour un support (`test_5202_debit_quorum` et quatre autres,
+  #8118) prenait toute la borne avant la carte. Sous psql, la carte ne mesure
+  pas ce pilote : seule `tests/parts/durees.json` tranche ;
 * à l'intérieur d'un bloc, un test qui couvre plus de blocs changés passe
   avant un test plus étroit (le prix tranche) ; durées mesurées et forfaits
   alternent, pour qu'un module sans mesure ne soit plus affamé par les tests
@@ -629,9 +631,13 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
     durations = read_durations(repo, driver)
     # la carte mesure psycopg, à son commit : ni psql, ni une base plus récente
     card_durations = driver == "psycopg" and card_prov.get("base") == "à jour"
-    # #8132 : une carte antérieure garde ses durées pour les tests inchangés
-    card_stale = (driver == "psycopg" and card is not None
-                  and card_prov.get("base") == "antérieure")
+    # #8132 : une carte antérieure à la base ne couvre plus le diff, quel que
+    # soit le pilote — paquet-auto prend psql quand psycopg manque, et une
+    # carte antérieure doit alors déclencher les mêmes appels directs. Ses
+    # durées, elles, ne valent que sous psycopg : sous psql, la table du
+    # pilote tranche (B de cx2).
+    card_old = card is not None and card_prov.get("base") == "antérieure"
+    card_stale = card_old and driver == "psycopg"
     card_commit = _text(card_prov.get("commit"))
     stale_changed: set[str] | None = None
     if card_stale:
@@ -668,7 +674,11 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
                if match and (repo / match.group(0)).is_file()}
         touched_tests = {path for path in files
                          if path.startswith("tests/") and path.endswith(".py")}
-        changed = changed_blocks_by_file(repo, sha, files, left)
+        # #8132 N (auditeur) : le découpage de `scripts/map.py` ne sert qu'à la
+        # carte ou aux appels directs ; sans carte ni carte antérieure, on
+        # l'évite au lieu de découper tous les `src/` pour rien.
+        changed = (changed_blocks_by_file(repo, sha, files, left)
+                   if card is not None or card_old else None)
         added: list[dict] = []
         taken = set(own)
         supports = []
@@ -696,7 +706,7 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
         # appelées passent d'abord, dans leur propre budget : la carte ne peut
         # pas les avoir vues, et sa borne ne doit pas les chasser.
         direct_spent = 0.0
-        if card_stale:
+        if card_old:
             groups = direct_callers(repo, files, left, sha, tests_dir,
                                     texts=texts, changed=changed)
             for key in sorted(groups, key=lambda name: (
@@ -771,19 +781,30 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
                           "seconds": round(seconds, 1)})
 
         def drain() -> None:
+            """#7195 : un forfait ne chasse pas le mesuré d'un autre bloc.
+
+            Chaque tour sert d'abord la tête mesurée de chaque bloc en
+            attente, puis les têtes au forfait. Un forfait de 60 s ne peut
+            donc pas épuiser le budget avant qu'un autre bloc ait proposé son
+            test mesuré (#8132 B1 de l'auditeur) ; il entre dès le premier
+            tour quand aucun mesuré ne le précède, pour qu'un module sans
+            mesure ne soit pas affamé (#8118).
+            """
             pending = list(queues)
+
+            def advance(which: int) -> None:
+                for entry in pending:
+                    queue = entry[which]
+                    while queue and (queue[0] in selected
+                                     or queue[0] in taken):
+                        queue.pop(0)
+                    if queue:
+                        offer(queue.pop(0))
+
             while pending:
-                still = []
-                for measured, unknown in pending:
-                    for queue in (measured, unknown):
-                        while queue and (queue[0] in selected
-                                         or queue[0] in taken):
-                            queue.pop(0)
-                        if queue:
-                            offer(queue.pop(0))
-                    if measured or unknown:
-                        still.append((measured, unknown))
-                pending = still
+                advance(0)
+                advance(1)
+                pending = [entry for entry in pending if entry[0] or entry[1]]
 
         drain()
         dropped += len(candidates) - len(selected)
