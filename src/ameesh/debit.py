@@ -15,7 +15,8 @@ relecture » alors que la colonne `reviewer` ne nommait personne de courant).
 Ce module sépare la lecture (SQL, `read`) du calcul (`build`), pour que le
 calcul soit témoin-testable sans base. Il ne calcule **pas** un second avis
 dû : la désignation est relue dans les marques du dernier gel
-(`review-designation:` / `review-designation-carried:`), les désignations et
+(`review-designation:` / `review-designation-carried:` /
+`review-designation-continued:`), les désignations et
 retraits manuels (`reviewer X designated|removed`) et les verdicts qui portent
 sur la tête gelée — la même règle que #3033, sans sa colonne.
 
@@ -112,9 +113,12 @@ MAX_JOB_RUNS = 5
 #: profondeur du journal ramené pour une lecture : les marques de désignation
 #: et les holds/wakes des lots actifs ; les lots terminaux sont écartés.
 EVENT_DAYS = 60
-#: marque d'une désignation automatique (`_sync_reviewers` la relit)
+#: marque d'une désignation automatique (`_sync_reviewers` la relit) ; #8118 :
+#: la continuation d'un regel à relecteurs inchangés est la désignation du gel,
+#: elle porte le même JSON (`state`, `required`, `reviewers`, `authors`).
 _MARK = re.compile(
-    r"^review-designation(?:-carried)?:(\d+):(\d+):\s*(\{.*\})\s*$", re.S)
+    r"^review-designation(?:-carried|-continued)?:(\d+):(\d+):\s*(\{.*\})\s*$",
+    re.S)
 _MARK_NONE = re.compile(r"^review-designation-none:(\d+):(\d+):")
 #: #7804 : l'état effectif d'une désignation n'est pas toujours dans la marque
 #: JSON du gel. Un plancher non couvert (`review-designation-floor:… not
@@ -926,8 +930,9 @@ def designations(milestones: list[dict], events: list[dict], *,
     ni `reviewers` :
 
     * le dernier `frozen` du lot et sa tête ;
-    * la dernière marque de désignation de ce gel (sélection automatique ou
-      report `-carried:`), et `review-designation-none:` quand le lot léger
+    * la dernière marque de désignation de ce gel (sélection automatique,
+      report `-carried:` ou continuation `-continued:` d'un regel à
+      relecteurs inchangés), et `review-designation-none:` quand le lot léger
       n'attend aucun avis ;
     * les désignations manuelles (`reviewer X designated`) et leurs retraits,
       qui survivent aux rotations : un nom jamais porté par une marque compte

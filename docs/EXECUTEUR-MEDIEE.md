@@ -18,7 +18,11 @@ puis par l'identité du tour fermé (version `1.10.0`, compatible : voir
 « Contrat 1.10 »), puis par le diagnostic atomique des refus de tour
 (#5856, version `1.11.0`, compatible : voir « Contrat 1.11 »), puis par
 l'attribution d'appelant des tours hors lot (#6005, version `1.12.0`,
-compatible : voir « Contrat 1.12 »).
+compatible : voir « Contrat 1.12 »), puis par les prises d'hôte lues par un
+runner médié (#7799, version `1.13.0`, compatible : voir « Contrat 1.13 »),
+puis par le plancher d'avis d'un lot (#8101, version `1.14.0`), puis par le
+courrier du jour et les actifs servis avant le stock (#8112, version
+`1.15.0`, compatible : voir « Contrat 1.15 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -1062,3 +1066,27 @@ ensuite. Un ancien serveur répond `404 op_not_allowed` ; le client lève
 `NotSupportedRemotely`, ne conclut pas et conserve le bail (comportement
 d'avant #7799, journalisé une fois). Un client d'avant 1.13 ignore
 simplement l'opération.
+
+### Contrat 1.15 : courrier du jour et actifs avant le stock (#8112)
+
+`mailbox.unread` est borné à 200 lignes et n'a pas de décalage. Un stock de
+passifs anciens (copies, accusés, comptes rendus) remplit donc la page et
+cache le courrier du jour lié à un lot comme un message actif plus récent ;
+c'était le critère 2 de #8040, tenu sur Postgres par
+`mailbox.unread_priority` mais pas sur un exécuteur médié, où le client
+relisait la page admise avant de filtrer.
+
+Le contrat 1.15 admet `mailbox.unread_priority(recipient, limit, since)` :
+même lecture que Postgres, filtrée dans la requête du serveur, du plus ancien
+au plus récent. Deux familles : le courrier du jour (`created_at >= since`,
+epoch calculé une fois par tour) lié à un lot (`work_item_id` non vide), et le
+courrier actif (négation du prédicat passif). `limit` est borné à 200 ; la
+ligne est servie par les routes `op` et `session/op` (`session: true`), avec
+les mêmes règles de portée que `mailbox.unread_human`.
+
+Déploiement : serveur d'abord (il doit servir l'opération), exécuteurs
+ensuite. Un ancien serveur répond `404 op_not_allowed` ; le client lève
+`NotSupportedRemotely` et retombe sur l'ancienne lecture de la page `unread`
+filtrée sur l'appareil — le tour n'est pas tué, mais un stock de plus de 200
+passifs continue de retarder le courrier du jour jusqu'au déploiement du
+serveur. Un client d'avant 1.15 ignore simplement l'opération.

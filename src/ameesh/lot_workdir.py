@@ -156,10 +156,23 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
     borne la lecture, ex. médié à 200 lignes sans décalage) : il peut rester
     des non-lus au-delà, même si peu sont remisables dans cette fenêtre. Le
     défaut reste la liste seule, pour les appelants qui n'ont pas besoin du
-    drapeau."""
+    drapeau.
+
+    #8112 : `mode="priority"` lit les non-lus à servir avant le stock FIFO —
+    courrier du jour lié à un lot et courrier actif (`mail.unread_priority`),
+    borne du jour fixée une fois — pour que la page pleine de `unread` ne les
+    cache pas."""
     if mode == "human":
         def lire(db, name, limit):
             return mail.unread_human(db, name, limit, names=human_names)
+    elif mode == "priority":
+        # #8112 : la borne du jour est fixée UNE fois pour toutes les pages
+        # d'une même lecture ; les branches courrier du jour et actif sont
+        # lues à part du stock FIFO (`unread`).
+        since = mail.day_start()
+
+        def lire(db, name, limit):
+            return mail.unread_priority(db, name, limit, since=since)
     else:
         lire = {"unread": mail.unread, "active": mail.unread_active,
                 "urgent": mail.unread_urgent}[mode]

@@ -673,7 +673,12 @@ resté sur l'ancien canon garde `lend` après la fenêtre, ou le hook après R2.
      Sans cette garde, la première passe du worker demande le retour
      (`wake_due`, branche `return_targets` : du travail ouvert qui ne peut
      tourner que sur AG3), comme au R1 du 19/11. Ce comportement de
-     l'adaptateur est voulu et reste inchangé. La ligne « réveil immédiat »
+     l'adaptateur est voulu et reste inchangé, à une exception près (#8129) :
+     pendant un drainage manuel à retour daté (`--for`), un courrier non lu
+     n'appelle le retour que s'il est `--urgent` ; le courrier ordinaire
+     attend l'heure annoncée (lot actionnable, invite en attente et
+     redémarrage demandé rappellent toujours l'hôte ; un drainage
+     automatique se réveille sur tout courrier). La ligne « réveil immédiat »
      de la commande nomme les agents qui déclencheraient ce retour ;
    - la version lancée sur AG3 contient #7874 : la sonde du retour
      (`probe_agent`) figure parmi les agents réclamables d'un retour
