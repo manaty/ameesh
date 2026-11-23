@@ -1516,12 +1516,15 @@ séquence ne déploie.
 garantit un fichier complet, pas une mise à jour conditionnelle : tout
 écrivain de la configuration de l'hôte prend un `flock` exclusif sur
 `<config>.lock` pour **tout** son cycle relire-modifier-remplacer. Le helper
-de montée et `role_timers.sync_github_projects` suivent cette convention ; le
-helper attend le verrou jusqu'à 10 s puis refuse (état nommé), et son retour
-arrière ne réécrit l'ancienne version que si le fichier porte encore
-exactement les octets qu'il vient d'écrire. Un écrivain qui ignorerait le
-verrou reste détecté par la relecture intégrale avant écriture, sans jamais
-recevoir un fichier tronqué.
+de montée, `role_timers.sync_github_projects` et le `switch`/`rollback` de
+`pgbouncer-host.py` suivent cette convention ; le helper attend le verrou
+jusqu'à 10 s puis refuse (état nommé), et son retour arrière ne réécrit
+l'ancienne version que si le fichier porte encore exactement les octets qu'il
+vient d'écrire. Le rollback PgBouncer ne remet que la clé qu'il a changée
+(`dsn`, valeur d'origine conservée à côté de la sauvegarde complète) : une
+épingle `canon_ref` posée entre-temps n'est jamais annulée. Un écrivain qui
+ignorerait le verrou reste détecté par la relecture intégrale avant écriture,
+sans jamais recevoir un fichier tronqué.
 
 Une fois la configuration et les accès approuvés, l'opérateur active les
 services sur les candidats et soumet un SHA complet :

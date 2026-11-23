@@ -49,6 +49,8 @@ def _charger(chemin, nom):
 
 
 helper = _charger(HELPER, 'canon_executant_8109')
+PGBOUNCER = ROOT / 'deploy/pgbouncer-host.py'
+pgbouncer = _charger(PGBOUNCER, 'pgbouncer_host_8109')
 COMPTE = getpass.getuser()
 
 
@@ -332,6 +334,107 @@ class Banc(unittest.TestCase):
             self.assertEqual(self.config.read_bytes(), b'ancienne\n')
         finally:
             os.close(dossier)
+
+    def _poser_config_dsn(self, dsn='postgresql://ancien'):
+        self._poser_config({'canon': str(self.copie),
+                            'canon_ref': self.ancien,
+                            'segments': {'garde': True},
+                            'dsn': dsn})
+
+    def test_pgbouncer_switch_puis_rollback_ne_restaure_que_le_dsn(self):
+        """Le rollback ne remet que la clé changée : une épingle posée reste."""
+        self._poser_config_dsn()
+        state = self.root / 'state'
+        state.mkdir()
+        (state / 'socket.dsn').write_text('postgresql://nouveau\n')
+        pgbouncer.switch(self.home, state)
+        self.assertEqual(self._lire_config()['dsn'], 'postgresql://nouveau')
+        donnees = self._lire_config()
+        donnees['canon_ref'] = self.tete          # épingle avancée entre-temps
+        donnees['autre'] = {'gardee': True}
+        self._poser_config(donnees)
+        pgbouncer.switch(self.home, state, rollback=True)
+        donnees = self._lire_config()
+        self.assertEqual(donnees['dsn'], 'postgresql://ancien')
+        self.assertEqual(donnees['canon_ref'], self.tete)
+        self.assertEqual(donnees['autre'], {'gardee': True})
+        self.assertEqual(donnees['segments'], {'garde': True})
+
+    def test_pgbouncer_switch_prend_le_verrou_partage(self):
+        """Un switch concurrent ne remplace pas la configuration sans verrou."""
+        self._poser_config_dsn()
+        verrou = self.config.with_name(self.config.name + '.lock')
+        handle = os.open(verrou, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        state = self.root / 'state'
+        state.mkdir()
+        (state / 'socket.dsn').write_text('postgresql://nouveau\n')
+        try:
+            with mock.patch.object(pgbouncer, 'LOCK_WAIT', 0.2), \
+                    mock.patch.object(pgbouncer, 'LOCK_STEP', 0.02):
+                with self.assertRaises(ValueError):
+                    pgbouncer.switch(self.home, state)
+            self.assertEqual(self._lire_config()['dsn'], 'postgresql://ancien')
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            os.close(handle)
+        pgbouncer.switch(self.home, state)
+        self.assertEqual(self._lire_config()['dsn'], 'postgresql://nouveau')
+
+    def test_switch_concurrent_avec_le_helper_garde_les_deux_deltas(self):
+        """Helper (pin) et switch (dsn) se sérialisent : aucun delta perdu."""
+        self._poser_config_dsn()
+        state = self.root / 'state'
+        state.mkdir()
+        (state / 'socket.dsn').write_text('postgresql://nouveau\n')
+        erreurs = []
+
+        def bascule():
+            try:
+                pgbouncer.switch(self.home, state)
+            except Exception as exc:      # noqa: BLE001 — témoin du thread
+                erreurs.append(exc)
+
+        fil = threading.Thread(target=bascule)
+        fil.start()
+        try:
+            resultat = self._lancer()
+            self.assertEqual(resultat['state'], 'installed', resultat)
+        finally:
+            fil.join(timeout=5)
+        self.assertEqual(erreurs, [])
+        self.assertFalse(fil.is_alive())
+        donnees = self._lire_config()
+        self.assertEqual(donnees['canon_ref'], self.tete)
+        self.assertEqual(donnees['dsn'], 'postgresql://nouveau')
+
+    def test_rollback_concurrent_avec_le_helper_garde_les_deux_deltas(self):
+        """Rollback (dsn) et helper (pin) se sérialisent : l'épingle survit."""
+        self._poser_config_dsn()
+        state = self.root / 'state'
+        state.mkdir()
+        (state / 'socket.dsn').write_text('postgresql://nouveau\n')
+        pgbouncer.switch(self.home, state)
+        erreurs = []
+
+        def retour():
+            try:
+                pgbouncer.switch(self.home, state, rollback=True)
+            except Exception as exc:      # noqa: BLE001
+                erreurs.append(exc)
+
+        fil = threading.Thread(target=retour)
+        fil.start()
+        try:
+            resultat = self._lancer()
+            self.assertEqual(resultat['state'], 'installed', resultat)
+        finally:
+            fil.join(timeout=5)
+        self.assertEqual(erreurs, [])
+        donnees = self._lire_config()
+        self.assertEqual(donnees['canon_ref'], self.tete)
+        self.assertEqual(donnees['dsn'], 'postgresql://ancien')
+        self.assertEqual(donnees['segments'], {'garde': True})
 
     # -- formes de configuration -----------------------------------------
 

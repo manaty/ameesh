@@ -8,6 +8,7 @@ Errors deliberately omit exception text: libpq errors can contain a DSN.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -16,10 +17,12 @@ import pwd
 from pathlib import Path
 import re
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from datetime import datetime, timezone
 import uuid
 from urllib.request import urlopen
@@ -27,6 +30,11 @@ from urllib.request import urlopen
 VERSION = '1.26.0'
 SHA256 = 'afd25dd61ee6775d37b40629b87ce08736b3e6955f3057bb212e410fbf21c71d'
 URL = f'https://www.pgbouncer.org/downloads/files/{VERSION}/pgbouncer-{VERSION}.tar.gz'
+#: #8109 : convention partagée avec le helper de staging et les timers —
+#: flock exclusif sur `<config>.lock` pour tout le cycle relire-modifier-remplacer.
+LOCK_SUFFIX = '.lock'
+LOCK_WAIT = 10.0
+LOCK_STEP = 0.05
 APPROVED_OPERATORS = {
     'ameesh-agents-1': 'ameesh',
     'ameesh-agents-2': 'ameesh',
@@ -143,6 +151,38 @@ def replace(path, content):
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+
+
+def config_lock(path):
+    """Verrou exclusif partagé par les écrivains de la configuration (#8109).
+
+    Le helper de staging et les timers prennent le même `<config>.lock` pour
+    tout leur cycle relire-modifier-remplacer. Attente bornée puis refus
+    nommé : jamais de remplacement silencieux d'une écriture concurrente.
+    """
+    lock = path.with_name(path.name + LOCK_SUFFIX)
+    try:
+        handle = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, 0o600)
+    except OSError:
+        raise ValueError('configuration lock unreadable') from None
+    try:
+        info = os.fstat(handle)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022):
+            raise ValueError('configuration lock is not a private regular file')
+        limite = time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                if time.monotonic() >= limite:
+                    raise ValueError('configuration locked by another writer') from None
+                time.sleep(LOCK_STEP)
+    except BaseException:
+        os.close(handle)
+        raise
 
 
 def run(argv):
@@ -510,21 +550,37 @@ def install_amont(home, python, script):
 def switch(home, state, rollback=False):
     config = home / '.config/ameesh/config.json'
     backup = config.with_name('config.json.before-pgbouncer-653')
-    if config.is_symlink() or backup.is_symlink():
+    keys = config.with_name('config.json.before-pgbouncer-653.keys.json')
+    if config.is_symlink() or backup.is_symlink() or keys.is_symlink():
         raise ValueError('symlink config')
-    if rollback:
-        raw = backup.read_bytes()
-        json.loads(raw)
-    else:
-        raw = config.read_bytes()
-        data = json.loads(raw)
-        dsn = (state / 'socket.dsn').read_text().strip()
-        if data.get('dsn') == dsn:
-            raise ValueError('already switched')
-        write_new(backup, raw)
-        data['dsn'] = dsn
-        raw = (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
-    replace(config, raw)
+    verrou = config_lock(config)
+    try:
+        if rollback:
+            # #8109 : ne remet que les clés changées par le switch. Une épingle
+            # canon avancée entre-temps, ou toute autre clé, reste intacte.
+            if keys.exists():
+                changes = json.loads(keys.read_text())
+            else:
+                # Un switch antérieur au témoin ne changeait que `dsn`.
+                changes = {'dsn': json.loads(backup.read_bytes()).get('dsn')}
+            data = json.loads(config.read_bytes())
+            for cle, valeur in changes.items():
+                data[cle] = valeur
+            raw = (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
+        else:
+            raw = config.read_bytes()
+            data = json.loads(raw)
+            dsn = (state / 'socket.dsn').read_text().strip()
+            if data.get('dsn') == dsn:
+                raise ValueError('already switched')
+            write_new(backup, raw)
+            replace(keys, (json.dumps({'dsn': data.get('dsn')},
+                                      ensure_ascii=False, indent=2) + '\n').encode())
+            data['dsn'] = dsn
+            raw = (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
+        replace(config, raw)
+    finally:
+        os.close(verrou)
     print('Configuration restored.' if rollback else 'Configuration switched.')
     print('Existing runners need operator-managed drain/restart to adopt the DSN.')
 
