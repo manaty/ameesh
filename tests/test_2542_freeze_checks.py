@@ -225,6 +225,16 @@ class ScriptTest(unittest.TestCase):
         self.assertIn("RED compilation", out)
         self.assertIn("test_casse.py", out)
 
+    def test_compilation_tmpdir_trop_long_reste_un_controle_reel(self):
+        root = self.tree()
+        tmp = pathlib.Path(root, "é" * 40)
+        tmp.mkdir()
+        env = dict(os.environ, TMPDIR=str(tmp))
+        check = next(c for c in script.CHECKS if c[0] == "compilation")
+        self.assertEqual(script._run(check, root, env)[1], 0)
+        pathlib.Path(root, "tests", "test_casse.py").write_text("def (:\n", encoding="utf-8")
+        self.assertNotEqual(script._run(check, root, env)[1], 0)
+
     def test_hors_d_un_arbre_ameesh(self):
         root = tempfile.mkdtemp(prefix="ameesh-2542-vide-")
         self.addCleanup(shutil.rmtree, root, True)
