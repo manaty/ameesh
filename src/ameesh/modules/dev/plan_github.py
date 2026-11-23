@@ -69,6 +69,7 @@ import functools
 import hashlib
 import json
 import os
+import posixpath
 import re
 import subprocess
 import socket
@@ -1864,8 +1865,14 @@ SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms",
 #: #2130/D : clés admises d'un mapping Process (data only, compilé au chargement)
 PROCESS_KEYS = ("ref", "version", "document", "labels")
 #: forme longue d'un projet : `repo`, les workflows suivis par le veilleur de
-#: CI (#1110, `ci.Watcher`) et la ou les branches de base du dépôt (#1483)
-PROJECT_KEYS = ("repo", "workflows", "base")
+#: CI (#1110, `ci.Watcher`), la ou les branches de base du dépôt (#1483) et le
+#: bloc `ci` (#8156 : son dispatcher déterministe)
+PROJECT_KEYS = ("repo", "workflows", "base", "ci")
+#: #8156 : clés admises du bloc `ci` d'un projet. `dispatcher` est le chemin,
+#: dans le dépôt, du script qui sélectionne et lance lui-même les suites dues
+#: (Nexlink : `scripts/ci/dispatch-due-parts.mjs`) ; absent, la CI reste
+#: l'étiquette `ci-lot`/`ci-full` de #1343.
+CI_KEYS = ("dispatcher",)
 #: suffixes admis pour un fichier de workflow (`.github/workflows/…`)
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 DEFAULT_INTERVAL = 300.0
@@ -1942,6 +1949,10 @@ class Settings:
     #: exécution n'est jamais remplacée et dont le rouge sert de référence
     #: (#1483 : Nexlink a `develop` pour base) ; sans entrée, `ci.BASE_BRANCHES`
     bases: dict = field(default_factory=dict)
+    #: #8156 : {dépôt: chemin du dispatcher} — le script du dépôt qui compose
+    #: et lance lui-même ses suites dues ; sans entrée, la demande de CI suit
+    #: le chemin d'étiquette de #1343.
+    dispatchers: dict = field(default_factory=dict)
     #: #2130/D : {projet: (ProcessMapping, …)} — les révisions Process admises et
     #: leurs libellés de board ; un lot pinné n'est projeté que par un mapping
     #: admis de son couple exact (ref, version). Vide : aucune greffe.
@@ -1978,6 +1989,14 @@ class Settings:
         if not key:
             return None
         return next((tuple(branches) for name, branches in self.bases.items()
+                     if name.casefold() == key), None)
+
+    def dispatcher_for(self, repo: str | None) -> str | None:
+        """#8156 : le dispatcher déclaré d'un dépôt, ou None (chemin d'étiquette)."""
+        key = (repo or "").strip().casefold()
+        if not key:
+            return None
+        return next((script for name, script in self.dispatchers.items()
                      if name.casefold() == key), None)
 
     def all_bases(self) -> tuple:
@@ -2071,6 +2090,7 @@ def parse_settings(raw) -> Settings:
     projects: dict = {}
     workflows: dict = {}
     bases: dict = {}
+    dispatchers: dict = {}
     for name, value in declared.items():
         name = str(name).strip()
         where = "`github.projects.%s`" % name
@@ -2080,6 +2100,7 @@ def parse_settings(raw) -> Settings:
             raise SettingsError("%s: project declared twice (case-insensitive)" % where)
         files = None
         declared_bases = None
+        declared_ci = None
         if isinstance(value, dict):
             extra = sorted(set(map(str, value)) - set(PROJECT_KEYS))
             if extra:
@@ -2087,6 +2108,7 @@ def parse_settings(raw) -> Settings:
                                     % (where, ", ".join(extra), ", ".join(PROJECT_KEYS)))
             files = value.get("workflows")
             declared_bases = value.get("base")
+            declared_ci = value.get("ci")
             value = value.get("repo")
         if not isinstance(value, str) or not _REPO_RE.fullmatch(value.strip()):
             raise SettingsError("%s: repository \"owner/repo\" expected, not %r" % (where, value))
@@ -2124,6 +2146,32 @@ def parse_settings(raw) -> Settings:
                     names.append(item)
             key = projects[name]
             bases[key] = tuple(dict.fromkeys(bases.get(key, ()) + tuple(names)))
+        if declared_ci is not None:
+            where_ci = "`github.projects.%s.ci`" % name
+            where_script = "`github.projects.%s.ci.dispatcher`" % name
+            if not isinstance(declared_ci, dict):
+                raise SettingsError("%s: object {\"dispatcher\": …} expected" % where_ci)
+            extra = sorted(set(map(str, declared_ci)) - set(CI_KEYS))
+            if extra:
+                raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
+                                    % (where_ci, ", ".join(extra), ", ".join(CI_KEYS)))
+            script = declared_ci.get("dispatcher")
+            if not isinstance(script, str) or not script.strip() \
+                    or script.strip() != script:
+                raise SettingsError("%s: repository path expected, not %r"
+                                    % (where_script, script))
+            script = script.strip()
+            if (script.startswith(("/", "~")) or "\\" in script or "\0" in script
+                    or script.endswith("/") or ".." in script.split("/")
+                    or posixpath.normpath(script) != script):
+                raise SettingsError("%s: a path inside the repository expected, "
+                                    "not %r" % (where_script, script))
+            key = projects[name]
+            previous = dispatchers.get(key)
+            if previous is not None and previous != script:
+                raise SettingsError("%s: repository %s already declares the "
+                                    "dispatcher %r" % (where_script, key, previous))
+            dispatchers[key] = script
     host = raw.get("host")
     if host is not None and not isinstance(host, str):
         raise SettingsError("`github.host`: host name expected")
@@ -2165,7 +2213,8 @@ def parse_settings(raw) -> Settings:
                     interval=float(interval), ci_ttl=float(ci_ttl),
                     watch_role=watch_role,
                     exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
-                    workflows=workflows, bases=bases, process=process)
+                    workflows=workflows, bases=bases, dispatchers=dispatchers,
+                    process=process)
 
 
 def settings_of(cfg) -> Settings:

@@ -259,6 +259,18 @@ STATUS_SCHEMA = "ameesh-ci-status/1"
 #: (`scripts/ci/dispatch-due-parts.mjs`). Le cœur lit ce schéma générique ;
 #: un module peut déclarer l'ancien nom de son planificateur en alias.
 DISPATCH_PLAN_SCHEMA = "ameesh-dispatch-due-parts/1"
+#: #8156 : convention d'un dépôt qui ne déclare pas de dispatcher ; un projet
+#: qui en déclare un (`github.projects.<projet>.ci.dispatcher`) nomme son
+#: script et son absence est un refus, jamais un repli silencieux.
+DEFAULT_DISPATCH_SCRIPT = "scripts/ci/dispatch-due-parts.mjs"
+#: #8156 : identité et date figées du commit de composition. Deux hôtes qui
+#: composent la même tête sur la même pointe de cible écrivent le **même**
+#: commit (mêmes arbre, parents, message, auteur et date) : un second push est
+#: un « up-to-date », jamais une course entre deux compositions.
+COMPOSE_IDENTITY = {
+    "GIT_AUTHOR_NAME": "ameesh ci", "GIT_AUTHOR_EMAIL": "ci@ameesh.invalid",
+    "GIT_COMMITTER_NAME": "ameesh ci", "GIT_COMMITTER_EMAIL": "ci@ameesh.invalid",
+}
 #: #845 (arbitrage A du pilote, 14/10) : le relevé « runner busy sans job »
 #: coûte un appel par exécution non conclue (en plus des listes par état et de
 #: celle des runners) : il est mené au plus toutes les `GUARD_SCAN_S` secondes,
@@ -3761,6 +3773,7 @@ REQUEST_RE = re.compile(
     r"^ci-label (?P<state>reserve|applied|released) pr=(?P<pr>\d+) "
     r"label=(?P<label>ci-(?:lot|full)-[0-9a-f]{40}) sha=(?P<sha>[0-9a-f]{40}) "
     r"base=(?P<base>[0-9a-f]{40}) mode=(?P<mode>lot|full) token=(?P<token>[0-9a-f]{16})"
+    r"(?: reviewed=(?P<reviewed>[0-9a-f]{40}))?"
     r"(?: avis=(?P<avis>\d+))?(?: seen=(?P<seen>\d+))?\b")
 #: l'acteur du `GITHUB_TOKEN` d'Actions : ses étiquettes ne déclenchent rien
 ACTIONS_BOT = "github-actions[bot]"
@@ -3916,7 +3929,220 @@ def _runs_of(api, repo: str, *, sha: str = "", branch: str = "",
     return rows
 
 
-def _dispatch_plan(db, cfg, item, api, repo, branch, sha) -> dict:
+def _dispatcher_for(cfg, repo: str) -> str | None:
+    """#8156 : le dispatcher déclaré du projet de ce dépôt, ou None.
+
+    Un lot sans dispatcher garde le chemin d'étiquette de #1343 ; un projet
+    qui en déclare un fait composer sa tête et lance ses suites par le script
+    du dépôt (`github.projects.<projet>.ci.dispatcher`)."""
+    from . import plan_github
+    try:
+        return plan_github.settings_of(cfg).dispatcher_for(repo)
+    except plan_github.SettingsError as exc:
+        raise GelError(str(exc)) from exc
+
+
+def _git(repo: str, *args: str, timeout: float = 120.0, env: dict | None = None):
+    """Un `git -C <repo>` sans interaction : jamais de prompt de credentials."""
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                              timeout=timeout,
+                              env=dict(os.environ if env is None else env,
+                                       GIT_TERMINAL_PROMPT="0"))
+    except subprocess.TimeoutExpired as exc:
+        raise GelError("git %s timed out (%ss)" % (" ".join(args[:2]), timeout)) from exc
+    except OSError as exc:
+        raise GelError("git %s: %s" % (" ".join(args[:2]), exc)) from exc
+
+
+def _git_out(repo: str, *args: str, **kwargs) -> str:
+    proc = _git(repo, *args, **kwargs)
+    if proc.returncode:
+        detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
+        raise GelError("git %s: %s" % (" ".join(args[:3]), detail or "failed"))
+    return (proc.stdout or "").strip()
+
+
+def _local_commit(repo: str, sha: str) -> bool:
+    return bool(sha) and _git(repo, "cat-file", "-e", "%s^{commit}" % sha).returncode == 0
+
+
+def _path_in_commit(repo: str, sha: str, path: str) -> bool:
+    """#8156 : le chemin existe-t-il dans l'arbre de ce commit ?"""
+    return bool(sha and path) and _git(
+        repo, "cat-file", "-e", "%s:%s" % (sha, path)).returncode == 0
+
+
+def _is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
+    return _git(repo, "merge-base", "--is-ancestor",
+                ancestor, descendant).returncode == 0
+
+
+def _merge_tree(repo: str, base: str, tip: str) -> str:
+    """L'arbre de la fusion propre de `tip` dans `base`, ou un refus nommé.
+
+    Aucun working tree ni index n'est touché : `merge-tree --write-tree` écrit
+    l'arbre dans le magasin d'objets. Un conflit n'est pas résolu par la
+    commande — c'est le pilote qui le résout sur la branche."""
+    proc = _git(repo, "merge-tree", "--write-tree", "--name-only", base, tip,
+                timeout=300)
+    if proc.returncode == 1:
+        #: `--name-only` liste les chemins en conflit juste après l'arbre,
+        #: avant une ligne vide et les messages d'auto-fusion.
+        paths = []
+        for line in (proc.stdout or "").splitlines()[1:]:
+            if not line.strip():
+                break
+            paths.append(line.strip())
+        raise GelError("the composition of %s into %s conflicts on %s: resolve it on "
+                       "the branch (only a clean merge is composed here)"
+                       % (tip[:12], base[:12],
+                          ", ".join(paths) if paths else "unlisted paths"))
+    if proc.returncode != 0:
+        detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
+        raise GelError("git merge-tree %s %s: %s" % (base[:12], tip[:12],
+                                                     detail or "failed"))
+    tree = (proc.stdout or "").splitlines()[0].strip() if (proc.stdout or "").splitlines() else ""
+    if not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise GelError("git merge-tree %s %s rendered no tree" % (base[:12], tip[:12]))
+    return tree
+
+
+def _composition_chain(repo: str, frozen: str, head: str, target: str) -> str:
+    """#8156 : la branche est-elle le gel, ou une chaîne de fusions de cible ?
+
+    Rend "" quand chaque commit de la chaîne de premiers parents depuis le gel
+    est une fusion à deux parents dont le second appartient à l'histoire de la
+    cible (`target`) et dont l'arbre est exactement le résultat de
+    `merge-tree` (aucune modification manuelle, aucune résolution cachée) ;
+    sinon le refus nommé. C'est la preuve que la tête qui porte la CI ne
+    contient, après le gel, que des compositions de la cible : les avis du gel
+    restent ceux de la tête relue, et l'avance est celle que le canon §12
+    décrit pour un porteur (« cible bougée sans conflit = paquet mis à jour »).
+    """
+    frozen = (frozen or "").strip().lower()
+    head = (head or "").strip().lower()
+    target = (target or "").strip().lower()
+    if not frozen or not head:
+        return "the freeze or the branch head is empty"
+    if not _sha_ok(target):
+        return "the target head is unreadable"
+    if head == frozen:
+        return ""
+    if not _is_ancestor(repo, frozen, head):
+        return ("%s is not a descendant of the frozen head %s: the branch was "
+                "rewritten" % (head[:12], frozen[:12]))
+    proc = _git(repo, "rev-list", "--first-parent", "--reverse",
+                "%s..%s" % (frozen, head))
+    if proc.returncode:
+        detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
+        return "the first-parent chain is unreadable: %s" % (detail or "failed")
+    previous = frozen
+    for sha in [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]:
+        parents = _git_out(repo, "rev-list", "--parents", "-n", "1", sha).split()[1:]
+        if len(parents) != 2 or parents[0] != previous:
+            return ("%s is not a composition merge of %s (parents: %s): a commit after "
+                    "the freeze is not a merge of the target"
+                    % (sha[:12], previous[:12],
+                       ", ".join(p[:12] for p in parents) or "none"))
+        if not _is_ancestor(repo, parents[1], target):
+            return ("%s merges %s, which is not in the target %s: only the target "
+                    "moves a carrier after its freeze"
+                    % (sha[:12], parents[1][:12], target[:12]))
+        tree = _git_out(repo, "rev-parse", "%s^{tree}" % sha)
+        try:
+            merged = _merge_tree(repo, previous, parents[1])
+        except GelError:
+            return ("%s carries a manual resolution: its composition of %s and %s "
+                    "conflicts" % (sha[:12], previous[:12], parents[1][:12]))
+        if merged != tree:
+            return ("%s changes the merge result of %s and %s: a manual edit or a "
+                    "resolution inside a composition"
+                    % (sha[:12], previous[:12], parents[1][:12]))
+        previous = sha
+    if previous != head:
+        return "the first-parent chain does not reach %s" % head[:12]
+    return ""
+
+
+def _compose_commit(repo: str, head: str, target: str, target_ref: str,
+                    item_id: int, frozen: str) -> str:
+    """#8156 : le commit de composition `head + target`, déterministe.
+
+    L'arbre vient de `merge-tree` ; l'identité et la date sont figées
+    (`COMPOSE_IDENTITY` et le plus récent des deux commits), donc la même
+    entrée rend le même SHA sur tout hôte et le push concurrent est idempotent.
+    """
+    tree = _merge_tree(repo, head, target)
+    stamps = []
+    for sha in (head, target):
+        proc = _git(repo, "show", "-s", "--format=%ct", sha)
+        try:
+            stamps.append(int((proc.stdout or "0").strip() or 0))
+        except ValueError:
+            stamps.append(0)
+    stamp = max(stamps or [0])
+    message = ("ameesh ci composition: %s@%s into %s\n\n"
+               "Clean merge of the target head into the branch head; the project "
+               "dispatcher runs on this tree.\n\n"
+               "Ameesh-Lot: #%d\nAmeesh-Frozen: %s\nAmeesh-Target: %s@%s\n"
+               % (target_ref or "target", target[:12], head[:12], int(item_id),
+                  frozen, target_ref or "target", target))
+    env = dict(os.environ, **COMPOSE_IDENTITY)
+    env["GIT_AUTHOR_DATE"] = "@%d +0000" % stamp
+    env["GIT_COMMITTER_DATE"] = "@%d +0000" % stamp
+    commit = _git_out(repo, "commit-tree", tree, "-p", head, "-p", target,
+                      "-m", message, env=env, timeout=300)
+    if not _sha_ok(commit):
+        raise GelError("git commit-tree rendered no composition commit")
+    parents = _git_out(repo, "rev-list", "--parents", "-n", "1", commit).split()[1:]
+    if parents != [head, target]:
+        raise GelError("the composed commit %s does not carry %s and %s as parents"
+                       % (commit[:12], head[:12], target[:12]))
+    return commit
+
+
+def _push_composition(repo: str, branch: str, sha: str, expected: str = "") -> None:
+    """#8156 : pousse le commit composé sur la branche du porteur.
+
+    Avance rapide seulement, jamais de force : le bail porte sur la tête
+    observée (`expected`, le premier parent du commit composé). Une composition
+    identique déjà poussée par un autre hôte est reconnue et acceptée sans
+    repousser (le commit est déterministe) ; toute autre tête distante refuse.
+    """
+    expected = (expected or "").strip().lower()
+    if not expected:
+        parents = _git_out(repo, "rev-list", "--parents", "-n", "1", sha).split()[1:]
+        expected = parents[0] if parents else ""
+    if not _sha_ok(expected):
+        raise GelError("composition %s has no usable first parent: nothing pushed"
+                       % sha[:12])
+    remote = _git(repo, "ls-remote", "origin", "refs/heads/%s" % branch, timeout=120)
+    if remote.returncode:
+        detail = " ".join((remote.stderr or remote.stdout or "").split())[-300:]
+        raise GelError("remote branch %s is unreadable (%s): nothing pushed"
+                       % (branch, detail or "git ls-remote failed"))
+    current = ((remote.stdout or "").split() or [""])[0].strip().lower()
+    if current == sha:
+        return
+    if current != expected:
+        raise GelError("composition push to %s refused: the remote head is %s, the "
+                       "observed head is %s (the branch moved; refreeze and "
+                       "re-review); nothing pushed"
+                       % (branch, current[:12] or "absent", expected[:12]))
+    proc = _git(repo, "push", "--porcelain",
+                "--force-with-lease=refs/heads/%s:%s" % (branch, expected),
+                "origin", "%s:refs/heads/%s" % (sha, branch), timeout=300)
+    if proc.returncode:
+        text = " ".join((proc.stderr or proc.stdout or "").split())[-400:]
+        raise GelError("composition push to %s refused (%s): the branch moved or the "
+                       "remote refuses the push; nothing dispatched"
+                       % (branch, text or "failed"))
+
+
+def _dispatch_plan(db, cfg, item, api, repo, branch, sha, *, script: str = "",
+                   checkout: str = "", required: bool = False) -> dict:
     """Use declared/discovered suites and the repository's own due-parts plan.
 
     No project-specific workflow list lives here. A repository that provides
@@ -3930,7 +4156,9 @@ def _dispatch_plan(db, cfg, item, api, repo, branch, sha) -> dict:
     found = watcher.discovered_workflows(repo)
     if found is None:
         raise GelError("cannot discover registered CI workflows in %s" % repo)
-    selected = _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha)
+    selected = _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha,
+                                         script=script, checkout=checkout,
+                                         required=required)
     if selected is None:
         workflows = declared if declared is not None else tuple(w for w in found if SUITE_RE.search(w))
         if not workflows:
@@ -3961,29 +4189,39 @@ def _dispatch_plan(db, cfg, item, api, repo, branch, sha) -> dict:
     return selected
 
 
-def _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha):
+def _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha, *,
+                              script: str = "", checkout: str = "",
+                              required: bool = False):
     """Read the planner at the frozen tree, then run only its dry-run path.
 
     Mirrors the Nexlink release module's `ci_plan`: a detached worktree
     prevents the caller's checkout from substituting a planner. Absence permits
     generic suites; presence with an unreadable/invalid plan fails before any
-    dispatch.
+    dispatch. #8156: a project that declares its dispatcher (`script`) must
+    have it — its absence is refused, never silently replaced by the label;
+    `checkout` is the clone where the composed commit was made.
     """
     import json
     import os
     import subprocess
     import tempfile
     from . import plan_github, prevalidation_calls, release_cutoff as rc
-    script = "scripts/ci/dispatch-due-parts.mjs"
+    script = (script or DEFAULT_DISPATCH_SCRIPT).strip()
     try:
         data = api("repos/%s/contents/%s?ref=%s" % (repo, script, sha)) or {}
     except plan_github.GithubError as exc:
         if "404" not in str(exc):
             raise
+        if required:
+            raise GelError("the project declares the dispatcher %s, but %s does not "
+                           "carry it: nothing dispatched" % (script, sha[:12])) from exc
         return None
     if not data.get("content"):
+        if required:
+            raise GelError("the project declares the dispatcher %s, but %s carries an "
+                           "empty file: nothing dispatched" % (script, sha[:12]))
         return None
-    local = prevalidation_calls.repository(cfg, db, item, sha)
+    local = (checkout or "").strip() or prevalidation_calls.repository(cfg, db, item, sha)
     if not local:
         raise GelError("repository CI planner needs a local clone containing %s" % sha)
     folder = path = None
@@ -4391,9 +4629,14 @@ def _latest_check(api, repo: str, sha: str) -> dict | None:
 
 def _request_note(state: str, number: int, label: str, sha: str, base: str,
                   mode: str, token: str, text: str = "",
-                  avis: int | None = None, seen: int | None = None) -> str:
+                  avis: int | None = None, seen: int | None = None,
+                  reviewed: str = "") -> str:
     marker = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
               % (state, number, label, sha, base, mode, token))
+    if reviewed and reviewed != sha:
+        #: #8156 : une demande dispatchée teste la tête composée (`sha`) et lit
+        #: les avis sur le gel (`reviewed`) ; la marque nomme les deux.
+        marker += " reviewed=%s" % reviewed
     if avis is not None:
         #: N2 #2240 : le nombre d'avis déclaré par l'appelant reste lisible
         #: dans la marque, `--avis 0 --full` compris (aucun passage muet).
@@ -4415,6 +4658,7 @@ def request_events(db, item_id: int, *, limit: int = 200) -> list[dict]:
                     "pr": int(m.group("pr")), "label": m.group("label"),
                     "sha": m.group("sha"), "base": m.group("base"),
                     "mode": m.group("mode"), "token": m.group("token"),
+                    "reviewed": m.group("reviewed") or "",
                     "avis": int(m.group("avis")) if m.group("avis") is not None else None,
                     "seen": int(m.group("seen")) if m.group("seen") is not None else None,
                     "ts": float(ev.get("created_ts") or 0.0)})
@@ -4549,6 +4793,15 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
         # sinon un lot jamais gelé obtiendrait sa CI sans trace de gel.
         raise GelError("lot #%s is not frozen: ameesh work milestone %s frozen --sha <sha>"
                        % (item_id, item_id))
+    dispatcher = _dispatcher_for(cfg, name)
+    if dispatcher is not None and not full:
+        # #8156 : dans un projet qui déclare son dispatcher, la CI d'un lot
+        # passe par son paquet ; seule la suite complète d'un porteur
+        # `integration/**` est composée et dispatchée par `ci run`.
+        raise GelError("lot #%s: project %s declares the CI dispatcher %s; a lot "
+                       "request is tested by its packet — only the full suite "
+                       "(--full) of an integration/** carrier uses the dispatcher"
+                       % (item_id, item.get("app") or name, dispatcher))
     head = _head_of(api, name, branch)
     #: la tête demandée : le gel pour une demande normale ; pour une exception
     #: ou la suite complète, le `--sha` nommé ou la tête de la branche (le
@@ -4557,7 +4810,43 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
     if not _sha_ok(tested):
         raise GelError("lot #%s: the frozen milestone carries no usable sha (%r): "
                        "refreeze with --sha" % (item_id, tested))
-    if head != tested:
+    reviewed = tested
+    composition_repo = ""
+    pending_composition = ""
+    if dispatcher is not None:
+        # #8156 : le projet déclare son dispatcher. Sa branche est un porteur
+        # `integration/**` dont la tête peut avoir avancé après le gel par des
+        # compositions de la cible (§12) : on prouve cette chaîne, et la pointe
+        # courante de la cible sera composée avant le dispatch.
+        if not branch.startswith("integration/"):
+            raise GelError("lot #%s: project %s declares the CI dispatcher %s; its CI "
+                           "runs on an integration/** carrier, not on the lot branch %s"
+                           % (item_id, item.get("app") or name, dispatcher, branch))
+        if not frozen:
+            raise GelError("lot #%s: project %s declares the CI dispatcher %s, which "
+                           "composes the target into an integration/** carrier: freeze "
+                           "the carrier first (ameesh work milestone %s frozen --sha "
+                           "<sha>), the reviews are read on that pre-composition head"
+                           % (item_id, item.get("app") or name, dispatcher, item_id))
+        from . import prevalidation_calls
+        composition_repo = (checkout or "").strip() or prevalidation_calls.repository(
+            cfg, db, item, frozen, explicit=(checkout or ""))
+        if not composition_repo:
+            raise GelError("lot #%s: the project declares the CI dispatcher %s, which "
+                           "composes the target head into the branch: a local clone "
+                           "containing the freeze %s is required (--prevalidation-repo "
+                           "<checkout>)" % (item_id, dispatcher, frozen[:12]))
+        if not _local_commit(composition_repo, frozen):
+            raise GelError("lot #%s: the local clone %s does not hold the freeze %s: "
+                           "fetch the lot branch before requesting the CI"
+                           % (item_id, composition_repo, frozen[:12]))
+        if not _local_commit(composition_repo, head):
+            raise GelError("lot #%s: the local clone %s does not hold the branch head "
+                           "%s: fetch the lot branch before requesting the CI"
+                           % (item_id, composition_repo, head[:12]))
+        tested = head
+        reviewed = frozen
+    elif head != tested:
         raise GelError("branch %s is on %s, %s is %s: the ref moved — refreeze and "
                        "re-review, nothing requested"
                        % (branch, head[:12], "--sha" if exempt else "the freeze",
@@ -4574,9 +4863,8 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
             "included — rewrite the commit message, push a new head (refreeze it if "
             "this is not an exception), then request the CI again; nothing requested"
             % (head[:12], marker))
-    frozen_sha = tested
     mode = "full" if full else "lot"
-    verdicts = latest_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
+    verdicts = latest_verdicts(db, item_id, reviewed, item.get("assignee") or "")
     reviews = [m for m in verdicts if (m.get("verdict") or "") == "ok"]
     blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
     vehicle_reading = None
@@ -4590,66 +4878,133 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
             raise GelError("lot #%s: %s blocked %s (last verdict of that reviewer): "
                            "fix the head, refreeze and re-review; nothing requested"
                            % (item_id, blocked[0].get("actor") or "a reviewer",
-                              frozen_sha[:12]))
+                              reviewed[:12]))
         from . import packet_reviews
         if len(reviews) < avis and full and packet_reviews.is_vehicle(item):
             needed, reading = _vehicle_review_need(
-                db, cfg, item, frozen_sha, name, checkout=checkout)
+                db, cfg, item, reviewed, name, checkout=checkout)
             if needed and needed.get("ok") is True and needed.get("required") == 0:
                 vehicle_reading = reading
         if len(reviews) < avis and vehicle_reading is None:
             raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required "
                            "(ameesh work milestone %s verdict ok --sha %s --actor <relecteur>); "
                            "an incident or a CI unblock uses --exception incident|unblock "
-                           "--reason …" % (item_id, len(reviews), frozen_sha[:12], avis,
-                                           item_id, frozen_sha[:12]))
+                           "--reason …" % (item_id, len(reviews), reviewed[:12], avis,
+                                           item_id, reviewed[:12]))
     pr = _pr_of(api, name, branch)
-    if pr["head"] != frozen_sha:
-        raise GelError("pull request #%d head is %s, the freeze is %s: the PR moved — "
+    if pr["head"] != tested:
+        raise GelError("pull request #%d head is %s, the %s is %s: the PR moved — "
                        "refreeze and re-review, nothing requested"
-                       % (pr["number"], pr["head"][:12], frozen_sha[:12]))
+                       % (pr["number"], pr["head"][:12],
+                          "tested head" if reviewed != tested else "freeze", tested[:12]))
     if not _sha_ok(pr["base"]):
         raise GelError("pull request #%d: unusable base commit (%r): the composition "
                        "cannot be checked" % (pr["number"], pr["base"]))
+    base = pr["base"]
+    if dispatcher is not None:
+        # #8156 : la pointe de la cible que la PR nomme est la tête à composer.
+        # Elle est relue localement (fetch sans --depth) avant la preuve de la
+        # chaîne : une pointe qui a bougé pendant la lecture refuse, la
+        # composition part d'une tête précise.
+        target_ref = pr["base_ref"]
+        proc = _git(composition_repo, "fetch", "--no-tags", "origin",
+                    "+refs/heads/%s:refs/remotes/origin/%s" % (target_ref, target_ref),
+                    timeout=300)
+        if proc.returncode:
+            detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
+            raise GelError("target %s is unreadable in %s: %s"
+                           % (target_ref, composition_repo, detail or "fetch failed"))
+        tip = _git_out(composition_repo, "rev-parse",
+                       "refs/remotes/origin/%s" % target_ref).strip().lower()
+        if tip != base:
+            raise GelError("target %s is at %s, %s was read from GitHub: the target "
+                           "moved while the request was prepared; run again"
+                           % (target_ref, tip[:12], base[:12]))
+        #: la tête du porteur peut avoir avancé après le gel, mais seulement
+        #: par des fusions propres de la cible (§12) : la chaîne de premiers
+        #: parents ne porte aucun commit d'auteur. L'avance ne retire donc pas
+        #: les avis du gel et ne demande pas de regel (#2442).
+        why = _composition_chain(composition_repo, frozen, tested, base)
+        if why:
+            raise GelError("lot #%s: branch %s is on %s, after the freeze %s and %s: "
+                           "refreeze and re-review, nothing requested"
+                           % (item_id, branch, tested[:12], frozen[:12], why))
+        if not _is_ancestor(composition_repo, base, tested):
+            pending_composition = _compose_commit(
+                composition_repo, tested, base, target_ref, item_id, frozen)
+            #: le chemin déclaré est exigé sur l'arbre composé, pas seulement
+            #: sur la tête relue : une erreur nommée avant toute poussée, sans
+            #: repli silencieux sur l'étiquette.
+            if not _path_in_commit(composition_repo, pending_composition, dispatcher):
+                raise GelError("the project declares the dispatcher %s, but the "
+                               "composition %s does not carry it: nothing pushed, "
+                               "nothing dispatched" % (dispatcher, base[:12]))
     if full and avis == 0 and not exception:
         # (b) §12 #2240 (pilote mesh-design, 17/10 13:22) : le zéro avis d'une
         # suite complète est réservé à un porteur `integration/**` qui publie
         # son manifeste ; hors de ce cas la relecture reste la règle (#2214).
         # Cette garde ne touche que la demande de CI : checks requis,
         # review_gate et porte de fusion du porteur restent inchangés.
+        # #8156 : le manifeste est relu sur le gel (`reviewed`), pas sur la
+        # composition qui n'existe pas encore dans GitHub.
         head_ref = (pr["head_ref"] or "").strip()
         if not head_ref.startswith("integration/"):
             raise GelError("pull request #%d: --avis 0 --full is reserved to an "
                            "integration/** carrier head (source %r); review the head "
                            "and pass its required verdicts"
                            % (pr["number"], head_ref or "—"))
-        manifest = _carrier_manifest(api, name, head_ref, frozen_sha, pr["base"], db=db,
+        manifest = _carrier_manifest(api, name, head_ref, reviewed, pr["base"], db=db,
                                      target=pr["base_ref"], carrier=item_id)
         if not manifest:
             raise GelError("pull request #%d: --avis 0 --full needs the carrier's own "
                            "manifest (reviews/%s) at %s, absent from the base; without "
                            "it, review the head and pass its required verdicts"
-                           % (pr["number"], _manifest_name(head_ref), frozen_sha[:12]))
+                           % (pr["number"], _manifest_name(head_ref), reviewed[:12]))
     if release_refs(pr["head_ref"], pr["base_ref"]) and mode == "lot":
         raise GelError("pull request #%d: source %s or target %s is release/** or "
                        "integration/**: request the full suite (--full --reason …); a lot "
                        "request never covers a release"
                        % (pr["number"], pr["head_ref"] or "—", pr["base_ref"] or "—"))
-    base = pr["base"]
-    label = label_name(mode, frozen_sha)
+    label = label_name(mode, tested)
+    if pending_composition:
+        # #8156 : le premier passage rend la composition à pousser, sans écrire ;
+        # `cmd_ci_run` pousse puis rappelle le plan, qui dispatche la tête poussée.
+        return {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
+                "branch": branch, "target": target, "sha": pending_composition,
+                "reviewed": reviewed, "base": base, "head_ref": pr["head_ref"],
+                "base_ref": pr["base_ref"], "mode": mode,
+                "label": label_name(mode, pending_composition),
+                "path": "workflow-dispatch", "pr": pr["number"],
+                "exception": exception, "reason": reason.strip(),
+                "avis": 0 if vehicle_reading is not None else avis,
+                **({"vehicle_review": vehicle_reading} if vehicle_reading is not None else {}),
+                "verdicts": sorted((m.get("actor") or "") for m in reviews),
+                "frozen": bool(freeze), "runs": 0, "unreadable": [], "requested": [],
+                "action": "compose",
+                "why": "compose %s@%s into %s (freeze %s reviewed), then the project "
+                       "dispatcher %s: nothing pushed yet"
+                       % (pr["base_ref"], base[:12], tested[:12], frozen[:12], dispatcher),
+                "composition": {"repo": composition_repo, "reviewed": frozen,
+                                "head": tested, "target": base,
+                                "target_ref": pr["base_ref"],
+                                "composed": pending_composition}}
     dispatch = None
-    if full:
+    if dispatcher is not None:
+        dispatch = _dispatch_plan(db, cfg, item, api, name, branch, tested,
+                                  script=dispatcher, checkout=composition_repo,
+                                  required=True)
+    elif full:
         from . import plan_github
         declared = plan_github.settings_of(cfg).workflows_for(name)
         if (declared is not None and WORKFLOWS[0] not in declared
-                or not _carries_freeze_request(api, name, frozen_sha)):
-            dispatch = _dispatch_plan(db, cfg, item, api, name, branch, frozen_sha)
-    dispatch_decision = {"repo": name, "sha": frozen_sha, "base": base,
+                or not _carries_freeze_request(api, name, tested)):
+            dispatch = _dispatch_plan(db, cfg, item, api, name, branch, tested)
+    dispatch_decision = {"repo": name, "sha": tested, "base": base,
                          "branch": branch, "pr": pr["number"], "mode": mode,
                          "dispatch": dispatch}
     runs, carried = (_dispatch_request_runs(db, item_id, api, dispatch_decision)
                      if dispatch is not None else
-                     _pr_request_runs(api, name, pr["number"], frozen_sha, branch))
+                     _pr_request_runs(api, name, pr["number"], tested, branch))
     #: P1 R1 : la composition compte — même tête mais autre base, ou mode
     #: insuffisant (`lot` ne prouve pas le `full`), ne verdit pas. #5192 : sauf
     #: une base que seuls des atterrissages de coupure séparent de `base`, pour
@@ -4662,11 +5017,16 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
     green = [r for r in applicable if r["status"] == "completed"
              and r["conclusion"] == "success"]
     decision = {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
-                "branch": branch, "target": target, "sha": frozen_sha, "base": base,
+                "branch": branch, "target": target, "sha": tested, "base": base,
+                "reviewed": reviewed,
                 "head_ref": pr["head_ref"], "base_ref": pr["base_ref"],
                 "mode": mode, "label": label,
                 "path": "workflow-dispatch" if dispatch is not None else "pr-label",
                 **({"dispatch": dispatch} if dispatch is not None else {}),
+                **({"composition": {"reviewed": reviewed, "head": tested,
+                                    "target": base, "target_ref": pr["base_ref"],
+                                    "repo": composition_repo}}
+                   if reviewed != tested else {}),
                 "pr": pr["number"],
                 "exception": exception, "reason": reason.strip(),
                 "avis": 0 if vehicle_reading is not None else avis,
@@ -4685,26 +5045,26 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
         return {**decision, "action": "running",
                 "why": "a %s request of this composition (PR #%d, %s, base %s) is already "
                        "in flight%s: nothing posed"
-                       % (live[0]["mode"], pr["number"], frozen_sha[:12], base[:12],
+                       % (live[0]["mode"], pr["number"], tested[:12], base[:12],
                           _cutoff_why(live[0], base)),
                 "run": _short_run(live[0]["row"])}
     if green:
         #: le vert applicable ne suffit pas si le dernier check requis de la
         #: tête est rouge (une étiquette étrangère a pu le laisser ainsi) : la
         #: reprise est alors explicite (`--force`), jamais automatique.
-        check = None if dispatch is not None else _latest_check(api, name, frozen_sha)
+        check = None if dispatch is not None else _latest_check(api, name, tested)
         if check is None or (check["status"] == "completed"
                              and check["conclusion"] in CHECK_GREEN):
             return {**decision, "action": "green",
                     "why": "already green on this composition (PR #%d, %s, base %s, "
                            "mode %s%s): nothing posed"
-                           % (pr["number"], frozen_sha[:12], base[:12], mode,
+                           % (pr["number"], tested[:12], base[:12], mode,
                               _cutoff_why(green[-1], base)),
                     "run": _short_run(green[-1]["row"])}
         if check["status"] != "completed":
             return {**decision, "action": "running",
                     "why": "the required `tests` check of %s is %s (run %s): nothing posed"
-                           % (frozen_sha[:12], check["status"] or "?",
+                           % (tested[:12], check["status"] or "?",
                               check.get("id") or "?"),
                     "check": check}
         if not force:
@@ -4712,13 +5072,13 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                            "green although a %s request of this composition succeeded: "
                            "--force to request the CI again on this composition (explicit "
                            "resumption of a red or cancelled check)"
-                           % (item_id, frozen_sha[:12], check["conclusion"] or "?",
+                           % (item_id, tested[:12], check["conclusion"] or "?",
                               check.get("id") or "?", mode))
     if applicable and not green and not force:
         raise GelError("lot #%s: %d request(s) already ran on PR #%d for %s (base %s), "
                        "none green (%s): --force to request the CI again (explicit "
                        "resumption of a red or cancelled run)"
-                       % (item_id, len(applicable), pr["number"], frozen_sha[:12],
+                       % (item_id, len(applicable), pr["number"], tested[:12],
                           base[:12],
                           ", ".join(sorted({r["conclusion"] or r["status"] or "?"
                                             for r in applicable}))))
@@ -4726,7 +5086,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
         #: P2 R1 : GitHub ne montre pas un run aussitôt ; une étiquette déjà
         #: posée par un autre processus est dite, jamais reposée. Un run
         #: illisible, lui, matérialise la marque qui l'a produit (#2364).
-        held = reservation_holder(request_events(db, item_id), frozen_sha, base, mode, "",
+        held = reservation_holder(request_events(db, item_id), tested, base, mode, "",
                                   now=time.time(),
                                   runs=tuple((r["id"], r["mode"]) for r in carried))
         if held:
@@ -4744,7 +5104,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                         "why": "a request of this composition (PR #%d, %s) is visible "
                                "but its run-name is unreadable (run %s, mode %s): its "
                                "state cannot be checked; nothing posed"
-                               % (pr["number"], frozen_sha[:12], live_carried[0]["id"],
+                               % (pr["number"], tested[:12], live_carried[0]["id"],
                                   live_carried[0]["mode"]),
                         "run": _short_run(live_carried[0]["row"])}
             if not force:
@@ -4753,15 +5113,15 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                                "SHA: old workflow/CLI), so its composition cannot be "
                                "checked: --force to request the CI again (explicit "
                                "resumption)"
-                               % (item_id, pr["number"], frozen_sha[:12],
+                               % (item_id, pr["number"], tested[:12],
                                   carried[0]["id"], carried[0]["mode"]))
-    if dispatch is None and not _carries_freeze_request(api, name, frozen_sha):
+    if dispatch is None and not _carries_freeze_request(api, name, tested):
         raise GelError("the workflow at %s does not carry the freeze request trigger "
                        "with a pinned target base (#1343/#2328, ci-lot/ci-full label): "
                        "rebase the lot on main before "
-                       "requesting the CI" % frozen_sha[:12])
+                       "requesting the CI" % tested[:12])
     return {**decision, "action": "request",
-            "why": ("%s verdict(s) on %s" % (len(reviews), frozen_sha[:12])
+            "why": ("%s verdict(s) on %s" % (len(reviews), tested[:12])
                     if not (exception or full) else
                     ("exception %s: %s" % (exception, reason.strip()) if exception
                      else "full suite: %s" % reason.strip()))}
@@ -4769,7 +5129,8 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
 
 def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
                 repo: str = "", number: int = 0, base: str = "", workflows=WORKFLOWS,
-                target: str = "", checkout: str = "", proven=()) -> dict:
+                target: str = "", checkout: str = "", proven=(),
+                head: str = "") -> dict:
     """Les runs d'un lot à annuler : non conclues, hors de la composition gardée.
 
     `all_runs` annule aussi le run du SHA gelé (geste explicite). Un lot non
@@ -4778,6 +5139,8 @@ def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
     mais d'une autre base est périmé lui aussi : sa composition a bougé —
     sauf une base que seuls des atterrissages de coupure séparent de `base`
     (#5192, canon §12 ; `proven` : bases déjà prouvées par le plan).
+    #8156 : `head` remplace le gel comme tête courante quand la CI est
+    dispatchée sur un commit composé, postérieur au gel.
     """
     from . import work
     item = work.get(db, int(item_id))
@@ -4789,14 +5152,15 @@ def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
         raise GelError("lot #%s has no branch: nothing to cancel" % item_id)
     freeze = frozen_of(db, item_id)
     frozen = ((freeze or {}).get("sha") or "").strip().lower()
+    reference = (head or "").strip().lower() or frozen
     rows = [r for r in _runs_of(api, name, branch=branch, workflows=workflows)
             if (r.get("status") or "").strip().lower() in OPEN_STATUSES]
     covered: list[str] = []
-    if frozen and not all_runs and number and base:
+    if reference and not all_runs and number and base:
         same = []
         for row in rows:
             info = pr_run(row)
-            if (info is not None and info["number"] == number and info["sha"] == frozen
+            if (info is not None and info["number"] == number and info["sha"] == reference
                     and info["base"] != base):
                 same.append({"base": info["base"], "mode": info["mode"],
                              "status": (row.get("status") or "").strip().lower(),
@@ -4804,13 +5168,15 @@ def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
         covered = _cutoff_bases(cfg, db, item, name,
                                 target or (item.get("branch_target") or "main"), base,
                                 same, "", checkout=checkout, proven=proven)
-    if frozen and not all_runs:
-        rows = [r for r in rows if not _current_run(r, frozen, number, base, covered)]
+    if reference and not all_runs:
+        rows = [r for r in rows if not _current_run(r, reference, number, base, covered)]
     return {"schema": CANCEL_SCHEMA, "work_item": int(item_id), "repo": name,
-            "branch": branch, "frozen": frozen, "all": bool(all_runs),
+            "branch": branch, "frozen": frozen, "head": reference,
+            "all": bool(all_runs),
             "runs": [_short_run(r) for r in rows],
-            "why": ("every open run of the branch" if all_runs or not frozen else
-                    "open runs that do not carry the frozen composition %s" % frozen[:12])}
+            "why": ("every open run of the branch" if all_runs or not reference else
+                    "open runs that do not carry the current composition %s"
+                    % reference[:12])}
 
 
 def _cancel_runs(gh, repo: str, runs: list[dict], *, say=print, on_cancel=None) -> int:
@@ -4948,6 +5314,10 @@ def _revalidate(db, item_id: int, decision: dict, *, cfg=None) -> None:
     if decision.get("exception"):
         return
     sha = decision["sha"]
+    #: #8156 : les avis portent sur la tête relue (`reviewed`, le gel) et non
+    #: sur la tête composée que le dispatcher teste ; hors composition, les
+    #: deux sont la même.
+    reviewed = (decision.get("reviewed") or sha).strip().lower()
     if decision.get("mode") != "full":
         #: un `--full` nomme sa tête lui-même (gel facultatif, cf. `gel_plan`) ;
         #: il ne relit donc pas le gel, mais bien les verdicts ci-dessous.
@@ -4961,15 +5331,15 @@ def _revalidate(db, item_id: int, decision: dict, *, cfg=None) -> None:
                            "prepared (%s requested): refreeze and re-review, nothing posed"
                            % (item_id, frozen[:12], sha[:12]))
     assignee = (item.get("assignee") or "")
-    verdicts = latest_verdicts(db, item_id, sha, assignee)
+    verdicts = latest_verdicts(db, item_id, reviewed, assignee)
     blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
     if blocked:
         raise GelError("lot #%s: %s blocked %s (last verdict of that reviewer, read under "
                        "the lock): fix the head, refreeze and re-review; nothing posed"
-                       % (item_id, blocked[0].get("actor") or "a reviewer", sha[:12]))
+                       % (item_id, blocked[0].get("actor") or "a reviewer", reviewed[:12]))
     if decision.get("vehicle_review"):
         needed, _ = _vehicle_review_need(
-            db, cfg, item, sha, decision["repo"], reading=decision["vehicle_review"])
+            db, cfg, item, reviewed, decision["repo"], reading=decision["vehicle_review"])
         if not (needed and needed.get("ok") is True and needed.get("required") == 0):
             raise GelError("vehicle review proof changed while the request was prepared: "
                            "read the vehicle again; nothing posed")
@@ -4978,7 +5348,7 @@ def _revalidate(db, item_id: int, decision: dict, *, cfg=None) -> None:
     if len(reviews) < avis:
         raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required (a "
                        "verdict changed while the request was prepared): nothing posed"
-                       % (item_id, len(reviews), sha[:12], avis))
+                       % (item_id, len(reviews), reviewed[:12], avis))
 
 
 def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool,
@@ -5019,7 +5389,8 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool,
             #: compris 0 (`--avis 0 --full` ne passe plus sans trace).
             work.note(tx, int(item_id),
                       _request_note(state, number, label, sha, base, mode, token, text,
-                                    avis=int(decision.get("avis") or 0), seen=seen))
+                                    avis=int(decision.get("avis") or 0), seen=seen,
+                                    reviewed=str(decision.get("reviewed") or "")))
 
         note("reserve", "freeze CI requested")
         known, carried = (_dispatch_request_runs(tx, item_id, api, decision)
@@ -5187,10 +5558,29 @@ def _render_gel(decision: dict) -> list[str]:
     lines = ["lot #%d  %s  %s  %s" % (decision["work_item"], decision["repo"],
                                     decision["branch"], decision["sha"][:12])]
     lines.append("  %s: %s" % (decision["action"], decision.get("why") or ""))
+    reviewed = str(decision.get("reviewed") or "")
+    if reviewed and reviewed != decision.get("sha"):
+        lines.append("  reviewed freeze: %s (the reviews are read on the freeze)"
+                     % reviewed[:12])
+    composition = decision.get("composition") or {}
+    if composition:
+        lines.append("  composition: %s + %s@%s -> %s%s"
+                     % (str(composition.get("reviewed") or "")[:12],
+                        composition.get("target_ref") or "target",
+                        str(composition.get("target") or "")[:12],
+                        str(composition.get("composed") or decision["sha"])[:12],
+                        " (pushed)" if decision["action"] != "compose" else " (to push)"))
     if decision.get("base"):
-        lines.append("  PR #%s  base %s  mode %s  label %s"
-                     % (decision.get("pr"), decision["base"][:12], decision["mode"],
-                        decision.get("label") or "—"))
+        if decision.get("dispatch") is not None:
+            #: #8156 : le dispatcher remplace l'étiquette de demande ; la ligne
+            #: nomme les suites qu'il a sélectionnées, jamais un `ci-full` posé.
+            lines.append("  PR #%s  base %s  mode %s  dispatcher %s"
+                         % (decision.get("pr"), decision["base"][:12],
+                            decision["mode"], ", ".join(decision["dispatch"])))
+        else:
+            lines.append("  PR #%s  base %s  mode %s  label %s"
+                         % (decision.get("pr"), decision["base"][:12], decision["mode"],
+                            decision.get("label") or "—"))
     if decision.get("exception"):
         lines.append("  exception %s (canon §3): %s" % (decision["exception"],
                                                         decision["reason"]))
@@ -5244,7 +5634,8 @@ def _packet_prevalidation(cfg, db, item, decision, args) -> int:
         return 0
     result = prevalidation_calls.gate_packet(
         cfg, db, item, decision,
-        repo=getattr(args, "prevalidation_repo", "") or "",
+        repo=(getattr(args, "prevalidation_repo", "")
+              or (decision.get("composition") or {}).get("repo") or ""),
         map_path=getattr(args, "prevalidation_map", "") or "",
         deadline=prevalidation_calls.caller_deadline(
             getattr(args, "prevalidation_budget", None)))
@@ -5319,6 +5710,7 @@ def _arm_packet(cfg, db, decision: dict, gh, args) -> dict | None:
             target=decision.get("base_ref") or "", gh=packet_automerge.gh_of(gh),
             actor=getattr(args, "actor", "") or work.SYSTEM_SENDER,
             checkout=(getattr(args, "prevalidation_repo", "")
+                      or (decision.get("composition") or {}).get("repo")
                       or (decision.get("vehicle_review") or {}).get("repo") or ""))
     except Exception as exc:  # noqa: BLE001 - l'étiquette est posée : jamais fatal
         out = {"state": "error", "why": "%s: %s" % (type(exc).__name__, exc)}
@@ -5384,12 +5776,15 @@ def cmd_ci_run(cfg, args) -> int:
                 print("ameesh ci run: %s" % exc)
             return 1
 
+    def plan() -> dict:
+        return gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
+                        avis=args.avis, exception=args.exception or "",
+                        reason=args.reason or "", full=args.full, force=args.force,
+                        repo=args.repo or "",
+                        checkout=getattr(args, "prevalidation_repo", "") or "")
+
     try:
-        decision = gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
-                            avis=args.avis, exception=args.exception or "",
-                            reason=args.reason or "", full=args.full, force=args.force,
-                            repo=args.repo or "",
-                            checkout=getattr(args, "prevalidation_repo", "") or "")
+        decision = plan()
     except (GelError, plan_github.GithubError) as exc:
         if getattr(args, "json", False):
             print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
@@ -5398,6 +5793,39 @@ def cmd_ci_run(cfg, args) -> int:
         else:
             print("ameesh ci run: %s" % exc)
         return 1
+    # #8156 : un projet qui déclare son dispatcher compose la pointe de la
+    # cible dans la branche avant de dispatcher. Le plan ne pousse rien ; ici
+    # le commit composé (déterministe) est poussé en avance rapide, puis le
+    # plan est relu sur la tête poussée. Une cible qui bouge entre deux
+    # lectures est recomposée, au plus trois fois.
+    attempts = 0
+    while decision["action"] == "compose" and not args.dry_run:
+        composition = decision.get("composition") or {}
+        try:
+            _push_composition(str(composition.get("repo") or ""), decision["branch"],
+                              decision["sha"], str(composition.get("head") or ""))
+        except GelError as exc:
+            print("ameesh ci run: %s" % exc)
+            return 1
+        try:
+            work.note(db, args.id,
+                      "composition: freeze %s + %s@%s -> %s (pushed)"
+                      % (str(composition.get("reviewed") or "")[:12],
+                         composition.get("target_ref") or "target",
+                         str(composition.get("target") or "")[:12],
+                         decision["sha"]), actor="ameesh")
+        except Exception:  # noqa: BLE001 - la composition est poussée, la note informative
+            pass
+        attempts += 1
+        if attempts > 3:
+            print("ameesh ci run: the target kept moving during the composition; "
+                  "nothing dispatched")
+            return 1
+        try:
+            decision = plan()
+        except (GelError, plan_github.GithubError) as exc:
+            print("ameesh ci run: %s" % exc)
+            return 1
     if args.dry_run or decision["action"] != "request":
         if not args.dry_run:
             _arm_packet(cfg, db, decision, gh, args)
@@ -5421,8 +5849,12 @@ def cmd_ci_run(cfg, args) -> int:
     stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "",
                         number=decision["pr"], base=decision["base"],
                         target=decision.get("base_ref") or "",
-                        checkout=getattr(args, "prevalidation_repo", "") or "",
+                        checkout=(getattr(args, "prevalidation_repo", "")
+                                  or (decision.get("composition") or {}).get("repo")
+                                  or ""),
                         proven=decision.get("cutoff_bases") or (),
+                        head=(decision["sha"] if decision.get("dispatch") is not None
+                              else ""),
                         workflows=tuple(decision["dispatch"]) if decision.get("dispatch")
                         is not None else WORKFLOWS)["runs"]
     if stale:
@@ -5431,7 +5863,9 @@ def cmd_ci_run(cfg, args) -> int:
     try:
         result = _request_once(db, args.id, decision, api=api, gh=gh, force=args.force,
                                cfg=cfg,
-                               checkout=getattr(args, "prevalidation_repo", "") or "")
+                               checkout=(getattr(args, "prevalidation_repo", "")
+                                         or (decision.get("composition") or {}).get("repo")
+                                         or ""))
     except (GelError, plan_github.GithubError) as exc:
         print("ameesh ci run: %s" % exc)
         return 1
