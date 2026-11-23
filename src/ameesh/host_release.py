@@ -1114,7 +1114,8 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
         # (auditeur B1 on #5932).
         gate_closed = (control.get("mode") in ("draining", "returning")
                        and not control.get("claims_open"))
-        if gate_closed and control.get('mode') == 'draining':
+        if (gate_closed and control.get('mode') == 'draining'
+                and control.get('release_state') != 'idle-drained'):
             try:
                 from .storage.postgres.vm_adapter import Queue
                 short = Queue(db).short_drain(host, generation, epoch)
