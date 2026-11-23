@@ -628,7 +628,45 @@ def _state_before(events, moment: float) -> tuple[set, set, bool]:
     return deps, footprints, held
 
 
-def _episode_evidence(episode: dict) -> tuple[dict, dict, float]:
+def _blocker_closures(db, ids) -> dict[int, float]:
+    """L'instant où chaque bloqueur cesse d'être un prérequis ouvert.
+
+    La fermeture d'un bloqueur ne supprime pas la ligne de dépendance et
+    n'écrit pas « Dependency removed » chez le dépendant : elle se lit sur le
+    bloqueur lui-même, `closed_at` ou son premier événement d'état terminal
+    (`merged`, `closed`, `delivered`). Sans cette borne, un prérequis fermé
+    10 min après le début d'une attente de 6 h serait compté jusqu'au bout.
+    """
+    ids = sorted({int(i) for i in ids})
+    if not ids:
+        return {}
+    marks = ", ".join(["%s"] * len(ids))
+    out: dict[int, float] = {}
+    try:
+        rows = db.query(
+            "SELECT id, extract(epoch from closed_at)::float8 AS closed_ts"
+            " FROM work_items WHERE id IN (" + marks + ")", tuple(ids))
+        for row in rows:
+            if row.get("closed_ts") is not None:
+                out[int(row["id"])] = float(row["closed_ts"])
+        rows = db.query(
+            "SELECT work_item_id, min(extract(epoch from created_at))::float8 AS ts"
+            " FROM work_item_events WHERE work_item_id IN (" + marks + ")"
+            " AND state = ANY(%s) GROUP BY work_item_id",
+            tuple(ids) + (list(lifecycle.COMPLETED),))
+        for row in rows:
+            if row.get("ts") is None:
+                continue
+            ident = int(row["work_item_id"])
+            ts = float(row["ts"])
+            out[ident] = min(out.get(ident, ts), ts)
+    except Exception:  # noqa: BLE001 - sans borne, la couverture reste prudentielle
+        return out
+    return out
+
+
+def _episode_evidence(episode: dict,
+                      closed: dict[int, float] | None = None) -> tuple[dict, dict, float]:
     """(couverture des prérequis, couverture des empreintes, durée du hold).
 
     Chaque bloqueur est chronométré sur l'épisode : un prérequis ou une
@@ -638,9 +676,22 @@ def _episode_evidence(episode: dict) -> tuple[dict, dict, float]:
     blocage d'une minute avant la fin ne doit pas la résumer non plus.
     """
     from . import planned_waits
+    closed = closed or {}
     start, end = float(episode["start"]), float(episode["end"])
+
+    def close_dep(ident: int, ts: float) -> None:
+        if ident not in dep_since:
+            return
+        limit = min(float(ts), float(closed.get(ident, ts)))
+        dep_cov[ident] = dep_cov.get(ident, 0.0) + max(
+            0.0, limit - dep_since.pop(ident))
+
     deps, footprints, held = _state_before(episode["events"], start)
-    dep_since = {ident: start for ident in deps}
+    dep_since = {}
+    for ident in deps:
+        limit = closed.get(ident)
+        if limit is None or float(limit) > start:
+            dep_since[ident] = start
     fp_since = {ident: start for ident in footprints}
     dep_cov: dict[int, float] = {}
     fp_cov: dict[int, float] = {}
@@ -653,11 +704,15 @@ def _episode_evidence(episode: dict) -> tuple[dict, dict, float]:
         note = str(event.get("note") or "")
         if note.startswith("Dependency added: lot #"):
             for ident in _ids_after(note, "Dependency added:"):
-                dep_since.setdefault(ident, ts)
+                limit = closed.get(ident)
+                if limit is None or float(limit) > ts:
+                    dep_since.setdefault(ident, ts)
         elif note.startswith("Dependency removed: lot #"):
             for ident in _ids_after(note, "Dependency removed:"):
-                if ident in dep_since:
-                    dep_cov[ident] = dep_cov.get(ident, 0.0) + ts - dep_since.pop(ident)
+                close_dep(ident, ts)
+        elif note.startswith("Dependency released"):
+            for ident in list(dep_since):
+                close_dep(ident, ts)
         elif note.startswith("en attente d'empreinte"):
             for ident in _ids_after(note, "en attente d'empreinte"):
                 fp_since.setdefault(ident, ts)
@@ -673,7 +728,8 @@ def _episode_evidence(episode: dict) -> tuple[dict, dict, float]:
                 held_total += ts - held_since
                 held_since = None
     for ident, since in dep_since.items():
-        dep_cov[ident] = dep_cov.get(ident, 0.0) + end - since
+        limit = min(end, float(closed.get(ident, end)))
+        dep_cov[ident] = dep_cov.get(ident, 0.0) + max(0.0, limit - since)
     for ident, since in fp_since.items():
         fp_cov[ident] = fp_cov.get(ident, 0.0) + end - since
     if held_since is not None:
@@ -681,7 +737,8 @@ def _episode_evidence(episode: dict) -> tuple[dict, dict, float]:
     return dep_cov, fp_cov, held_total
 
 
-def _episode_reason(item: dict, episode: dict, lots: list[dict]) -> tuple[str, str, str]:
+def _episode_reason(item: dict, episode: dict, lots: list[dict],
+                    closed: dict[int, float] | None = None) -> tuple[str, str, str]:
     """`(raison, détail, certitude)` d'un épisode, d'après les seules preuves."""
     from . import file_decoupage
     ident = int(item["id"])
@@ -691,7 +748,7 @@ def _episode_reason(item: dict, episode: dict, lots: list[dict]) -> tuple[str, s
         return ("external", "réservé à %s" % item["external_executor"], "observed")
     start, end = float(episode["start"]), float(episode["end"])
     wait = end - start
-    dep_cov, fp_cov, held_total = _episode_evidence(episode)
+    dep_cov, fp_cov, held_total = _episode_evidence(episode, closed)
     if held_total >= wait / 2.0:
         return "hold", "hold de pilote vivant pendant l'attente", "observed"
     deps = sorted((ident for ident, cover in dep_cov.items() if cover >= wait / 2.0))
@@ -738,13 +795,20 @@ def history(cfg, db, *, since: float, until: float | None = None,
         episode["project"] = backlog._lot_project(episode["item"])
     lots = [episode for episode in episodes
             if episode["item"].get("type") != "improvement"]
+    dep_ids = set()
+    for episode in episodes:
+        for event in episode["events"]:
+            note = str(event.get("note") or "")
+            if note.startswith("Dependency added: lot #"):
+                dep_ids |= _ids_after(note, "Dependency added:")
+    closed = _blocker_closures(db, dep_ids)
     rows = []
     for episode in episodes:
         item = episode["item"]
         wait = float(episode["end"]) - float(episode["start"])
         if wait < float(min_wait):
             continue
-        reason, detail, certainty = _episode_reason(item, episode, lots)
+        reason, detail, certainty = _episode_reason(item, episode, lots, closed)
         rows.append({
             "id": int(item["id"]),
             "kind": "basket" if item.get("type") == "improvement" else "lot",

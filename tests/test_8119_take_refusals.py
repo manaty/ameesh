@@ -180,6 +180,44 @@ class HistoryTest(Base):
         self.assertEqual(row["certainty"], "observed")
         self.assertIn("#%d" % int(parent["id"]), row["detail"])
 
+    def test_a_parent_closed_during_the_wait_is_not_the_reason(self):
+        self.agent("dev0")
+        parent = self.lot("parent")
+        item = self.lot("suite", age_s=6 * HEURE)
+        work_dependencies.add(self.db, int(item["id"]), int(parent["id"]),
+                              actor="test")
+        self.age_events(item["id"], 6 * HEURE)
+        # le bloqueur est livré 10 min après le début de l'attente
+        self.db.execute(
+            "INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
+            " VALUES (%s, 'merged', 'merge seen', 'test',"
+            " now() - interval '5 hours 50 minutes')", (int(parent["id"]),))
+        work.assign(self.db, int(item["id"]), "dev0", actor="test")
+        rows = take_refusals.history(
+            self.cfg, self.db, since=self.now - 12 * HEURE, until=self.now)
+        row = next(row for row in rows if row["id"] == int(item["id"]))
+        self.assertNotEqual(row["reason"], "prerequisite")
+        self.assertEqual(row["reason"], "indeterminate")
+
+    def test_a_released_dependency_stops_counting(self):
+        self.agent("dev0")
+        parent = self.lot("parent")
+        item = self.lot("suite", age_s=6 * HEURE)
+        work_dependencies.add(self.db, int(item["id"]), int(parent["id"]),
+                              actor="test")
+        self.age_events(item["id"], 6 * HEURE)
+        self.db.execute(
+            "INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
+            " VALUES (%s, 'intake', %s, 'test', now() - interval '5 hours')",
+            (int(item["id"]),
+             "Dependency released: back to intake (no assignee, #1668)"))
+        work.assign(self.db, int(item["id"]), "dev0", actor="test")
+        rows = take_refusals.history(
+            self.cfg, self.db, since=self.now - 12 * HEURE, until=self.now)
+        row = next(row for row in rows if row["id"] == int(item["id"]))
+        self.assertNotEqual(row["reason"], "prerequisite")
+        self.assertEqual(row["reason"], "indeterminate")
+
     def test_a_footprint_wait_named_by_the_journal_is_reconstructed(self):
         self.agent("dev0")
         item = self.lot("attend une empreinte", age_s=6 * HEURE)
