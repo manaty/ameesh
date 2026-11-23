@@ -213,15 +213,21 @@ class DevWork(DevDomain):
         cible) est l'exécuteur d'un bail `train-service…` vivant
         (`train-service:<runner>:<incarnation>`), et la cible a bougé depuis
         moins de `fresh_s`. Le bail d'un service qui dessert un autre projet
-        ne fait pas vivre une cible qu'il ne tient pas (B #45894/#45896)."""
+        ne fait pas vivre une cible qu'il ne tient pas (B #45894/#45896).
+
+        Le runner peut lui-même contenir des `:` (`host:pid` est le défaut de
+        `cfg.runner`, #8174) : on retire le préfixe puis la dernière
+        incarnation du bail, jamais un découpage à l'index — un
+        `split_part(..., ':', 2)` ne lirait que l'hôte et déclarerait à tort
+        le train absent."""
         return [str(row.get("project") or "") for row in self.db.query(
             "SELECT DISTINCT split_part(t.target_key, ':', 1) AS project"
             " FROM integration_trains t JOIN merge_locks l"
             " ON l.target LIKE 'train-service%%' AND l.expires_at > clock_timestamp()"
-            " AND split_part(l.owner, ':', 1) = 'train-service'"
-            " AND split_part(l.owner, ':', 2) <> ''"
-            " AND 'train:' || split_part(l.owner, ':', 2)"
-            " = t.document -> 'reservation' ->> 'owner'"
+            " AND l.owner LIKE 'train-service:%%'"
+            " AND (t.document -> 'reservation' ->> 'owner') LIKE 'train:%%'"
+            " AND regexp_replace(l.owner, '^train-service:(.*):[^:]+$', '\\1')"
+            " = substring(t.document -> 'reservation' ->> 'owner' from 7)"
             " WHERE t.updated_at > clock_timestamp() - make_interval(secs => %s)",
             (float(fresh_s),))]
 
