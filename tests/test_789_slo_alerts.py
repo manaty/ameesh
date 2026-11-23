@@ -1092,14 +1092,20 @@ class PaquetTest(_Base):
         self._ci_on_head(head, self.GO - 10 * 60)
         carrier = self.packet(body="unités : #%d @ %s" % (self.lot["id"], head),
                               head=head)
-        self.db.execute("UPDATE work_items SET branch_head_at = to_timestamp(%s)"
-                        " WHERE id = %s", (self.GO - HEURE, carrier["id"]))
         self.now = self.GO + 3 * HEURE
         self._packet_ci_on_head(carrier, composed, status="running", run_id=700101,
                                 workflow="mobile-android-release.yml")
         self._packet_ci_on_head(carrier, composed, status="failure", run_id=700102,
                                 workflow="host-rust.yml")
-        alerts = self.slo()
+        # L'ascendance lue dans le dépôt du porteur : `composed` descend de `head`.
+        seen = []
+
+        def descends(db, cfg, row, *, cache):
+            seen.append(int(row["id"]))
+            return lambda a, b: (a, b) == (head, composed)
+        with mock.patch.object(exploitation, "_carrier_descends", descends):
+            alerts = self.slo()
+        self.assertIn(int(carrier["id"]), seen)
         self.assertEqual([a["step"] for a in alerts], ["verdict_merge"])
         ci = alerts[0]["waiting"]["ci"]
         self.assertEqual((ci["state"], ci["head_sha"]), ("red", composed))
