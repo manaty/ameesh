@@ -196,6 +196,39 @@ def _avatar_correspondence(db, *agents) -> bool:
     return any(fil.avatar_conversation(row) for row in rows)
 
 
+def _review_notice_passive(db: Db, sender: str, recipient: str, kind: str,
+                           payload: dict | None,
+                           work_item_id: str | None) -> bool:
+    """#8118 : un avis d'auteur ne double pas le réveil d'une demande de relecture.
+
+    Sur un lot gelé (`qa`) dont `recipient` est un relecteur désigné, un simple
+    `notify` d'un pair n'ouvre pas de tour tant qu'un verdict est dû sur la
+    tête gelée ou qu'un `blocked` y engage un nouveau gel : la demande de
+    désignation du siège est le seul réveil de cette tête. L'avis n'est ni
+    perdu ni retiré : il devient passif (lu au tour suivant, comme une copie),
+    et la porte (#2442) ne change pas.
+    Un humain, le système, un urgent et un `reply`/`decision` réveillent
+    toujours ; une erreur de lecture laisse le message actif, jamais perdu.
+    """
+    if kind != "notify":
+        return False
+    if payload is not None and not isinstance(payload, dict):
+        return False
+    if (payload or {}).get("urgent") or (payload or {}).get("human"):
+        return False
+    if not str(work_item_id or "").strip().isdigit():
+        return False
+    if not sender or sender.startswith("human:") or sender == "ameesh":
+        return False
+    try:
+        # #8118 : la lecture du siège est dans le stockage ; un pilote qui ne
+        # la sert pas rend False, et l'avis reste actif.
+        return bool(storage.of(db).mailbox.review_seat_pending(
+            recipient, int(work_item_id)))
+    except Exception:  # noqa: BLE001 - un avis reste actif plutôt que perdu
+        return False
+
+
 def send(
     db: Db,
     sender: str,
@@ -296,6 +329,10 @@ def send(
             raise ValueError("payload.idempotency_key does not match the key")
         payload["idempotency_key"] = idempotency_key
     fil.ensure_readable(body, allow_structured)
+    if _review_notice_passive(db, sender, recipient, kind, payload, work_item_id):
+        # #8118 : le dépôt reste le même ; seule l'ouverture du tour change.
+        payload = dict(payload or {})
+        payload["info"] = True
     mailbox = storage.of(db).mailbox
     args = dict(host=host, kind=kind, payload=payload,
                 work_item_id=work_item_id, signature=signature,

@@ -1848,6 +1848,15 @@ class Mailbox(Domain):
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis marqués `payload.urgent`."""
 
+    def review_seat_pending(self, recipient: str, lot: int) -> bool:
+        """#8118 : le destinataire est-il un relecteur désigné du lot dont le
+        verdict est encore dû sur la dernière tête gelée, ou qu'un `blocked` y
+        engage un nouveau gel ?
+
+        Lecture locale au pilote Postgres : un stockage qui ne la sert pas
+        (exécuteur médié) rend False, et l'avis reste actif."""
+        return False
+
     @abc.abstractmethod
     def unread_human(self, recipient: str, limit: int, *,
                      names: Sequence[str] | None = None) -> list[dict]:

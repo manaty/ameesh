@@ -900,6 +900,45 @@ class Mailbox(interface.Mailbox):
             (recipient, str(lot)),
         )
 
+    def review_seat_pending(self, recipient, lot) -> bool:
+        """#8118 : voir `interface.Mailbox.review_seat_pending`.
+
+        Un `verdict` d'un autre relecteur sur la tête gelée peut être
+        `blocked` : le cycle de correctif est ouvert et un nouveau gel est
+        attendu, donc l'avis de l'auteur ne doit pas rouvrir un tour lui
+        aussi. La tête est le dernier jalon `frozen` du lot, jamais un
+        argument d'appelant."""
+        rows = self.db.query(
+            """
+            SELECT 1
+              FROM work_items w
+              JOIN LATERAL (
+                    SELECT m.sha
+                      FROM work_item_milestones m
+                     WHERE m.work_item_id = w.id AND m.kind = 'frozen'
+                     ORDER BY m.id DESC
+                     LIMIT 1) f ON true
+             WHERE w.id = %s
+               AND w.state = 'qa'
+               AND %s = ANY(coalesce(w.reviewers, ARRAY[]::text[]))
+               AND (EXISTS (
+                        SELECT 1
+                          FROM work_item_milestones b
+                         WHERE b.work_item_id = w.id
+                           AND b.kind = 'verdict'
+                           AND b.verdict = 'blocked'
+                           AND lower(coalesce(b.sha, '')) = lower(coalesce(f.sha, '')))
+                    OR NOT EXISTS (
+                        SELECT 1
+                          FROM work_item_milestones v
+                         WHERE v.work_item_id = w.id
+                           AND v.kind = 'verdict'
+                           AND v.actor = %s
+                           AND lower(coalesce(v.sha, '')) = lower(coalesce(f.sha, ''))))
+             LIMIT 1
+            """, (int(lot), recipient, recipient))
+        return bool(rows)
+
     def delivered_for_lot(self, recipient, lot, limit) -> list[dict]:
         """#2539 : les derniers messages déjà remis de CE lot, filtrés dans la
         requête (destinataire + lot), sans fenêtre de temps — un verdict ancien
