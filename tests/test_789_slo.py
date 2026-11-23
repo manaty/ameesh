@@ -1013,6 +1013,50 @@ class ReservationExterneLeveeTest(unittest.TestCase):
                              now=T0 + 5400 + 20 * 60)
         self.assertNotIn("external_done", self._row(rows))
 
+    def test_verification_en_cours_ne_prouve_pas_la_fin(self):
+        # B (mty-amh-impl-11) : « vérification » n'est pas « vérifié ». Une
+        # mention en cours dans la réservation ne doit pas produire « to close »
+        # après la levée.
+        item = self._item()
+        events = [_ev("intake", T0,
+                      "created; estimate: 1 h; reserved to external executor bureau"),
+                  _ev("intake", T0 + 1800,
+                      "VÉRIFICATION en cours, rien de conclu"),
+                  _ev("intake", T0 + 5400,
+                      "external executor cleared (was bureau)")]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 5400 + 20 * 60)
+        row = self._row(rows)
+        self.assertEqual((row["started_ts"], row["level"]), (T0 + 5400, 1))
+        self.assertNotIn("external_done", row)
+
+    def test_echec_apres_deploiement_ne_prouve_pas_la_fin(self):
+        # B (mty-amh-impl-11) : la négation après le mot de fin compte aussi.
+        # « deployed ; smoke failed » n'est pas une preuve de fin.
+        item = self._item()
+        events = [_ev("intake", T0,
+                      "created; estimate: 1 h; reserved to external executor bureau"),
+                  _ev("intake", T0 + 1800, "deployed; smoke failed"),
+                  _ev("intake", T0 + 5400,
+                      "external executor cleared (was bureau)")]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 5400 + 20 * 60)
+        self.assertNotIn("external_done", self._row(rows))
+
+    def test_note_negative_ulterieure_invalide_la_preuve_de_fin(self):
+        # B (mty-amh-impl-11) : « FAIT » puis un échec postérieur ne reste pas
+        # « à clore » ; la dernière note qui parle de fin tranche.
+        item = self._item()
+        events = [_ev("intake", T0,
+                      "created; estimate: 1 h; reserved to external executor bureau"),
+                  _ev("intake", T0 + 1800, "FAIT"),
+                  _ev("intake", T0 + 3000, "smoke failed, not delivered"),
+                  _ev("intake", T0 + 5400,
+                      "external executor cleared (was bureau)")]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 5400 + 20 * 60)
+        self.assertNotIn("external_done", self._row(rows))
+
     def test_reservation_encore_ouverte_reste_mesuree_sans_escalade(self):
         # #6255 A2 ne bouge pas : tant que la réservation tient, la ligne est
         # mesurée mais sans escalade ; le temps de la période ouverte n'est pas

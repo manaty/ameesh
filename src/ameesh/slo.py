@@ -292,8 +292,10 @@ def _external_executor_ts(item: dict, events: Iterable[dict]) -> float | None:
 #: #8163 : mots d'une note qui attestent le travail fait par l'exécutant
 #: externe — relevé de vérification, commentaire de livraison. « FAIT » n'est
 #: reconnu qu'en majuscules (la forme du bureau) : « faites sous #8054 », un
-#: rappel de migrations antérieures, n'est pas une preuve de fin. Une négation
-#: proche (« pas fait », « not delivered »…) annule la preuve.
+#: rappel de migrations antérieures, n'est pas une preuve de fin. Une note qui
+#: porte aussi une attente, un échec ou une négation (« pas fait », « smoke
+#: failed », « vérification en cours ») n'est pas une preuve, et une note
+#: négative postérieure annule une preuve antérieure (`external_done_evidence`).
 _EXTERNAL_DONE_WORDS = re.compile(
     r"(?:\btermin[ée]e?s?\b|\blivr[ée]e?s?\b|\bd[ée]ploy[ée]e?s?\b|"
     r"\bdelivered\b|\bdeployed\b|\bverified\b|\bverification\b|"
@@ -301,22 +303,34 @@ _EXTERNAL_DONE_WORDS = re.compile(
     r"\bcommentaire\s+de\s+livraison\b|"
     r"\bwork\s+done\b|\bdone\b|\bcomplete[ds]?\b)", re.I)
 _EXTERNAL_DONE_UPPER = re.compile(r"\bFAIT\b")
+#: #8163 B (mty-amh-impl-11) : une note qui porte un marqueur d'attente,
+#: d'échec ou de négation ne prouve pas la fin, même si elle cite « deployed »
+#: ou « vérification » — « smoke failed » après « deployed », « vérification
+#: en cours ». Le doute ne clôt pas.
 _EXTERNAL_UNDONE = re.compile(
-    r"(?:\bnot\s+(?:done|delivered|deployed|verified|complete)\b|"
-    r"\bpas\s+(?:fait|livr[ée]e?s?|d[ée]ploy[ée]e?s?|v[ée]rifi[ée]e?s?)\b|"
-    r"\bnon\s+(?:fait|livr[ée]e?s?|v[ée]rifi[ée]e?s?)\b|"
-    r"\breste\s+[àa]\s+faire\b|\bstill\s+to\s+do\b|\bpending\b|"
-    r"\bfail(?:ed|ure)\b|\b[ée]chec\b)", re.I)
+    r"(?:\bnot\s+(?:done|delivered|deployed|verified|complete|green|successful|ready)\b|"
+    r"\bpas\s+(?:fait|livr[ée]e?s?|d[ée]ploy[ée]e?s?|v[ée]rifi[ée]e?s?|termin[ée]e?s?)\b|"
+    r"\bnon\s+(?:fait|livr[ée]e?s?|v[ée]rifi[ée]e?s?|termin[ée]e?s?)\b|"
+    r"\breste\s+[àa]\s+faire\b|\bstill\s+to\s+do\b|\bto\s+do\b|"
+    r"\ben\s+cours\b|\bin\s+progress\b|\bongoing\b|\bpending\b|"
+    r"\bnot\s+yet\b|\bto\s+verify\b|\bto\s+be\s+verified\b|"
+    r"\b[àa]\s+v[ée]rifier\b|\bfail(?:ed|ure)?\b|\b[ée]chec\b|"
+    r"\bred\b|\brouge\b|\bblocked\b|\bretry\b|\brelance\b)", re.I)
 
 
-def _external_done_note(note: str) -> bool:
-    """#8163 : la note atteste-t-elle le travail fait (sans négation proche) ?"""
+def _external_done_signal(note: str) -> int:
+    """#8163 : +1 preuve de fin, -1 attente/échec/négation, 0 note neutre.
+
+    Une note qui porte les deux est une non-preuve : c'est le cas « deployed ;
+    smoke failed » relevé par la relecture. Le signe seul ne suffit pas : il
+    est daté et une note négative postérieure annule une preuve antérieure
+    (`external_done_evidence`)."""
     text = str(note or "")
-    match = _EXTERNAL_DONE_WORDS.search(text) or _EXTERNAL_DONE_UPPER.search(text)
-    if match is None:
-        return False
-    window = text[max(0, match.start() - 40):match.end()]
-    return _EXTERNAL_UNDONE.search(window) is None
+    if _EXTERNAL_UNDONE.search(text):
+        return -1
+    if _EXTERNAL_DONE_WORDS.search(text) or _EXTERNAL_DONE_UPPER.search(text):
+        return 1
+    return 0
 
 
 def _external_name(note: str, prefix: str) -> str | None:
@@ -419,13 +433,22 @@ def external_reservation_pause(periods: Iterable[dict], ready: float,
 
 
 def external_done_evidence(periods: Iterable[dict],
-                           events: Iterable[dict]) -> dict | None:
-    """#8163 : la dernière note de travail fait DANS une réservation levée.
+                           events: Iterable[dict], *,
+                           now: float | None = None) -> dict | None:
+    """#8163 : la preuve de travail fait, dans la dernière réservation levée.
 
-    Rend `{done_ts, executor}` ou None. Seules les périodes fermées comptent :
-    une réservation qui tient encore n'escalade déjà pas. La note peut venir
-    de l'exécutant (son compte rendu) comme d'un vérificateur (relevé,
-    livraison) : c'est la preuve que le travail est fait, pas une attribution.
+    Rend `{done_ts, executor, released_ts}` ou None. Seules les périodes
+    fermées comptent : une réservation qui tient encore n'escalade déjà pas.
+    La note peut venir de l'exécutant (son compte rendu) comme d'un
+    vérificateur (relevé, livraison).
+
+    #8163 B (mty-amh-impl-11) : la preuve est CHRONOLOGIQUE. Une note négative
+    postérieure (« smoke failed, not delivered ») annule une note de fin
+    antérieure ; une note positive postérieure rétablit la preuve. Les notes
+    postérieures à la levée comptent aussi, jusqu'à `now` : la levée ne fige
+    pas un fait que le journal dément ensuite. Il faut en revanche au moins
+    une preuve positive PENDANT la réservation levée, sinon un simple
+    « delivered » d'après coup ne dit pas que l'exécutant avait fini.
     """
     closed = [period for period in periods or ()
               if period.get("closed_ts") is not None]
@@ -434,23 +457,38 @@ def external_done_evidence(periods: Iterable[dict],
     # La DERNIÈRE réservation levée fait foi : une preuve de fin antérieure ne
     # vaut pas pour une nouvelle réservation (un second geste aurait sa note).
     period = max(closed, key=lambda candidate: float(candidate["closed_ts"]))
-    latest = None
-    for event in sorted(events or (),
-                        key=lambda ev: (float(ev.get("created_ts") or 0.0),
-                                        int(ev.get("id") or 0))):
+    opened = float(period["opened_ts"])
+    released = float(period["closed_ts"])
+    horizon = released if now is None else max(released, float(now))
+    signals = []
+    for order, event in enumerate(sorted(events or (),
+                                         key=lambda ev: (
+                                             float(ev.get("created_ts") or 0.0),
+                                             int(ev.get("id") or 0)))):
         note = str(event.get("note") or "")
         at = event.get("created_ts")
-        if not note or at is None or not _external_done_note(note):
+        if not note or at is None:
             continue
         stamp = float(at)
-        if not (float(period["opened_ts"]) <= stamp
-                <= float(period["closed_ts"])):
+        if stamp < opened or stamp > horizon:
             continue
-        if latest is None or stamp > latest["done_ts"]:
-            latest = {"done_ts": stamp,
-                      "executor": period.get("executor"),
-                      "released_ts": float(period["closed_ts"])}
-    return latest
+        signal = _external_done_signal(note)
+        if signal:
+            signals.append((stamp, order, signal))
+    if not signals:
+        return None
+    # Le dernier signe tranche : « FAIT » puis « smoke failed » n'est pas une
+    # fin, « smoke failed » puis « redeployed, green » en est une.
+    if max(signals, key=lambda item: (item[0], item[1]))[2] < 0:
+        return None
+    # Une preuve positive doit exister pendant la réservation levée.
+    in_period = [item for item in signals
+                 if item[2] > 0 and item[0] <= released]
+    if not in_period:
+        return None
+    return {"done_ts": max(item[0] for item in in_period),
+            "executor": period.get("executor"),
+            "released_ts": released}
 
 
 def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
@@ -1195,7 +1233,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     (`external_reservation_pause`). Quand l'exécutant a noté le travail fait
     avant de lever (compte rendu, vérification, livraison), la ligne porte
     `external_done` : le lot est **à clore**, pas « unassigned », et le brief
-    ne prescrit pas de le réassigner.
+    ne prescrit pas de le réassigner. La preuve est chronologique : une note
+    négative postérieure (« smoke failed ») l'annule.
     """
     events = list(events)
     fixes = list(fixes or ())
@@ -1308,7 +1347,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         if (not str(item.get("external_executor") or "").strip()
                 and started is None and state == lifecycle.REQUESTED
                 and not str(item.get("assignee") or "").strip()):
-            external_done = external_done_evidence(reservations, events)
+            external_done = external_done_evidence(reservations, events,
+                                                   now=now)
         if external_done is not None:
             intake_extra["external_done"] = True
             if external_done.get("executor"):
