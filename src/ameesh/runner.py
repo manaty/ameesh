@@ -12066,6 +12066,11 @@ class AgentWorker(threading.Thread):
             return pas
         return min(max(pas, float(runner.IDLE_SAFETY_S)), self._idle_deadlines(row))
 
+    def _sweep_covers(self) -> bool:
+        """#8166 : la passe groupée a-t-elle réussi récemment ? (sans requête)"""
+        alive = getattr(self.runner, "idle_sweep_alive", None)
+        return callable(alive) and bool(alive())
+
     def _idle_deadlines(self, row: dict) -> float:
         """#8166 : délai jusqu'à la prochaine échéance connue sans requête."""
         now_wall, now = time.time(), time.monotonic()
@@ -12120,6 +12125,12 @@ class AgentWorker(threading.Thread):
         fin = horloge.monotonic() + max(0.0, pas)
         tranche = max(1.0, self.lease_ttl / 3.0)
         runner = self.runner
+        couvert = getattr(self, "_idle_gated", False)
+        if couvert:
+            # #8166 (B P2 cx2) : couvert par la passe groupée, le sommeil long
+            # relit sa santé (sans requête) : passe groupée en panne ou bloquée,
+            # la passe suivante repart au pas ordinaire
+            tranche = min(tranche, 3 * float(getattr(runner, "IDLE_SWEEP_S", 10.0)))
         # #8166 : au repos, le battement groupé renouvelle ce bail
         self._resting = True
         try:
@@ -12133,6 +12144,8 @@ class AgentWorker(threading.Thread):
                         or self.deadline_passed()
                         or getattr(runner, "stop", _NEVER).is_set()
                         or getattr(runner, "draining", _NEVER).is_set()):
+                    return False
+                if couvert and not self._sweep_covers():
                     return False
         finally:
             self._resting = False

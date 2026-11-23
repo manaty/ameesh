@@ -562,6 +562,57 @@ class PasDuWorkerCouvert(unittest.TestCase):
         self.assertEqual(worker._idle_pace(), 1200.0)
 
 
+class SommeilCouvertSansPasseGroupee(unittest.TestCase):
+    """B P2 cx2 : un worker déjà endormi au filet sort quand la passe groupée
+    meurt ou se bloque (`idle_sweep_alive` faux), sans attendre 900 s."""
+
+    TTL = 180.0
+
+    def _worker(self, vivant):
+        from tests.test_8152_runner_repos import _Horloge, _Reveil
+        worker = AgentWorker.__new__(AgentWorker)
+        worker.runner = types.SimpleNamespace(
+            stop=threading.Event(), draining=threading.Event(),
+            IDLE_SWEEP_S=10.0, idle_sweep_alive=vivant)
+        worker.stopping, worker.lease_lost = threading.Event(), threading.Event()
+        worker.clock = _Horloge()
+        worker.lease_deadline = worker.clock.t + self.TTL
+        patcher = mock.patch.object(AgentWorker, "lease_ttl",
+                                    new_callable=mock.PropertyMock, return_value=self.TTL)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        worker.wake = _Reveil(worker, worker.clock)
+        return worker
+
+    def test_panne_apres_l_endormissement(self):
+        etat = {"vivant": True}
+        worker = self._worker(lambda: etat["vivant"])
+        worker._idle_gated = True
+        original = worker.wake.wait
+
+        def wait(timeout=None):
+            if len(worker.wake.attentes) == 2:
+                etat["vivant"] = False  # passe groupée morte ou bloquée
+            return original(timeout)
+
+        worker.wake.wait = wait
+        self.assertFalse(worker._idle_sleep(900.0))
+        self.assertAlmostEqual(sum(worker.wake.attentes), 90.0)
+        self.assertTrue(all(a <= 30.0 for a in worker.wake.attentes))
+
+    def test_couverture_tenue_dort_le_filet(self):
+        worker = self._worker(lambda: True)
+        worker._idle_gated = True
+        self.assertFalse(worker._idle_sleep(900.0))
+        self.assertAlmostEqual(sum(worker.wake.attentes), 900.0)
+
+    def test_pas_ordinaire_inchange(self):
+        worker = self._worker(lambda: False)
+        worker._idle_gated = False
+        self.assertFalse(worker._idle_sleep(640.0))
+        self.assertAlmostEqual(sum(worker.wake.attentes), 640.0)
+
+
 class EmpreintesEnBase(PgTestCase):
     def test_empreintes(self):
         self.register("s1", "claude")
