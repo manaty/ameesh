@@ -15,6 +15,7 @@ gelée et le verdict reste dû.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 import unittest
@@ -73,6 +74,21 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
             self.assertEqual(out["state"], "designated", out)
             self.assertEqual(set(designated(work.get(self.db, self.lot))),
                              {"r1", "r2"})
+            # B2 #45616 (ameesh-cx2) : un regel à relecteurs inchangés n'écrit
+            # pas de nouvelle désignation ; il garde les sièges et ne dépose
+            # qu'une demande de delta par relecteur (marque de continuation).
+            self.assertEqual(len(self.marks()), 1,
+                             [note[:80] for note in self.marks()])
+            continuations = [note for note in self.notes()
+                             if note.startswith("review-designation-continued:")]
+            self.assertEqual(len(continuations), index)
+            if index:
+                payload = json.loads(continuations[-1].split(": ", 1)[1])
+                self.assertEqual(payload["freeze"]["sha"], self.frozen)
+                self.assertEqual(payload["previous"]["sha"], previous)
+                self.assertEqual({row["name"] for row in payload["reviewers"]},
+                                 {"r1", "r2"})
+                self.assertEqual(len(payload["sent"]), 2, payload)
             # L'auteur prévient les relecteurs après le gel, comme dans
             # l'incident (#8087, #8096) : l'avis ne doit pas rouvrir un tour.
             for name in ("r1", "r2"):
@@ -91,6 +107,8 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
                 if index:
                     self.assertIn("git diff %s..%s"
                                   % (previous[:12], self.frozen[:12]),
+                                  newest["body"])
+                    self.assertIn("Review continued at re-freeze",
                                   newest["body"])
             # Le siège est réveillé (demande lue) puis rend son verdict : la
             # tête suivante aura sa propre demande.
@@ -216,6 +234,19 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
         self._author_note("r1")
         self.assertEqual(len(self._notifies("r1")), 2)
         self.assertTrue(mail.passive_reason(self._notifies("r1")[1]))
+
+    def test_a_question_citing_gel_and_head_always_wakes(self):
+        # B1 #45616 (ameesh-cx2) : citer « gel » et les 12 caractères de la
+        # tête ne fait pas une annonce ; une question réveille, même avant la
+        # livraison de la demande.
+        self.freeze()
+        before = len(self._wakes("r1"))
+        mail.send(self.db, "author", "r1",
+                  "#%d : sur le gel %s, quelle option choisir ?"
+                  % (self.lot, self.frozen),
+                  kind="notify", work_item_id=str(self.lot))
+        self.assertEqual(len(self._wakes("r1")), before + 1)
+        self.assertEqual(mail.passive_reason(self._notifies("r1")[-1]), "")
 
     def test_delivery_between_the_read_and_the_deposit_keeps_the_wake(self):
         # B #231419 : la livraison gagne entre la lecture de la demande et le

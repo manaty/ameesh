@@ -1350,7 +1350,8 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      eligible_families: Optional[int] = None,
                      correction: Optional[Mapping] = None,
                      sql_migration: bool = False,
-                     previous_review: Optional[Mapping] = None) -> str:
+                     previous_review: Optional[Mapping] = None,
+                     continued: bool = False) -> str:
     """The mail that hands the reviewer the exact head and its place.
 
     The SHA is written in full, with its `frozen` milestone: the verdict will
@@ -1386,8 +1387,11 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     row = dict(lot or {})
     who = ", ".join(str((a or {}).get("name") or "") for a in authors or () if a) or "unknown"
     lines = [
-        "Automatic designation at freeze (canon §2, #1617): review %d/%d of lot #%s."
-        % (rank, required, row.get("id")),
+        ("Review continued at re-freeze (canon §2, #8118): reviewers unchanged;"
+         " review %d/%d of lot #%s." % (rank, required, row.get("id"))
+         if continued else
+         "Automatic designation at freeze (canon §2, #1617): review %d/%d of lot #%s."
+         % (rank, required, row.get("id"))),
         "",
         "Lot: #%s \"%s\"" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
         "- Freeze: frozen milestone #%s, exact head %s." % (fid, sha),

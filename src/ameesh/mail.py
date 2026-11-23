@@ -196,24 +196,29 @@ def _avatar_correspondence(db, *agents) -> bool:
     return any(fil.avatar_conversation(row) for row in rows)
 
 
-#: #8118 : mots d'une annonce de gel (français et anglais).
-_FREEZE_WORDS = ("gel", "freeze", "frozen")
+#: #8118 : une annonce de gel ouvre sur le gel (français et anglais), après un
+#: éventuel rappel de lot (« #8118 : … »). Une phrase qui cite « gel » au fil
+#: d'une question n'annonce rien (B1 #45616).
+_FREEZE_ANNOUNCEMENT = re.compile(
+    r"^\s*(?:#\d+\s*[:\-—]\s*)?(?:nouveau\s+|new\s+)?(?:gel|freeze|frozen)\b",
+    re.IGNORECASE)
 
 
 def _announces_freeze(body: str, head: str) -> bool:
-    """#8118 : le message annonce-t-il le gel de cette tête ?
+    """#8118 : le message est-il l'annonce du gel de cette tête ?
 
-    Une annonce de gel nomme la tête gelée (son SHA complet ou son abréviation
-    de 12 caractères) et le gel lui-même. Une question, une réponse ou une
-    consigne de l'auteur ne le fait pas : elle réveille, même si la demande de
-    relecture attend encore livraison. Un message non reconnu réveille : le
-    silence ne se devine pas (B #231383).
+    B1 #45616 (ameesh-cx2) : une question qui cite le gel et le SHA n'est pas
+    une annonce. Seul un message qui **ouvre** sur l'annonce (« gel <sha> »,
+    « #8118 : nouveau gel <sha> ») et qui ne pose pas de question est reconnu ;
+    toute autre formulation réveille. Le silence ne se devine pas (#231383).
     """
-    text = str(body or "").lower()
+    text = str(body or "")
     sha = str(head or "").strip().lower()
-    if len(sha) < 12 or sha[:12] not in text:
+    if "?" in text:
         return False
-    return any(word in text for word in _FREEZE_WORDS)
+    if len(sha) < 12 or sha[:12] not in text.lower():
+        return False
+    return bool(_FREEZE_ANNOUNCEMENT.match(text))
 
 
 def _review_notice_head(db: Db, sender: str, recipient: str, kind: str,
