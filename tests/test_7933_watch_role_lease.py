@@ -88,7 +88,7 @@ class WatchRoleLeaseTest(PgTestCase):
     def test_the_lease_holder_emits_even_when_recorded_elsewhere(self):
         self.put("atelier")
         self.hold("banc")
-        self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
+        self.assertIn("instruction sent to %s" % NAME, self.send(self.banc))
         [row] = storage.of(self.db).watches.list(NAME)
         # the holder took the row over in the message's transaction
         self.assertEqual(row["host"], "banc")
@@ -102,13 +102,13 @@ class WatchRoleLeaseTest(PgTestCase):
     def test_a_handover_moves_the_emitter(self):
         self.put("banc")
         self.hold("banc", epoch=7)
-        self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
+        self.assertIn("instruction sent to %s" % NAME, self.send(self.banc))
         self.hold("atelier", epoch=8)
         # the old holder stands by as soon as the lease moves
         self.assertIn("held by atelier", self.send(self.banc))
         self.assertEqual(len(self.veille()), 1)
         # the new holder sends on its next firing, without re-enabling
-        self.assertEqual(self.send(self.atelier), "instruction sent to %s" % NAME)
+        self.assertIn("instruction sent to %s" % NAME, self.send(self.atelier))
         [row] = storage.of(self.db).watches.list(NAME)
         self.assertEqual(row["host"], "atelier")
         self.assertEqual(len(self.veille()), 2)
@@ -203,7 +203,7 @@ class WatchRoleLeaseTest(PgTestCase):
     def test_a_not_due_tick_beats_without_moving_the_cadence(self):
         self.put("banc")
         self.hold("banc")
-        self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
+        self.assertIn("instruction sent to %s" % NAME, self.send(self.banc))
         before = self.watched()
         out = self.send(self.banc, now=time.time() + watch.ROLE_TICK_S)
         self.assertIn("next instruction", out)
@@ -278,7 +278,7 @@ class WatchRoleLeaseTest(PgTestCase):
         # the new code accepts the N-1 row and populates the new columns when
         # the lease holder emits (no re-registration, no backfill)
         self.hold("banc")
-        self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
+        self.assertIn("instruction sent to %s" % NAME, self.send(self.banc))
         row = self.watched()
         self.assertEqual(row["host"], "banc")
         self.assertEqual(row["last_fired_reason"], "sent")
@@ -364,7 +364,7 @@ class WatchRoleLeaseTest(PgTestCase):
         self.assertTrue(any("missing %s" % timer.name in problem
                             for problem in problems), problems)
         # and the holder still emits from that unit, without `watch enable`
-        self.assertEqual(self.send(self.banc), "instruction sent to %s" % NAME)
+        self.assertIn("instruction sent to %s" % NAME, self.send(self.banc))
 
     def test_an_unreadable_watch_storage_does_not_block_the_role_timers(self):
         # #5947: the watch reconciliation is a complement of the deployment

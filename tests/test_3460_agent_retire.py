@@ -332,8 +332,8 @@ class RetireTest(PgTestCase):
         with self.assertRaises(undeliverable.Refused):
             undeliverable.check_send(self.cfg, self.db, sender="worker", dest=watch.SENDER)
         storage.of(self.db).watches.put("worker", 1800, self.cfg.host, actor=ALICE)
-        self.assertEqual(watch.send(self.cfg, self.db, "worker", env={}),
-                         "instruction sent to worker")
+        self.assertIn("instruction sent to worker",
+                      watch.send(self.cfg, self.db, "worker", env={}))
 
     def test_designation_never_picks_a_retired_agent(self):
         registry.upsert(self.db, "reviewer", harness="codex", host=self.cfg.host,

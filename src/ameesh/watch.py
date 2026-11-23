@@ -12,14 +12,23 @@
 A watch is a systemd user timer (`ameesh-watch-<agent>.timer`) that runs
 `ameesh watch send` every period. Before waking anyone, a firing does its own
 reading — the projects board (agents and open lots), the active alerts and the
-agent's due lots (`actionable`, `due_wakes`) — and fingerprints it (#5698).
-An unchanged reading never opens a turn: if the agent had a turn within the
-last 30 minutes nothing is sent, otherwise a short `--info` note is deposited
-(read at the next turn). A changed reading sends the instruction shipped with
-the package (`consignes/veille.md`, versioned), from `veille`, and stores the
-fingerprint on the watch row; a change seen within 30 minutes of the agent's
-own turn is kept pending (nothing sent, the next firing whose turn is older
-sends it). An
+agent's due lots (`actionable`, `due_wakes`) — and fingerprints it twice
+(#5698, #8097). The full reading records every movement, for the passive note
+and the attribution printed on the firing's line. The waking reading keeps
+only what calls for a gesture of the instruction shipped with the package
+(`consignes/veille.md`, versioned): an agent stopped or blocked outside a
+deliberate stop or an automatic sleep, a turn over 40 minutes, a session over
+its rotation threshold ("giant session"), an orchestrator left paused, the
+agent's due lots, a critical alert or a new alert type. A
+waking change sends the instruction, from `veille`, and stores the reading on
+the watch row; a waking change seen within 30 minutes of the agent's own turn
+is kept pending (nothing sent, the next firing whose turn is older sends it).
+Only a NEW signal opens a turn: a resolved one (agent resumed, turn ended,
+session rotated, alert resolved) does not wake on its own.
+An ordinary movement (a lot passing to qa elsewhere, an assignment, an alert
+key rotating) never opens a turn: if the agent had a turn within the last 30
+minutes nothing is sent, otherwise a short `--info` note is deposited (read at
+the next turn), the same note at most once every 6 hours (#7625). An
 unreadable reading never mutes the watch: the instruction is sent.
 The watch is recorded in the database (`agent_watches`, 0362): `ameesh
 projects` shows it from any host, and enabling or disabling it is noted in
@@ -113,6 +122,23 @@ FIRING_TIMEOUT_S = 300
 #: cette fenêtre ne reçoit pas de note « rien n'a changé » : elle serait lue
 #: au tour suivant, sans rien lui apprendre de neuf.
 RECENT_TURN_S = 1800
+#: #8097 : un tour qui dure plus longtemps appelle un redémarrage (consigne
+#: veille.md §1, « a turn over 40 min »).
+LONG_TURN_S = 40 * 60
+#: #8097 : les arrêts qui sont un geste délibéré (arrêt manuel, retrait du
+#: canon, session externe) et non une erreur à reprendre. Un arrêt
+#: automatique de l'exécuteur (`erreur`, `bail_expire`) reste un signal.
+DELIBERATE_STOPS = ("manuel", "retire_du_canon", "externe")
+#: #8097 : les parties de la lecture complète, dans l'ordre d'attribution.
+READING_PARTS = ("agents", "lots", "alerts", "due")
+#: #8097 : les parties dont un mouvement appelle un geste de la veille.
+#: Les lots ouverts de TOUT le mesh n'en sont pas : seuls les lots dus à
+#: l'agent comptent, et ils sont déjà dans `due`.
+WAKING_PARTS = ("agents", "alerts", "due")
+#: #8097 : version du document rangé dans `agent_watches.last_reading`. La
+#: valeur d'avant était un sha256 nu, sans partition : elle est lue comme une
+#: lecture sans précédent (une invite, puis le document prend le relais).
+READING_VERSION = 2
 #: #5698 : clé du méta du fil qui porte l'empreinte de la lecture d'un tir.
 READING_KEY = "watch"
 #: #7933 : un rôle élu n'appartient à aucun hôte inscrit ; `releve` le dit sur
@@ -122,12 +148,15 @@ ELECTED_RELEVE = "election"
 #: que la période d'envoi, pour voir une relève dans les 5 min du canon §11 ;
 #: `send` ne dépose qu'une fois `every_s` écoulé (et bat à chaque autre tir).
 ROLE_TICK_S = 60
-#: #5698 : la note passive déposée quand la lecture n'a pas changé (elle
-#: n'ouvre pas de tour : elle est lue au tour suivant).
+#: #5698 : la note passive déposée quand la lecture ne réveille pas (elle
+#: n'ouvre pas de tour : elle est lue au tour suivant). #8097 : le corps reste
+#: constant — un mouvement ordinaire (lot, affectation, clé d'alerte) la
+#: dépose au même titre qu'une lecture inchangée, et #7625 la dédoublonne sur
+#: cette constante, au plus une toutes les 6 h.
 UNCHANGED_TEXT = (
-    "WATCH (no change) — %s: nothing changed since the last watch "
-    "(projects, alerts, due lots). No action expected; this note is read at "
-    "your next turn."
+    "WATCH (no action) — %s: nothing needs your attention since the last watch "
+    "(no waking change in projects, alerts or due lots). No action expected; "
+    "this note is read at your next turn."
 )
 #: lot #1020: the identity a wake unit carries BY CONSTRUCTION. The runner
 #: sets it for the session it launches, but not for a systemd unit an agent
@@ -960,31 +989,48 @@ def _refuse_foreign(cfg: Config, env: dict | None, what: str, regenerate: str) -
             "Regenerate it on this host: %s" % (what, cfg.host, own, regenerate))
 
 
-def _agent_reading(row: dict) -> list:
-    """The stable part of an agent row for the watch's fingerprint.
+def _agent_reading(row: dict, now: float,
+                   session: dict | None = None) -> dict:
+    """The stable part of an agent row for the FULL reading.
 
     The running/idle churn of a turn is not a change the watch must see (it
     happens at every turn); a stop, a block, a pause, a mode, an assignment or
-    a project change is."""
+    a project change is. #8097: the projection also derives `long_turn`,
+    `budget_pause` and `session_too_big` at read time — a raw turn timestamp
+    or a raw session token count would change at every turn — so the waking
+    projection can use them without carrying the churn. This full projection
+    feeds the passive note and the attribution; `_waking_agents` is the
+    restricted one that may wake the agent."""
+    from . import budget
+
     status = str(row.get("status") or "")
+    started = row.get("turn_started_ts") or row.get("status_since_ts")
     projects = row.get("projects")
     if isinstance(projects, (list, tuple)):
         projects = sorted(str(project) for project in projects)
     else:
         projects = str(projects or "")
-    return [
-        str(row.get("name") or ""),
-        "up" if status in ("running", "idle") else status,
-        str(row.get("mode") or ""),
-        bool(row.get("operator_paused")),
-        str(row.get("operator_pause_reason") or ""),
-        str(row.get("stop_reason") or ""),
-        str(row.get("team") or ""),
-        str(row.get("workstream") or ""),
-        projects,
-        str(row.get("responsible") or ""),
-        int(row.get("open_lots") or 0),
-    ]
+    running = status == "running"
+    return {
+        "name": str(row.get("name") or ""),
+        "status": "up" if status in ("running", "idle") else status,
+        "mode": str(row.get("mode") or ""),
+        "operator_paused": bool(row.get("operator_paused")),
+        "operator_pause_reason": str(row.get("operator_pause_reason") or ""),
+        "stop_reason": str(row.get("stop_reason") or ""),
+        "team": str(row.get("team") or ""),
+        "workstream": str(row.get("workstream") or ""),
+        "projects": projects,
+        "responsible": str(row.get("responsible") or ""),
+        "open_lots": int(row.get("open_lots") or 0),
+        "long_turn": bool(running and started
+                          and now - float(started) >= LONG_TURN_S),
+        "budget_pause": bool(status == "blocked"
+                             and str(row.get("status_text") or "")
+                             .startswith(budget.PAUSE_PREFIX)),
+        "session_too_big": bool(session),
+        "session_limit": int(session.get("threshold") or 0) if session else 0,
+    }
 
 
 def _alerts_reading(db) -> dict:
@@ -1022,8 +1068,57 @@ def _due_reading(db, agent: str, now: float) -> dict:
     }
 
 
+def _session_sizes(db, cfg) -> dict:
+    """#8097: the agents whose live session is over its rotation threshold.
+
+    The source is the one `session_too_big` already uses (#4448): the token
+    total of the agent's current session in the cost ledger
+    (`turn_costs.session_total`), the per-harness threshold compiled from the
+    canon (or the agent's `session_max_tokens`), the same minimum number of
+    turns, the same "jamais" policy. A turn in progress is never a session to
+    rotate, and the session must be the one the last turn used: that is
+    exactly when the rotation decision (and the alert) can be taken. Only the
+    agents over the threshold are returned — an agent's raw token count grows
+    at every turn and would wake the watch at every firing; the projection
+    keeps the derived `session_too_big` and its `session_limit`."""
+    from . import exploitation, mechanics
+
+    try:
+        document = mechanics.configured(cfg)
+    except Exception:  # noqa: BLE001 — no canon: the local common threshold
+        document = None
+
+    def threshold(harness: str) -> float:
+        fallback = float(getattr(cfg, "session_max_tokens", 0) or 0)
+        if document is None:
+            return fallback
+        return float(document.session_max_tokens(harness, fallback))
+
+    minimum = int(getattr(cfg, "session_min_turns", 0) or 0)
+    out: dict[str, dict] = {}
+    for row in storage.of(db).operations.listing():
+        name = str(row.get("name") or "")
+        session = row.get("session_id")
+        if (not name or not session or row.get("retired_ts")
+                or str(row.get("last_turn_session") or "") != str(session)
+                or row.get("turn_started_ts")
+                or exploitation.effective_policy(cfg, row) == "jamais"):
+            continue
+        total = storage.of(db).turn_costs.session_total(name, session)
+        if not total or int(total.get("turns") or 0) < minimum:
+            continue
+        harness = str(total.get("harness") or row.get("harness") or "")
+        limit = (float(row["session_max_tokens"]) if row.get("session_max_tokens")
+                 else threshold(harness))
+        tokens = int(total.get("tokens") or 0)
+        if limit > 0 and tokens >= limit:
+            out[name] = {"tokens": tokens, "threshold": int(limit),
+                         "turns": int(total.get("turns") or 0)}
+    return out
+
+
 def reading(db, agent: str, now: float | None = None,
-            board: dict | None = None) -> dict:
+            board: dict | None = None, sessions: dict | None = None) -> dict:
     """#5698 : la lecture propre de la veille — projets, alertes, lots dus.
 
     The projects part keeps only what a watch acts on: an agent's stop, block,
@@ -1031,18 +1126,24 @@ def reading(db, agent: str, now: float | None = None,
     Turn timestamps, counters, unread mail and spend are left out: they change
     at every turn, not at the events the watch must see. `board` may be given
     when the caller already read it (it also carries the recent-turn check).
+    #8097: `sessions` (the result of `_session_sizes`) carries the one datum
+    the board does not: the agents whose session is over its rotation
+    threshold. Without it the giant-session signal is absent, never guessed.
     """
     from . import projects
 
     now = time.time() if now is None else float(now)
     if board is None:
         board = storage.of(db).projects.board(max_lots=projects.MAX_LOTS)
+    sessions = sessions or {}
     raw_lots = list(board.get("lots") or [])
     lots = sorted([
         [lot.get("id"), str(lot.get("state") or ""),
          str(lot.get("assignee") or ""), str(lot.get("app") or "")]
         for lot in raw_lots], key=lambda row: int(row[0] or 0))
-    agents = sorted([_agent_reading(row) for row in board.get("agents") or []])
+    agents = sorted([_agent_reading(row, now, sessions.get(str(row.get("name") or "")))
+                     for row in board.get("agents") or []],
+                    key=lambda row: row["name"])
     return {
         "projects": {
             "agents": agents,
@@ -1059,6 +1160,233 @@ def fingerprint(state: dict) -> str:
     data = json.dumps(state, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, default=str)
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def part_digests(state: dict) -> dict:
+    """#8097: one digest per part of the full reading, for the attribution.
+
+    `projects/agents`, `projects/lots`, `alerts` and `due` are hashed apart:
+    a firing says which of them moved, instead of only that "the reading"
+    changed (the 18 wakes of #8097 were nearly all ordinary lot movements)."""
+    projects = state.get("projects") or {}
+    return {
+        "agents": fingerprint(projects.get("agents") or []),
+        "lots": fingerprint(projects.get("lots") or []),
+        "alerts": fingerprint(state.get("alerts") or {}),
+        "due": fingerprint(state.get("due") or {}),
+    }
+
+
+def _waking_agents(state: dict, orchestrators=(), retired=()) -> list:
+    """#8097: the agent rows that may wake the watch, and only those.
+
+    A stop outside a deliberate gesture (`DELIBERATE_STOPS`) wakes, as does a
+    block outside a budget pause, a turn running longer than `LONG_TURN_S`
+    (the instruction's 40 minutes), a session over its rotation threshold (the
+    instruction's "giant session"), and an orchestrator left paused or
+    blocked. Everything else — an assignment, a project, a turn start/end,
+    an intentional operator hold, the automatic sleep of `file_decoupage`, a
+    budget pause — is left out: the instruction says to preserve those, and
+    their churn is what woke the watch nearly every hour. A retired agent and
+    an external session (`mode == "externe"`) are never resumed by the watch,
+    so they are left out too."""
+    rows = []
+    for row in (state.get("projects") or {}).get("agents") or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "")
+        if not name or name in retired or str(row.get("mode") or "") == "externe":
+            continue
+        status = str(row.get("status") or "")
+        paused = bool(row.get("operator_paused"))
+        signals = []
+        if status in ("stopped", "dead"):
+            reason = str(row.get("stop_reason") or "")
+            if reason not in DELIBERATE_STOPS:
+                signals.append(["stopped", reason])
+        elif status == "blocked" and not paused and not row.get("budget_pause"):
+            signals.append(["blocked"])
+        if name in orchestrators and (paused or status == "blocked"):
+            # An orchestrator that no longer dispatches is a governance
+            # failure, even when the pause is an intentional hold: veille.md
+            # §2 says to resume it. (The automatic sleep never lands on one.)
+            signals.append(["orchestrator-paused",
+                            str(row.get("operator_pause_reason") or status)])
+        if row.get("long_turn"):
+            signals.append(["long-turn", "over %d min" % (LONG_TURN_S // 60)])
+        if row.get("session_too_big"):
+            # The limit, not the token count: the count grows at every turn
+            # and would move the waking fingerprint at every firing.
+            signals.append(["session-too-big",
+                            str(int(row.get("session_limit") or 0))])
+        for signal in signals:
+            rows.append([name] + signal)
+    return sorted(rows)
+
+
+def _waking_alerts(state: dict) -> dict:
+    """#8097: the alerts that may wake the watch.
+
+    A new alert TYPE wakes, and so does a new critical alert instance; the
+    rotation of the housekeeping alert keys (a new `tmp_orphan` path, a
+    `worktree_kept` count) does not, because their type stays the same. The
+    notifier already persists only its `notify.types` here (`notify_state`);
+    an unreadable source stays a stable marker, as in #5698."""
+    alerts = state.get("alerts") or {}
+    if alerts.get("unreadable"):
+        return {"unreadable": True}
+    rows = alerts.get("active") or []
+    return {
+        "types": sorted({str(row[1]) for row in rows if len(row) > 1}),
+        "critical": sorted([[str(row[0]), str(row[1])] for row in rows
+                            if len(row) > 2 and row[2]]),
+    }
+
+
+def waking(state: dict, *, orchestrators=(), retired=()) -> dict:
+    """#8097: the restricted reading that may open a turn.
+
+    Only what the instruction asks the watch to act on: agents stopped,
+    blocked, paused as orchestrators, in a too long turn or with a giant
+    session; critical or new alert types; the agent's due lots. The full
+    reading still records the rest (a lot passing to qa, an assignment, a key
+    rotating) and sends it as a passive `--info` note, never as a waking
+    instruction."""
+    return {
+        "agents": _waking_agents(state, orchestrators, retired),
+        "alerts": _waking_alerts(state),
+        "due": state.get("due") or {},
+    }
+
+
+def _waking_signals(wake: dict) -> dict:
+    """#8097: the stable token of each waking signal, per part.
+
+    A token exists exactly while its signal exists. The next firing compares
+    these sets and opens a turn only on a NEW token: a signal that disappears
+    (agent resumed, turn over, session rotated, alert resolved) calls for no
+    gesture, so its resolution must not wake the watch by itself."""
+    agents = sorted("agent:" + ":".join(str(field) for field in row)
+                    for row in wake.get("agents") or [])
+    alerts = wake.get("alerts") or {}
+    if alerts.get("unreadable"):
+        alert_tokens = ["alerts:unreadable"]
+    else:
+        alert_tokens = (["alert-type:%s" % kind
+                         for kind in alerts.get("types") or []]
+                        + ["alert-critical:%s:%s" % (key, kind)
+                           for key, kind in alerts.get("critical") or []])
+    due = wake.get("due") or {}
+    due_tokens = (["due-lot:%s" % row[0] for row in due.get("actionable") or []]
+                  + ["due-wake:%s" % row[0] for row in due.get("due_wakes") or []])
+    return {"agents": agents, "alerts": sorted(alert_tokens),
+            "due": sorted(due_tokens)}
+
+
+def reading_snapshot(state: dict, *, orchestrators=(), retired=()) -> dict:
+    """#8097: the document stored in `agent_watches.last_reading`.
+
+    It keeps the full digest (the passive note), the waking digest (what may
+    open a turn), the per-part digests of both and the stable tokens of the
+    waking signals (`_waking_signals`, the comparison `waking_moved` makes).
+    Compact on purpose: the column held a bare sha256 before, and a full board
+    snapshot would be rewritten at every firing."""
+    wake = waking(state, orchestrators=orchestrators, retired=retired)
+    return {
+        "v": READING_VERSION,
+        "digest": fingerprint(state),
+        "wake": fingerprint(wake),
+        "parts": part_digests(state),
+        "waking": {part: fingerprint(wake[part]) for part in WAKING_PARTS},
+        "signals": _waking_signals(wake),
+    }
+
+
+def previous_reading(raw) -> dict | None:
+    """#8097: decode a stored `last_reading`; None when there is none.
+
+    A bare sha256 (the #5698 format) is returned as `{"legacy": ...}`: it
+    carries no partition, so the first firing after the upgrade reads it as a
+    reading without precedent and sends one instruction (`waking_moved`)."""
+    if raw is None or raw == "":
+        return None
+    text = str(raw)
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return {"legacy": text}
+    if not isinstance(value, dict):
+        return {"legacy": text}
+    try:
+        version = int(value.get("v") or 0)
+    except (TypeError, ValueError):
+        return {"legacy": text}
+    if version < READING_VERSION:
+        return {"legacy": text}
+    return value
+
+
+def changed_parts(previous: dict | None, current: dict) -> list:
+    """#8097: which part of the FULL reading moved, for the firing's line."""
+    if previous is None or "legacy" in previous:
+        return list(READING_PARTS)
+    old = previous.get("parts") or {}
+    return [part for part in READING_PARTS
+            if old.get(part) != (current.get("parts") or {}).get(part)]
+
+
+def waking_moved(previous: dict | None, current: dict) -> tuple:
+    """#8097: did a waking part gain a signal, and which ones.
+
+    Only a NEW signal opens a turn: the comparison is between the stable
+    signal tokens (`_waking_signals`), never their mere presence or absence,
+    so a resolution (a resumed agent, a finished turn, a rotated session, a
+    resolved alert) does not wake the watch by itself. A reading without
+    precedent (first firing, the bare digest of the previous format, or a
+    document written before the tokens existed) counts as a waking change: a
+    signal is never missed on the strength of a format the code cannot
+    compare."""
+    if previous is None or "legacy" in previous:
+        return True, list(WAKING_PARTS)
+    old = previous.get("signals")
+    if not isinstance(old, dict):
+        return True, list(WAKING_PARTS)
+    current_signals = current.get("signals") or {}
+    moved = [part for part in WAKING_PARTS
+             if set(current_signals.get(part) or ())
+             - set(old.get(part) or ())]
+    return bool(moved), moved
+
+
+def _governance_rows(db) -> tuple:
+    """#8097: the orchestrators and the retired agents, read once per firing.
+
+    The registry carries the canon-declared `roles` (the `orchestrateur` role)
+    and the retirement mark; the board does not. A read failure is not fatal:
+    the caller passes no orchestrator and no retired mark, so the watch still
+    sees stops, blocks, long turns, alerts and due lots."""
+    from .roles import ORCHESTRATOR_ROLES
+
+    wanted = set(ORCHESTRATOR_ROLES)
+    orchestrators, retired = set(), set()
+    for row in storage.of(db).agents.overview():
+        name = str(row.get("name") or "")
+        if not name:
+            continue
+        if row.get("retired_ts"):
+            retired.add(name)
+        elif wanted & set(row.get("roles") or ()):
+            orchestrators.add(name)
+    return frozenset(orchestrators), frozenset(retired)
+
+
+def _moved_text(changed, moved) -> str:
+    """#8097: the attribution of one firing, for its line and its thread."""
+    if changed is None or moved is None:
+        return "(reading unreadable)"
+    return "(changed: %s; waking: %s)" % (
+        ", ".join(changed) or "none", ", ".join(moved) or "none")
+
 
 
 def _unread_note(db, agent: str) -> bool:
@@ -1086,15 +1414,21 @@ def _recent_turn(board: dict | None, agent: str, now: float) -> bool:
 
 
 def _beat(db, agent: str, host: str, reason: str, *, takeover: bool = False,
-          epoch: int | None = None, attempt: bool = False) -> dict | None:
+          epoch: int | None = None, attempt: bool = False,
+          reading: str | None = None) -> dict | None:
     """#7933 (B1) : enregistre un tir qui ne dépose rien, sous le même fencing
     que le message. Une erreur échoue le tir (la minuterie réessaiera), elle
     ne doit jamais être avalée en silence : le battement est ce qui distingue
-    une veille saine d'une veille morte."""
+    une veille saine d'une veille morte.
+
+    #8097 : `reading` enregistre l'observation du tir quand elle ne porte
+    aucun signal nouveau (une résolution, une lecture inchangée). Sans elle,
+    un signal résolu resterait dans la lecture précédente et sa réapparition
+    passerait pour un signal déjà connu."""
     try:
         return storage.of(db).watches.deliver(
             agent, host, None, takeover=takeover, epoch=epoch,
-            fired=reason, attempt=attempt)
+            fired=reason, attempt=attempt, reading=reading)
     except Exception as exc:  # noqa: BLE001 — un battement non écrit est un échec
         raise WatchError("recording the firing of %s failed: %s"
                          % (agent, exc)) from exc
@@ -1106,18 +1440,22 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
     watch; else nothing (disabled, moved, or a role it does not hold).
 
     #5698 : the firing first does its own reading (projects, alerts, due lots)
-    and fingerprints it. An unchanged reading does not open a turn: nothing is
-    sent while its last note is still unread, nothing when the agent had a
-    turn within `RECENT_TURN_S`, otherwise a short passive (`--info`) note is
-    deposited. A changed reading sends the instruction and the fingerprint is
-    stored on the watch row; a change seen right after a turn is kept pending
-    (nothing sent until a firing whose turn is older). A reading that cannot
-    be made never mutes the watch: the instruction is sent.
+    and fingerprints it. #8097 : the full reading only earns the short passive
+    (`--info`) note (nothing while its last note is unread, nothing when the
+    agent had a turn within `RECENT_TURN_S`); only the waking reading — stops
+    outside a deliberate gesture, blocks outside a budget pause, a turn over
+    40 minutes, a session over its rotation threshold, a paused orchestrator,
+    the agent's due lots, a critical or new alert type — sends the instruction
+    and stores the reading on the watch row. A waking change seen right after
+    a turn is kept pending (nothing sent until a firing whose turn is older). A reading that cannot be made never
+    mutes the watch: the instruction is sent. Every firing's line names the
+    parts that moved (`changed`) and those that could wake (`waking`), the
+    measurement #8097 asks for.
 
-    The host check, the message, `last_sent_ts` and the fingerprint are one
+    The host check, the message, `last_sent_ts` and the reading are one
     transaction on the watch row (codex r1 and r2, #303): a move or a disable
     waits for a firing in progress, a firing after them sends nothing, and a
-    firing that fails drops neither the message nor the fingerprint, so that
+    firing that fails drops neither the message nor the reading, so that
     the next one never sends a second copy.
     `mail_send(tx, agent, text)` drops the message in the transaction (tests).
     What happened, in words.
@@ -1172,41 +1510,66 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
     # the message is committed, nothing may fail the firing (the timer would
     # retry, and send it twice)
     agent_row = registry.get(db, agent)
+    current: dict | None = None
+    document: str | None = None
     digest: str | None = None
-    changed = True
+    changed: list | None = []
+    moved: list | None = []
     recent = False
     passive = False
     # a takeover is a first firing on this host: its reading has no local
     # precedent, so the instruction goes (the same epoch never sends twice).
-    previous = watch.get("last_reading") if watch["host"] == host else None
+    previous = (previous_reading(watch.get("last_reading"))
+                if watch["host"] == host else None)
     # the checks of `agent-mail send`, before the transaction (read only)
     try:
         undeliverable.check_send(cfg, db, sender=SENDER, dest=agent, explicit=True)
     except undeliverable.Refused as exc:
         raise WatchError("instruction to %s not sent: %s" % (agent, exc)) from exc
+    # #8097 : the canon-declared orchestrators and the retired agents, needed
+    # by the waking projection; a read failure does not mute the watch.
+    try:
+        orchestrators, retired = _governance_rows(db)
+    except Exception as exc:  # noqa: BLE001 — a doubt must not mute the watch
+        print("warning: watch roles of %s unreadable: %s: %s"
+              % (agent, type(exc).__name__, exc), file=sys.stderr)
+        orchestrators, retired = frozenset(), frozenset()
+    # #8097 : la taille des sessions (grand livre, seuil de rotation #4448),
+    # absente du board ; une lecture impossible ne fait pas taire la veille.
+    try:
+        sessions = _session_sizes(db, cfg)
+    except Exception as exc:  # noqa: BLE001 — a doubt must not mute the watch
+        print("warning: watch session sizes of %s unreadable: %s: %s"
+              % (agent, type(exc).__name__, exc), file=sys.stderr)
+        sessions = {}
     try:
         board = storage.of(db).projects.board(max_lots=projects.MAX_LOTS)
-        state = reading(db, agent, now, board=board)
-        digest = fingerprint(state)
-        changed = previous is None or previous != digest
+        state = reading(db, agent, now, board=board, sessions=sessions)
+        current = reading_snapshot(state, orchestrators=orchestrators,
+                                   retired=retired)
+        document = json.dumps(current, sort_keys=True, separators=(",", ":"))
+        digest = current["digest"]
+        changed = changed_parts(previous, current)
+        waking_change, moved = waking_moved(previous, current)
         # a first firing always sends: the watch just got enabled and has
         # no reading yet, even if the agent had a turn a minute ago.
         recent = previous is not None and _recent_turn(board, agent, now)
     except Exception as exc:  # noqa: BLE001 — a reading failure never mutes
         print("warning: watch reading of %s unreadable: %s: %s"
               % (agent, type(exc).__name__, exc), file=sys.stderr)
-        digest, changed, recent = None, True, False
-    if not changed:
+        current, document, digest, changed, moved = None, None, None, None, None
+        waking_change, recent = True, False
+    if not waking_change:
         if recent:
             _beat(db, agent, host, "recent-turn", takeover=takeover,
-                  epoch=epoch, attempt=True)
-            return ("watch of %s: unchanged and a turn within %d min: nothing sent"
-                    % (agent, RECENT_TURN_S // 60))
+                  epoch=epoch, attempt=True, reading=document)
+            return ("watch of %s: no action %s, a turn within %d min: nothing sent"
+                    % (agent, _moved_text(changed, moved), RECENT_TURN_S // 60))
         if _unread_note(db, agent):
             _beat(db, agent, host, "unread-note", takeover=takeover,
-                  epoch=epoch, attempt=True)
-            return ("watch of %s: unchanged, its last note is not read yet: "
-                    "nothing sent" % agent)
+                  epoch=epoch, attempt=True, reading=document)
+            return ("watch of %s: no action %s, its last note is not read yet: "
+                    "nothing sent" % (agent, _moved_text(changed, moved)))
         passive = True
     elif recent:
         # B/P2 cx3 : never consume a change on the strength of a recent
@@ -1215,8 +1578,9 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
         # turn is older sends the instruction.
         _beat(db, agent, host, "change-pending", takeover=takeover,
               epoch=epoch, attempt=True)
-        return ("watch of %s: changed, but a turn within %d min: nothing sent "
-                "(change kept pending)" % (agent, RECENT_TURN_S // 60))
+        return ("watch of %s: change kept pending %s, a turn within %d min: "
+                "nothing sent" % (agent, _moved_text(changed, moved),
+                                  RECENT_TURN_S // 60))
     if passive:
         text = UNCHANGED_TEXT % agent
     else:
@@ -1225,15 +1589,17 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
     payload = {"info": True} if passive else None
     report_fp = mail.report_digest(text) if passive else None
     if passive:
-        # #7625 : le compte rendu « rien n'a changé » est identique à chaque
+        # #7625 : le compte rendu « aucune action » est identique à chaque
         # relève. Il n'est pas redéposé avant `mail.REPORT_REMIND_S` (6 h) ;
-        # la veille elle-même n'est pas muette pour autant, un changement de
-        # lecture part toujours (sa propre empreinte, cas passif ci-dessous).
+        # la veille elle-même n'est pas muette pour autant, un mouvement
+        # ordinaire part toujours (la note passive ci-dessous).
         if not mail.report_due(db, SENDER, agent, "info", report_fp, now=now):
             _beat(db, agent, host, "report-reminder", takeover=takeover,
-                  epoch=epoch, attempt=True)
-            return ("watch of %s: unchanged, the same note was sent less than %d h "
-                    "ago: nothing sent" % (agent, int(mail.REPORT_REMIND_S // 3600)))
+                  epoch=epoch, attempt=True, reading=document)
+            return ("watch of %s: no action %s, the same note was sent less than "
+                    "%d h ago: nothing sent"
+                    % (agent, _moved_text(changed, moved),
+                       int(mail.REPORT_REMIND_S // 3600)))
     if mail_send is None:
         def mail_send(tx, recipient: str, body: str) -> int | None:
             return mail.send(tx, SENDER, recipient, body, host=host,
@@ -1251,11 +1617,12 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
             raise _ReportJustSent()
         sent.append(message_id)
     try:
-        row = storage.of(db).watches.deliver(agent, host, deliver, reading=digest,
-                                             takeover=takeover, epoch=epoch)
+        row = storage.of(db).watches.deliver(
+            agent, host, deliver, reading=document,
+            takeover=takeover, epoch=epoch)
     except _ReportJustSent:
         _beat(db, agent, host, "report-reminder", takeover=takeover,
-              epoch=epoch, attempt=True)
+              epoch=epoch, attempt=True, reading=document)
         return ("watch of %s: the same report was just sent: nothing sent" % agent)
     except WatchError:
         raise
@@ -1270,17 +1637,22 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
                     % (agent, epoch))
         return "the watch of %s is on %s: nothing sent from here" % (agent, row["host"])
     # committed: the readable thread, as `agent-mail send` writes it
-    # (fil.record never raises)
+    # (fil.record never raises). #8097: the `watch` line carries the parts
+    # that moved and the waking ones, so a 24 h count reads the thread.
     fil.record(cfg, db, sender=SENDER, recipients=[agent], text=text,
                project=fil.agent_project(agent_row) if agent_row else None,
                mailbox_ids=[int(m) for m in sent if isinstance(m, int)],
                meta={"host": host, READING_KEY: {
-                   "digest": digest, "changed": bool(changed),
+                   "digest": digest,
+                   "wake_digest": current["wake"] if current else None,
+                   "changed": bool(changed) if changed is not None else None,
+                   "changed_parts": changed,
+                   "waking": moved,
                    "passive": passive, "recent_turn": bool(recent)}})
     if passive:
-        return ("watch of %s: unchanged, an information was deposited "
-                "(read at its next turn)" % agent)
-    return "instruction sent to %s" % agent
+        return ("watch of %s: no action %s, an information was deposited "
+                "(read at its next turn)" % (agent, _moved_text(changed, moved)))
+    return "instruction sent to %s %s" % (agent, _moved_text(changed, moved))
 
 
 def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
