@@ -11959,7 +11959,9 @@ class AgentWorker(threading.Thread):
             self._peek_publisher = Publisher(
                 self.cfg, agent=self.name, owner=self.runner.runner_id, epoch=self.epoch,
                 cwd=lambda: self.agent.get("cwd") or "",
-                reader=lambda: getattr(self, "_peek_reader", None), warn=log_async)
+                reader=lambda: getattr(self, "_peek_reader", None), warn=log_async,
+                # #8166 : au repos, ni git ni écriture si rien n'a bougé
+                active=lambda: getattr(self, "proc", None) is not None)
 
     def _close_peek(self) -> None:
         publisher = getattr(self, "_peek_publisher", None)
