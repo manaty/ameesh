@@ -603,15 +603,23 @@ class OperatorRecipe(unittest.TestCase):
             self.assertEqual(json.loads(config.read_bytes())['poll'], 5)
             self.assertEqual(json.loads(config.read_bytes())['dsn'],
                              'host=/private/socket port=6432')
+            # #8109 : une écriture concurrente après le switch n'est pas annulée
+            # par le rollback, qui ne restaure que les clés qu'il a changées.
+            donnees = json.loads(config.read_bytes())
+            donnees['canon_ref'] = 'a' * 40
+            config.write_text(json.dumps(donnees, indent=2) + '\n')
             backup = config.with_name('config.json.before-pgbouncer-653')
             self.assertEqual(backup.read_bytes(), original)
             self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.recipe.switch(home, state, rollback=True)
-            self.assertEqual(config.read_bytes(), original)
+            restauree = json.loads(config.read_bytes())
+            self.assertEqual(restauree['dsn'], 'host=server password=fake-secret')
+            self.assertEqual(restauree['poll'], 5)
+            self.assertEqual(restauree['canon_ref'], 'a' * 40)
             with self.assertRaises(FileExistsError):
                 self.recipe.switch(home, state)
-            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(json.loads(config.read_bytes())['canon_ref'], 'a' * 40)
 
     def test_private_directory_rejects_symlink_and_shared_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
