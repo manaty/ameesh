@@ -637,6 +637,41 @@ class PorteeTest(ServeurExecTest):
             self.assertEqual(got.status, 200, got.body)
             self.assertEqual([m["id"] for m in got.body["value"]], [human], got.body)
 
+    def test_unread_priority_sees_the_day_past_a_passive_prefix(self):
+        """#8112/cx2 : le courrier du jour lié à un lot franchit 300 passifs.
+
+        `mailbox.unread` est borné à 200 lignes sans décalage : trois cents
+        copies passives anciennes remplissent la page et cachent le message du
+        jour. La requête prioritaire du serveur le rend, ainsi que l'actif
+        déjà présent dans la boîte, sans les passifs, sur les deux routes.
+        """
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload,"
+            " created_at)"
+            " SELECT 'coord', 'inge-front', 'vieux compte rendu ' || g, 'notify',"
+            "        '{\"info\": true}'::jsonb, now() - make_interval(days => 30)"
+            " FROM generate_series(1, 300) AS g")
+        jour = int(self.db.query(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload,"
+            " work_item_id, created_at)"
+            " VALUES ('coord', 'inge-front', 'avis du jour 8112', 'notify',"
+            "         '{\"info\": true}'::jsonb, '8112', now())"
+            " RETURNING id")[0]["id"])
+        prefix = self.op("mailbox.unread", ["inge-front", 200], token=SESSION,
+                         route="/session/op")
+        self.assertEqual(len(prefix.body["value"]), 200, prefix.body)
+        self.assertNotIn(jour, [m["id"] for m in prefix.body["value"]])
+        since = time.time() - 86400
+        for token, route in ((TOKEN, "/op"), (SESSION, "/session/op")):
+            got = self.op("mailbox.unread_priority", ["inge-front", 200],
+                          {"since": since}, token=token, route=route)
+            self.assertEqual(got.status, 200, got.body)
+            ids = [m["id"] for m in got.body["value"]]
+            self.assertIn(jour, ids, got.body)
+            self.assertIn(812, ids, got.body)
+            self.assertEqual(ids, sorted(ids), got.body)
+            self.assertFalse([i for i in ids if i not in (812, jour)], got.body)
+
     def test_cout_d_un_appareil_range_device(self):
         """Contrat 1.1 : `turn_costs.insert` d'un appareil est rangé
         `source=device`, avec l'exécuteur et le bail de l'enveloppe, quoi

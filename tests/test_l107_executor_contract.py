@@ -117,17 +117,22 @@ class TableTest(unittest.TestCase):
         # pending_spend.put(attribution) (attribution d'appelant des tours
         # hors lot), deux paramètres facultatifs ; contrat 1.13 : #7799
         # admet host_lifecycle.claims_open (lecture des prises d'hôte pour
-        # un runner médié au repos).
-        self.assertEqual(len(self.c.operations), 75)
+        # un runner médié au repos) ; contrat 1.14 : #8101 admet
+        # work.review_floor (plancher d'avis d'un lot, sans contenu de
+        # décision) ; contrat 1.15 : #8112 admet
+        # mailbox.unread_priority (courrier du jour et actifs filtrés dans la
+        # requête du serveur, devant le stock FIFO).
+        self.assertEqual(len(self.c.operations), 76)
         self.assertEqual(sum(o.write for o in ops), 44)
-        self.assertEqual(sum(not o.write for o in ops), 31)
+        self.assertEqual(sum(not o.write for o in ops), 32)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 10)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
         self.assertEqual(sorted(o.name for o in ops if o.session),
                          ["agents.resolve_name", "mailbox.deliver", "mailbox.release", "mailbox.reserve",
                           "mailbox.unread", "mailbox.unread_human",
-                          "mailbox.unread_human_page", "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.14.0")
+                          "mailbox.unread_human_page", "mailbox.unread_priority",
+                          "threads.index", "threads.recount"])
+        self.assertEqual(self.c.version, "1.15.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 

@@ -439,16 +439,24 @@ def unread_priority(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
     le courrier du jour et un actif au-delà de la page attendent la vidange
     du stock (#8040, critère 2).
 
-    Chemin médié : `mailbox.unread_priority` n'est pas au contrat 1.1 ; on
-    relit la page admise (`unread`) et on applique la même règle ici, bornée
-    à cette page comme `unread_active`."""
+    Chemin médié : `mailbox.unread_priority` (contrat 1.14) applique la même
+    requête sur le serveur, donc un stock de plus de 200 passifs ne cache plus
+    le courrier du jour ni l'actif au-delà de la page. Un ancien serveur
+    refuse l'opération : repli sur la page admise (`unread`) et la même règle,
+    bornée à cette page — le correctif s'active au déploiement du serveur."""
     from .agent_names import resolve as resolve_agent_name
     recipient = resolve_agent_name(recipient, db=db, operation="mail.unread_priority")
     since = day_start() if since is None else float(since)
     st = storage.of(db)
     if getattr(st, "driver", None) == "mediated":
-        rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
-        return [row for row in rows if _priority_row(row, since)][:int(limit)]
+        from .mediated_executor.contract import NotSupportedRemotely
+        try:
+            return st.mailbox.unread_priority(recipient, limit, since=since)
+        except NotSupportedRemotely:
+            # Serveur d'avant le contrat 1.14 : lire comme avant, sans tuer le
+            # tour ; le préfixe passif reste la limite de l'ancien backend.
+            rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
+            return [row for row in rows if _priority_row(row, since)][:int(limit)]
     return st.mailbox.unread_priority(recipient, limit, since=since)
 
 
