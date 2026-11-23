@@ -1805,11 +1805,18 @@ def _recheck_production_review(db, cfg, lot: int) -> None:
     """Recheck under the lot lock in the transaction that signs the decision."""
     from . import merge_queue
     item = work.get(db, lot)
-    if not item or item.get("state") != "validated":
+    if not item or item.get("state") not in ("validated", "waiting_human"):
         return
     gate = merge_queue.review_gate_for_item(
         db, cfg, item, work.milestones(db, lot), refresh_target=False)
     if gate and gate.get("ok"):
+        return
+    # Withdrawal shares the signing transaction and lot lock. The removed
+    # receipt also invalidates a landing pass that captured the old entry.
+    storage.of(db).work.queue_remove(
+        lot, note="merge queue: withdrawn (production review quorum missing #8101)",
+        actor=work.SYSTEM_SENDER)
+    if item.get("state") != "validated":
         return
     rows = db.query("UPDATE work_items SET state = 'qa', updated_at = now() "
                     "WHERE id = %s AND state = 'validated' RETURNING id", (lot,))

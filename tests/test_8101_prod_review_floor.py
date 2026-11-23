@@ -37,6 +37,8 @@ class ProductionFloorTest(unittest.TestCase):
             self.assertEqual(klass["reviews_floor"], 2)
             self.assertEqual(klass["production_reviews_floor"], 2)
             self.assertIn("operation unavailable", logs.output[0])
+            with self.assertLogs("ameesh.review_floor", level="WARNING"):
+                self.assertFalse(review_floor.production_decision_verified(object(), 42))
 
     def test_verified_and_pending_decisions(self):
         self.assertEqual(self.read(), 'decision #7')
@@ -70,8 +72,10 @@ class ProductionFloorTest(unittest.TestCase):
         db.query.return_value = [{'id': 42}]
         with mock.patch.object(decisions.work, 'get', return_value={'id': 42, 'state': 'validated'}), \
              mock.patch.object(decisions.work, 'milestones', return_value=[]), \
+             mock.patch.object(decisions.storage, 'of') as store, \
              mock.patch.object(merge_queue, 'review_gate_for_item', return_value={'ok': False}):
             decisions._recheck_production_review(db, None, 42)
+            store.return_value.work.queue_remove.assert_called_once()
             self.assertIn("SET state = 'qa'", db.query.call_args.args[0])
             self.assertIn('two families', db.execute.call_args.args[1][1])
         db.reset_mock()
@@ -118,6 +122,43 @@ class SignedProductionFloorTest(fixtures._Base):
         klass = review_floor.apply({'class': 'normal', 'files': [{'path': 'script'}]}, self.db, self.lot['id'])
         self.assertEqual(klass['production_reviews_floor'], 2)
         self.assertEqual(merge_queue.required_verdicts(klass), 2)
+
+    def test_signing_withdraws_queued_lot_in_both_review_states(self):
+        from ameesh import land, storage
+        ops = storage.of(self.db).work
+        for state in ("validated", "waiting_human"):
+            with self.subTest(state=state):
+                view = self.ask(question=self.question(), options=['a=Proceed'])
+                self.db.execute("UPDATE work_items SET state = %s WHERE id = %s",
+                                (state, self.lot['id']))
+                queued = ops.queue_add(self.lot['id'], target='main', frozen_sha='a' * 40,
+                                       note='queued', actor='dev1')
+                entry = tuple(queued.get(k) for k in ('generation', 'target', 'frozen_id', 'frozen_sha'))
+                landing = SimpleNamespace(lot=self.lot['id'], entry=entry, ops=ops, row=queued)
+                landing.queue_gone = lambda: land._Landing.queue_gone(landing)
+                with mock.patch.object(merge_queue, 'review_gate_for_item', return_value={'ok': False}):
+                    self.answer(view['id'], 'a', key_path=self.key)
+                self.assertFalse(ops.queue('main'))
+                self.assertEqual(land._fire_guard(landing)['result'], 'taken-out')
+                receipts = self.db.query(
+                    "SELECT kind FROM integration_train_queue_receipts WHERE work_item_id = %s",
+                    (self.lot['id'],))
+                self.assertTrue(any(r['kind'] == 'removed' for r in receipts))
+
+    def test_failed_queue_withdrawal_rolls_back_signature(self):
+        from ameesh import storage
+        ops = storage.of(self.db).work
+        view = self.ask(question=self.question(), options=['a=Proceed'])
+        self.db.execute("UPDATE work_items SET state = 'validated' WHERE id = %s", (self.lot['id'],))
+        ops.queue_add(self.lot['id'], target='main', frozen_sha='a' * 40,
+                      note='queued', actor='dev1')
+        with mock.patch.object(merge_queue, 'review_gate_for_item', return_value={'ok': False}), \
+             mock.patch.object(type(ops), 'queue_remove', side_effect=RuntimeError('withdrawal failed')):
+            with self.assertRaisesRegex(RuntimeError, 'withdrawal failed'):
+                self.answer(view['id'], 'a', key_path=self.key)
+        self.assertEqual(decisions.get(self.db, view['id'])['state'], 'pending')
+        self.assertEqual(self.lot_state(), 'validated')
+        self.assertEqual(len(ops.queue('main')), 1)
 
     def test_signed_operation_requires_two_verdict_families(self):
         from ameesh import registry, storage, work

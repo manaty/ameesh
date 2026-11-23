@@ -2948,7 +2948,7 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
         return
     current = [str(name) for name in (rows[0].get("reviewers") or []) if name]
     if "-none" in current:
-        if not review_floor.production_decision_floor(db, lot):
+        if not review_floor.production_decision_verified(db, lot):
             return
         current.remove("-none")
     names = [str(name or "").strip() for name in names or ()]

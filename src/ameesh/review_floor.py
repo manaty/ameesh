@@ -127,7 +127,7 @@ def _remote_floor(db, lot: int) -> dict:
         logging.getLogger(__name__).warning(
             "review floor for lot %s unavailable; using two families: %s: %s",
             lot, type(exc).__name__, str(exc)[:200])
-        return {"floor": 2, "codes": ["production"]}
+        return {"floor": 2, "codes": ["unavailable"]}
 
 
 def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
@@ -141,7 +141,8 @@ def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
         if storage.is_remote(db):
             remote = _remote_floor(db, lot)
             found = {"floor": remote["floor"], "actor": "mediated floor"}
-            production = "production" if "production" in remote["codes"] else ""
+            production = "production" if ("production" in remote["codes"]
+                                          or "unavailable" in remote["codes"]) else ""
         else:
             found = of_lot(db, lot, cfg=cfg)
             production = production_decision_floor(db, lot)
@@ -199,6 +200,13 @@ def production_decision_floor(db, lot: int) -> str:
             raise ValueError("production decision signature: " + reason)
         return "decision #%s" % view["id"]
     return ""
+
+
+def production_decision_verified(db, lot: int) -> bool:
+    """Only proven production may remove a pilot's durable waiver."""
+    if storage.is_remote(db):
+        return "production" in _remote_floor(db, lot)["codes"]
+    return bool(production_decision_floor(db, lot))
 
 
 def _complete_designation(cfg, db, lot: int, floor: int):
