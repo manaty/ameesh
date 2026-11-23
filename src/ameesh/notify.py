@@ -2376,6 +2376,9 @@ class Notifier:
         self._github_watcher = None
         #: L161c : relevé de la CI, échecs au courrier de l'agent du lot
         self._ci_watcher = None
+        #: #8119 : le rattrapage des refus historiques se fait une fois par
+        #: processus (les notes sont idempotentes, pas le balayage).
+        self._take_history_done = False
 
     # -- passage --------------------------------------------------------------
     def _delivery_open(self) -> bool:
@@ -3054,6 +3057,20 @@ class Notifier:
                                 "correction": "correction proposée"}.get(
                                     take.get("kind"), "file d'amélioration")}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
+        # #8119 : le journal des refus de L165, une note par élément et par
+        # heure ; le pilote est alerté quand un élément démarrable reste sans
+        # preneur. En a-blanc, le journal n'écrit rien.
+        if not self.dry_run:
+            from . import take_refusals
+            try:
+                take_refusals.journal(self.cfg, db, now=now)
+                if not self._take_history_done:
+                    self._take_history_done = True
+                    take_refusals.journal_history(self.cfg, db, now=now)
+            except db_mod.DbError:
+                raise
+            except Exception as exc:  # le journal ne fait pas tomber les alertes
+                self.log("take refusal journal failed: %s" % _clean(exc, 200))
 
     def _queue_fill(self, db, now: float) -> None:
         """#3256 A : le lot de découpage d'un projet dont la file est vide alors

@@ -578,6 +578,11 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("--parent-lot: a %s number (e.g. 1070 or #1070)" % v.noun, file=sys.stderr)
             return 2
         parent_lot = int(number)
+        print("warning: --parent-lot #%d makes it a BLOCKING prerequisite: the created "
+              "%s stays untakeable until #%d is merged or closed. For a mere 'see also' "
+              "relation, create the %s without --parent-lot and note it (or use "
+              "`ameesh work add --see-also`)." % (parent_lot, v.noun, parent_lot, v.noun),
+              file=sys.stderr)
     dest = args[0]
     body = args[1:]
     if body == ["-"] and not literal:
