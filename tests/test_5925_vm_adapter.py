@@ -108,6 +108,14 @@ class DecisionTest(unittest.TestCase):
             with self.assertRaisesRegex(vm.Refused, 'reserve protected'):
                 vm.stop_evidence(config.Config(), mock.Mock(), 'burst', {}, now=1000)
 
+    def test_stop_evidence_names_a_missing_canon_apart_from_an_unreadable_one(self):
+        with mock.patch('ameesh.vm_adapter.host_release._canon_read', return_value=([], False)):
+            with self.assertRaisesRegex(vm.Refused, '^no canon configured$'):
+                vm.stop_evidence(config.Config(), mock.Mock(), 'burst', {}, now=1000)
+        with mock.patch('ameesh.vm_adapter.host_release._canon_read', return_value=([], True)):
+            with self.assertRaisesRegex(vm.Refused, '^canon unavailable$'):
+                vm.stop_evidence(config.Config(), mock.Mock(), 'burst', {}, now=1000)
+
     def test_adapter_hysteresis_does_not_change_native_drain_timeout(self):
         cfg = config.Config()
         control = dict(host='burst', requested_ts=1000)
@@ -406,6 +414,19 @@ class AdapterTest(PgTestCase):
         self.provider.action.assert_not_called()
         self.assertEqual(self.tick(), 'stop prepared')
         self.assertNotEqual(self.q.pending('burst')[0]['result'], 'canon unavailable')
+
+    def test_missing_canon_is_recorded_distinctly_and_cleared_on_recovery(self):
+        self.request()
+        self.observe_old()
+        with mock.patch('ameesh.vm_adapter.storage.of', return_value=self.store):
+            self.assertEqual(vm.tick_host(
+                self.cfg, self.db, policy(), 'burst', self.provider,
+                probe=self.probe, evidence=mock.Mock(side_effect=vm.Refused('no canon configured'))),
+                'no canon configured')
+        self.assertEqual(self.q.pending('burst')[0]['result'], 'no canon configured')
+        self.provider.action.assert_not_called()
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertNotEqual(self.q.pending('burst')[0]['result'], 'no canon configured')
 
     def test_deadline_records_why_stop_was_superseded(self):
         self.request()
