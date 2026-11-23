@@ -493,8 +493,19 @@ def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
     store = storage.of(db)
     reading = store.hosts.latest(host)
     listing = store.operations.listing()
+    # Match the return decision for a dated manual drain (#8129).  Only the
+    # idle projection ignores ordinary active and passive mail; keep the original listing
+    # for the remaining safety checks. Missing urgent evidence stays unknown.
+    idle_listing = listing
+    if listing is not None and host_release._dated_manual_drain(control):
+        idle_listing = [dict(row, unread=(None if row.get('unread') is None
+                                          or row.get('urgent_unread') is None
+                                          else bool(row['urgent_unread']
+                                                    or row.get('restart_requested_ts'))),
+                             passive_unread=0)
+                        if row.get('host') == host else row for row in listing]
     fp = host_idle.snapshot(cfg, db, canons, {host: reading}, now=now,
-                            listing=listing, history_s=quiet_s).get(host)
+                            listing=idle_listing, history_s=quiet_s).get(host)
     if not fp or fp.get('capacity') != 'burst' or fp.get('unknown'):
         raise Refused('idle burst evidence unavailable')
     # Always read elections even when baseline declarations are complete.
