@@ -143,7 +143,10 @@ class DurationsBySelectionTest(unittest.TestCase):
         self.assertEqual(self.modules(report),
                          ["tests.test_c", "tests.test_a", "tests.test_b"])
 
-    def test_carte_anterieure_ne_donne_plus_de_duree(self) -> None:
+    def test_carte_anterieure_garde_la_duree_d_un_test_inchange(self) -> None:
+        # #8132 : une carte antérieure ne vaut plus pour la couverture, mais la
+        # durée qu'elle a mesurée reste juste pour un test dont le fichier n'a
+        # pas changé depuis : test_c (0,1 s) entre, au lieu du forfait 60 s.
         old = self.base
         self.write("README", "x\n")
         self.base = self.commit("base suivante")
@@ -151,7 +154,20 @@ class DurationsBySelectionTest(unittest.TestCase):
         report = self.select(self.unit(), budget=30, driver="psycopg")
         self.assertEqual(report["card"]["base"], "antérieure")
         self.assertFalse(report["durations"]["card"])
-        # test_c, sans mesure, est au forfait : hors budget
+        self.assertTrue(report["durations"]["stale"])
+        self.assertEqual(self.modules(report),
+                         ["tests.test_c", "tests.test_a", "tests.test_b"])
+
+    def test_carte_anterieure_forfait_un_test_modifie(self) -> None:
+        # #8132 : le test a changé depuis la carte ; sa durée ne vaut plus, le
+        # forfait 60 s le laisse hors d'un budget de 30 s.
+        old = self.base
+        self.write("tests/test_c.py", "X = 2\n")
+        self.base = self.commit("base suivante, test_c modifié")
+        self.card(old)
+        report = self.select(self.unit(), budget=30, driver="psycopg")
+        self.assertEqual(report["card"]["base"], "antérieure")
+        self.assertFalse(report["durations"]["card"])
         self.assertEqual(self.modules(report), ["tests.test_a", "tests.test_b"])
 
     def test_pilote_inconnu_refuse(self) -> None:
