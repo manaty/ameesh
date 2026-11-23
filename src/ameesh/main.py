@@ -161,6 +161,9 @@
         or a stopped one (unless --queue);
   ameesh mail forward <old> <new> [--dry-run]
         re-delivers the pending mail of a stopped agent to a live agent;
+  ameesh mail returns [--replay] [--agent NAME] [--json]
+        #8113: the durable return queue of mail closed at a retirement;
+        --replay re-sends notices and the pilot relay, never twice;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh migrate              apply schema migrations;
   ameesh model-report [--json] [--project P] [--days N] [--at T] [--start T] [--end T]

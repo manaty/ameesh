@@ -1087,6 +1087,11 @@ def _retire_gesture(cfg: Config, args: argparse.Namespace, gesture) -> int:
         print("%s %s by %s (journal #%d)" % (
             result["agent"], "retired" if args.agent_command == "retire" else "restored",
             result["actor"], result["event"]))
+    mail = result.get("mail") or {}
+    if mail.get("closed"):
+        # #8113 : le courrier clos est rendu aux expéditeurs vivants.
+        print("%d pending message(s) closed at retirement; sender(s) informed: %s" % (
+            mail["closed"], ", ".join(mail.get("informed") or ()) or "none"))
     return 0
 
 
