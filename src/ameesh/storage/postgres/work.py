@@ -928,6 +928,19 @@ class WorkItems(interface.WorkItems):
                 " coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
                 " AS workflow_version")
 
+    def review_floor(self, item_id: int) -> dict | None:
+        from ... import review_floor
+
+        if self.get(item_id) is None:
+            return None
+        manual = review_floor.of_lot(self.db, item_id)
+        production = review_floor.production_decision_floor(self.db, item_id)
+        codes = ["manual"] if manual["floor"] else []
+        if production:
+            codes.append("production")
+        return {"floor": max(int(manual["floor"]), 2 if production else 0),
+                "codes": codes}
+
     def get(self, item_id) -> dict | None:
         # #5993 : la tête du dernier gel et son instant, plus le dernier
         # passage en build, sont portés par cette lecture — comme

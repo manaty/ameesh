@@ -23,6 +23,21 @@ class ProductionFloorTest(unittest.TestCase):
              mock.patch.object(decisions, 'verify_proof', return_value=(valid, 'invalid')):
             return review_floor.production_decision_floor(object(), 42)
 
+    def test_mediated_floor_and_old_server_fallback(self):
+        remote = SimpleNamespace(work=SimpleNamespace(review_floor=mock.Mock()))
+        with mock.patch.object(review_floor.storage, "is_remote", return_value=True), \
+             mock.patch.object(review_floor.storage, "of", return_value=remote):
+            remote.work.review_floor.return_value = {"floor": 2, "codes": ["production"]}
+            klass = review_floor.apply({}, object(), 42)
+            self.assertEqual(klass["production_reviews_floor"], 2)
+            self.assertTrue(review_floor.production_decision_floor(object(), 42))
+            remote.work.review_floor.side_effect = RuntimeError("operation unavailable")
+            with self.assertLogs("ameesh.review_floor", level="WARNING") as logs:
+                klass = review_floor.apply({}, object(), 42)
+            self.assertEqual(klass["reviews_floor"], 2)
+            self.assertEqual(klass["production_reviews_floor"], 2)
+            self.assertIn("operation unavailable", logs.output[0])
+
     def test_verified_and_pending_decisions(self):
         self.assertEqual(self.read(), 'decision #7')
         self.assertEqual(self.read({**self.view, 'state': 'pending'}), '')
@@ -93,9 +108,13 @@ class SignedProductionFloorTest(fixtures._Base):
         view = self.ask(question=self.question(), options=['a=Proceed', 'b=Refuse'])
         self.assertTrue(view['needs_signature'])
         self.assertEqual(review_floor.production_decision_floor(self.db, self.lot['id']), '')
+        self.assertEqual(review_floor.storage.of(self.db).work.review_floor(self.lot['id']),
+                         {'floor': 0, 'codes': []})
         with self.assertRaises(decisions.DecisionError):
             self.answer(view['id'], 'a')
         self.answer(view['id'], 'a', key_path=self.key)
+        self.assertEqual(review_floor.storage.of(self.db).work.review_floor(self.lot['id']),
+                         {'floor': 2, 'codes': ['production']})
         klass = review_floor.apply({'class': 'normal', 'files': [{'path': 'script'}]}, self.db, self.lot['id'])
         self.assertEqual(klass['production_reviews_floor'], 2)
         self.assertEqual(merge_queue.required_verdicts(klass), 2)

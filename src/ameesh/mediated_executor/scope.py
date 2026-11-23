@@ -439,6 +439,12 @@ class HostScopeRules(ScopeRules):
             rows.append(row)
         return rows
 
+    def _apply_work_review_floor(self, principal, kw, fence):
+        from .. import storage
+        item = storage.of(self.db).work.get(kw["item_id"])
+        if self._filter_work_get(principal, item) is None:
+            raise Immediate(None)
+
     def _filter_work_get(self, principal, value):
         if not value:
             return None

@@ -82,6 +82,41 @@
    }
   },
   {
+   "name": "work.review_floor/ok",
+   "op": "work.review_floor",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "work.review_floor",
+     "args": [
+      812
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "floor": 2,
+      "codes": [
+       "production"
+      ]
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
    "name": "work.move/ok",
    "op": "work.move",
    "request": {
