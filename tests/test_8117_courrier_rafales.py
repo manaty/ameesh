@@ -147,6 +147,66 @@ class FenetreAdaptativeTest(unittest.TestCase):
         self.assertFalse(mail.is_decision_answer(_etat(1, T0)))
 
 
+class CheminsCompletsTest(unittest.TestCase):
+    """B de mty-amh-impl-11 (gel 43f204d1) : le retard #7976 et la cadence
+    `reveil` ne contournent plus le regroupement."""
+
+    def _a(self, t: float):
+        horloge = _Horloge()
+        horloge.t = t
+        return mock.patch.object(runner_mod, "time", horloge.module())
+
+    def test_le_premier_d_une_rafale_n_est_pas_en_retard_a_300_s(self):
+        worker = _ouvrier()
+        rafale = [_etat(1, T0), _etat(2, T0 + 200)]
+        with self._a(AgentWorker.MAIL_OVERDUE_S + 10):
+            self.assertFalse(worker._mail_overdue(rafale))
+        with self._a(AgentWorker.BURST_CAP_S + 1):
+            self.assertTrue(worker._mail_overdue(rafale))
+        # un message seul garde le retard de 300 s
+        with self._a(AgentWorker.MAIL_OVERDUE_S + 10):
+            self.assertTrue(_ouvrier()._mail_overdue([_etat(1, T0)]))
+
+    def test_rafale_par_le_chemin_complet_du_retard(self):
+        # le pilote est occupé quand la rafale commence : à sa sortie, les
+        # deux premiers ont plus de 300 s mais la rafale continue
+        arrivees = [(i * 100.0, _etat(i + 1, T0 + i * 100.0)) for i in range(6)]
+        horloge = _Horloge()
+        worker = _ouvrier()
+        worker._turn_end_mono = 0.0
+        with mock.patch.object(runner_mod, "time", horloge.module()):
+            horloge.t = 320.0
+            vus = [m for t, m in arrivees if t <= horloge.t]
+            self.assertFalse(worker._mail_overdue(vus))
+
+    def test_reponse_de_decision_sous_cadence_regroupee(self):
+        worker = _ouvrier()
+        reponses = [_reponse(i + 1, 7000 + i, T0 + i * 2.0) for i in range(12)]
+        with self._a(30.0):
+            self.assertFalse(worker._reveil_due({"immediat": ["humain", "urgent",
+                                                              "decision"],
+                                                 "fenetre_s": 1800}, reponses))
+        with self._a(120.0):
+            self.assertTrue(worker._reveil_due({"immediat": ["humain", "urgent",
+                                                             "decision"],
+                                                "fenetre_s": 1800}, reponses))
+        # un humain ordinaire reste immédiat sous la cadence
+        humain = dict(_etat(50, T0, sender="human:smichea"), payload={"human": True})
+        with self._a(1.0):
+            self.assertTrue(_ouvrier()._reveil_due({"immediat": ["humain"],
+                                                    "fenetre_s": 1800}, [humain]))
+
+    def test_cadence_minimale_regroupe_aussi(self):
+        # « humain » reste toujours immédiat (décision owner du 17/11) : la
+        # réponse n'est pas ouverte sur-le-champ, mais à la fin de la fenêtre
+        # adaptative de base, sans attendre les 30 min déclarées
+        politique = {"immediat": ["humain"], "fenetre_s": 1800}
+        with self._a(30.0):
+            self.assertFalse(_ouvrier()._reveil_due(politique, [_reponse(1, 7000, T0)]))
+        with self._a(91.0):
+            self.assertTrue(_ouvrier()._reveil_due(politique, [_reponse(1, 7000, T0)]))
+
+
 class ReponseDeDecisionTest(_Base):
     def _reponse(self, to: str, lot: int, sender: str = "human:smichea") -> int:
         return mail.send(self.db, sender, to, "réponse : a", kind="reply",

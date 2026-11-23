@@ -7875,12 +7875,17 @@ class AgentWorker(threading.Thread):
         if seuil <= 0 or reveil_mod.of(self.agent) is not None:
             return False
         now = time.time()
-        self._note_bursts(rows)
+        rafales = self._note_bursts(rows)
         cap = max(seuil, float(self.BURST_CAP_S))
 
         def borne(m: dict) -> float:
-            if mail.is_event(m) or self._burst_size(
-                    self._burst_key(m), float(m.get("created_ts") or now)) < 2:
+            # B mty-amh-impl-11 : le premier message d'une rafale en fait
+            # partie dès qu'un autre le suit — compté des deux côtés.
+            if mail.is_event(m):
+                return seuil
+            created = float(m.get("created_ts") or now)
+            voisins = (rafales.get(self._burst_key(m)) or {}).values()
+            if sum(1 for ts in voisins if abs(ts - created) < float(self.BURST_CAP_S)) < 2:
                 return seuil
             return cap
 
@@ -7900,9 +7905,19 @@ class AgentWorker(threading.Thread):
         cadence déclarée ? Oui si l'un des messages est d'une nature
         immédiate (l'humain toujours ; un événement urgent seulement d'un
         expéditeur habilité, comme `_events_due`), sinon à la fin de la
-        fenêtre, comptée comme celle de `_mail_due`."""
+        fenêtre, comptée comme celle de `_mail_due`.
+
+        #8117 : une réponse de décision n'est pas immédiate par ses marques
+        (humaine, urgente) ; si la cadence déclare sa nature immédiate, elle
+        est regroupée par la fenêtre adaptative de base (`mail_batch`), au
+        plus tard la fenêtre déclarée."""
+        reponses = []
         for row in rows:
             human = self._from_human(row)
+            if mail.is_decision_answer(row):
+                if reveil_mod.immediate(policy, row, human=human):
+                    reponses.append(row)
+                continue
             if mail.is_event(row) and mail.is_urgent(row) and not human \
                     and not self.interrupt_allowed(row):
                 found = reveil_mod.natures(row) - {"urgent"}
@@ -7910,7 +7925,10 @@ class AgentWorker(threading.Thread):
                     return True
             elif reveil_mod.immediate(policy, row, human=human):
                 return True
-        return self._window_elapsed(rows, float(policy["fenetre_s"]))
+        if self._window_elapsed(rows, float(policy["fenetre_s"])):
+            return True
+        return bool(reponses) and self._bursts_elapsed(
+            reponses, self.mail_batch(), remember=False)
 
     def _events_due(self, events: list[dict]) -> bool:
         """Les événements en attente ouvrent-ils un tour ? (C9)"""
@@ -8044,7 +8062,8 @@ class AgentWorker(threading.Thread):
         cap = max(float(self.BURST_CAP_S), base)
         return min(base * (2 ** max(n - 1, 0)), cap)
 
-    def _bursts_elapsed(self, rows: list[dict], base: float) -> bool:
+    def _bursts_elapsed(self, rows: list[dict], base: float, *,
+                        remember: bool = True) -> bool:
         """#8117 : le courrier ordinaire attendu ouvre-t-il un tour ?
 
         Les messages sont groupés par expéditeur et par lot. Un groupe est dû
@@ -8053,7 +8072,9 @@ class AgentWorker(threading.Thread):
         quand le plus ancien attend depuis `BURST_CAP_S`. L'attente se compte
         comme dans `_window_elapsed` (horloge de la base et première lecture),
         et la fin du dernier tour retient toujours `base` (#3451). Sinon,
-        l'échéance la plus proche est retenue pour le réveil (#3218)."""
+        l'échéance la plus proche est retenue pour le réveil (#3218).
+        `remember=False` : `rows` n'est qu'une partie du courrier en attente,
+        les premières lectures retenues ne sont pas réécrites."""
         if base <= 0:
             return True
         self._note_bursts(rows)
@@ -8067,7 +8088,8 @@ class AgentWorker(threading.Thread):
             created = float(row.get("created_ts") or now)
             age = max(now - created, mono - first)
             groups.setdefault(self._burst_key(row), []).append((age, created))
-        self._batch_seen = kept  # les messages remis entre-temps sont oubliés
+        if remember:
+            self._batch_seen = kept  # les messages remis entre-temps sont oubliés
         cap = max(float(self.BURST_CAP_S), base)
         reste = float("inf")
         for key, ages in groups.items():
