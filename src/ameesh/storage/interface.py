@@ -3113,8 +3113,9 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def record_designation_mark(self, item_id: int, state: str, text: str, actor: str,
                                 evidence: dict) -> None:
-        """#6365 : journalise la marque de désignation avec sa preuve
-        structurée (`work_item_events.evidence`) et rafraîchit `updated_at`.
+        """#6365 : journalise la marque de désignation — ou, #8118, de
+        continuation à relecteurs inchangés — avec sa preuve structurée
+        (`work_item_events.evidence`) et rafraîchit `updated_at`.
 
         Écrivain système du port de désignation seul : hors du contrat de
         l'exécuteur médié (L107), aucune voie à texte libre (`note`,

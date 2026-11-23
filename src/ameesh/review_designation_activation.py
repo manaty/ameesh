@@ -1086,7 +1086,9 @@ def _mark_reviewers(note: str) -> Optional[list]:
     a valid mark prefix and invalid JSON is an unreadable mark, not a database
     error that aborts the freeze transaction (#3047). `designation_of` refuses
     an unreadable selection mark and `carried_mark_of` returns None; both are
-    the same refusal here, and the caller journals it.
+    the same refusal here, and the caller journals it. #8118 : une marque de
+    continuation nomme les sièges gardés — les ignorer retirerait du calcul
+    des avis dus les relecteurs d'un regel à relecteurs inchangés.
     """
     from . import verdict_carry
 
@@ -1098,6 +1100,11 @@ def _mark_reviewers(note: str) -> Optional[list]:
             return None
     elif text.startswith(verdict_carry.CARRIED_MARK_PREFIX):
         payload = verdict_carry.carried_mark_of(text)
+    elif text.startswith(pg.CONTINUED_PREFIX):
+        try:
+            payload = pg.continued_mark_of(text)
+        except rd.DesignationError:
+            return None
     else:
         return []
     if not isinstance(payload, dict):
@@ -1143,6 +1150,8 @@ _PENDING_FACTS_SQL = f"""
          WHERE e.work_item_id = ANY (ARRAY(SELECT lot FROM latest_freeze))
            AND (starts_with(e.note, 'review-designation:' || e.work_item_id || ':')
             OR starts_with(e.note, 'review-designation-carried:'
+                                   || e.work_item_id || ':')
+            OR starts_with(e.note, 'review-designation-continued:'
                                    || e.work_item_id || ':'))
          GROUP BY e.work_item_id
     ), manual AS (
@@ -1187,6 +1196,9 @@ _PENDING_FACTS_SQL = f"""
                               || ':' || f.freeze_id || ':')
                   OR starts_with(e.note,
                                  'review-designation-carried:' || f.lot
+                                 || ':' || f.freeze_id || ':')
+                  OR starts_with(e.note,
+                                 'review-designation-continued:' || f.lot
                                  || ':' || f.freeze_id || ':'))
            ORDER BY e.id DESC
            LIMIT 1
@@ -1218,9 +1230,10 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
     the current head:
 
     - a name of the **effective** mark of the latest freeze
-      (`review-designation:` selection or `review-designation-carried:`
-      report, the last one in journal order — the mark `_sync_reviewers`
-      derives the column from);
+      (`review-designation:` selection, `review-designation-carried:` report
+      or `review-designation-continued:` unchanged-seat re-freeze, the last
+      one in journal order — the mark `_sync_reviewers` derives the column
+      from);
     - a manual designation: a name that no automatic mark of the lot ever
       carried (kept across freezes by `_sync_reviewers`), or a name whose
       latest `reviewer X designated` line (`ameesh work reviewer`) follows
@@ -3709,7 +3722,12 @@ def _continued_in_transaction(tx, item: Mapping, inputs: "Inputs",
                     "continued": True,
                     "why": str(mark.get("why") or "")}
     context = pg.PgPort(tx).previous_review(lot, freeze_id)
-    sha = str(freeze.get("sha") or "")
+    sha = plan_git.full_commit_id(freeze.get("sha"))
+    # #8118 : la continuation garde la base du delta lue à ce gel, avec la
+    # même preuve structurée que la désignation (#6365) : la porte ne retombe
+    # pas sur la ref `origin/<cible>` du clone qui lit, qui peut être en
+    # retard. Sans base complète, aucune preuve n'est posée (lecture d'avant).
+    base = plan_git.full_commit_id(inputs.base)
     migration = rd.sql_migration(inputs.paths)
     sent = []
     for index, seat in enumerate(seats or ()):
@@ -3741,8 +3759,14 @@ def _continued_in_transaction(tx, item: Mapping, inputs: "Inputs",
         why="reviewers unchanged at re-freeze: seats continued, one delta"
             " request each (#8118)",
         authors=inputs.authors, policy_ref=inputs.policy.ref,
-        base=inputs.base, unknown_authors=inputs.unknown_authors)
-    storage.of(tx).work.note(lot, str((item or {}).get("state") or ""), note, SENDER)
+        base=base, unknown_authors=inputs.unknown_authors)
+    state = str((item or {}).get("state") or "")
+    if base:
+        storage.of(tx).work.record_designation_mark(
+            lot, state, note, SENDER,
+            pg.base_evidence(lot, freeze_id, sha, base))
+    else:
+        storage.of(tx).work.note(lot, state, note, SENDER)
     names = [str((seat or {}).get("name") or "").strip() for seat in seats or ()]
     _sync_reviewers(
         tx, item, freeze, names,

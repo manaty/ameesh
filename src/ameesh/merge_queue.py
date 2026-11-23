@@ -587,9 +587,15 @@ def _designated_base(db, item, milestone, repo, frozen) -> str:
     joignable. L'acteur d'une note est déclaratif (`work note --actor`) : seule
     compte la preuve structurée que le port écrit dans `evidence` (schéma,
     lot, gel, tête et base concordants, comme `review_floor`, #3183) ; une
-    copie du texte est ignorée quel que soit l'acteur revendiqué. La base
-    doit être un commit présent et un ancêtre strict de la tête. Sinon "" :
-    la lecture d'avant s'applique."""
+    copie du texte est ignorée quel que soit l'acteur revendiqué.
+
+    #8118 : un regel à relecteurs inchangés n'écrit pas de nouvelle
+    désignation ; sa marque `review-designation-continued` porte la même
+    preuve et la base lue à ce gel. Les deux préfixes sont lus, la dernière
+    preuve valide du journal l'emporte (comme `PgPort.recorded`) ; une note
+    sans preuve n'écrase pas une preuve antérieure. La base doit être un
+    commit présent et un ancêtre strict de la tête. Sinon "" : la lecture
+    d'avant s'applique."""
     from . import review_designation_pg as pg
 
     try:
@@ -601,14 +607,21 @@ def _designated_base(db, item, milestone, repo, frozen) -> str:
     if not lot or not freeze_id or not repo or not head:
         return ""
     try:
-        events = storage.of(db).work.events_noted(
-            pg.mark_prefix(lot, freeze_id), 0.0, ids=[lot]) or []
+        ops = storage.of(db).work
+        events = list(ops.events_noted(
+            pg.mark_prefix(lot, freeze_id), 0.0, ids=[lot]) or [])
+        events.extend(ops.events_noted(
+            pg.continued_mark_prefix(lot, freeze_id), 0.0, ids=[lot]) or [])
     except Exception:  # noqa: BLE001 - journal illisible : lecture d'avant
         return ""
     base = ""
     for event in sorted(events, key=lambda row: int((row or {}).get("id") or 0)):
         try:
-            payload = pg.designation_of(str((event or {}).get("note") or ""))
+            note = str((event or {}).get("note") or "")
+            if note.startswith(pg.continued_mark_prefix(lot, freeze_id)):
+                payload = pg.continued_mark_of(note)
+            else:
+                payload = pg.designation_of(note)
             evidence = (event or {}).get("evidence")
             if isinstance(evidence, str):
                 evidence = json.loads(evidence)

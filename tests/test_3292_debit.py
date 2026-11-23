@@ -53,6 +53,17 @@ def mark_authors(ident, freeze_id, names, authors):
                     "authors": [{"name": n, "family": ""} for n in authors]}))
 
 
+def mark_continued(ident, freeze_id, names, required=1):
+    """#8118 : la marque d'un regel à relecteurs inchangés (même JSON)."""
+    import json
+    return 'review-designation-continued:%d:%d: %s' % (
+        ident, freeze_id,
+        json.dumps({"state": "designated", "required": required,
+                    "reviewers": [{"name": n, "family": ""} for n in names],
+                    "authors": [], "missing": 0, "why": "",
+                    "freeze": {"id": freeze_id, "sha": "b" * 40}}))
+
+
 def run(**extra):
     values = dict(items=[], milestones=[], events=[], agents=[], turns=[],
                   merges=[], ci_runs=[], jobs=[], now=T, installed="1.20.0",
@@ -174,6 +185,25 @@ class ReviewDueTest(unittest.TestCase):
         self.assertEqual(report["reviews_due"], [])
         self.assertEqual([row["lot"] for row in report["qa"]], [9])
         self.assertTrue(report["qa"][0]["missing_reviewer"])
+
+    def test_une_continuation_designe_les_sieges_gardes_8118(self):
+        # #8118 : un regel à relecteurs inchangés n'écrit que la marque
+        # `review-designation-continued:`. Le débit doit y lire les sièges
+        # gardés et l'état `designated` du gel, comme dans la désignation.
+        report = run(
+            items=[item(8118)],
+            milestones=[frozen(8118, 10, T - 5 * H),
+                        frozen(8118, 11, T - 2 * H, sha="b" * 40)],
+            events=[event(8118, 1, T - 5 * H, mark(8118, 10, ["ameesh-cx2"])),
+                    event(8118, 2, T - 2 * H,
+                          mark_continued(8118, 11, ["ameesh-cx2"]))])
+        qa = [row for row in report["qa"] if row["lot"] == 8118][0]
+        self.assertEqual(qa["pending_reviewers"], ["ameesh-cx2"])
+        self.assertFalse(qa["missing_reviewer"])
+        self.assertEqual(qa["required_reviews"], 1)
+        self.assertFalse(qa["ready"])
+        self.assertEqual([row["reviewer"] for row in report["reviews_due"]],
+                         ["ameesh-cx2"])
 
     def test_retrait_manuel_du_relecteur(self):
         report = run(

@@ -21,7 +21,9 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import mail, storage, work
+from ameesh import mail, merge_queue, storage, work
+from ameesh import review_designation_activation as act
+from ameesh import review_designation_pg as pg
 from ameesh.storage.postgres import mailbox as _pg
 from ameesh.work_reviewers import designated
 
@@ -123,6 +125,36 @@ class OneWakePerRegelTest(_ActivationFixture, PgTestCase):
             self.assertEqual(len(wakes), 3,
                              [(m["kind"], m["body"][:50]) for m in wakes])
             self.assertEqual([m["kind"] for m in wakes], ["request"] * 3)
+
+    def test_a_continued_regel_keeps_the_proven_base_and_the_due_review(self):
+        # B/P2 #231515 (auditeur) : un regel à relecteurs inchangés n'écrit
+        # pas de désignation ; sa marque de continuation doit porter la même
+        # preuve de base que le port (#6365), sinon la porte retombe sur un
+        # origin/<cible> en retard. Les sièges gardés restent aussi des avis
+        # dus sur la nouvelle tête (file de l'agent et charge de la sélection).
+        self.freeze()
+        self._advance("head2")
+        _mark, out = self.freeze()
+        self.assertTrue(out.get("continued"), out)
+        rows = self.db.query(
+            "SELECT note, evidence FROM work_item_events"
+            " WHERE work_item_id = %s AND note LIKE %s ORDER BY id",
+            (self.lot, pg.continued_mark_prefix(self.lot) + "%"))
+        self.assertEqual(len(rows), 1, rows)
+        payload = pg.continued_mark_of(rows[0]["note"])
+        self.assertEqual(payload["base"], self.base)
+        self.assertEqual(rows[0]["evidence"],
+                         pg.base_evidence(self.lot,
+                                          int(payload["freeze"]["id"]),
+                                          self.frozen, self.base))
+        self.assertEqual(merge_queue._designated_base(
+            self.db, work.get(self.db, self.lot),
+            {"id": int(payload["freeze"]["id"])}, self.repo.root, self.frozen),
+            self.base)
+        for name in ("r1", "r2"):
+            due = act.pending_reviews(self.db, name)
+            self.assertIn((self.lot, self.frozen),
+                          [(row["lot"], row["sha"]) for row in due], due)
 
     def test_a_human_or_system_notice_always_wakes(self):
         self.freeze()
