@@ -352,9 +352,12 @@ class Config:
     #: l'hôte (0 = défaut `Runner.IDLE_PASSES_PER_S`, plafonné à 45 s de pas).
     #: Réglé, le pas vaut `agents / débit` sans plafond de 45 s ni tiers du
     #: bail, sauf `idle_poll_max` : la relève élue est vue un pas plus tard.
+    #: #8168 : relu à chaud (voir `RELOADABLE_FIELDS`).
     idle_passes_per_s: float = 0.0
     #: #8152 : plafond du pas au repos (s) ; 0 = 45 s par défaut, sans plafond
-    #: si `idle_passes_per_s` est réglé.
+    #: si `idle_passes_per_s` est réglé. #8168 : réglé seul, il lève aussi le
+    #: tiers du bail de l'attente au repos (le battement renouvelle seul) et
+    #: suit une relecture à chaud.
     idle_poll_max: float = 0.0
     runner_liveness_interval: float = 60.0  # #508 : écriture groupée, au moins 60 s
     #: regroupement des événements (C9) : au plus un réveil par ce délai,

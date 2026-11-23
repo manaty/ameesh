@@ -90,6 +90,25 @@ class RelectureConfigTest(unittest.TestCase):
             self.assertTrue(runner.reload_config())
         self.assertEqual(list(runner.cfg.accounts), ["claude"])
 
+    def test_le_rythme_de_repos_suit_la_relecture(self):
+        """#8168 (N1 de #8152) : `idle_pace` promet qu'une config relue
+        s'applique sans redémarrer ; les deux champs du rythme de repos sont
+        donc dans `RELOADABLE_FIELDS` et suivent le fichier."""
+        runner = self._runner()
+        self.assertEqual((runner.cfg.idle_passes_per_s,
+                          runner.cfg.idle_poll_max), (0.0, 0.0))
+        self._write(self.host, {
+            "budget_usd_per_hour": 100,
+            "accounts": {"deepseek": [{"name": "cle-a"}]},
+            "idle_passes_per_s": 0.25,
+            "idle_poll_max": 120,
+        })
+        with mock.patch.dict(os.environ, {"HOME": self.home,
+                                          "AMEESH_CONFIG": self.profil}):
+            self.assertTrue(runner.reload_config())
+        self.assertEqual((runner.cfg.idle_passes_per_s,
+                          runner.cfg.idle_poll_max), (0.25, 120.0))
+
     def test_le_partage_des_comptes_suit_la_relecture(self):
         """#2571 (N1 de #313) : la politique de partage et le registre sont
         relus comme les comptes. Un passage `report` → `strict` avec un

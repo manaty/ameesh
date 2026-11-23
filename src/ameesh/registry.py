@@ -112,7 +112,14 @@ def upsert_unleased(db: Db, name: str, *, chantier: str | None = None,
 
 
 def get(db: Db, name: str) -> dict | None:
-    row = storage.of(db).agents.get(name)
+    agents = storage.of(db).agents
+    # #8168 : un primaire déjà lu dans la passe se relit sans le résolveur SQL ;
+    # la première lecture le résout et l'audite, puis `note_row` le confirme.
+    # L'exécuteur médié n'a que `name` dans son contrat : il garde le résolveur.
+    if agent_names.primary_known(name) and not storage.is_remote(db):
+        row = agents.get_exact(name)
+    else:
+        row = agents.get(name)
     agent_names.note_row(row)  # #8152 : primaire confirmé pour la passe
     return row
 

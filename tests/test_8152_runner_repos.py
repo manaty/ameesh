@@ -12,11 +12,13 @@ Témoins :
 
 * l'hôte règle le débit de repos (`AMEESH_IDLE_PASSES_PER_S`), à toute
   taille : ni plafond de 45 s ni tiers du bail, sauf `AMEESH_IDLE_POLL_MAX` ;
-  sans réglage, le pas est inchangé ;
+  sans réglage, le pas est inchangé ; #8168 : le plafond seul lève aussi le
+  tiers du bail ;
 * la passe garde les noms primaires lus du registre : `resolve` ne refait pas
-  la requête dans la passe, et l'oublie après ;
-* une passe au repos réelle (base de test) ne relit ni le marqueur de schéma
-  (partagé 5 s, #5980) ni la résolution du nom.
+  la requête dans la passe, et l'oublie après ; #8168 : `registry.get` relit
+  un primaire confirmé sans le résolveur SQL ;
+* une passe au repos réelle (base de test) ne relit pas le marqueur de schéma
+  (partagé 5 s, #5980) et ne paie qu'au plus une résolution du nom par passe.
 """
 from __future__ import annotations
 
@@ -91,6 +93,17 @@ class DebitDeRepos(unittest.TestCase):
         # le battement renouvelle seul (#5806) : le débit réglé n'est pas
         # ramené au tiers du bail
         self.assertAlmostEqual(self._worker(_runner(128, rate=0.2), 180)._idle_wait(), 640.0)
+
+    def test_plafond_seul_leve_le_tiers_du_bail(self):
+        # #8168 (N2 de #8152) : AMEESH_IDLE_POLL_MAX seul n'est plus ramené au
+        # tiers du bail ; le battement renouvelle seul (#5806).
+        runner = _runner(128, cap=120.0)
+        self.assertTrue(runner.idle_pace_set())
+        self.assertEqual(runner.idle_poll(), 120.0)
+        self.assertEqual(self._worker(runner, 180)._idle_wait(), 120.0)
+
+    def test_plafond_seul_sous_le_tiers_reste_le_plafond(self):
+        self.assertEqual(self._worker(_runner(128, cap=10.0), 180)._idle_wait(), 10.0)
 
     def test_doublure_sans_reglage(self):
         worker = self._worker(types.SimpleNamespace(poll=3.0), 180)
@@ -243,12 +256,35 @@ class ResolutionDansLaPasse(unittest.TestCase):
                 registry.get(object(), "ancien-nom")
                 self.assertEqual(agent_names._PASS_PRIMARIES.get(), {"orch"})
 
+    def test_registry_get_relit_sans_resolveur_apres_le_primaire(self):
+        """#8168 (N3 de #8152) : le primaire confirmé de la passe se relit
+        directement ; un nom inconnu de la passe repasse par le résolveur."""
+        store = types.SimpleNamespace(agents=mock.Mock())
+        store.agents.get.return_value = {"name": "orch"}
+        store.agents.get_exact.return_value = {"name": "orch"}
+        with mock.patch.object(registry.storage, "of", return_value=store):
+            with agent_names.pass_scope():
+                registry.get(object(), "orch")
+                registry.get(object(), "orch")
+                registry.get(object(), "inconnu")
+        self.assertEqual(store.agents.get.call_args_list,
+                         [mock.call("orch"), mock.call("inconnu")])
+        self.assertEqual(store.agents.get_exact.call_args_list, [mock.call("orch")])
 
-_RESOLVE = re.compile(r"SELECT ameesh_resolve_agent_name\(\S+, \S+\) AS name")
+    def test_registry_get_hors_passe_resout(self):
+        store = types.SimpleNamespace(agents=mock.Mock())
+        store.agents.get.return_value = {"name": "orch"}
+        with mock.patch.object(registry.storage, "of", return_value=store):
+            registry.get(object(), "orch")
+        self.assertEqual(store.agents.get.call_args_list, [mock.call("orch")])
+
+
+_RESOLVE = re.compile(r"ameesh_resolve_agent_name\(")
 
 
 class PasseAuReposReelle(PgTestCase):
-    """Une passe au repos réelle : ni marqueur de schéma ni résolution du nom."""
+    """Une passe au repos réelle : ni marqueur de schéma, et au plus une
+    résolution du nom par passe (#8168 : le reste vient du primaire lu)."""
 
     def test_passe_au_repos(self):
         name = "repos8152"
@@ -293,7 +329,15 @@ class PasseAuReposReelle(PgTestCase):
         self.assertLessEqual(
             sum("schema_non_additive_migrations" in sql for sql in steady), 1,
             "the idle pass shares the runner's schema admission (5 s)")
-        self.assertEqual([sql for sql in steady if _RESOLVE.search(sql)], [])
+        # #8168 : le motif voit désormais le résolveur de `registry.get` (sous
+        # forme de sous-requête) ; au plus la première lecture de chaque passe
+        # le paie, les suivantes lisent le primaire confirmé.
+        par_passe = {}
+        for n, sql in statements:
+            if 1 <= n < 4 and _RESOLVE.search(sql):
+                par_passe[n] = par_passe.get(n, 0) + 1
+        self.assertTrue(par_passe, "the pattern must see registry.get's resolver")
+        self.assertTrue(all(count <= 1 for count in par_passe.values()), par_passe)
 
     def test_debit_regle_tenu_par_la_boucle_reelle(self):
         """B impl-11 : bail de 3 s renouvelé par le vrai battement, pas réglé à
