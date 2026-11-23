@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from unittest import mock
 
 from ameesh import (canon, config as config_mod, db as db_mod, exploitation, notify,
@@ -710,7 +711,13 @@ class ExecuteurTest(PgTestCase):
         os.makedirs(self.gate_dir)
         self.state_path = os.path.join(self.gate_dir, "state.json")
         self.ack_path = os.path.join(self.gate_dir, "ack.json")
-        self.journal = os.path.join(self.tmp, "harnais.jsonl")
+        # #8169 : le dossier de classe est recréé à chaque test, mais un
+        # harnais d'un test précédent encore vivant écrit son journal *par
+        # chemin* : son « outil » atterrissait dans le journal du test suivant
+        # et faisait croire que son tour avait commencé (0 « fini » ensuite,
+        # rouge en CI seule sous charge). Un journal propre à ce test rend le
+        # témoin insensible à ces processus retardataires.
+        self.journal = os.path.join(self.tmp, "harnais-%s.jsonl" % uuid.uuid4().hex)
         script = os.path.join(self.tmp, "claude-l112")
         with open(script, "w") as fh:
             fh.write(FAUX_HARNAIS)
@@ -770,6 +777,20 @@ class ExecuteurTest(PgTestCase):
             runner.stop.set()
             runner.wake_all.set()
             fil.join(timeout=60)
+            # #8169 : un worker du test qui survit à son cleanup démarre un
+            # harnais avec l'environnement du test *suivant* (journal,
+            # barrières L112) et son « outil » tombe dans le journal du
+            # suivant. On attend la fin des workers avant de rendre la main.
+            with runner.lock:
+                workers = list(runner.workers.values())
+            fin = time.monotonic() + 60.0
+            for worker in workers:
+                worker.join(timeout=max(0.1, fin - time.monotonic()))
+            with runner.lock:
+                survivants = sorted(w.name for w in runner.workers.values()
+                                    if w.is_alive())
+            self.assertEqual(survivants, [],
+                             "worker(s) survivant(s) au test : %s" % survivants)
         self.addCleanup(arret)
         return runner
 
@@ -800,6 +821,10 @@ class ExecuteurTest(PgTestCase):
         self.addCleanup(relacher)
         runner = self.lance()
         self.assertTrue(attendre(lambda: any("outil" in m for m in self.harnais())))
+        with runner.lock:
+            travailleurs = list(runner.workers.values())
+        self.assertEqual(len(travailleurs), 1)
+        travailleur = travailleurs[0]
         ecrit_etat(self.state_path, etat("draining", 2,
                                          drain_deadline_ts=time.time() + 60))
         # #3846 : la porte est appliquée par un fil (tick 0,25 s) ; sous la
@@ -817,14 +842,20 @@ class ExecuteurTest(PgTestCase):
         # qui rend son unique résultat puis bloque au point sûr.
         with open(avant + ".suite", "w"):
             pass
-        relache = time.monotonic()
-        ack = attendre(lambda: (self.ack() or {}).get("drained") and self.ack())
+        # #8169 : la fermeture au point sûr se lit sur le worker — il passe à
+        # `host_yield == safe point` avant de fermer le tour —, pas sur
+        # l'acquittement `drained` : celui-ci n'arrive qu'après le ménage de
+        # fin de tour, qui dépasse 30 s sous la charge d'une CI de paquet
+        # (mesuré 33 à 37 s, sans dépassement du point sûr). Sans fermeture au
+        # point sûr, seule l'échéance (60 s) poserait un autre motif.
+        self.assertTrue(
+            attendre(lambda: travailleur.host_yield == AgentWorker.HOST_SAFE_POINT,
+                     timeout=30.0),
+            "fermeture au point sûr, pas à l'échéance")
+        ack = attendre(lambda: (self.ack() or {}).get("drained") and self.ack(),
+                       timeout=120.0)
         self.assertTrue(ack, "le retrait doit finir par un acquittement drained")
         self.assertEqual((ack["seq"], ack["state"], ack["held"]), (2, "draining", []))
-        # Le harnais bloque au point sûr : sans fermeture à ce point, seule
-        # l'échéance (60 s) drainerait. 30 s les distingue sous charge (#3832).
-        self.assertLess(time.monotonic() - relache, 30.0,
-                        "fermeture au point sûr, pas à l'échéance")
         vus = self.harnais()
         self.assertFalse(any(m.get("fin") for m in vus), "tour arrêté avant sa fin")
         # l'appel d'outil en cours a fini (point sûr), aucun autre après lui
