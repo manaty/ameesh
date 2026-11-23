@@ -178,19 +178,20 @@ class LaterPassTest(unittest.TestCase):
 
     def test_failed_pass_keeps_the_last_refusal(self):
         refused = dict(state="refused", reason="canon check")
-        (key, data), = self.canons([
-            dict(data=dict(state="failed", canon_ref="c" * 40)),
-            dict(data=dict(state="completed", canon_ref="c" * 40,
-                           canon_refresh=refused))])
+        (key, row), = self.canons([
+            dict(id=3, data=dict(state="failed", canon_ref="c" * 40)),
+            dict(id=2, data=dict(state="completed", canon_ref="c" * 40,
+                                 canon_refresh=refused))])
+        data = row["data"]
         self.assertEqual((key, data["state"], data["canon_refresh"]),
                          ("mesh", "failed", refused))
 
     def test_refusal_on_another_copy_is_not_carried(self):
-        (_, data), = self.canons([
-            dict(data=dict(state="failed", canon_ref="d" * 40)),
-            dict(data=dict(state="completed", canon_ref="c" * 40,
-                           canon_refresh=dict(state="refused")))])
-        self.assertNotIn("canon_refresh", data)
+        (_, row), = self.canons([
+            dict(id=3, data=dict(state="failed", canon_ref="d" * 40)),
+            dict(id=2, data=dict(state="completed", canon_ref="c" * 40,
+                                 canon_refresh=dict(state="refused")))])
+        self.assertNotIn("canon_refresh", row["data"])
 
 
 class UndatableRefusalTest(unittest.TestCase):
