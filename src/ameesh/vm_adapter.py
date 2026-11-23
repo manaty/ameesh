@@ -438,7 +438,8 @@ def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, tar
 
 def elected_wake_due(role, lots, *, now, horizon):
     """A role needs its executor for active mail or a scheduled lot."""
-    if (role.get('releve') not in ('election', 'preference')
+    if (role.get('retired_ts') is not None
+            or role.get('releve') not in ('election', 'preference')
             or role.get('lease_live') or role.get('status') == 'stopped'
             or role.get('mode') not in (None, 'execute')):
         return False
@@ -446,7 +447,7 @@ def elected_wake_due(role, lots, *, now, horizon):
                     and lot.get('state') not in host_idle.DONE
                     and isinstance(lot.get('wake_ts'), (int, float))
                     and lot['wake_ts'] <= now + horizon for lot in lots)
-    return bool(role.get('unread') or role.get('has_pending_prompt') or scheduled)
+    return bool(role.get('vm_wake_mail_id') or role.get('has_pending_prompt') or scheduled)
 
 
 def elected_wake_target(role, candidates, lots, targets, holds, *, now, horizon,
@@ -571,6 +572,18 @@ def prepare_elected_wake(db, policy, host, listing, lots, controls, holds):
                                    now=now, horizon=policy['wake_delay_s'], stalled=stalled) == host:
                 q.return_intent(host)
                 q.request(host, control['generation'], control['release_epoch'], 'busy')
+                scheduled = next((lot for lot in lots if lot.get('assignee') == role['name']
+                                  and lot.get('state') not in host_idle.DONE
+                                  and isinstance(lot.get('wake_ts'), (int, float))
+                                  and lot['wake_ts'] <= now + policy['wake_delay_s']), None)
+                cause = ({'mail_id': role['vm_wake_mail_id']} if role.get('vm_wake_mail_id')
+                         else {'prompt': True} if role.get('has_pending_prompt')
+                         else {'lot_id': scheduled.get('id')} if scheduled else {})
+                tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
+                           "VALUES ('vm.elected_wake',%s,%s,%s::jsonb)",
+                           (host, role.get('project'), json.dumps(
+                               dict(role=role['name'], generation=control['generation'],
+                                    release_epoch=control['release_epoch'], **cause))))
                 return
 
 

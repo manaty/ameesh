@@ -169,6 +169,8 @@ def _unavailable(row: dict, closed: set) -> str:
     Une ligne sans information de bail (appel hors base, test) n'est pas
     déclarée morte : on ne remplace pas une preuve absente par une
     supposition."""
+    if row.get("retired_ts") is not None:
+        return "retired"
     host = str(row.get("host") or "")
     if host and host in closed:
         return "host %s: claims closed" % host
