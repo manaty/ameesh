@@ -1118,6 +1118,17 @@ def is_decision_request(row: Any) -> bool:
             and message_payload(row).get("decision") is not None)
 
 
+def is_decision_answer(row: Any) -> bool:
+    """#8117 : la réponse d'un humain à une demande de décision
+    (`decisions._answer_mail`, `payload.decision_answer`).
+
+    Elle porte `human` et `urgent` à l'envoi ; le runner ne la laisse pourtant
+    ni interrompre un tour en cours ni ouvrir un tour sans regroupement : une
+    rafale de réponses (12 à 09:52Z le 22/11) donne un seul tour, à la fin de
+    celui qui tourne."""
+    return bool(_payload(row).get("decision_answer"))
+
+
 #: #2814: the EXPLICIT request deadline, in the message payload. It is NOT
 #: the signature's `signature_expires_at` (a TTL for the signature, 24 h by
 #: default): a signed owner order must never disappear because its signature

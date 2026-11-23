@@ -5361,9 +5361,12 @@ class AgentWorker(threading.Thread):
         Les agents passent par `AMEESH_INTERRUPT_SENDERS` ; la capacité
         « interrupt » d'une fiche canon s'ajoutera ici. Un urgent non habilité
         est remis comme un message normal (et l'abus est journalisé).
+
+        #8117 : une réponse de décision n'interrompt jamais un tour, même de
+        l'owner : elle est livrée à la fin du tour, regroupée (`_mail_due`).
         """
         sender = (row.get("sender") or row.get("from") or "").strip()
-        if not sender:
+        if not sender or mail.is_decision_answer(row):
             return False
         from . import resident_queue, work
         # L77/B1 : toute entrée humaine est vérifiée AVANT la liste des agents.
@@ -7053,6 +7056,9 @@ class AgentWorker(threading.Thread):
         urgents = self._live_mail(lot_workdir.deliverable_unread(
             cfg, self.db, self.agent, besoin=50, mode="urgent",
             deferred=self._lot_deferred))
+        # #8117 : une réponse de décision n'est ni un urgent ni un humain de
+        # rang 1-2 ; elle attend son regroupement avec le courrier ordinaire.
+        urgents = [m for m in urgents if not mail.is_decision_answer(m)]
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
         for refuse in (m for m in urgents if m not in autorises):
             mid = int(refuse.get("id") or 0)
@@ -7098,7 +7104,8 @@ class AgentWorker(threading.Thread):
         # avant le courrier du jour situé en fin de page : priorité stable.
         messages = mail.priority_order(messages, mail.day_start())
         humans = [m for m in messages
-                  if self._from_human(m) and not mail.passive_reason(m)]
+                  if self._from_human(m) and not mail.passive_reason(m)
+                  and not mail.is_decision_answer(m)]
         if not humans and page_pleine:
             # L77/B13 : le préfixe de `UNREAD_LIMIT` peut être saturé par du
             # courrier ordinaire actif devant un humain. Recherche dédiée,
@@ -7122,7 +7129,8 @@ class AgentWorker(threading.Thread):
                         "server, reading without it" % (self.name, exc))
                 humains_profonds = []
             humans = [m for m in humains_profonds
-                      if self._from_human(m) and not mail.passive_reason(m)]
+                      if self._from_human(m) and not mail.passive_reason(m)
+                      and not mail.is_decision_answer(m)]
         if humans:
             self.nudged = False
             self._reprise_attach = False
@@ -7858,13 +7866,31 @@ class AgentWorker(threading.Thread):
 
         Une cadence `reveil` déclarée (#7632) garde sa règle entière (fenêtre
         depuis l'arrivée ET depuis la fin du tour) : le retard ne la
-        raccourcit pas, il ne s'applique pas à elle."""
+        raccourcit pas, il ne s'applique pas à elle.
+
+        #8117 : un message ordinaire d'une rafale en cours (au moins deux
+        messages du même expéditeur sur le même lot dans `BURST_CAP_S`) n'est
+        en retard qu'au plafond de la rafale, pas à `MAIL_OVERDUE_S`."""
         seuil = float(self.MAIL_OVERDUE_S)
         if seuil <= 0 or reveil_mod.of(self.agent) is not None:
             return False
         now = time.time()
+        rafales = self._note_bursts(rows)
+        cap = max(seuil, float(self.BURST_CAP_S))
+
+        def borne(m: dict) -> float:
+            # B mty-amh-impl-11 : le premier message d'une rafale en fait
+            # partie dès qu'un autre le suit — compté des deux côtés.
+            if mail.is_event(m):
+                return seuil
+            created = float(m.get("created_ts") or now)
+            voisins = (rafales.get(self._burst_key(m)) or {}).values()
+            if sum(1 for ts in voisins if abs(ts - created) < float(self.BURST_CAP_S)) < 2:
+                return seuil
+            return cap
+
         return any(not mail.passive_reason(m) and not mail.maybe_redelivered(m)
-                   and now - float(m.get("created_ts") or now) >= seuil
+                   and now - float(m.get("created_ts") or now) >= borne(m)
                    for m in rows)
 
     def _retard_avant(self) -> float | None:
@@ -7961,11 +7987,114 @@ class AgentWorker(threading.Thread):
         2 à 6 s après le précédent, il attend que la fenêtre ait regroupé ce
         qui suit. Le retard ajouté est au plus d'une fenêtre ; l'urgent et
         l'humain n'attendent jamais.
+
+        #8117 : la fenêtre est adaptative par expéditeur et par lot
+        (`_bursts_elapsed`). Une réponse de décision, bien que marquée humaine
+        et urgente, est regroupée comme le reste.
         """
         window = self.mail_batch()
-        if window <= 0 or any(mail.is_urgent(m) or self._from_human(m) for m in rows):
+        if window <= 0 or any(
+                (mail.is_urgent(m) or self._from_human(m))
+                and not mail.is_decision_answer(m) for m in rows):
             return True
-        return self._window_elapsed(rows, window)
+        return self._bursts_elapsed(rows, window)
+
+    #: #8117 : plafond de la fenêtre adaptative d'un même expéditeur sur un
+    #: même lot — le plus ancien message d'une rafale n'attend jamais plus. Sous
+    #: la borne de la sonde staging (900 s, voir `MAIL_OVERDUE_S`).
+    BURST_CAP_S = 600.0
+
+    @staticmethod
+    def _burst_key(row: dict) -> tuple[str, str]:
+        """#8117 : la rafale d'un message — son expéditeur et son lot."""
+        return (str(row.get("sender") or row.get("from") or ""),
+                str(row.get("work_item_id") or ""))
+
+    def _note_bursts(self, rows: list[dict]) -> dict:
+        """#8117 : l'historique récent des rafales, `{clé: {id: created_ts}}`.
+
+        Chaque message ordinaire actif vu au repos y est noté ; ce qui est
+        plus ancien que deux plafonds (`BURST_CAP_S`) est oublié. Un message
+        déjà remis reste compté : la rafale continue d'un tour à l'autre.
+        Mémoire du worker seulement : un redémarrage repart d'une fenêtre de
+        base (plus court, jamais plus long)."""
+        now = time.time()
+        cap = 2 * float(self.BURST_CAP_S)
+        rafales = getattr(self, "_rafales", {})
+        for row in rows:
+            if row.get("id") is None or mail.is_event(row) or mail.passive_reason(row):
+                continue
+            rafales.setdefault(self._burst_key(row), {})[int(row["id"])] = float(
+                row.get("created_ts") or now)
+        self._rafales = {
+            key: kept for key, kept in (
+                (key, {i: ts for i, ts in ids.items() if now - ts < cap})
+                for key, ids in rafales.items()) if kept}
+        return self._rafales
+
+    def _burst_size(self, key, ts: float) -> int:
+        """#8117 : les messages de la rafale `key` arrivés dans les
+        `BURST_CAP_S` qui précèdent `ts` (lui compris). Comptés depuis
+        l'arrivée et non depuis maintenant : la fenêtre ne rétrécit pas
+        pendant qu'elle attend."""
+        cap = float(self.BURST_CAP_S)
+        return sum(1 for created in (getattr(self, "_rafales", {}).get(key) or {}).values()
+                   if 0 <= ts - created < cap)
+
+    def _burst_window(self, key, base: float, newest_ts: float) -> float:
+        """#8117 : la fenêtre de calme d'une rafale — `base` pour un message
+        seul, doublée à chaque message de plus arrivé dans les `BURST_CAP_S`
+        qui précèdent le plus récent, au plus `BURST_CAP_S`."""
+        n = self._burst_size(key, newest_ts)
+        cap = max(float(self.BURST_CAP_S), base)
+        return min(base * (2 ** max(n - 1, 0)), cap)
+
+    def _bursts_elapsed(self, rows: list[dict], base: float) -> bool:
+        """#8117 : le courrier ordinaire attendu ouvre-t-il un tour ?
+
+        Les messages sont groupés par expéditeur et par lot. Un groupe est dû
+        quand son message le plus récent attend depuis sa fenêtre adaptative
+        (`_burst_window` : elle s'allonge tant que la rafale continue), ou
+        quand le plus ancien attend depuis `max(BURST_CAP_S, base)`. L'attente se compte
+        depuis l'arrivée (horloge de la base) et depuis la première lecture
+        par cet exécuteur (horloge monotone), la plus longue des deux,
+        et la fin du dernier tour retient toujours `base` (#3451). Sinon,
+        l'échéance la plus proche est retenue pour le réveil (#3218).
+        Une cadence `reveil` déclarée (#7632) garde sa fenêtre fixe
+        (`_window_elapsed`, arbitrage du pilote du 23/11 16:18Z)."""
+        if base <= 0:
+            return True
+        self._note_bursts(rows)
+        now, mono = time.time(), time.monotonic()
+        seen = getattr(self, "_batch_seen", {})
+        kept: dict[int, float] = {}
+        groups: dict = {}
+        for row in rows:
+            first = seen.get(int(row["id"]), mono)
+            kept[int(row["id"])] = first
+            created = float(row.get("created_ts") or now)
+            age = max(now - created, mono - first)
+            groups.setdefault(self._burst_key(row), []).append((age, created))
+        self._batch_seen = kept  # les messages remis entre-temps sont oubliés
+        cap = max(float(self.BURST_CAP_S), base)
+        reste = float("inf")
+        for key, ages in groups.items():
+            newest_age, newest_ts = min(ages)
+            window = self._burst_window(key, base, newest_ts)
+            reste = min(reste, window - newest_age, cap - max(ages)[0])
+        fin_tour = getattr(self, "_turn_end_mono", None)
+        if fin_tour is not None:
+            reste = max(reste, base - (mono - fin_tour))
+        if reste <= 0:
+            return True
+        self.note_due_at(now + reste)
+        oldest = min(kept)
+        if getattr(self, "_batch_logged", None) != oldest:
+            self._batch_logged = oldest
+            log_async("[%s] mail batched: %d message(s) from %d sender/lot group(s), "
+                      "turn in %ds at most (window %gs, adaptive up to %gs)"
+                      % (self.name, len(rows), len(groups), int(reste) + 1, base, cap))
+        return False
 
     def _window_elapsed(self, rows: list[dict], window: float) -> bool:
         """L125/#3451 : le plus ancien de `rows` attend-il depuis au moins
@@ -14280,7 +14409,8 @@ class Runner:
             if worker is not None and payload.get("id"):
                 with admission_lock.priority_for(admission_lock.CONTROL):
                     row = mail.get(self.db, int(payload["id"]))
-                if row and mail.is_urgent(row):
+                if row and mail.is_urgent(row) and not mail.is_decision_answer(row):
+                    # #8117 : une réponse de décision réveille sans interrompre
                     prioritaire = worker.interrupt_allowed(row)
                     if not prioritaire:
                         log_async("urgent from %s without interruption: sender not "
