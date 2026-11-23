@@ -1008,9 +1008,14 @@ class TrainRunnerTest(PgTestCase):
             return rows
         train_ci.GitHub._api.side_effect = failed
         with mock.patch.object(train_ci.GitHub, "start") as start, \
-                mock.patch.object(train_git.Repository, "promote") as promote:
+                mock.patch.object(train_git.Repository, "promote") as promote, \
+                mock.patch("ameesh.train_canon.pilot_of", return_value=lambda db: "fixture-pilot"):
             result = passage.step(self.db, self.now + 1)
         self.assertEqual(result["result"], "paused", result)
+        messages = self.db.query("SELECT kind, body FROM agent_mailbox WHERE recipient = %s", ("fixture-pilot",))
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["kind"], "notify")
+        self.assertIn(plan["id"], messages[0]["body"])
         report = self.ops.train_read(self.key)["diagnosis"]
         self.assertEqual(report["packet"]["head"], plan["head"])
         self.assertEqual(report["ci"][0]["attempt"], 1)
