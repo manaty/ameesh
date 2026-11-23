@@ -208,16 +208,22 @@ class DevWork(DevDomain):
     def train_live_projects(self, fresh_s: float) -> list[str]:
         """#8159 : les projets dont un train tourne, vus de tout hôte.
 
-        Un bail `train-service…` vivant (`merge_locks`) prouve qu'un service
-        de train passe quelque part ; la cible d'un projet mise à jour depuis
-        moins de `fresh_s` dit qu'il passe pour ce projet. Sans bail vivant,
-        aucun projet : une ligne ancienne ne fait pas un train."""
+        Une cible est vivante quand le service qui la dessert l'est : le
+        propriétaire de sa réservation (`train:<runner>`, document de la
+        cible) est l'exécuteur d'un bail `train-service…` vivant
+        (`train-service:<runner>:<incarnation>`), et la cible a bougé depuis
+        moins de `fresh_s`. Le bail d'un service qui dessert un autre projet
+        ne fait pas vivre une cible qu'il ne tient pas (B #45894/#45896)."""
         return [str(row.get("project") or "") for row in self.db.query(
-            "SELECT DISTINCT split_part(target_key, ':', 1) AS project"
-            " FROM integration_trains"
-            " WHERE updated_at > clock_timestamp() - make_interval(secs => %s)"
-            " AND EXISTS (SELECT 1 FROM merge_locks WHERE target LIKE 'train-service%%'"
-            " AND expires_at > clock_timestamp())", (float(fresh_s),))]
+            "SELECT DISTINCT split_part(t.target_key, ':', 1) AS project"
+            " FROM integration_trains t JOIN merge_locks l"
+            " ON l.target LIKE 'train-service%%' AND l.expires_at > clock_timestamp()"
+            " AND split_part(l.owner, ':', 1) = 'train-service'"
+            " AND split_part(l.owner, ':', 2) <> ''"
+            " AND 'train:' || split_part(l.owner, ':', 2)"
+            " = t.document -> 'reservation' ->> 'owner'"
+            " WHERE t.updated_at > clock_timestamp() - make_interval(secs => %s)",
+            (float(fresh_s),))]
 
     def train_receipt_kinds(self, work_item_id, frozen_id, *, exact=False) -> list[str]:
         """Les reçus d'allocation/retrait d'un lot (attestation de paquet)."""

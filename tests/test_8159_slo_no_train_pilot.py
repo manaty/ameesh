@@ -178,20 +178,24 @@ class SloNoTrainTest(PgTestCase):
                 self.assertNotIn("orch-amh", briefs)
                 self.assertNotIn("dev1", briefs)
 
-    def live_train(self, *, age_s=60.0, lease=True):
-        """Un train nexlink tenu par un AUTRE hôte : cible centrale et bail."""
+    def live_train(self, *, age_s=60.0, lease=True,
+                   service_runner="runner-nx@autre-hote"):
+        """Un train nexlink tenu par un AUTRE hôte : sa cible centrale, dont
+        la réservation nomme l'exécuteur `runner-nx@autre-hote`, et le bail
+        de service de `service_runner` (celui de nexlink par défaut)."""
         self.db.execute(
             "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
-            " VALUES ('nexlink:develop', 'train:autre-hote', 1, now() + interval '1 hour')")
+            " VALUES ('nexlink:develop', NULL, 1, NULL)")
         self.db.execute(
             "INSERT INTO integration_trains (target_key, document, updated_at)"
-            " VALUES ('nexlink:develop', '{}'::jsonb, now() - make_interval(secs => %s))",
-            (age_s,))
+            " VALUES ('nexlink:develop', %s::jsonb, now() - make_interval(secs => %s))",
+            ('{"reservation": {"key": "nexlink:develop",'
+             ' "owner": "train:runner-nx@autre-hote"}}', age_s))
         if lease:
             self.db.execute(
                 "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
-                " VALUES ('train-service:train-role:3', 'train-service:autre-hote:x',"
-                " 1, now() + interval '10 minutes')")
+                " VALUES ('train-service', %s, 1, now() + interval '10 minutes')",
+                ("train-service:%s:abc123" % service_runner,))
 
     def test_un_train_vivant_sur_un_autre_hote_garde_le_comportement_actuel(self):
         self.live_train()
@@ -201,7 +205,10 @@ class SloNoTrainTest(PgTestCase):
         self.assertNotIn("no train declared", alert["detail"])
 
     def test_une_cible_ancienne_ou_sans_bail_ne_fait_pas_un_train(self):
-        for kwargs in ({"age_s": 3 * 24 * HEURE}, {"lease": False}):
+        # B #45894/#45896 : le bail vivant d'un service qui dessert un autre
+        # projet (ameesh) ne fait pas vivre la cible nexlink fraîche.
+        for kwargs in ({"age_s": 3 * 24 * HEURE}, {"lease": False},
+                       {"service_runner": "runner-amh@ameesh-hote"}):
             with self.subTest(**kwargs):
                 self.db.execute("DELETE FROM integration_trains")
                 self.db.execute("DELETE FROM merge_locks")
