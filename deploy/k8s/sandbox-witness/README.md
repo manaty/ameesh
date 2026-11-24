@@ -30,10 +30,11 @@ adoption du **même** Job (même UID, un seul Job), bail perdu (`stale`, reprise
 (`duplicate`/`replayed`) et Job supprimé sans observation (`orphaned`, événement
 `sandbox.orphan`, alerte `sandbox_orphan` après expiration du bail).
 
-Deux tests sans cluster complètent la preuve : le témoin produit exactement le
-canon JCS attendu et ne lit que les deux fichiers du Secret du tour (aucun
-import ameesh, aucun DSN, aucune clé de fournisseur) ; la resynchronisation du
-canon distingue `revoked`, `changed` (limites comprises) et `same`.
+Trois tests sans cluster complètent la preuve : le témoin produit exactement
+le canon JCS attendu, ne lit que les deux fichiers du Secret du tour (aucun
+import ameesh, aucun DSN, aucune clé de fournisseur) et appelle le relais avec
+le jeton du tour sur la bonne route ; la resynchronisation du canon distingue
+`revoked`, `changed` (limites comprises) et `same`.
 
 ## Lancement local
 

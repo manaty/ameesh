@@ -132,6 +132,8 @@ class _RelayUpstream:
     def __init__(self):
         provider = self
         self.requests = []
+        self.paths = []
+        self.headers_seen = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -140,6 +142,8 @@ class _RelayUpstream:
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers.get("content-length") or 0))
                 provider.requests.append(json.loads(raw))
+                provider.paths.append(self.path)
+                provider.headers_seen.append({k.lower(): v for k, v in self.headers.items()})
                 payload = json.dumps({
                     "id": "msg-kind",
                     "type": "message",
@@ -248,6 +252,25 @@ class WitnessContractTest(unittest.TestCase):
         }
         self.assertEqual(module.canonical(envelope).encode("utf-8"),
                          jcs.canonicalize(envelope, doubles=True))
+
+    def test_witness_relay_call_uses_the_turn_token_on_the_wire(self):
+        module = witness_module()
+        upstream = _RelayUpstream()
+        self.addCleanup(upstream.close)
+        base = "http://127.0.0.1:%d" % upstream.server.server_address[1]
+        token = "amsb1." + "t" * 43
+        with tempfile.TemporaryDirectory(prefix="kind-turn-") as directory:
+            with open(os.path.join(directory, "relay_token"), "w",
+                      encoding="utf-8") as stream:
+                stream.write(token)
+            module.TURN_DIR = directory
+            module.relay_call({"relay_url": base})
+
+        self.assertEqual(upstream.paths,
+                         ["/api/exec/v1/llm/deepseek/v1/messages"])
+        self.assertEqual(upstream.headers_seen[0].get("x-api-key"), token)
+        self.assertEqual(upstream.requests[0]["model"], "deepseek-flash")
+        self.assertEqual(upstream.requests[0]["messages"][0]["role"], "user")
 
     def test_witness_reads_only_the_turn_secret(self):
         text = read_witness()
