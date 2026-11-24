@@ -230,27 +230,38 @@ class ChatWakeDeliveryTest(ChatWakeCase):
 
 
 class ChatWakeAlertTest(ChatWakeCase):
-    """#8196 lit exactement ce que la veille écrit : une échéance consommée
-    n'est plus `wake_undelivered`."""
+    """#8196 lit exactement ce que la veille écrit : l'échéance échue n'est
+    signalée `wake_undelivered` qu'après la grâce de suivi, et sa
+    consommation la fait passer `delivered_without_note`, grâce comprise."""
 
     def test_delivery_lifts_the_undelivered_reason(self):
         from ameesh import exploitation
         check = getattr(exploitation, "_follow_ups_unfollowed", None)
         if check is None:
             self.skipTest("alerte #8196 absente de cette tête")
+        grace = exploitation.FOLLOW_UP_GRACE_S
         lot = self.arm(time.time() - 1)
-        now = time.time()
+        armed = time.time()
         listing = storage.of(self.db).operations.listing()
-        reasons = [a["reason"] for a in check(self.db, listing, now + 60)
+        reasons = [a["reason"] for a in check(self.db, listing, armed + 60)
                    if a.get("lot") == lot]
-        self.assertEqual(reasons, [])
+        self.assertEqual(reasons, [], "la grâce de suivi court encore")
+        [alert] = [a for a in check(self.db, listing, armed + grace + 1)
+                   if a.get("lot") == lot]
+        self.assertEqual(alert["reason"], "wake_undelivered")
+
         veille = self.veille()
         veille.observe([], [])
         veille._pump_wakes()
         self.assertIsNotNone(veille.due())
         veille.delivered()
         veille._pump_wakes()
-        [alert] = [a for a in check(self.db, listing, now + 60) if a.get("lot") == lot]
+        delivered = time.time()
+        self.assertEqual([a for a in check(self.db, listing, delivered + 60)
+                          if a.get("lot") == lot], [],
+                         "la délivrance ouvre un nouvel épisode sous la grâce")
+        [alert] = [a for a in check(self.db, listing, delivered + grace + 1)
+                   if a.get("lot") == lot]
         self.assertEqual(alert["reason"], "delivered_without_note")
 
 
