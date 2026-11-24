@@ -605,17 +605,23 @@ def credentials_timer_lines(run=_systemctl) -> tuple[bool, list[str]]:
     Les deux portées sont lues : un serveur interrogé par `runuser -l ameesh`
     n'a pas de gestionnaire utilisateur, et une unité utilisateur posée à la
     main ne doit pas faire un faux KO quand l'unité système vit. Une seule
-    unité active et activée suffit. Sans aucune lecture systemd, on ne
-    conclut pas (canon §3)."""
+    unité active et activée suffit. Si une portée est illisible, son absence
+    ne peut pas être déduite de l’absence de l’unité dans l’autre portée
+    (#8186)."""
     found = []
-    unreadable = 0
+    unreadable = []
+    absent = 0
     for scope, label in (((), "user"), ((SYSTEM,), "system")):
         load = _timer_value(run(*scope, "show", CREDENTIALS_TIMER,
                                 "-p", "LoadState", "--value"))
         if load is None:
-            unreadable += 1
+            unreadable.append(label)
             continue
         if load != "loaded":
+            if load == "not-found":
+                absent += 1
+            else:
+                unreadable.append(label)
             continue
         state = _timer_value(run(*scope, "show", CREDENTIALS_TIMER,
                                  "-p", "ActiveState", "--value")) or "unknown"
@@ -624,7 +630,7 @@ def credentials_timer_lines(run=_systemctl) -> tuple[bool, list[str]]:
     for label, state, enabled in found:
         if state == "active" and enabled in ENABLED_STATES:
             return False, ["%s active (%s unit)" % (CREDENTIALS_TIMER, label)]
-    if not found and unreadable < 2:
+    if not found and absent == 2:
         return True, [
             "KO — %s is not installed: the credential sentinel never probes, "
             "so an expiry is silent" % CREDENTIALS_TIMER,
@@ -633,8 +639,16 @@ def credentials_timer_lines(run=_systemctl) -> tuple[bool, list[str]]:
             "it would not survive the next update",
         ]
     if not found:
-        return False, ["not checked: systemd unavailable — %s not verified"
-                       % CREDENTIALS_TIMER]
+        lines = ["not checked: systemd unavailable (%s scope unreadable) — "
+                 "%s not verified" % (", ".join(unreadable), CREDENTIALS_TIMER)]
+        if "user" in unreadable:
+            lines.append(
+                "             in the ameesh user session, re-run: "
+                'XDG_RUNTIME_DIR=/run/user/$(id -u) '
+                'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus '
+                'systemctl --user show '
+                "%s -p LoadState -p ActiveState" % CREDENTIALS_TIMER)
+        return False, lines
     detail = "; ".join("%s unit %s (%s)" % (label, state, enabled)
                        for label, state, enabled in found)
     label = found[0][0]
