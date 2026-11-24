@@ -1001,6 +1001,30 @@ def check(profile: Profile, environ=None) -> list[str]:
     return ([refused] if refused else []) + _check(profile, environ)
 
 
+def declared_environ(cfg, environ=None) -> dict:
+    """L'environnement de l'affichage, complété des variables de clé DÉCLARÉES.
+
+    #8201 : `accounts list` est lancé depuis un shell qui ne porte pas la clé
+    (`DEEPSEEK_API_KEY` vit dans l'EnvironmentFile de l'exécuteur) ; `check`
+    y voyait une variable manquante et le compte s'affichait « invalid » alors
+    que ses tours partaient. Une variable absente ici est donc tenue pour
+    déclarée, exactement comme `account_turn._declared_environ` (même
+    compensation pour l'attribution) : c'est l'exécuteur qui la porte, et un
+    vrai problème d'authentification se lit `auth_blocked` sur la ligne de
+    l'agent. Seul le NOM de la variable est repris, jamais sa valeur.
+    """
+    base = dict(os.environ if environ is None else environ)
+    try:
+        declared = parse(getattr(cfg, "accounts", None) or {})
+    except AccountError:
+        return base
+    for items in declared.values():
+        for profile in items:
+            if profile.key_env and not base.get(profile.key_env):
+                base[profile.key_env] = "declared"
+    return base
+
+
 def _check(profile: Profile, environ=None) -> list[str]:
     environ = os.environ if environ is None else environ
     from . import setup_token
@@ -3634,7 +3658,8 @@ def automatic(db, host: str, harness: str, *, by: str) -> bool:
 def report(cfg, db, book, *, now: float | None = None,
            harnesses: list[str] | None = None,
            evaluate_fn: Callable | None = None,
-           record: bool = True) -> list[dict]:
+           record: bool = True,
+           environ: dict | None = None) -> list[dict]:
     """Une ligne par compte déclaré : actif, forcé, état, jauges, retenue.
 
     Lecture seule : aucune bascule n'est faite ici. `record=False` (L71) :
@@ -3651,6 +3676,12 @@ def report(cfg, db, book, *, now: float | None = None,
     (`reserve=True`, L242b), comme `choose` — l'état, les plafonds affichés et
     le prochain choix sont ceux de la pause : un compte dans la bande de
     réserve n'est ni « ok » ni proposé.
+
+    #8201 : une clé `api_key_env` absente de CE shell n'est pas manquante —
+    l'exécuteur la porte (EnvironmentFile). L'évaluation la tient pour
+    déclarée (`declared_environ`) et la ligne porte `key_env_unverified`,
+    pour que l'affichage dise « portée par l'exécuteur, non vérifiée ici »
+    au lieu d'« invalid ».
     """
     now = time.time() if now is None else now
     from . import account_claims
@@ -3663,6 +3694,12 @@ def report(cfg, db, book, *, now: float | None = None,
                                                      shares=shares)
                 for harness, items in with_canon_pace(
                     cfg, parse(getattr(cfg, "accounts", None) or {})).items()}
+    # #8201 : l'environnement de CE shell, complété des clés déclarées que
+    # l'exécuteur porte (EnvironmentFile). `shell` garde la vérité de
+    # l'affichage : une clé qui n'y est pas est dite non vérifiée, pas
+    # manquante.
+    shell = os.environ if environ is None else environ
+    effective = declared_environ(cfg, shell)
     store = storage.of(db).accounts if db is not None else None
     rows: list[dict] = []
     for harness, items in declared.items():
@@ -3682,8 +3719,12 @@ def report(cfg, db, book, *, now: float | None = None,
                 # proposait un compte que la garde mettait en pause sur une
                 # autre fenêtre, et l'alerte `plan_underused` promettait la
                 # même capacité.
-                result = (evaluate_fn or evaluate)(
-                    book, profile, items, now, record=record, reserve=True)
+                if evaluate_fn is None:
+                    result = evaluate(book, profile, items, now, environ=effective,
+                                      record=record, reserve=True)
+                else:
+                    result = evaluate_fn(book, profile, items, now, record=record,
+                                         reserve=True)
             except Exception as exc:  # noqa: BLE001 — #1600 : jauge illisible
                 # #1600 : une lecture en erreur ne fait pas tomber l'affichage
                 # (`ameesh accounts list`) : le compte reste listé, sans marge
@@ -3699,6 +3740,11 @@ def report(cfg, db, book, *, now: float | None = None,
                 "scope": profile.scope,
                 "type": profile.kind,
                 "where": profile.describe(),
+                # #8201 : clé `api_key_env` absente de CE shell — portée par
+                # l'exécuteur, non vérifiée ici (le nom seul, jamais la valeur)
+                "key_env_unverified": (
+                    profile.key_env
+                    if profile.key_env and not shell.get(profile.key_env) else ""),
                 "active": profile.name == active_name,
                 "forced": bool((active or {}).get("forced")) and profile.name == active_name,
                 # #3755 : l'échéance du forçage (epoch), None sans forçage
@@ -3871,6 +3917,13 @@ def format_rows(rows: list[dict]) -> str:
             lines.append("%-9s %-14s %-7s %-8s ↳ reading not current: "
                          "window reset since the reading (unverified)"
                          % ("", "", "", ""))
+        if row.get("key_env_unverified"):
+            # #8201 : ce shell ne porte pas la clé, l'exécuteur si — on ne dit
+            # ni « invalid » (le compte travaille) ni « vérifiée » (rien ici ne
+            # le prouve). Le nom de la variable seulement, jamais sa valeur.
+            lines.append("%-9s %-14s %-7s %-8s ↳ key %s carried by the executor, "
+                         "not verifiable from this shell"
+                         % ("", "", "", "", row["key_env_unverified"]))
         if row["reason"]:
             lines.append("%-9s %-14s %-7s %-8s ↳ %s" % ("", "", "", "", row["reason"]))
         if row.get("pace_raises"):

@@ -586,10 +586,19 @@ def ensure_ref(project, ref, sha):
 
 
 def gh(project, args):
-    code, out, err = rc.plan_github.Gh().run(args)
+    # #8182: GH_DEBUG=api makes gh print the refusal's status, headers and
+    # body on stderr. The shared quota detector needs the original response
+    # (a secondary limit's Retry-After is not replayed by /rate_limit).
+    code, out, err = rc.plan_github.Gh(
+        env=dict(os.environ, GH_DEBUG="api")).run(args)
     if code:
-        raise rc.TransientReleaseError("Nexlink GitHub operation failed: %s" %
-                                       " ".join((err or out).split())[:300])
+        detail = rc.plan_github.gh_error_line(err, out)
+        error = rc.TransientReleaseError(
+            "Nexlink GitHub operation failed: %s" % detail)
+        refusal = rc.plan_github.debug_refusal(err)
+        if refusal is not None:
+            error.github_refusal = refusal
+        raise error
     return out
 
 
@@ -1371,6 +1380,16 @@ def error_body(slot, text, transient):
             "n'a été posé pour cette coupure ; corriger la cause, puis "
             "la relancer si elle reste due."
             % (" (erreur transitoire)" if transient else "", text))
+
+
+def pending_version(slot):
+    """The version of the frozen candidate a quota wait suspends (#8182).
+
+    The core reads this hook through the release provider, so the state key
+    stays in the module that owns it and no client name enters the core
+    (#7660). Empty when no candidate is pending."""
+    pending = slot.get("pending_nexlink") or {}
+    return str(pending.get("version") or "")
 
 
 def _handoff_body(pending):

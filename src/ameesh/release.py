@@ -325,7 +325,150 @@ def _alarm_key(text: str, holders: list[dict], tag: dict | None) -> str:
                       ensure_ascii=False, sort_keys=True)
 
 
-def _report_error(cfg, db, project, exc, now: float) -> None:
+#: #8182: after a GitHub quota reset, let the recharge settle before retrying.
+QUOTA_RESUME_MARGIN_S = 60.0
+
+
+def _quota_probe_resource(text: str) -> str | None:
+    """The API bucket a GitHub refusal may have exhausted, else None (#8182).
+
+    The text only routes the probe: a GitHub 403/429 is graded by the shared
+    headers, not by its wording (REST vs GraphQL). Other errors — a git
+    timeout, a rights 404 — never buy a probe. The markers are the ones
+    `plan_github.SharedReads.note` already uses.
+    """
+    from . import plan_github
+    lowered = str(text or "").lower()
+    if ("github" not in lowered and "gh:" not in lowered
+            and "gh api" not in lowered):
+        return None
+    if not any(mark in lowered for mark in (
+            "http 403", "http 429", "api rate limit exceeded",
+            plan_github.SECONDARY_LIMIT_MARK)):
+        return None
+    return "graphql" if "graphql:" in lowered else "core"
+
+
+def _quota_probe():
+    """`gh api -i rate_limit`: the headers and body, spending no quota."""
+    from . import plan_github
+    return plan_github.gh_api_response(
+        plan_github.Gh(timeout=15.0), "rate_limit")
+
+
+def _quota_wait_until(cfg, text: str, now: float, refusal=None) -> float | None:
+    """When the shared detector says GitHub is recharged, else None (#8182).
+
+    The original refusal (status, headers, body, when the wrapper could keep
+    it) is graded first: only it carries a secondary limit's `Retry-After`.
+    Then the `/rate_limit` probe covers a primary budget. Both go through
+    `plan_github.SharedReads.note`, the detector the CI and GitHub readers
+    already use; nothing here parses quota headers by hand.
+    """
+    from . import plan_github
+    resource = _quota_probe_resource(text)
+    if resource is None:
+        return None
+    state_dir = str(getattr(cfg, "state_dir", "") or "")
+    if not state_dir:
+        return None
+    try:
+        reads = plan_github.SharedReads(state_dir, priority="gate")
+        until = reads.blocked(now, resource)
+        if until is not None:
+            return float(until)
+        if refusal is not None:
+            try:
+                status, headers, body = refusal
+            except (TypeError, ValueError):
+                status = None
+            else:
+                until = reads.note(headers, status=status, now=now,
+                                   resource=resource, body=body)
+                if until is not None:
+                    return float(until)
+        status, headers, body = _quota_probe()
+        if status == 200 and body:
+            # The body names each bucket; the response headers only describe
+            # the default core one. `note` still does the grading below.
+            try:
+                payload = json.loads(body)
+                row = ((payload.get("resources") or {}).get(resource) or {})
+            except (ValueError, AttributeError):
+                row = {}
+            if isinstance(row, dict) and row.get("remaining") == 0 \
+                    and isinstance(row.get("reset"), (int, float)):
+                headers = {"X-RateLimit-Remaining": "0",
+                           "X-RateLimit-Reset": str(int(row["reset"])),
+                           "X-RateLimit-Resource": resource}
+        until = reads.note(headers, status=status, now=now,
+                           resource=resource, body=body)
+        return float(until) if until is not None else None
+    except Exception:  # noqa: BLE001 - a quota probe never masks the failure
+        return None
+
+
+def _report_quota_wait(cfg, db, project, slot, state, text, cutoff_at, label,
+                       now: float, reset: float) -> None:
+    """One non-urgent notice per quota window, plus the durable wait (#8182).
+
+    The wait is stored before mailing, so the next ticks skip the engine even
+    if delivery fails; `release_cutoff.execute` reads it before dispatching to
+    the model. The key is the reset instant: a new window may report again, a
+    repeated failure in the same window never does.
+    """
+    from . import release_cutoff
+    resume_at = max(float(reset), now) + QUOTA_RESUME_MARGIN_S
+    key = "%d" % int(reset)
+    if (slot.get("quota_wait_key") == key
+            and float(slot.get("quota_wait_until") or 0) > now):
+        return
+    slot["quota_wait_key"] = key
+    slot["quota_wait_reset"] = float(reset)
+    slot["quota_wait_until"] = resume_at
+    slot["quota_wait_at"] = now
+    slot["last_error_cutoff"] = cutoff_at
+    slot["last_error"] = "GitHub quota exhausted (reset at %s)" % time.strftime(
+        "%H:%M:%SZ", time.gmtime(reset))
+    slot["last_error_at"] = now
+    # A quota notice is not the previous alarm: a failure after the wait must
+    # be able to speak again (the core model's key is not rewritten here).
+    slot.pop("last_error_key", None)
+    release_cutoff.save_state(cfg, state)
+    if db is None:
+        return
+    when = time.strftime("%H:%M:%SZ", time.gmtime(reset))
+    resume = time.strftime("%H:%M:%SZ", time.gmtime(resume_at))
+    body = (
+        "Coupe %s en attente : quota GitHub épuisé (recharge à %s, marge de "
+        "%ds). Reprise automatique à %s ; l'état de reprise est conservé et "
+        "les gestes déjà faits restent acquis. Aucune action attendue.\n\n"
+        "Détail : %s"
+        % (project.name, when, int(QUOTA_RESUME_MARGIN_S), resume, text))
+    report = {"schema": release_cutoff.SCHEMA, "result": "waiting-quota",
+              "project": project.name, "cutoff_at": cutoff_at, "label": label,
+              "completed_at": now, "reset_at": float(reset),
+              "resume_at": resume_at, "message": text}
+    if cutoff_at is not None:
+        # The report keeps the pending candidate's version when the model's
+        # provider knows it (#7660: no client state key in the core).
+        version = "quota-wait"
+        try:
+            provider = release_cutoff.release_provider(project.model)
+            reader = getattr(provider, "pending_version", None)
+            if callable(reader):
+                version = str(reader(slot) or version)
+        except Exception:  # noqa: BLE001 - a report name never masks the wait
+            pass
+        try:
+            report["report_path"] = release_cutoff.write_report(
+                cfg, project, dict(report, version=version))
+        except Exception:  # noqa: BLE001 - the alert still goes out
+            pass
+    release_cutoff.send_report(cfg, db, project, body, report, urgent=False)
+
+
+def _report_error(cfg, db, project, exc, now: float) -> bool:
     """Mail an error once per cutoff, transient or definitive (#6014).
 
     A transient error used to reach the journal only: a cutoff could fail
@@ -337,12 +480,15 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
     tag whose own staging holds the lock is information, never "aucun tag".
     #6584: the de-duplication key is the cutoff and the holders' identity,
     never the lease expiry renewed at every tick.
+    #8182: a GitHub quota rejection is not a failed cutoff: the reset is
+    stored and one non-urgent notice replaces the per-tick urgent event.
+    Returns True when the failure was a quota wait (not a failure).
     """
     from . import release_cutoff
     if getattr(exc, "already_reported", False):
         # #6039 N8: the raiser already sent the one coherent message (refused
         # preflight closes its pending; there is no state to resume).
-        return
+        return False
     transient = isinstance(exc, release_cutoff.TransientReleaseError)
     busy = isinstance(exc, release_cutoff.ReleaseBusy)
     try:
@@ -356,6 +502,12 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
             # A missing calendar can itself be the failure being reported.
             # Keep the previous once-per-error behavior until it is readable.
             cutoff_at, _label = None, ""
+        quota_reset = _quota_wait_until(
+            cfg, text, now, getattr(exc, "github_refusal", None))
+        if quota_reset is not None:
+            _report_quota_wait(cfg, db, project, slot, state, text,
+                               cutoff_at, _label, now, quota_reset)
+            return True
         if project.model in release_cutoff.CORE_RELEASE_MODELS:
             # #6520: before alarming, read the cutoff's tag and who holds the
             # staging door. A tag published at/after the cutoff is a durable
@@ -378,11 +530,11 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
             if busy and "another release holds" in text:
                 # The running tick on this host owns the cutoff and reports
                 # it; a lock contention is not a release failure.
-                return
+                return False
             if tag and busy and same:
                 if (slot.get("staging_info_key") == alarm_key
                         and slot.get("staging_info_cutoff") == cutoff_at):
-                    return
+                    return False
                 slot["staging_info_cutoff"] = cutoff_at
                 slot["staging_info_key"] = alarm_key
                 slot["staging_info"] = text
@@ -411,10 +563,10 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
                             cfg, project, dict(report, version=tag["version"]))
                     release_cutoff.send_report(cfg, db, project, body, report,
                                                urgent=False)
-                return
+                return False
             if (slot.get("last_error_key") == alarm_key
                     and slot.get("last_error_cutoff") == cutoff_at):
-                return
+                return False
             slot["last_error_cutoff"] = cutoff_at
             slot["last_error_key"] = alarm_key
             slot["last_error"] = text
@@ -451,10 +603,10 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
                         cfg, project, dict(report,
                                            version=tag["version"] if tag else "refused"))
                 release_cutoff.send_report(cfg, db, project, body, report, urgent=True)
-            return
+            return False
         if (slot.get("last_error") == text
                 and slot.get("last_error_cutoff") == cutoff_at):
-            return
+            return False
         slot["last_error_cutoff"] = cutoff_at
         slot["last_error"] = text
         slot["last_error_at"] = now
@@ -484,6 +636,7 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
             release_cutoff.send_report(cfg, db, project, body, report, urgent=True)
     except Exception:  # a report never masks the original error
         pass
+    return False
 
 
 CONFIG_ERROR_INTERVAL_S = 6 * 3600.0
@@ -598,8 +751,10 @@ def _release_tick(cfg, args, declared) -> int:
                 print("%s: %s" % (name, exc), file=sys.stderr)
                 # #6014: a transient failure is still a cutoff not done; say
                 # it once per cutoff instead of leaving it in the journal.
-                _report_error(cfg, db, project, exc, now)
-                status = 1
+                # #8182: a quota wait is scheduled, not a failed cutoff, but
+                # it never clears a failure an earlier project recorded.
+                if not _report_error(cfg, db, project, exc, now):
+                    status = 1
                 continue
             except release_cutoff.ReleaseError as exc:
                 print("%s: %s" % (name, exc), file=sys.stderr)
@@ -616,7 +771,8 @@ def _release_tick(cfg, args, declared) -> int:
                                             "already-recorded", "not-due", "missed",
                                             "kept-active", "waiting-ci", "waiting-staging",
                                             "empty", "skipped", "waiting-attestation",
-                                            "held-attestation", "staging-unattested"):
+                                            "held-attestation", "staging-unattested",
+                                            "waiting-quota"):
                 status = 1
         return status
     finally:

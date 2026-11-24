@@ -967,7 +967,7 @@ tests) :
   (`$AMEESH_TMPDIR` est le même) et, pour un tour qui porte un lot, un
   sous-dossier `ameesh-lot-<id>` gardé d'un tour à l'autre du même lot,
   atteint par un alias court sous `~/.t/<mesh>/l<lot>-<empreinte>` (#8128 :
-  `len($TMPDIR) + 40 <= 107`, pour qu'une socket AF_UNIX du forkserver
+  `len($TMPDIR) + 40 <= 103`, pour qu'une socket AF_UNIX du forkserver
   tienne) ;
   `docker save -o "$TMPDIR/image.tar"`, `git clone … "$TMPDIR/relecture"`,
   `jest --cacheDirectory "$TMPDIR/jest"` ;

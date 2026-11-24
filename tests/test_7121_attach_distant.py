@@ -33,7 +33,8 @@ from ameesh.runner import run_attach
 from .support import FAKEBIN, PgTestCase
 from .test_7120_attach_relay import (AGENT, COMMAND, HOST, HOST_PUBLIC_KEY,
                                      HOST_SIGNING_KEY, TOKEN, FakeVerifier,
-                                     LOCAL_IO_TIMEOUT, SESSION_BUDGET,
+                                     HOST_REQUEST_TIMEOUT, LOCAL_IO_TIMEOUT,
+                                     SESSION_BUDGET,
                                      _ObservedConnector, _wait_host_connected,
                                      make_grant)
 
@@ -107,7 +108,11 @@ class StationSessionTest(unittest.TestCase):
             host=HOST, agents=(AGENT,), plaintext_loopback=True, command=COMMAND,
             host_signing_key=HOST_SIGNING_KEY, max_sessions=4,
             max_session_seconds=SESSION_BUDGET,
-            request_timeout=SESSION_BUDGET, keepalive=1.0), self.verifier,
+            # #8202 : HostConfig plafonne request_timeout à 300 s ; sous psql
+            # SESSION_BUDGET vaut 10 × 150 s (échelle 5 de #5629) et le poste
+            # refusait la configuration avant même d'ouvrir la session, ce qui
+            # rougissait la part psql du nocturne. Même borne que le banc 7120.
+            request_timeout=HOST_REQUEST_TIMEOUT, keepalive=1.0), self.verifier,
             logger=self.logger)
         self.thread = threading.Thread(target=self.connector.run_forever, daemon=True)
         self.thread.start()

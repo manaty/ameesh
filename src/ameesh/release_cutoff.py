@@ -3365,12 +3365,19 @@ def execute(cfg, db, project: ProjectRelease, *, now: float | None = None,
             version: str | None = None) -> dict:
     """One release attempt; the report is the durable answer."""
     now = time.time() if now is None else float(now)
+    state = load_state(cfg)
+    state_slot = project_state(state, project.name)
+    # #8182: a GitHub quota rejection stores the reset plus a margin. Every
+    # tick before it is a quiet no-op; no engine call, no new alert.
+    wait_until = float(state_slot.get("quota_wait_until") or 0.0)
+    if not force and wait_until > now:
+        return {"schema": SCHEMA, "result": "waiting-quota",
+                "project": project.name, "resume_at": wait_until,
+                "completed_at": now}
     provider = release_provider(project.model)
     if provider is not None:
         return provider.execute(cfg, db, project, now=now, force=force,
                                 no_staging=no_staging, version=version)
-    state = load_state(cfg)
-    state_slot = project_state(state, project.name)
     rules, source = compiled_rules(cfg, project.name)
     project = with_staging_topology(cfg, project)
     at, label = cutoff_slot(rules, now)

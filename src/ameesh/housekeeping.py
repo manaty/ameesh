@@ -389,11 +389,13 @@ DEFAULT_SWEEP_AGE_S = 6 * 3600.0
 DEFAULT_SWEEP_PREFIXES = ("ameesh-",)
 #: #8020 : sous-dossier temporaire d'un lot, sous le dossier de l'agent
 LOT_TMP_PREFIX = "ameesh-lot-"
-#: #8128 : longueur maximale d'un chemin de socket AF_UNIX (`sun_path` du
-#: noyau, NUL compris) et marge qu'un `TMPDIR` doit laisser sous cette borne
-#: aux noms que les outils ajoutent (`multiprocessing` :
-#: `pymp-…/listener-…`). `len(TMPDIR) + 40 <= 107`.
-AF_UNIX_PATH_MAX = 107
+#: #8128 : longueur maximale PORTATIVE d'un chemin de socket AF_UNIX et marge
+#: qu'un `TMPDIR` doit laisser sous cette borne aux noms que les outils
+#: ajoutent (`multiprocessing` : `pymp-…/listener-…`). `sun_path` vaut 104
+#: octets NUL compris sous Darwin et 108 sous Linux : on retient la plus
+#: stricte (103 caractères), pour que l'alias tienne sur les deux plateformes.
+#: `len(TMPDIR) + 40 <= 103`.
+AF_UNIX_PATH_MAX = 103
 LOT_TMP_SOCKET_MARGIN = 40
 #: #8128 : racine courte des alias de `TMPDIR` par lot, sur disque et hors
 #: /tmp et /dev/shm (sous le home, sinon sous l'état d'ameesh)
@@ -1468,7 +1470,7 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
 
     #8128 : le sous-dossier du lot est atteint par un **alias court** sous
     `<home>/.t/<mesh>/l<lot>-<empreinte>` (ou, à défaut, sous
-    `<état>/.t/<mesh>`), pour que `len(TMPDIR) + 40 <= 107` et qu'une socket
+    `<état>/.t/<mesh>`), pour que `len(TMPDIR) + 40 <= 103` et qu'une socket
     AF_UNIX du forkserver tienne. L'alias est un lien vers le dossier géré :
     le quota, le verrou, la lecture des processus et les copies Git de #8020
     restent donc inchangés. Sans racine candidate qui tienne la marge,

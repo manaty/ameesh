@@ -37,7 +37,7 @@ def _write(path: str, size: int = 10) -> None:
 class _Base(unittest.TestCase):
     def setUp(self) -> None:
         # #8128 : le banc doit avoir un chemin assez court pour la racine
-        # courte (`len(TMPDIR) + 40 <= 107`) ; `$TMPDIR` d'une session de lot
+        # courte (`len(TMPDIR) + 40 <= 103`) ; `$TMPDIR` d'une session de lot
         # est justement le chemin long que ce lot corrige.
         try:
             self.base = tempfile.mkdtemp(prefix=".ameesh-8020-",

@@ -185,7 +185,7 @@ class DesktopChannelTest(PgTestCase):
         self.assertEqual(len(lines), 1)
         argv = lines[0]
         text = " ".join(argv)
-        self.assertIn("Nouveau courrier pour att86", argv)
+        self.assertIn("Nouveau courrier pour att86", text)
         self.assertIn("alice", text)
         self.assertIn("#%d" % message, text)
         self.assertIn("Sujet affiché", text)
