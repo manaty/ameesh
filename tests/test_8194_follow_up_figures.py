@@ -3,7 +3,8 @@
 import time
 
 from ameesh import (debit, estimates, exploitation, file_decoupage, model_evaluation_report,
-                    progress, registry, stagnation, storage, take_refusals, work)
+                    plan, progress, projects, registry, stagnation, storage, take_refusals,
+                    work)
 from ameesh import work_lifecycle as lifecycle
 
 from .support import PgTestCase
@@ -29,6 +30,7 @@ class FollowUpFiguresTest(PgTestCase):
                             actor="dev", estimate="1h", footprint=[])
         work.move(self.db, building["id"], "build")
         work.add(self.db, title="Free", app="ameesh", footprint=[])
+        self.lots = [delivered["id"], building["id"]]
 
     def follow_ups(self):
         """Open, due, done and dropped follow-ups of an agent without lots,
@@ -63,6 +65,13 @@ class FollowUpFiguresTest(PgTestCase):
                          progress.timeline(self.db, self.cfg, now=now)["lots"]],
             "stale": sorted(int(row["id"]) for row in
                             stagnation.stagnant_lots(self.db, now=now, cfg=self.cfg)),
+            # work list/show and the API read `stale` through plan.annotate
+            "annotated_stale": [row["stale"] for row in plan.annotate(
+                self.db, [work.get(self.db, ident) for ident in self.lots], now=now)],
+            # open lots of the progress page and `ameesh projects`
+            "projects": {group["name"]: (group["lots_open"],
+                                         len(group["lots_without_agent"]))
+                         for group in projects.snapshot(self.db, now=now)["projects"]},
             "slo": sorted(repr(sorted(row.items())) for row in
                           exploitation._slo_breaches_read(self.cfg, self.db, listing, now)),
             "refusals": sorted(int(row["id"]) for row in
@@ -91,6 +100,12 @@ class FollowUpFiguresTest(PgTestCase):
                 self.assertEqual(after[key], before[key])
         # the lots exist, and the figures did see the development lots
         self.assertEqual(len(made), 4)
+        # an open follow-up idle for two days is never stale either
+        for row in plan.annotate(self.db, [work.get(self.db, made[0]["id"]),
+                                           work.get(self.db, made[3]["id"])], now=now):
+            self.assertIsNone(row["stale"])
+        self.assertTrue(any(before["annotated_stale"]))
+        self.assertTrue(before["projects"])
         self.assertTrue(before["estimates"]["lots"])
         self.assertTrue(before["progress"])
 

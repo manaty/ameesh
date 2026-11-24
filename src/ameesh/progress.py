@@ -539,7 +539,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
                                responsible=(package or {}).get("responsible")),
             agent_states, agent_externals),
         "last_activity_ts": _round(last),
-        "stale": None if planned_wait else
+        "stale": None if planned_wait or lifecycle.is_follow_up(item) else
                  stagnation.stale(item.get("state") or "", last, now, stale_after),
         "planned_wait": planned_wait,
         "dependencies": dependencies or [],
