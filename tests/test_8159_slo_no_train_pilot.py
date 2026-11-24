@@ -153,13 +153,15 @@ class SloNoTrainTest(PgTestCase):
         self.assertEqual(waiting.get("no_train"), "nexlink")
         self.assertEqual(alert["targets"][0], "pilot")
         self.assertNotIn("assignee", alert["targets"])
-        self.assertIn(PHRASE, alert["detail"])
+        # #8172 : ce porteur est un véhicule `integration/**` ; son texte est
+        # celui du véhicule, que le train ne prend jamais.
+        self.assertIn(alert_briefs.PACKET_VEHICLE_MERGE, alert["detail"])
+        self.assertNotIn(PHRASE, alert["detail"])
         briefs = self.briefs(alert)
         self.assertIn("orch-nx", briefs)
         self.assertNotIn("dev1", briefs)
         self.assertNotIn("orch-amh", briefs)
-        self.assertIn(PHRASE, briefs["orch-nx"])
-        self.assertIn("dispatch the full CI yourself", briefs["orch-nx"])
+        self.assertIn(alert_briefs.PACKET_VEHICLE_MERGE, briefs["orch-nx"])
 
     def test_le_pilote_est_celui_du_projet_pas_celui_de_l_equipe_du_porteur(self):
         # B2 de ameesh-dev3 : l'assigné du porteur n'est pas du projet du lot
@@ -179,10 +181,14 @@ class SloNoTrainTest(PgTestCase):
                 self.assertNotIn("dev1", briefs)
 
     def live_train(self, *, age_s=60.0, lease=True,
-                   service_runner="runner-nx@autre-hote"):
+                   runner="runner-nx@autre-hote", service_runner=None):
         """Un train nexlink tenu par un AUTRE hôte : sa cible centrale, dont
-        la réservation nomme l'exécuteur `runner-nx@autre-hote`, et le bail
-        de service de `service_runner` (celui de nexlink par défaut)."""
+        la réservation nomme l'exécuteur `runner`, et le bail de service de
+        `service_runner` (par défaut le même). `runner` peut contenir des `:`
+        (`host:pid` est le défaut de `cfg.runner`, #8174)."""
+        service_runner = runner if service_runner is None else service_runner
+        self.db.execute("DELETE FROM integration_trains")
+        self.db.execute("DELETE FROM merge_locks")
         self.db.execute(
             "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
             " VALUES ('nexlink:develop', NULL, 1, NULL)")
@@ -190,7 +196,7 @@ class SloNoTrainTest(PgTestCase):
             "INSERT INTO integration_trains (target_key, document, updated_at)"
             " VALUES ('nexlink:develop', %s::jsonb, now() - make_interval(secs => %s))",
             ('{"reservation": {"key": "nexlink:develop",'
-             ' "owner": "train:runner-nx@autre-hote"}}', age_s))
+             ' "owner": "train:%s"}}' % runner, age_s))
         if lease:
             self.db.execute(
                 "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
@@ -203,6 +209,25 @@ class SloNoTrainTest(PgTestCase):
         alert = self.alerts(cfg)[0]
         self.assertNotIn("no_train", alert["waiting"] or {})
         self.assertNotIn("no train declared", alert["detail"])
+
+    def test_un_runner_id_avec_deux_points_est_un_train_vivant(self):
+        # #8174 : le runner par défaut est `host:pid` ; un découpage à
+        # l'index sur ':' ne lisait que l'hôte et un train lancé hors unité
+        # --runner-id était déclaré absent (faux no_train).
+        self.live_train(runner="ameesh-agents-1:4242",
+                        service_runner="ameesh-agents-1:4242")
+        cfg = dataclasses.replace(self.cfg, train={}, radar={})
+        alert = self.alerts(cfg)[0]
+        self.assertNotIn("no_train", alert["waiting"] or {})
+        self.assertNotIn("no train declared", alert["detail"])
+
+    def test_un_autre_runner_avec_deux_points_ne_fait_pas_un_train(self):
+        # Le même hôte ne suffit pas : seule l'identité complète compte.
+        self.live_train(runner="ameesh-agents-1:4242",
+                        service_runner="ameesh-agents-1:4243")
+        cfg = dataclasses.replace(self.cfg, train={}, radar={})
+        alert = self.alerts(cfg)[0]
+        self.assertEqual((alert["waiting"] or {}).get("no_train"), "nexlink")
 
     def test_une_cible_ancienne_ou_sans_bail_ne_fait_pas_un_train(self):
         # B #45894/#45896 : le bail vivant d'un service qui dessert un autre
@@ -221,8 +246,15 @@ class SloNoTrainTest(PgTestCase):
         cfg = dataclasses.replace(self.cfg, train={}, radar={})
         alert = dict(self.alerts(cfg)[0], level=3)
         text = alert_briefs._slo_breach(alert)
-        self.assertIn(PHRASE, text)
+        self.assertIn(alert_briefs.PACKET_VEHICLE_MERGE, text)
         self.assertIn("push the pilot of nexlink", text)
+        # #8159 : une unité de paquet ordinaire (exception déclarée) sans
+        # train garde le texte de composition manuelle.
+        waiting = {key: value for key, value in alert["waiting"].items()
+                   if key not in ("self", "packet_vehicle")}
+        text = alert_briefs._slo_breach(dict(alert, waiting=waiting))
+        self.assertIn(PHRASE, text)
+        self.assertIn("push the pilot of nexlink to compose", text)
 
     def test_un_projet_avec_train_garde_le_comportement_actuel(self):
         for block in ({"train": {"projects": {"nexlink": {}}}},

@@ -451,13 +451,20 @@ def elected_wake_due(role, lots, *, now, horizon):
 
 
 def elected_wake_target(role, candidates, lots, targets, holds, *, now, horizon,
-                        stalled=()):
+                        stalled=(), open_hosts=()):
     """Choose one enrolled candidate for pending work on a lease-free role.
 
     A sleeping candidate has no fresh standing; its declared placement, not
     election readiness, is the evidence available before the machine starts.
+    #8121: a declared, admitted and ready candidate already standing on an
+    open host (the hub is never an adapter target) will take the role by
+    election; waking a drained VM for it would pay for capacity the mesh
+    already has.
     """
     if not elected_wake_due(role, lots, now=now, horizon=horizon):
+        return None
+    if any(c.get('declared') and c.get('admitted') and c.get('ready')
+           and c.get('host') in open_hosts for c in candidates):
         return None
     admitted = set(role.get('admitted_hosts') or ())
     eligible = [c for c in candidates if c.get('declared') and c.get('admitted')
@@ -574,6 +581,11 @@ def prepare_elected_wake(db, policy, host, listing, lots, controls, holds):
         if not control or control['claims_open'] or control['mode'] not in ('draining', 'returning'):
             return
         now = q.now()
+        # #8121: same open-host evidence as wake_due. A candidate ready on a
+        # host whose claims are open (the hub, never an adapter target) takes
+        # the role by election; no drained VM is woken for it.
+        known = {h for row in listing for h in (row.get('admitted_hosts') or ())}
+        open_hosts = host_release._open_hosts(controls, known, holds)
         stalled = None
         for role in listing:
             if not elected_wake_due(role, lots, now=now, horizon=policy['wake_delay_s']):
@@ -584,7 +596,8 @@ def prepare_elected_wake(db, policy, host, listing, lots, controls, holds):
             if stalled is None:
                 stalled = stalled_role_wakes(q, policy['targets'], controls, now=now)
             if elected_wake_target(role, status['candidates'], lots, policy['targets'], holds,
-                                   now=now, horizon=policy['wake_delay_s'], stalled=stalled) == host:
+                                   now=now, horizon=policy['wake_delay_s'], stalled=stalled,
+                                   open_hosts=open_hosts) == host:
                 q.return_intent(host)
                 q.request(host, control['generation'], control['release_epoch'], 'busy')
                 scheduled = next((lot for lot in lots if lot.get('assignee') == role['name']

@@ -53,6 +53,11 @@ import time
 from . import sous_utilisation, vocab, work_lifecycle as lifecycle
 from .roles import AUDITOR_ROLES
 
+#: #8172 : le texte d'un véhicule de paquet validé, au détail de l'alerte SLO
+#: et à son brief : le train ne prend jamais un porteur `integration/**`.
+PACKET_VEHICLE_MERGE = ("packet vehicle: merged by the pilot (§12), the train "
+                        "does not take it")
+
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
                  # #5727 : le pilote fait poser une copie du canon à jour
@@ -944,7 +949,16 @@ def _slo_breach(alert: dict, *, level: int | None = None,
                     "full CI%s — do not reassign or nudge its holder; the composer/pilot "
                     "carries the packet merge" % (v.noun, packet, where, ci))
         no_train = str(waiting.get("no_train") or "")
-        if no_train:
+        vehicle_of = str(waiting.get("packet_vehicle") or "")
+        if vehicle_of:
+            # #8172 : le train exclut un véhicule `integration/**` par
+            # conception ; le pilote du projet le fusionne (§12).
+            move += "; %s — %s" % (
+                PACKET_VEHICLE_MERGE,
+                "push the pilot of %s to merge it once its full CI is green"
+                % vehicle_of if level >= 3
+                else "merge it yourself once its full CI is green on the target head")
+        elif no_train:
             # #8159 : aucun train ni radar n'est déclaré pour le projet ; rien
             # ne composera le paquet ni ne démarrera sa CI à la place du pilote.
             move += ("; no train declared for %s: manual composition by the pilot "
@@ -1746,6 +1760,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             # #8159 : sans train déclaré, le pilote visé est celui du projet du
             # lot (il compose à la main, §12), pas celui des équipes du porteur.
             teams = {str(alert["waiting"]["no_train"])}
+        if (alert.get("waiting") or {}).get("packet_vehicle"):
+            # #8172 : un véhicule de paquet va au pilote de son projet.
+            teams = {str(alert["waiting"]["packet_vehicle"])}
         # #3036 : le pilote se résout ici aussi quand l'alerte ne porte pas
         # `orchestrators` (niveau 1 d'une passe sans autre lot de niveau 2) ;
         # le notificateur fournit les rôles vivants du canon.
