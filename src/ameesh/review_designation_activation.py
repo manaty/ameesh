@@ -5352,21 +5352,29 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
 
 #: #8231 : une passe de reprise des attentes lit au plus ce nombre de lots
 RESUME_SCAN = 200
+#: son curseur, sous le répertoire d'état de l'hôte (B P2 ameesh-cx1) : le
+#: dernier lot examiné. Une passe reprend après lui et se replie au bout,
+#: comme `RETRY_CURSOR` : une fenêtre de lots sans candidat ne cache plus
+#: indéfiniment les lots suivants.
+RESUME_CURSOR = "review-designation-resume.cursor"
 
 
-def _waiting_lots(db, *, scan: int = RESUME_SCAN) -> list:
+def _waiting_lots(db, after: int = 0, *, scan: Optional[int] = None) -> list:
     """Les lots en `qa` qui portent une marque d'attente récente (#8231).
 
-    Une présélection seulement : la marque effective du dernier gel est
-    relue lot par lot (`_effective_mark`), seule preuve de l'attente."""
+    Une présélection seulement, après le lot `after` et bornée : la marque
+    effective du dernier gel est relue lot par lot (`_effective_mark`),
+    seule preuve de l'attente."""
     return db.query(
-        "SELECT DISTINCT w.id, w.app FROM work_items w"
-        " JOIN work_item_events e ON e.work_item_id = w.id"
-        " WHERE w.state = %s"
-        "   AND e.note LIKE %s AND e.note LIKE %s"
-        "   AND e.created_at >= now() - interval '30 days'"
+        "SELECT w.id, w.app FROM work_items w"
+        " WHERE w.state = %s AND w.id > %s"
+        "   AND EXISTS (SELECT 1 FROM work_item_events e"
+        "     WHERE e.work_item_id = w.id"
+        "       AND e.note LIKE %s AND e.note LIKE %s"
+        "       AND e.created_at >= now() - interval '30 days')"
         " ORDER BY w.id LIMIT %s",
-        (lifecycle.QA, pg.MARK_PREFIX + "%", '%"state": "waiting"%', int(scan)))
+        (lifecycle.QA, int(after), pg.MARK_PREFIX + "%", '%"state": "waiting"%',
+         int(RESUME_SCAN if scan is None else scan)))
 
 
 def _resumable(payload: Mapping, available: Mapping) -> list:
@@ -5400,7 +5408,8 @@ def resume_waiting(cfg, db, *, memo: Optional[dict] = None,
     `memo` (lot → signature du gel, de la marque et des candidats) évite de
     rejouer la même situation à chaque passe : un candidat écarté pour une
     autre raison (correcteur, plancher) ne relance pas la lecture git tant
-    que ni la marque ni les disponibles ne bougent. Bornée, ne lève jamais.
+    que ni la marque ni les disponibles ne bougent. La fenêtre avance par
+    `RESUME_CURSOR` et se replie au bout. Bornée, ne lève jamais.
     """
     out = {"examined": 0, "attempted": 0, "designated": 0, "waiting": 0,
            "errors": [], "results": []}
@@ -5409,10 +5418,16 @@ def resume_waiting(cfg, db, *, memo: Optional[dict] = None,
         limit = max(0, int(limit))
     except (TypeError, ValueError):
         limit = RETRY_LIMIT
+    start = _read_cursor(cfg, RESUME_CURSOR)
     try:
-        rows = _waiting_lots(db)
+        rows = _waiting_lots(db, start)
+        if not rows and start:
+            # bout de la file : le tour suivant reprend au plus ancien
+            start = 0
+            rows = _waiting_lots(db, 0)
         if not rows:
             memo.clear()
+            _write_cursor(cfg, RESUME_CURSOR, 0)
             return out
         families = mechanics.configured(cfg).families
         listing = registry.overview(db)
@@ -5422,10 +5437,15 @@ def resume_waiting(cfg, db, *, memo: Optional[dict] = None,
         return out
     pools: dict = {}
     seen: set = set()
+    last = start
     for row in rows:
         lot = int(row.get("id") or 0)
         project = str(row.get("app") or "")
+        if out["attempted"] >= limit:
+            # budget dépensé : ce lot reste pour la passe suivante
+            break
         seen.add(lot)
+        last = lot
         out["examined"] += 1
         try:
             if project not in pools:
@@ -5454,8 +5474,6 @@ def resume_waiting(cfg, db, *, memo: Optional[dict] = None,
                 continue
             if memo.get(lot) == signature:
                 continue
-            if out["attempted"] >= limit:
-                break
             out["attempted"] += 1
             memo[lot] = signature
             result = designate_deferred(cfg, db, lot, freeze)
@@ -5473,8 +5491,11 @@ def resume_waiting(cfg, db, *, memo: Optional[dict] = None,
             out[state] += 1
         out["results"].append({"lot": lot, "result": state or "?",
                                "detail": str((result or {}).get("why") or "")[:160]})
-    for lot in set(memo) - seen:
+    # seuls les lots de la fenêtre lue sont oubliés : un lot hors fenêtre
+    # garde sa signature jusqu'au tour du curseur qui le relit
+    for lot in [lot for lot in memo if start < lot <= last and lot not in seen]:
         memo.pop(lot, None)
+    _write_cursor(cfg, RESUME_CURSOR, last)
     return out
 
 

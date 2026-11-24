@@ -104,6 +104,34 @@ class ResumeWaitingTest(base._ActivationFixture, PgTestCase):
                                 [lambda: None, lambda: None])
         self.assertEqual(attempted, [1, 1])
 
+    def test_window_beyond_scan_wraps_to_the_eligible_lot(self):
+        """B P2 ameesh-cx1 : une fenêtre pleine de lots sans candidat ne
+        cache plus le lot dont la famille revient ; le curseur avance puis se
+        replie au bout."""
+        self.waiting_freeze()
+        for index in range(2):
+            decoy = self.db.query(
+                "INSERT INTO work_items (title, app, state, assignee)"
+                " VALUES (%s, 'ameesh', 'qa', 'author') RETURNING id",
+                ("decoy %d" % index,))[0]["id"]
+            self.db.execute(
+                "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                " VALUES (%s, 'qa', %s, 'ameesh')",
+                (decoy, 'review-designation:%d:1: {"state": "waiting"}' % decoy))
+        self.resume("r2")
+        act._write_cursor(self.cfg, act.RESUME_CURSOR, self.lot)
+        memo: dict = {}
+        with mock.patch.object(act, "RESUME_SCAN", 2):
+            first = act.resume_waiting(self.cfg, self.db, memo=memo)
+            self.assertEqual(first["examined"], 2, first)
+            self.assertEqual(first["attempted"], 0, first)
+            self.assertEqual(act._read_cursor(self.cfg, act.RESUME_CURSOR),
+                             self.lot + 2, first)
+            second = act.resume_waiting(self.cfg, self.db, memo=memo)
+        self.assertEqual(second["errors"], [], second)
+        self.assertEqual(second["designated"], 1, second)
+        self.assertEqual(sorted(designated(work.get(self.db, self.lot))), ["r1", "r2"])
+
     def test_resumable_ignores_author_and_seated_families(self):
         payload = {"authors": [{"name": "a", "family": "deepseek"}],
                    "reviewers": [{"name": "r1", "family": "claude"}]}
