@@ -81,6 +81,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import estimates, storage
+from . import work_lifecycle as lifecycle
 
 SCHEMA = "ameesh-model-evaluation-report/1"
 SOURCE = "docs/design/etudes/evaluation-modeles.md#M1"
@@ -405,6 +406,8 @@ WITH bounds AS (
        LIMIT 1
     ) e ON true
    WHERE w.app = %s
+     -- #8194 : un suivi n'est ni livré ni abandonné
+     AND """ + lifecycle.not_follow_up_sql("w") + """
      AND f.at < b.hi
      AND (f.at >= b.lo OR EXISTS (SELECT 1 FROM staged s1 WHERE s1.lot = w.id))
      AND (w.state <> 'closed' OR w.close_reason = 'delivered')
@@ -587,6 +590,8 @@ WITH bounds AS (
     FROM work_items w
     CROSS JOIN bounds b
    WHERE w.app = %s
+     -- #8194 : un suivi n'est ni livré ni abandonné
+     AND """ + lifecycle.not_follow_up_sql("w") + """
      AND NOT EXISTS (
        SELECT 1 FROM work_item_milestones m
         WHERE m.work_item_id = w.id

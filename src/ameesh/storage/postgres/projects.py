@@ -56,6 +56,8 @@ WITH unread AS (
            count(*) OVER (PARTITION BY assignee)::bigint AS n
       FROM work_items
      WHERE assignee IS NOT NULL AND state NOT IN __CLOSED__
+       -- #8194 : un suivi n'est ni le lot d'un agent ni un lot ouvert (ici, `lots`)
+       AND __NOT_FOLLOW_UP__
      ORDER BY assignee, updated_at DESC, id DESC
 ), open_labels AS (
     -- une étiquette (issue, fiche du plan, branche, premier mot du titre) qui
@@ -149,7 +151,7 @@ WITH unread AS (
            count(*) OVER ()::bigint AS total
       FROM work_items w
       LEFT JOIN work_packages k ON k.id = w.package_id
-     WHERE w.state NOT IN __CLOSED__
+     WHERE w.state NOT IN __CLOSED__ AND __NOT_FOLLOW_UP_W__
      ORDER BY w.updated_at DESC, w.id DESC
      LIMIT %s
 ), dead AS (
@@ -174,6 +176,8 @@ SELECT (SELECT coalesce(json_agg(agents ORDER BY agents.name), '[]'::json) FROM 
   .replace("__MAIL_REF__", _lot_ref("c.ref")) \
   .replace("__CITED_SCAN__", str(CITED_SCAN)) \
   .replace("__CLOSED__", _CLOSED) \
+  .replace("__NOT_FOLLOW_UP_W__", lifecycle.not_follow_up_sql("w")) \
+  .replace("__NOT_FOLLOW_UP__", lifecycle.not_follow_up_sql()) \
   .replace("__DEAD__", DEAD_LETTERS_SQL.strip()) \
   .replace("__NOT_EXTERNAL__", NOT_EXTERNAL_SQL.format(t="m")) \
   .replace("__DECISIONS__", PENDING_BOARD_SQL)

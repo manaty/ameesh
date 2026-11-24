@@ -556,6 +556,17 @@ URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "avatar_failover",
                 # base s'arrête ou va s'arrêter.
                 "db_no_primary", "db_etcd_no_quorum", "db_disk_low",
                 "host_network_overlap")
+#: #8180 : ces alertes d'identifiant ne peuvent pas être retirées par
+#: `notify.types`. C'est le défaut de l'incident du 23/11 : le login expiré de
+#: `secondaire` existait dans `ameesh alerts`, mais le notifieur le filtrait et
+#: l'owner ne l'a jamais reçu (`auth_blocked` pour l'agent arrêté,
+#: `credential_failing`/`credential_expiring` pour le compte,
+#: `credential_probe_stale` quand la sonde se tait — sans elle, une échéance
+#: n'est plus vue du tout). Elles restent livrées à leur responsable, sur ses
+#: canaux ; `notify.types` continue de régler les autres types.
+MANDATORY_TYPES = ("auth_blocked", "credential_failing",
+                   "credential_expiring", "credential_probe_stale")
+
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
@@ -2385,6 +2396,14 @@ class Notifier:
         self._take_history_done = False
 
     # -- passage --------------------------------------------------------------
+    def _deliverable(self, alert: dict) -> bool:
+        """#8180 : le type est-il livré à l'humain ? `notify.types` filtre les
+        types ordinaires, jamais un type urgent ni une alerte d'échéance
+        d'identifiant (MANDATORY_TYPES), ni une cible `owner`."""
+        return (alert.get("type") in self.ncfg.types
+                or alert.get("type") in MANDATORY_TYPES
+                or forces_owner(alert))
+
     def _delivery_open(self) -> bool:
         """Le bail partagé autorise-t-il encore des effets ? (#3913 B1)
 
@@ -2528,7 +2547,7 @@ class Notifier:
         # `slo_breach`, jamais poussé à l'owner (décision owner 18/10) ; ses
         # dépassements restent filtrables et partent aux rôles par courrier.
         wanted = {key_of(a): a for a in notifications
-                  if a.get("type") in self.ncfg.types or forces_owner(a)}
+                  if self._deliverable(a)}
         active = self.state["active"]
         self._reconcile_orphan_groups(active, wanted, router)
         # Persisted deliveries from an older routing policy must not retry or
@@ -2566,8 +2585,7 @@ class Notifier:
             del active[key]
             if self._acknowledged(entry, acknowledgements):
                 self._mute(entry)
-            if entry["alert"].get("type") not in self.ncfg.types \
-                    and not forces_owner(entry["alert"]):
+            if not self._deliverable(entry["alert"]):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue

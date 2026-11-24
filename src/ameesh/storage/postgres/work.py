@@ -4046,7 +4046,10 @@ class WorkItems(interface.WorkItems):
             "                      ORDER BY e.at, e.id LIMIT 1) f ON true"
             "  LEFT JOIN LATERAL (SELECT count(*) AS n FROM work_item_estimates e"
             "                      WHERE e.work_item_id = w.id) n ON true"
-            f" WHERE (w.state <> '{lifecycle.CLOSED}' OR w.close_reason = 'delivered')")
+            f" WHERE (w.state <> '{lifecycle.CLOSED}' OR w.close_reason = 'delivered')"
+            # #8194 : un suivi n'entre ni dans `work estimates` ni dans la table
+            # de référence (ni, par elle, dans l'alerte estimate_bias)
+            "   AND " + lifecycle.not_follow_up_sql("w"))
         params: list = []
         if app:
             sql += " AND (w.app = %s OR w.workstream = %s)"

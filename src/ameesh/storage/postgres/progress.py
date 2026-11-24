@@ -56,10 +56,12 @@ class Progress(interface.Progress):
 
     def lots(self, *, since_ts, project, limit) -> list[dict]:
         # L61 : lecture de `reviewer` sans sonde, cette commande est bornée
-        sql = ("SELECT %s, count(*) OVER ()::bigint AS total FROM work_items"
-               f" WHERE (state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
-               "        OR updated_at >= to_timestamp(%%s))"
-               % item_columns(self.db, "work_items"))
+        sql = (("SELECT %s, count(*) OVER ()::bigint AS total FROM work_items"
+                f" WHERE (state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
+                "        OR updated_at >= to_timestamp(%%s))"
+                % item_columns(self.db, "work_items"))
+               # #8194 : un suivi n'est ni du travail en cours ni du débit
+               + " AND " + lifecycle.not_follow_up_sql())
         params: list = [float(since_ts)]
         if project:
             sql += " AND (app = %s OR workstream = %s)"

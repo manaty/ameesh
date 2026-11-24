@@ -88,3 +88,23 @@ def phase_name(state: str) -> str:
         return state
     # The pre-switch generic delivery command meant the promotion stage.
     return "promoted" if state == "delivered" else canonical(state)
+
+
+#: #8191 : un suivi personnel (`work add --type follow-up`) n'a ni branche,
+#: ni estimation, ni revue, ni fusion.
+FOLLOW_UP = "follow-up"
+
+
+def is_follow_up(lot) -> bool:
+    """#8194 : le prédicat unique qui tient un suivi hors des chiffres du
+    mesh (débit, estimations, lots inertes, SLO, refus de prise,
+    sous-utilisation, découpeur, rapport d'évaluation) : il n'est ni du
+    travail démarrable, ni du travail en cours, ni du travail livré."""
+    return bool(lot) and lot.get("type") == FOLLOW_UP
+
+
+def not_follow_up_sql(alias: str = "") -> str:
+    """#8194 : `is_follow_up` en SQL, pour les lectures qui comptent des lots
+    (`alias` : l'alias de `work_items` dans la requête, sinon rien). Un type
+    NULL reste compté."""
+    return "%stype IS DISTINCT FROM '%s'" % (alias + "." if alias else "", FOLLOW_UP)

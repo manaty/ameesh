@@ -287,10 +287,28 @@ def _key_set(profile, environ) -> bool:
     return bool(name and environ.get(name))
 
 
-def _env_prefix(harness: str, profile) -> str:
-    if profile.kind == "config_dir" and profile.path:
-        return "%s=%s " % (accounts_mod.config_env_of(harness), shlex.quote(profile.path))
-    return ""
+def login_command(harness: str, account: str = "", kind: str = "") -> str:
+    """The human's real login gesture for an account, named by the alerts and
+    the runner's auth-blocked reason (#8180).
+
+    `ameesh accounts login` is the only remote path: the native
+    `claude auth login` is a paste-back flow, refused by the login service on
+    a distant host (#8110). A key account is repaired by writing its key.
+    """
+    if kind == "api_key_env":
+        return "set the key of account %s" % (account or "default")
+    if harness == "claude":
+        command = ["ameesh", "accounts", "login", "claude"]
+        if account:
+            command.append(account)
+        command += ["--token-file", "FILE"]
+        return " ".join(command)
+    if harness == "codex":
+        command = ["ameesh", "accounts", "login", "codex"]
+        if account:
+            command.append(account)
+        return " ".join(command)
+    return "log in again to %s/%s" % (harness, account or "(default)")
 
 
 def _probe_env(environ, declared, profile, variable: str, home: str) -> dict:
@@ -325,7 +343,7 @@ def probe_claude(profile, now: float, environ=None, run=None,
                        fingerprint=fingerprint("claude", profile, environ))
     from . import setup_token
     if setup_token.present(profile, environ):
-        fix = "ameesh accounts login claude %s --token-file FILE" % name
+        fix = login_command("claude", name, profile.kind)
         try:
             token, expires = setup_token.read(profile, environ)
         except setup_token.TokenError as exc:
@@ -341,7 +359,7 @@ def probe_claude(profile, now: float, environ=None, run=None,
                        expires, fix, fingerprint=held)
     home = profile.home(environ)
     path = os.path.join(home, ".credentials.json")
-    fix = "CLAUDE_CONFIG_DIR=%s claude auth login" % shlex.quote(home)
+    fix = login_command("claude", name, profile.kind)
     if not os.path.exists(path) and not profile.name and not profile.path:
         return None                   # no Claude credential here: not used on this host
     # #210 r5: the credential is read before the probe; a store replaced
@@ -393,7 +411,7 @@ def probe_codex(profile, now: float, environ=None) -> Verdict | None:
                        fix="set the key of account %s" % (name or "default"),
                        fingerprint=fingerprint("codex", profile, environ))
     path = os.path.join(profile.home(environ), "auth.json")
-    fix = "%scodex login" % _env_prefix("codex", profile)
+    fix = login_command("codex", name, profile.kind)
     if not os.path.exists(path):
         if not profile.name and not profile.path:
             return None

@@ -89,6 +89,7 @@ from dataclasses import dataclass, field
 from . import planned_waits, storage
 from . import sous_utilisation as su
 from . import work
+from . import work_lifecycle as lifecycle
 from .agent_pause import FILE_DECOUPAGE_ACTOR as SLEEP_ACTOR
 from .roles import AUDITOR_ROLES
 
@@ -1610,7 +1611,9 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         closed_hosts = host_lifecycle.closed_hosts(db)
     except Exception:  # noqa: BLE001 - une porte illisible ne coupe pas la passe
         closed_hosts = {}
-    lots = st.operations.open_lots_activity(None)
+    # #8194 : un suivi ouvert n'est ni un lot démarrable ni un lot en cours
+    lots = [lot for lot in st.operations.open_lots_activity(None)
+            if not lifecycle.is_follow_up(lot)]
     waits = planned_waits.read(db, lots, now=now) if lots else {}
     # #4717 : le déclencheur de découpage applique la même garde d'empreinte
     # que le débit (#4561) et `idle_capacity` (#4699) — une seule lecture
