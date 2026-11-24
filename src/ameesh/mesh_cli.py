@@ -19,6 +19,8 @@
   agent-mesh work add --title T [--type bug|evolution|follow-up] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work wake <id> --at ISO | --in DURATION | --cancel   scheduled wake, even under hold (#2466)
+  agent-mesh work wait <id> --on WHO [--wake-in D] | --clear   a follow-up waits on someone, or reopens (#8197)
+  agent-mesh work list --assignee N --type follow-up [--by-subject] [--json]   open follow-ups inventory (#8197)
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
   agent-mesh work external-executor <id> <agent> [--session S] | --clear   reserve a {work} to an external executor (#3447, #6839)
   agent-mesh work claim <id> --session S [--release] [--force]   take the external gesture exclusively, before acting (#6839)
@@ -1908,8 +1910,9 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         # #4043 : le retrait d'un paquet est le geste du pilote (paquet-horaire)
         args.actor = work.corrector(cfg, db, args.actor, what="package exclusion")
         return
-    if args.work_command == "move":
+    if args.work_command in ("move", "wait"):
         # #5041 : journaliser l'identité qui exerce l'autorité du move.
+        # #8197 : `work wait` déplace le suivi (blocked ↔ intake).
         from . import identity
         binding = identity.resolve_binding(cfg, db)
         if binding.name:
@@ -2734,6 +2737,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("%s%s #%s: %s" % ("[dry-run] " if row.get("dry_run") else "",
                                          v.noun, row["work_item_id"], issue))
             return 0
+        if args.work_command == "list" and (args.type or args.by_subject):
+            # #8197 : l'inventaire des suivis ouverts d'un agent, une lecture
+            from . import work_follow_ups
+            if (args.type or "follow-up") != "follow-up" or args.subject or args.state:
+                raise work.WorkError(
+                    "work list --type follow-up [--by-subject]: the open follow-ups of "
+                    "--assignee; --type takes only follow-up, without --state or --subject")
+            data = work_follow_ups.inventory(db, args.assignee)
+            if args.json:
+                print(json.dumps(data, ensure_ascii=False, indent=2))
+            else:
+                print(work_follow_ups.render(data, by_subject=args.by_subject))
+            return 0
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
                              subject=getattr(args, "subject", None),
@@ -3218,6 +3234,26 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                             planned_waits.ready_hold_warning(db, args.id, text)):
                 if warning:
                     print("warning: %s" % warning, file=sys.stderr)
+            return 0
+        if args.work_command == "wait":
+            from . import work_follow_ups
+            if bool(args.on) == bool(args.clear):
+                raise work.WorkError("work wait: give --on WHO, or --clear")
+            if args.clear and (args.wake_at or args.wake_in):
+                raise work.WorkError("work wait --clear: the wake is armed with "
+                                     "ameesh work wake")
+            work.check_mover(cfg, db, args.id, "intake" if args.clear else "blocked",
+                             args.actor)
+            if args.clear:
+                item = work_follow_ups.clear(db, args.id, actor=args.actor, why=args.why)
+                print("follow-up #%d reopened" % item["id"])
+                return 0
+            item = work_follow_ups.wait(db, args.id, args.on, actor=args.actor,
+                                        wake_ts=_wake_deadline(args))
+            print("follow-up #%d waiting on %s%s" % (
+                item["id"], " ".join(args.on.split()),
+                ", next check %s" % time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(
+                    item["wake_ts"])) if item.get("wake_ts") else ""))
             return 0
         if args.work_command == "wake":
             if args.cancel:
@@ -4666,6 +4702,11 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_list.add_argument("--subject", default=None, metavar="SLUG|CARD",
                          help=("#8193: the %s of a subject (`ameesh work subject add`) "
                                "or of a WorkPackage card, all states") % v.plural)
+    pw_list.add_argument("--type", default=None, choices=("follow-up",),
+                         help="#8197: the open follow-ups of --assignee (inventory)")
+    pw_list.add_argument("--by-subject", action="store_true",
+                         help=("#8197: with --type follow-up, grouped by subject "
+                               "(\"%s\" last)") % "sans sujet")
     pw_list.add_argument("--limit", type=int, default=50)
     pw_list.add_argument("--json", action="store_true")
     pw_list.add_argument("--freeze", action="store_true",
@@ -5031,6 +5072,23 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                          help=("why this wake (kept in the %s's journal)") % v.noun)
     pw_wake.add_argument("--actor", default="")
     pw_wake.set_defaults(func=cmd_work)
+
+    pw_wait = work_sub.add_parser(
+        "wait", help=("#8197: a follow-up waits on someone (blocked, journaled with "
+                      "who and since), or reopens with --clear; any note without a wake "
+                      "also reopens it, except the mechanics' own"))
+    pw_wait.add_argument("id", type=int)
+    pw_wait.add_argument("--on", default=None, metavar="WHO",
+                         help="who or what is awaited (a person, a lot), free text")
+    pw_wait.add_argument("--clear", action="store_true", help="reopen the follow-up")
+    pw_wait.add_argument("--why", default="", metavar="TEXT",
+                         help="with --clear: why it reopens (journaled)")
+    pw_wait.add_argument("--wake-at", default=None, metavar="TIME",
+                         help="with --on: also arm the next check (ISO 8601 with timezone)")
+    pw_wait.add_argument("--wake-in", dest="wake_in", default=None, metavar="DURATION",
+                         help="with --on: same, relative to now (e.g. 2d, 90m)")
+    pw_wait.add_argument("--actor", default="")
+    pw_wait.set_defaults(func=cmd_work)
 
     pw_app = work_sub.add_parser("set-app", help=("correct a %s's project, with a journal entry") % v.noun)
     pw_app.add_argument("id", type=int)

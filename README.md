@@ -159,6 +159,14 @@ pricing-v2` for an existing lot. `ameesh work list --subject pricing-v2` (also
 `--json`, and a WorkPackage card id) lists its lots; `work subject list [--open]`,
 `show <slug>` and `close <slug>` manage the subjects.
 
+A follow-up waiting on someone: `ameesh work wait <id> --on "Sébastien"
+[--wake-in 2d]` (state `blocked`, who and since kept in its journal);
+`ameesh work wait <id> --clear`, or any note, reopens it (a note arming a
+wake, or an automatic note of the mechanics, keeps it waiting). One read lists an agent's open
+follow-ups by subject, with `waiting_on`, `since`, `next_wake`, `subject` and
+`issue_ref`: `ameesh work list --assignee <agent> --type follow-up --by-subject
+[--json]` (follow-ups without a subject come last, under "sans sujet").
+
 Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/ameesh-approve`
 (they only set `PYTHONPATH=src`; nothing is installed into `~/.local/bin`).
 

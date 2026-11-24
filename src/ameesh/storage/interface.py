@@ -3612,6 +3612,14 @@ class WorkItems(Domain):
         parent), tous états confondus, par id."""
 
     @abc.abstractmethod
+    def follow_ups(self, assignee: str, *, waiting_prefix: str) -> list[dict]:
+        """#8197 : les suivis (`follow-up`) non clos de l'assigné, par id, avec
+        `subject_id`, `subject_slug`, `subject_title`, `subject_github_ref`, et
+        pour un suivi en attente (`blocked`) la dernière note d'attente
+        (`waiting_note`, préfixée par `waiting_prefix`) et l'instant d'entrée
+        dans l'attente courante (`waiting_since_ts`). UNE requête."""
+
+    @abc.abstractmethod
     def record_packet(self, package_id: int, *, branch: str, base_sha: str,
                       head_sha: str, units: Sequence[dict], note: str,
                       actor: str,

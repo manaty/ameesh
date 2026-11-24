@@ -5267,6 +5267,7 @@
     "subject_close",
     "subject_attach",
     "subject_items",
+    "follow_ups",
     "lock",
     "lock_deep_analysis",
     "lock_workflow_activation",
