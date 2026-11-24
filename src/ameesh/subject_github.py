@@ -140,17 +140,14 @@ class Context:
     (en cache) des dépôts."""
 
     def __init__(self, cfg, db, gh, *, cache: dict | None = None, local_host=None):
+        """Échoue fermé : des réglages `github` invalides (`SettingsError`) ou
+        une liste d'hôtes illisible lèvent ; jamais de publication avec une
+        garde privée de ses termes exclus ou des noms d'hôtes du mesh."""
         self.gh = gh
         self.cache = {} if cache is None else cache
-        try:
-            settings = plan_github.settings_of(cfg) if cfg is not None else plan_github.Settings()
-        except plan_github.SettingsError:
-            settings = plan_github.Settings()
+        settings = plan_github.settings_of(cfg) if cfg is not None else plan_github.Settings()
         hosts = {local_host or getattr(cfg, "host", None)}
-        try:
-            hosts |= {row.get("host") for row in storage.of(db).hosts.current(None)}
-        except Exception:  # noqa: BLE001 - une garde plus stricte suit (dépôt public)
-            pass
+        hosts |= {row.get("host") for row in storage.of(db).hosts.current(None)}
         self.guard = plan_github.make_guard(
             settings, hosts=[h for h in hosts if h],
             forge_hosts=getattr(cfg, "forge_hosts", None) or ())
@@ -205,13 +202,15 @@ def check_adoptable(db, gh, ref: str, *, subject: dict | None = None) -> tuple[s
     return repo, number, issue
 
 
-def adopt(db, ctx: Context, subject: dict, ref: str, *, issue: dict | None = None) -> dict:
+def adopt(db, ctx: Context, subject: dict, ref: str) -> dict:
     """Adopte le ticket `ref` comme épique du sujet : section écrite, puis
-    référence posée. Idempotent pour la même référence."""
+    référence posée. Idempotent pour la même référence. La section est
+    greffée sur la lecture faite ici, la plus récente : une édition humaine
+    antérieure n'est pas écrasée."""
     if subject["state"] != "open":
         raise WorkError("subject %s is closed" % subject["slug"])
     repo, number, read = check_adoptable(db, ctx.gh, ref, subject=subject)
-    write_section(db, ctx, subject, repo, number, issue=issue or read)
+    write_section(db, ctx, subject, repo, number, issue=read)
     row = storage.of(db).work.subject_set_github(int(subject["id"]), ref_of(repo, number))
     if row is None:
         raise WorkError("%s was adopted by another subject meanwhile; the section of %s "

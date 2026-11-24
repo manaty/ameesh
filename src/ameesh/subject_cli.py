@@ -92,10 +92,10 @@ def _github_context(cfg, db):
     from . import plan_github, subject_github
     from .work import WorkError
     try:
-        gh = plan_github.Gh()
+        # garde fermée : réglages `github` invalides → refus, rien n'est publié
+        return subject_github.Context(cfg, db, plan_github.Gh())
     except plan_github.GithubError as exc:
-        raise WorkError("GitHub epic: %s" % exc) from exc
-    return subject_github.Context(cfg, db, gh)
+        raise WorkError("GitHub epic: %s; nothing published" % exc) from exc
 
 
 def run(cfg, db, args: argparse.Namespace) -> int:
@@ -103,19 +103,19 @@ def run(cfg, db, args: argparse.Namespace) -> int:
     if command == "add":
         from . import work_projects
         project = work_projects.creation_project(cfg, db, args.actor, args.app)
-        ctx = issue = None
+        ctx = None
         if args.github:
             # #8195 : ticket illisible, fermé ou déjà adopté refusé AVANT la création
             from . import subject_github
             work_subjects.check_slug(args.slug)
             ctx = _github_context(cfg, db)
             known = work_subjects.find(db, args.slug, project=project)
-            _repo, _number, issue = subject_github.check_adoptable(
+            subject_github.check_adoptable(
                 db, ctx.gh, args.github, subject=known)
         subject, created = work_subjects.add(db, args.slug, args.title, project=project,
                                              actor=args.actor)
         if ctx is not None:
-            subject = subject_github.adopt(db, ctx, subject, args.github, issue=issue)
+            subject = subject_github.adopt(db, ctx, subject, args.github)
         if args.json:
             print(json.dumps({"created": created, "subject": subject},
                              ensure_ascii=False, indent=2, default=str))

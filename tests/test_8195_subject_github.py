@@ -108,6 +108,36 @@ class SubjectEpicTest(_SubjectBase):
         self.assertIn("- [x] ameesh #%d — Grille tarifaire (closed)" % a["id"], self.body())
         self.assertEqual(self.body().count("<!-- ameesh:subject=pricing-v2 -->"), 1)
 
+    def test_human_edit_after_the_pre_check_is_kept(self):
+        # B ameesh-dev3 #233701 : la CLI pré-contrôle (1re lecture) ; une édition
+        # humaine avant l'adoption n'est pas écrasée par le corps de cette lecture.
+        subject_github.check_adoptable(self.db, self.gh, "%s#812" % REPO, subject=self.subject)
+        issue = next(i for i in self.gh.repo(REPO)["issues"] if i["number"] == 812)
+        issue["body"] = HUMAN + "\n\nAjout humain."
+        subject_github.adopt(self.db, self.ctx, self.subject, "%s#812" % REPO)
+        self.assertTrue(self.body().startswith(HUMAN + "\n\nAjout humain.\n\n"))
+
+    def test_guard_fails_closed(self):
+        # B ameesh-dev3 #233698 : jamais de publication avec une garde dégradée.
+        with mock.patch.object(plan_github, "settings_of",
+                               side_effect=plan_github.SettingsError("bad github key")):
+            with self.assertRaises(plan_github.SettingsError):
+                subject_github.Context(mock.Mock(host="atelier"), self.db, self.gh)
+            projector = plan_github.Projector(mock.Mock(host="atelier", forge_hosts=()),
+                                              gh=self.gh)
+            subject_github.adopt(self.db, self.ctx, self.subject, "%s#812" % REPO)
+            self.lot("Grille tarifaire")
+            self.gh.reset_calls()
+            projector._subjects(self.db)
+            self.assertEqual(self.gh.writes(), [])
+        hosts = storage.of(self.db).hosts
+        with mock.patch.object(type(hosts), "current", side_effect=RuntimeError("db down")):
+            with self.assertRaises(RuntimeError):
+                subject_github.Context(None, self.db, self.gh)
+        # garde complète : un nom d'hôte du mesh n'est pas publié sur un dépôt public
+        ctx = subject_github.Context(None, self.db, self.gh, local_host="ameesh-agents-1")
+        self.assertIn("host name", ctx.guard.problems("voir ameesh-agents-1", public=True))
+
     def test_damaged_markers_are_refused_not_guessed(self):
         with self.assertRaisesRegex(work.WorkError, "damaged"):
             subject_github.splice("x <!-- ameesh:subject=pricing-v2 --> y", "pricing-v2", "S")
