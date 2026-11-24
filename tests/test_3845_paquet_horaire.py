@@ -101,6 +101,13 @@ class FakeShell:
         #: #6933 : `work reviewer --no-verdict` refusé à l'acteur
         self.refuse_waiver = False
         self.waiver_rc: tuple[int, str] | None = None
+        #: #8247 : clôture refusée (rc, sortie, erreur), ou course exacte d'un
+        #: autre acteur qui a déjà clos le lot avant l'appel.
+        self.close_rc: tuple[int, str, str] | None = None
+        self.close_already = False
+        #: #8247 : le porteur est clos par un autre acteur pendant la
+        #: composition (avant la fin de `paquet-auto`).
+        self.close_on_auto = False
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
         self.argvs.append(list(cmd))
@@ -149,8 +156,24 @@ class FakeShell:
                     self.clock += 1
                     item.setdefault("events", []).append(
                         {"note": args[3], "created_ts": self.clock})
+            if args[:2] == ["work", "close"]:
+                if self.close_already:
+                    item = self.items.get(int(args[2]))
+                    if item is not None:
+                        item["state"] = "closed"
+                        item["close_reason"] = "abandoned"
+                    return ph.Result(1, "", "error: lot %s already closed: "
+                                     "nothing to close\n" % args[2])
+                if self.close_rc:
+                    return ph.Result(*self.close_rc)
             return ph.Result(0, "ok\n")
         if str(cmd[1]).endswith("paquet-auto.py"):
+            if self.close_on_auto:
+                carrier_id = int(cmd[cmd.index("--carrier") + 1])
+                item = self.items.get(carrier_id)
+                if item is not None:
+                    item["state"] = "closed"
+                    item["close_reason"] = "abandoned"
             rc = self.auto_rcs.pop(0) if self.auto_rcs else self.auto_rc
             if self.recomposed_head and "--keep-composition" in cmd and rc == 0:
                 for item in self.items.values():
@@ -546,6 +569,41 @@ class ComposeTest(Base):
         self.assertTrue(self.shell.ran("work", "close", "4000", "--abandoned"))
         self.assertEqual(self.shell.ran("ci", "run"), [])
 
+    def test_porteur_vide_clos_pendant_la_composition_ne_le_reclot_pas(self):
+        # #8247 : le pilote a clos le porteur pendant que `paquet-auto`
+        # composait (cas de #8240) ; la fin de composition relit l'état, ne
+        # renvoie ni courrier ni `work close` sur un lot clos, et ne lève pas
+        # (aucun lot d'empreinte §16).
+        self.shell.auto_out = "aucune unité composée : #3801 (conflit)\n"
+        self.shell.items[4000] = carrier()
+        self.shell.close_on_auto = True
+        self.assertIn("porteur déjà clos", ph.tick(self.ctx))
+        self.assertEqual(self.shell.ran("work", "close"), [])
+        self.assertFalse([c for c in self.shell.calls if c[0] == "agent-mail"])
+
+    def test_porteur_vide_clos_entre_relecture_et_cloture_conclut_propre(self):
+        # #8247 : course exacte de #8240 — l'état relu juste avant la clôture
+        # est encore ouvert, puis un autre acteur clos le lot avant `work
+        # close`. Le refus « already closed » est confirmé par une seconde
+        # relecture : le tic conclut proprement, sans §16.
+        self.shell.auto_out = "aucune unité composée : #3801 (conflit)\n"
+        self.shell.items[4000] = carrier()
+        self.shell.close_already = True
+        out = ph.tick(self.ctx)
+        self.assertIn("rien composé", out)
+        self.assertTrue(any("pendant la clôture" in line for line in self.ctx.log),
+                        self.ctx.log)
+
+    def test_porteur_vide_cloture_refusee_sans_etat_clos_reste_un_echec(self):
+        # #8247 : un refus de clôture qui n'est pas une course (le porteur
+        # reste ouvert à la relecture) reste un échec : le lot d'empreinte §16
+        # garde son sens.
+        self.shell.auto_out = "aucune unité composée : #3801 (conflit)\n"
+        self.shell.items[4000] = carrier()
+        self.shell.close_rc = (1, "", "error: database is down\n")
+        with self.assertRaisesRegex(ph.HoraireError, "clôture du porteur vide"):
+            ph.tick(self.ctx)
+
     def test_porteur_vide_diagnostic_et_courrier_avant_cloture(self):
         self.shell.auto_out = (
             "tests unité #3801 : ROUGE (1 modules) — modules : tests.test_unite"
@@ -721,6 +779,20 @@ class FollowTest(Base):
         self.shell.items[4000] = item
         self.shell.lists["qa"] = [item]
         return item
+
+    def test_porteur_relu_clos_n_est_ni_publie_ni_recompose(self):
+        # #8247 : une ligne lue ouverte peut être clos avant `work show` ; le
+        # suivi s'arrête proprement au lieu de publier ou recomposer un lot clos.
+        item = carrier()
+        item["state"] = "closed"
+        item["close_reason"] = "abandoned"
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        self.assertIn("porteur clos (abandoned)", ph.tick(self.ctx))
+        self.assertEqual([c for c in self.shell.calls
+                          if "paquet-auto.py" in " ".join(c)], [])
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+        self.assertEqual(self.shell.ran("work", "add"), [])
 
     def test_validated_carrier_with_ci_running_prevents_another_composition(self):
         item = self.open_carrier()

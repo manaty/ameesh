@@ -1977,12 +1977,31 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                 carrier, name, where)
         reason = "rien composé (%s)" % step
         ctx.note(carrier, "%s%s\n\n%s" % (MARK, reason, diagnostic))
+        # #8247 : un autre acteur (pilote, second composeur) peut avoir clos le
+        # porteur entre la lecture du tic et cette fin de composition (cas de
+        # #8240) : le courrier et la clôture seraient alors refusés. Une
+        # relecture qui le dit clos conclut proprement, sans lot d'empreinte
+        # §16 ; une clôture refusée juste après cette lecture est relue de la
+        # même façon, et seul un état clos confirmé par cette seconde lecture
+        # l'emporte sur l'échec.
+        already = closed_reason(ctx, carrier)
+        if already:
+            ctx.say("#%d %s : porteur déjà clos (%s), ni courrier ni clôture"
+                    % (carrier, name, already))
+            return "%s : %s (porteur déjà clos)" % (name, reason)
         ctx.mail(ctx.pilot, carrier, "#%d %s : %s, clôture du porteur vide.\n\n%s"
                  % (carrier, name, reason, diagnostic))
         if not ctx.dry_run:
-            ctx.must("work", "close", str(carrier), "--abandoned",
-                     "--note", MARK + reason, "--actor", ctx.actor,
-                     what="clôture du porteur vide #%d" % carrier)
+            try:
+                ctx.must("work", "close", str(carrier), "--abandoned",
+                         "--note", MARK + reason, "--actor", ctx.actor,
+                         what="clôture du porteur vide #%d" % carrier)
+            except HoraireError as exc:
+                already = closed_reason(ctx, carrier)
+                if not already:
+                    raise
+                ctx.say("#%d %s : porteur clos (%s) pendant la clôture : %s"
+                        % (carrier, name, already, auto._tail(str(exc), 3)))
         return "%s : %s" % (name, reason)
     if re.search(r"^%s" % re.escape(auto.MERGED_LINE), result.stdout, re.MULTILINE):
         # #4322 : fusionné au vert pendant les tests par unité (§11 bis) ;
@@ -2141,6 +2160,11 @@ def composition_evidence(item: dict, now: float) -> str:
 def follow(ctx: Context, item: dict) -> str:
     """Un porteur horaire ouvert : publier, attendre, ou traiter un rouge."""
     carrier = int(item["id"])
+    if str(item.get("state") or "") == "closed":
+        # #8247 : le porteur a été clos entre la liste du tic et sa relecture
+        # (`work show`) ; plus rien à publier, retirer ni recomposer dessus.
+        return "#%d : porteur clos (%s), rien à faire" % (
+            carrier, str(item.get("close_reason") or "clos"))
     name = auto.package_name(str(item.get("branch") or ""))
     if name:
         holder = composition_in_progress(ctx, name)
