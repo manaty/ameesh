@@ -409,9 +409,30 @@ def baseline(db, project, host) -> dict | None:
     None when the host is not reported by the latest tagged attestation
     (already proved, or no tagged proof at all): there is nothing to catch
     up). An unreadable history raises ReleaseError for the explicit gesture.
+
+    #8188: the tags are read after a fetch of the project's remote. The clone
+    of the host that runs the command may lag the release tags (BG named
+    v1.68.0 while v1.71.0 was active); a declaration never names a version
+    from a stale tag set. A failed fetch is an explicit refusal.
+
+    #8188 B: an untagged staging run (§11 bis, a packet outside the cutoff)
+    writes its own attestation and still reports a server it cannot root:
+    the latest *tagged* attestation remains the baseline, and the newer
+    untagged report does not refuse the gesture — the host is still late
+    against that release, and the declaration is the only trace of the
+    avatar's catch-up until the next tagged cutoff replaces it.
     """
     from . import release_cutoff as rc
     rows = _rows(db, strict=True)
+    if not rows:
+        return None
+    try:
+        rc.fetch(project.repo, project.remote, project.target)
+    except rc.ReleaseError as exc:
+        raise rc.ReleaseError(
+            "staging catch-up baseline: cannot refresh the release tags of %s "
+            "from %s: %s" % (getattr(project, "name", project), project.remote,
+                             exc)) from exc
     chosen = _tagged(rows, rc._tags_by_commit(project))
     if chosen is None:
         return None

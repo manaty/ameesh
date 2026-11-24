@@ -325,6 +325,7 @@ class BaselineTest(unittest.TestCase):
     def test_baseline_is_the_tagged_attestation_that_reports_the_host(self):
         rows = [attestation(SHA, reportes={HOST: {"raison": "deferred"}})]
         with mock.patch.object(release_cutoff, "stored_attestations", return_value=rows), \
+             mock.patch.object(release_cutoff, "fetch"), \
              mock.patch.object(release_cutoff, "_tags_by_commit", return_value={SHA: TAG}):
             base = staging_deferred.baseline(object(), project(), HOST)
         self.assertEqual(base["sha"], SHA)
@@ -342,6 +343,7 @@ class BaselineTest(unittest.TestCase):
         rows = [attestation(SHA, hotes={**{h: {"actif": SHA} for h in AGENTS},
                                         HOST: {"actif": SHA}})]
         with mock.patch.object(release_cutoff, "stored_attestations", return_value=rows), \
+             mock.patch.object(release_cutoff, "fetch"), \
              mock.patch.object(release_cutoff, "_tags_by_commit", return_value={SHA: TAG}):
             self.assertIsNone(staging_deferred.baseline(object(), project(), HOST))
 
