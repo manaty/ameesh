@@ -3378,6 +3378,73 @@ class WorkItems(interface.WorkItems):
             "SELECT %s FROM work_items WHERE package_id = %%s ORDER BY id" % item_columns(self.db),
             (package_id,))
 
+    # -- sujets (#8193, 0608) -------------------------------------------------
+    _SUBJECT_COLUMNS = (
+        "id, project, slug, title, author, state, github_ref, closed_by,"
+        " extract(epoch from created_at)::float8 AS created_ts,"
+        " extract(epoch from closed_at)::float8 AS closed_ts")
+
+    def subject_add(self, project, slug, title, *, author) -> tuple[dict, bool]:
+        # ON CONFLICT DO NOTHING : deux créations concurrentes du même slug
+        # rendent la même ligne, la seconde sans la réécrire.
+        rows = self.db.query(
+            "INSERT INTO work_subjects (project, slug, title, author)"
+            " VALUES (%%s, %%s, %%s, %%s) ON CONFLICT (project, slug) DO NOTHING"
+            " RETURNING %s" % self._SUBJECT_COLUMNS,
+            (project, slug, title, author or ""))
+        if rows:
+            return rows[0], True
+        return self.subjects(project=project, slug=slug)[0], False
+
+    def subjects(self, *, project=None, slug=None, open_only=False) -> list[dict]:
+        where, params = " WHERE true", []
+        if project is not None:
+            where += " AND project = %s"
+            params.append(project)
+        if slug is not None:
+            where += " AND slug = %s"
+            params.append(slug)
+        if open_only:
+            where += " AND state = 'open'"
+        return self.db.query(
+            "SELECT %s FROM work_subjects%s ORDER BY project, slug"
+            % (self._SUBJECT_COLUMNS, where), tuple(params))
+
+    def subject_close(self, subject_id, *, actor) -> dict | None:
+        rows = self.db.query(
+            "UPDATE work_subjects SET state = 'closed',"
+            " closed_at = coalesce(closed_at, now()),"
+            " closed_by = coalesce(closed_by, %%s)"
+            " WHERE id = %%s RETURNING %s" % self._SUBJECT_COLUMNS,
+            (actor or "", int(subject_id)))
+        return rows[0] if rows else None
+
+    def subject_attach(self, item_id, subject_id, *, note, actor) -> dict | None:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE work_items SET subject_id = %%s, updated_at = now()"
+                " WHERE id = %%s RETURNING %s, subject_id" % item_columns(self.db),
+                (None if subject_id is None else int(subject_id), int(item_id)))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
+    def subject_items(self, *, subject_id=None, package_id=None) -> list[dict]:
+        clauses, params = [], []
+        if subject_id is not None:
+            clauses.append("subject_id = %s")
+            params.append(int(subject_id))
+        if package_id:
+            clauses.append("package_id = %s OR package_parent = %s")
+            params.extend([package_id, package_id])
+        if not clauses:
+            return []
+        return self.db.query(
+            "SELECT %s, subject_id FROM work_items WHERE %s ORDER BY id"
+            % (item_columns(self.db), " OR ".join("(%s)" % c for c in clauses)),
+            tuple(params))
+
     def record_packet(self, package_id, *, branch, base_sha, head_sha, units, note, actor, expect_pushed=None):
         return self._dev.record_packet(package_id, branch=branch, base_sha=base_sha, head_sha=head_sha, units=units, note=note, actor=actor, expect_pushed=expect_pushed)
 

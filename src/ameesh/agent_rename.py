@@ -112,6 +112,9 @@ KEPT = (
     # #7106 (0575): who registered a tenant of a shared host, dated evidence
     # like `executors.enrolled_by`; a rename does not rewrite it.
     "host_tenants.registered_by",
+    # #8193 (0608): who created or closed a lot subject, dated attribution
+    # like `host_tenants.registered_by`, never an authority; not rewritten.
+    "work_subjects.author", "work_subjects.closed_by",
     # #7697 (0601): the pod request's actor columns are operational
     # attribution, never an identity link. `requested_by` is hashed into the
     # request fingerprint (`pod_children.fingerprint`) together with its

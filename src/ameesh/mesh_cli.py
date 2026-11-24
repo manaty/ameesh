@@ -1957,8 +1957,11 @@ def _wake_deadline(args: argparse.Namespace) -> float | None:
 def work_rows(db, *, state: str | None = None, assignee: str | None = None,
               limit: int | None = None, threshold: float | None = None,
               cfg=None, freeze: bool = False, repo: str | None = None,
-              target: str | None = None) -> list:
+              target: str | None = None, subject: str | None = None) -> list:
     """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84).
+
+    #8193 : `subject` (slug d'un sujet ou id de fiche WorkPackage) restreint
+    aux lots du sujet, tous états ; `state`/`assignee`/`limit` s'y appliquent.
 
     `cfg` : le contexte de classe de revue (#1822), pour que la ligne d'un lot
     léger attende la fusion, pas un verdict.
@@ -1974,7 +1977,12 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
         threshold = stagnation.DEFAULT_THRESHOLD_S
 
     def lire(db):
-        rows = work.list_items(db, state=state, assignee=assignee, limit=limit)
+        if subject:
+            from . import work_subjects
+            rows = work_subjects.filtered(db, subject, state=state, assignee=assignee,
+                                          limit=limit)
+        else:
+            rows = work.list_items(db, state=state, assignee=assignee, limit=limit)
         plan.annotate(db, rows, threshold=threshold, cfg=cfg)
         # Les délais viennent d'un seul balayage, restreint aux lots
         # affichés (jamais une requête par ligne) ; le JSON les porte
@@ -2137,6 +2145,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return prevalidation.run(cfg, db, args)
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args, cfg=cfg)
+        if args.work_command == "subject":   # #8193 : sujets de lots
+            from . import subject_cli
+            return subject_cli.run(cfg, db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
             return backlog.run(db, args, cfg)
@@ -2269,6 +2280,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     raise work.WorkError(error)
             args.app = work_projects.creation_project(cfg, db, creator, args.app,
                                                       new_project=args.new_project)
+            # #8193 : sujet inconnu, clos ou d'un autre projet refusé AVANT la création
+            subject = None
+            if getattr(args, "subject", None):
+                from . import work_subjects
+                subject = work_subjects.for_lot(
+                    db, args.subject,
+                    project=work_subjects.lot_project(
+                        {"app": args.app, "workstream": args.workstream}))
             # #506: read before the lot exists (it makes its project known)
             introduced = (work_projects.introduction(cfg, db, args.app, creator)
                           if args.new_project and args.app else "")
@@ -2334,6 +2353,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # doit plus s'afficher (`_print_assignment` plus bas).
                 check = None
             args.created_item = item
+            if subject is not None and not item.get("existing"):
+                from . import work_subjects
+                try:
+                    work_subjects.attach(db, int(item["id"]), subject["slug"],
+                                         actor=creator or args.actor or "ameesh")
+                    print("subject: %s" % subject["slug"])
+                except work.WorkError as exc:
+                    print("warning: subject %s not attached (%s): ameesh work subject "
+                          "attach %d %s" % (subject["slug"], exc, int(item["id"]),
+                                            subject["slug"]), file=sys.stderr)
             if see_also is not None and not item.get("existing"):
                 # #8119 : relation informative seulement, JAMAIS un lien typé.
                 # Un genre neuf dans `work_item_links` casse un lecteur N-1 :
@@ -2707,6 +2736,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
+                             subject=getattr(args, "subject", None),
                              threshold=stagnation.stale_after(args.stale_after),
                              cfg=cfg, freeze=getattr(args, "freeze", False),
                              repo=getattr(args, "git_dir", None),
@@ -4542,6 +4572,10 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_add.add_argument("--budget", type=float, default=None)
     pw_add.add_argument("--actor", default="")
     pw_add.add_argument("--package", default=None, help=("WorkPackage card of the %s (L29)") % v.noun)
+    pw_add.add_argument("--subject", default=None, metavar="SLUG",
+                        help=("#8193: open subject of the %s's project (`ameesh work "
+                              "subject add`); an unknown subject is refused before "
+                              "creation") % v.noun)
     pw_add.add_argument("--parent-lot", type=int, default=None, metavar="LOT",
                         help=("#1193: parent of a suite %s: its BLOCKING prerequisite, linked "
                              "with the creation (unknown parent refused); a mere "
@@ -4629,6 +4663,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                          help="filter by state: v1 spelling (build, qa…) or its "
                               "generic name (in_progress, to_validate…, #4349)")
     pw_list.add_argument("--assignee", default=None)
+    pw_list.add_argument("--subject", default=None, metavar="SLUG|CARD",
+                         help=("#8193: the %s of a subject (`ameesh work subject add`) "
+                               "or of a WorkPackage card, all states") % v.plural)
     pw_list.add_argument("--limit", type=int, default=50)
     pw_list.add_argument("--json", action="store_true")
     pw_list.add_argument("--freeze", action="store_true",
@@ -5089,6 +5126,8 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
+    from . import subject_cli
+    subject_cli.add_parsers(work_sub, cmd_work)  # #8193 : sujets de lots
     from . import prevalidation
     prevalidation.add_parsers(work_sub, cmd_work)  # #1770 prévalidation au gel
     from . import backlog

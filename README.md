@@ -152,6 +152,13 @@ Personal reminders use `ameesh work add --type follow-up --title "Check the answ
 they stay personal and require no estimate, branch or development review.
 Close them with `ameesh work close <id> --done` or `--abandoned`.
 
+Lots of a project group under a subject: `ameesh work subject add pricing-v2
+--title "Pricing v2" [--app <project>]` (idempotent on the slug), then
+`ameesh work add --subject pricing-v2 …` or `ameesh work subject attach <id>
+pricing-v2` for an existing lot. `ameesh work list --subject pricing-v2` (also
+`--json`, and a WorkPackage card id) lists its lots; `work subject list [--open]`,
+`show <slug>` and `close <slug>` manage the subjects.
+
 Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/ameesh-approve`
 (they only set `PYTHONPATH=src`; nothing is installed into `~/.local/bin`).
 
