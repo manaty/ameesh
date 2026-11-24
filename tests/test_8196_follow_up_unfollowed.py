@@ -115,6 +115,26 @@ class FollowUpUnfollowedTest(PgTestCase):
         work.close(self.db, lot, done=True, actor="avatar")
         self.assertEqual(self.alerts(time.time() + GRACE + 1), [])
 
+    def test_rearm_by_someone_else_lifts_the_alert(self):
+        """B #46245 (ameesh-dev3) : un réarmement par le pilote ou l'humain."""
+        lot = self.follow_up()
+        delivered = self.deliver(lot)
+        self.assertTrue(self.alerts(delivered + GRACE + 1))
+        work.schedule_wake(self.db, lot, time.time() + 86400, text="pilot re-arms",
+                           actor="dev")
+        self.assertEqual(self.alerts(delivered + GRACE + HUMAN + 1), [])
+
+    def test_cancel_by_someone_else_opens_a_no_wake_episode(self):
+        lot = self.follow_up()
+        self.deliver(lot)
+        work.schedule_wake(self.db, lot, time.time() + 86400, text="x", actor="dev")
+        work.schedule_wake(self.db, lot, None, text="not needed", actor="dev")
+        cancelled = time.time()
+        self.assertEqual(self.alerts(cancelled + 60), [])
+        [alert] = self.alerts(cancelled + GRACE + 1)
+        self.assertEqual(alert["reason"], "no_wake")
+        self.assertGreaterEqual(alert["since"], cancelled - 5)
+
     def test_a_note_by_someone_else_does_not_count(self):
         lot = self.follow_up()
         delivered = self.deliver(lot)
@@ -137,8 +157,10 @@ class FollowUpUnfollowedTest(PgTestCase):
         listing = [dict(row, status="running", lease_live=True)
                    if row["name"] == "avatar" else row for row in self.listing()]
         self.assertEqual(_unfollowed(self.db, listing, delivered + GRACE + 1), [])
-        [alert] = _unfollowed(self.db, listing, delivered + GRACE + HUMAN + 1)
+        wait = exploitation.FOLLOW_UP_WORKING_WAIT_S
+        [alert] = _unfollowed(self.db, listing, delivered + GRACE + wait + 1)
         self.assertEqual(alert["lot"], lot)
+        self.assertFalse(alert["human_due"], "l'assigné est briefé avant l'humain")
 
     def test_alerts_pass_includes_it(self):
         lot = self.follow_up()

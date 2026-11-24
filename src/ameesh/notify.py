@@ -2340,7 +2340,7 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "cluster", "health_key",
          # #8196 : la bascule de `follow_up_unfollowed` vers l'humain reste
          # lisible à la résolution (`_deliverable`)
-         "human_due")
+         "human_due", "wake_ts")
 
 
 # --------------------------------------------------------------------------
