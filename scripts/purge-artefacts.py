@@ -65,6 +65,7 @@ RETENTION_H: dict[str, int | None] = {
     "github-pages": 24,      # actions/upload-pages-artifact (défaut du site)
     "horloge-rapport": 7 * 24,  # horloge.yml (#5427)
     "kind-logs": 3 * 24,     # pod-kind.yml (#7695)
+    "kind-logs-sandbox": 3 * 24,  # sandbox-kind.yml (#8246)
 }
 
 ETATS_EN_COURS = ("queued", "in_progress", "waiting", "requested", "pending")
