@@ -85,6 +85,8 @@ BRIEFED_TYPES = ("host_disk_soon_full", "host_unsampled", "staging_interrupted",
                  # #5695 : l'équipe du projet de la source renouvelle son jeton
                  "fingerprints_source_failing", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
+                 # #8196 : à l'assigné du suivi seul
+                 "follow_up_unfollowed",
                  "critical_budget_pause", "idle_actionable_lot", "slo_breach",
                  # #7712 : une coordination de vague qui refuse tour après
                  # tour — l'agent critique ne tourne plus, ce n'est pas un
@@ -598,6 +600,16 @@ def _waiting_without_question(alert: dict) -> str:
             "mail (to an avatar or anyone) never counts." % (
                 v.label(lot, capital=True), " « %s »" % title if title else "",
                 v.noun, lot, v.noun, lot))
+
+
+def _follow_up_unfollowed(alert: dict) -> str:
+    """#8196 : à l'assigné du suivi seul (son humain une heure après)."""
+    lot = int(alert["lot"])
+    title = alert.get("title")
+    return ("Your follow-up%s: %s. Write what you found in a note on #%d. Without a "
+            "change within the hour, your responsible human is told." % (
+                " « %s »" % title if title else "",
+                alert.get("detail") or alert.get("reason") or "?", lot))
 
 
 def _idle_actionable_lot(alert: dict) -> str:
@@ -1742,6 +1754,20 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     elif kind == "mail_undeliverable":
         return _mail_undeliverable_briefs(alert, by_name, auditor_names, closed,
                                           dead_out=dead_out, desk_names=desks)
+    elif kind == "follow_up_unfollowed":
+        # #8196 : l'assigné seul, ni pilote ni auditeur ; un assigné externe
+        # (session de conversation) lit le fil du lot, pas sa boîte. Sans
+        # lecteur, rien : l'humain prend le relais (`human_due`).
+        name = alert.get("agent")
+        if name not in by_name:
+            return {}
+        text = _follow_up_unfollowed(alert)
+        if _external(by_name, name):
+            return {"thread:%s" % name: text}
+        live, dead = _split_live({name: text}, by_name, closed)
+        if dead_out is not None:
+            dead_out.update(dead)
+        return live
     elif kind == "idle_actionable_lot":
         out = {}
         audit_text = _idle_actionable_lot(alert)

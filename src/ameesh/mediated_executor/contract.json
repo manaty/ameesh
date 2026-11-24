@@ -5307,6 +5307,7 @@
     "resolutions",
     "resolve_delegation",
     "returned_delegations",
+    "follow_up_watch",
     "review_catch_up_bound",
     "review_proposals",
     "save_measure",

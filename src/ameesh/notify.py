@@ -160,6 +160,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "avatar_failover", "orphan_lot",
                  "attached_session_forgotten",
                  "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
+                 # #8196 : un suivi que plus aucun réveil ne suit — à l'humain
+                 # seulement une heure après le brief de l'assigné (`human_due`)
+                 "follow_up_unfollowed",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
                  # #4164 : un compte fournisseur sans crédit — aucun tour accordé
                  "provider_credits_exhausted",
@@ -392,6 +395,7 @@ TYPE_LABELS = {
     "watch_silent": "watch silent",
     "delegation_expired": "delegation expired",
     "engagement_overdue": "commitment or due date passed",
+    "follow_up_unfollowed": "follow-up no longer followed by a wake",
     "long_turn": "long turn",
     "session_too_big": "session too big",
     # #8204 : la session d'un avatar, celle à laquelle son humain s'attache
@@ -2333,7 +2337,10 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          # l'état ; la clé garde `since` et `reason`, pas la publication.
          "bias_side", "bias_level", "tier_since", "biased_since",
          # #6862 : la clé des alertes du collecteur de grappe (`db_sante`)
-         "cluster", "health_key")
+         "cluster", "health_key",
+         # #8196 : la bascule de `follow_up_unfollowed` vers l'humain reste
+         # lisible à la résolution (`_deliverable`)
+         "human_due", "wake_ts")
 
 
 # --------------------------------------------------------------------------
@@ -2400,6 +2407,9 @@ class Notifier:
         """#8180 : le type est-il livré à l'humain ? `notify.types` filtre les
         types ordinaires, jamais un type urgent ni une alerte d'échéance
         d'identifiant (MANDATORY_TYPES), ni une cible `owner`."""
+        if alert.get("type") == "follow_up_unfollowed" and not alert.get("human_due"):
+            # #8196 : l'assigné d'abord (brief) ; l'humain une heure après
+            return False
         return (alert.get("type") in self.ncfg.types
                 or alert.get("type") in MANDATORY_TYPES
                 or forces_owner(alert))
@@ -3405,6 +3415,11 @@ class Notifier:
         # tenter une boîte avatar qui ne peut pas être écrite (relecture cx1).
         avatar = (None if db is None or entry.get("avatar_fallback")
                   else router.avatar_for(human))
+        if (avatar and alert.get("type") == "follow_up_unfollowed"
+                and avatar == alert.get("agent")):
+            # #8196 : l'avatar est l'assigné du suivi, déjà briefé ; l'humain
+            # est prévenu par ses canaux, pas par la boîte qui n'a pas réagi.
+            avatar = None
         if avatar and self._deliver_avatar(entry, avatar, human, now, db):
             return
         self._raise_direct(entry, human, now, first=first)
@@ -3823,8 +3838,10 @@ class Notifier:
                 # une relance), et rien n'est redéposé chez les morts.
                 already = {str(n) for n in entry.get("to") or ()}
                 fresh = {n: t for n, t in briefs.items() if n not in already}
-                remind_due = not entry.get("reminded") and now - float(
-                    entry["sent_ts"]) >= alert_briefs.REMIND_AFTER_S
+                # #8196 : une alerte par épisode, l'humain prend le relais
+                remind_due = (kind != "follow_up_unfollowed"
+                              and not entry.get("reminded") and now - float(
+                                  entry["sent_ts"]) >= alert_briefs.REMIND_AFTER_S)
                 if remind_due:
                     # #3057 : la relance échue part dans la même passe que le
                     # brief initial d'un destinataire revenu, et la relance
