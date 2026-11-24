@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#8193 : `ameesh work subject add|list|show|close|attach` (sujets de lots).
+"""#8193 : `ameesh work subject add|list|show|close|attach` (sujets de lots) ;
+#8195 : `add --github owner/repo#N` et `project --repo` (épique GitHub).
 
 Gardées hors de `mesh_cli` (qui les branche), comme `plan_cli`. Le domaine
 est `work_subjects`."""
@@ -19,13 +20,16 @@ def add_parsers(work_sub, func) -> None:
     """Ajoute `subject` à `ameesh work`."""
     p_subject = work_sub.add_parser(
         "subject", help="#8193: subjects grouping lots of a project (add, list, show, "
-                        "close, attach)")
+                        "close, attach, project)")
     sub = p_subject.add_subparsers(dest="subject_command", required=True)
     p_add = sub.add_parser("add", help="create a subject (idempotent on the slug)")
     p_add.add_argument("slug", help="short slug, unique per project (e.g. pricing-v2)")
     p_add.add_argument("--title", required=True)
     p_add.add_argument("--app", default=None,
                        help="project; default: the creating agent's project")
+    p_add.add_argument("--github", default=None, metavar="OWNER/REPO#N",
+                       help="#8195: adopt this existing GitHub issue as the subject's epic "
+                            "(it must be readable by the mesh's GitHub identity)")
     p_add.add_argument("--actor", default="")
     p_add.add_argument("--json", action="store_true")
     p_list = sub.add_parser("list", help="the subjects")
@@ -46,7 +50,12 @@ def add_parsers(work_sub, func) -> None:
     p_attach.add_argument("slug", nargs="?", default=None)
     p_attach.add_argument("--none", action="store_true", help="detach the lot from its subject")
     p_attach.add_argument("--actor", default="")
-    for parser in (p_add, p_list, p_show, p_close, p_attach):
+    p_project = sub.add_parser("project", help="#8195: create the GitHub epic of a subject "
+                                               "born without --github")
+    p_project.add_argument("slug")
+    p_project.add_argument("--repo", required=True, metavar="OWNER/REPO")
+    p_project.add_argument("--app", default=None)
+    for parser in (p_add, p_list, p_show, p_close, p_attach, p_project):
         parser.set_defaults(func=func)
 
 
@@ -78,13 +87,35 @@ def _lot_view(row: dict) -> dict:
              "subject_id", "package_id")}
 
 
+def _github_context(cfg, db):
+    """#8195 : le client `gh` (identité GitHub du mesh) et la garde de publication."""
+    from . import plan_github, subject_github
+    from .work import WorkError
+    try:
+        gh = plan_github.Gh()
+    except plan_github.GithubError as exc:
+        raise WorkError("GitHub epic: %s" % exc) from exc
+    return subject_github.Context(cfg, db, gh)
+
+
 def run(cfg, db, args: argparse.Namespace) -> int:
     command = args.subject_command
     if command == "add":
         from . import work_projects
         project = work_projects.creation_project(cfg, db, args.actor, args.app)
+        ctx = issue = None
+        if args.github:
+            # #8195 : ticket illisible, fermé ou déjà adopté refusé AVANT la création
+            from . import subject_github
+            work_subjects.check_slug(args.slug)
+            ctx = _github_context(cfg, db)
+            known = work_subjects.find(db, args.slug, project=project)
+            _repo, _number, issue = subject_github.check_adoptable(
+                db, ctx.gh, args.github, subject=known)
         subject, created = work_subjects.add(db, args.slug, args.title, project=project,
                                              actor=args.actor)
+        if ctx is not None:
+            subject = subject_github.adopt(db, ctx, subject, args.github, issue=issue)
         if args.json:
             print(json.dumps({"created": created, "subject": subject},
                              ensure_ascii=False, indent=2, default=str))
@@ -94,6 +125,15 @@ def run(cfg, db, args: argparse.Namespace) -> int:
         else:
             print("subject %s already exists in %s (%s): %s"
                   % (subject["slug"], subject["project"], subject["state"], subject["title"]))
+        if ctx is not None and not args.json:
+            print("epic: %s (lot list kept in its body)" % subject["github_ref"])
+        return 0
+    if command == "project":
+        from . import subject_github
+        subject = work_subjects.get(db, args.slug, project=args.app)
+        subject = subject_github.create_epic(db, _github_context(cfg, db), subject, args.repo)
+        print("subject %s (%s): epic %s created" % (subject["slug"], subject["project"],
+                                                   subject["github_ref"]))
         return 0
     if command == "list":
         rows = work_subjects.list_subjects(db, project=args.app, open_only=args.open)
@@ -115,6 +155,8 @@ def run(cfg, db, args: argparse.Namespace) -> int:
                              ensure_ascii=False, indent=2, default=str))
             return 0
         print("subject  : %s (%s) — %s" % (subject["slug"], subject["project"], subject["title"]))
+        if subject.get("github_ref"):
+            print("epic     : %s" % subject["github_ref"])
         print("state    : %s   author: %s   created: %s%s" % (
             subject["state"], subject.get("author") or "—", _ts(subject.get("created_ts")),
             "   closed: %s by %s" % (_ts(subject.get("closed_ts")), subject.get("closed_by") or "—")

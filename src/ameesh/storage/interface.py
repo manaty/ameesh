@@ -3606,6 +3606,16 @@ class WorkItems(Domain):
         le lot n'existe pas. UNE transaction."""
 
     @abc.abstractmethod
+    def subject_set_github(self, subject_id: int, ref: str) -> dict | None:
+        """#8195 : pose l'épique GitHub `ref` (`owner/repo#N`) du sujet, si
+        le sujet n'en a pas d'autre et qu'aucun autre sujet ne porte cette
+        référence (casse ignorée) ; rend la ligne, None en cas de refus."""
+
+    @abc.abstractmethod
+    def subjects_by_github(self, ref: str) -> list[dict]:
+        """#8195 : les sujets dont l'épique est `ref` (casse ignorée)."""
+
+    @abc.abstractmethod
     def subject_items(self, *, subject_id: int | None = None,
                       package_id: str | None = None) -> list[dict]:
         """Les lots du sujet, ou de la fiche WorkPackage (`package_id` ou son

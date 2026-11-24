@@ -158,6 +158,13 @@ Lots of a project group under a subject: `ameesh work subject add pricing-v2
 pricing-v2` for an existing lot. `ameesh work list --subject pricing-v2` (also
 `--json`, and a WorkPackage card id) lists its lots; `work subject list [--open]`,
 `show <slug>` and `close <slug>` manage the subjects.
+A subject can adopt an existing GitHub issue as its epic (`work subject add
+<slug> --title … --github owner/repo#N`, refused if the mesh's GitHub identity
+cannot read it) or create one later (`work subject project <slug> --repo
+owner/repo`). Its body gets a section between `<!-- ameesh:subject=<slug> -->`
+markers listing the lots and their state, rewritten by the GitHub projection;
+text outside the markers is never touched. Closing the issue on GitHub closes
+the subject (read by the GitHub watch of the repository).
 
 A follow-up waiting on someone: `ameesh work wait <id> --on "Sébastien"
 [--wake-in 2d]` (state `blocked`, who and since kept in its journal);
