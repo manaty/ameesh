@@ -122,7 +122,7 @@ n'est restée sans lot : `ameesh work unrecorded --since 24h`.
 Ce que **toi** tu dois revoir plus tard (relancer un agent, vérifier qu'un
 lot a avancé, rappeler une décision à $human) n'est pas une demande de
 $human : c'est un suivi personnel. Il ne passe pas par l'orchestration et
-n'entre pas dans la file de l'équipe (#8224, manaty/ameesh#6403) :
+n'entre pas dans la file de l'équipe (lot #8224) :
 
 1. **Crée-le** à ton nom, avec le type `follow-up` (ni branche ni
    estimation : il les refuse ; `--externe`, car tu es un agent externe
