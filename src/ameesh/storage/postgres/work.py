@@ -2284,6 +2284,7 @@ class WorkItems(interface.WorkItems):
         `schedule_wake` : le journal dit quand le réveil a cessé d'être armé."""
         if not has_wake_at(self.db):
             return []
+        delivered = "wake: scheduled wake delivered%"
         return self.db.query(
             "SELECT w.id, w.title, w.state, w.assignee,"
             "       extract(epoch from w.created_at)::float8 AS created_ts,"
@@ -2294,19 +2295,19 @@ class WorkItems(interface.WorkItems):
             "  FROM work_items w"
             "  LEFT JOIN LATERAL (SELECT e.id, e.created_at FROM work_item_events e"
             "                      WHERE e.work_item_id = w.id"
-            "                        AND e.note LIKE 'wake: scheduled wake delivered%%'"
+            "                        AND e.note LIKE %%s"
             "                      ORDER BY e.id DESC LIMIT 1) d ON true"
             "  LEFT JOIN LATERAL (SELECT e.created_at FROM work_item_events e"
             "                      WHERE e.work_item_id = w.id"
-            "                        AND (e.note LIKE 'wake: scheduled wake delivered%%'"
-            "                             OR e.note LIKE 'wake: cancelled%%')"
+            "                        AND (e.note LIKE %%s OR e.note LIKE %%s)"
             "                      ORDER BY e.id DESC LIMIT 1) x ON true"
             "  LEFT JOIN LATERAL (SELECT min(e.created_at) AS created_at"
             "                       FROM work_item_events e"
             "                      WHERE e.work_item_id = w.id AND e.id > d.id"
             "                        AND e.actor = w.assignee) n ON true"
             " WHERE w.type = %%s AND w.state NOT IN %s"
-            " ORDER BY w.id" % _CLOSED, (lifecycle.FOLLOW_UP,))
+            " ORDER BY w.id" % _CLOSED,
+            (delivered, delivered, "wake: cancelled%", lifecycle.FOLLOW_UP))
 
     def returned_delegations(self, since_ts) -> list[dict]:
         """Délégations rendues au délégant depuis `since_ts` (alerte
