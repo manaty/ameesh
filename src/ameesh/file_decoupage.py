@@ -98,12 +98,19 @@ SOURCE_PREFIX = "file-decoupage:"
 FALLBACK_S = 3600.0
 #: marque du repli, posée une fois sur le lot de découpage
 FALLBACK_MARK = "repli " + AUDITOR_ROLES[0]
+#: #8198 : le pilote écrit sa raison sous `hold:` (et la levée sous
+#: `unhold:`), et la sentinelle de feuille de route vit dans cette raison :
+#: `hold: roadmap: épuisée nexlink — …`. Le préfixe de retenue est donc
+#: facultatif devant les deux sentinelles, jamais exigé.
+HOLD_WRAPPER = r"(?:(?:un)?hold:\s*)?"
 #: la note du pilote (§1, « Feuille de route épuisée »)
 EXHAUSTED_PREFIX = "roadmap: épuisée"
-EXHAUSTED_RE = re.compile(r"^\s*roadmap\s*:\s*épuisée\s+(\S+)", re.IGNORECASE)
+EXHAUSTED_RE = re.compile(r"^\s*" + HOLD_WRAPPER + r"roadmap\s*:\s*épuisée\s+(\S+)",
+                          re.IGNORECASE)
 #: #4623 : la note qui rouvre la feuille de route ; deux orthographes déclarées
 REOPENED_PREFIX = "roadmap: rouverte"
-REOPENED_RE = re.compile(r"^\s*roadmap\s*:\s*r(?:é)?ouverte\s+(\S+)", re.IGNORECASE)
+REOPENED_RE = re.compile(r"^\s*" + HOLD_WRAPPER + r"roadmap\s*:\s*r(?:é)?ouverte\s+(\S+)",
+                         re.IGNORECASE)
 #: toutes les notes de feuille de route, lues d'un seul préfixe : les deux
 #: formes sont ensuite départagées par leur ordre dans le journal
 ROADMAP_PREFIX = "roadmap:"
@@ -361,8 +368,11 @@ def roadmap_notes(db, item_id: int) -> list:
 
     Un seul préfixe (`roadmap:`) suffit : les formes épuisée/rouverte sont
     départagées par `roadmap_state`, dans l'ordre du journal (`id` d'événement,
-    stable et monotone pour un lot)."""
-    return _roadmap_order(work.events_noted(db, int(item_id), ROADMAP_PREFIX))
+    stable et monotone pour un lot). #8198 : une sentinelle écrite dans la
+    raison d'un `hold:`/`unhold:` est lue comme les autres (`wrapped`), sinon
+    une note `hold: roadmap: épuisée …` resterait invisible au sommeil."""
+    return _roadmap_order(work.events_noted(db, int(item_id), ROADMAP_PREFIX,
+                                            wrapped=True))
 
 
 def roadmap_state(notes: list, project: str) -> str | None:

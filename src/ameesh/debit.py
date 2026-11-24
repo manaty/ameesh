@@ -3152,6 +3152,9 @@ _TURNS_SQL = """
 #: sur un lot de découpage du projet vaut, spec §1). #6215 : l'`id` de
 #: l'événement est joint pour que `file_decoupage.roadmap_state` ordonne les
 #: notes par le journal, comme le sommeil — jamais par un tri d'`at_ts` à part.
+#: #8198 : une sentinelle écrite dans la raison d'un `hold:`/`unhold:`
+#: (`hold: roadmap: épuisée …`) est retenue par le même filtre, sinon le débit
+#: ne verrait pas la note que le sommeil lit.
 _ROADMAP_SQL = """
     SELECT e.id, e.work_item_id, e.note, w.source,
            extract(epoch FROM e.created_at)::float8 AS at_ts
@@ -3159,7 +3162,7 @@ _ROADMAP_SQL = """
       JOIN work_items w ON w.id = e.work_item_id
      WHERE e.created_at > to_timestamp(%s)
        AND w.source LIKE 'file-decoupage:%%'
-       AND (lower(left(ltrim(e.note), 8)) = 'roadmap:'
+       AND (ltrim(e.note) ~* '^(?:(?:un)?hold:\\s*)?roadmap\\s*:'
             OR ltrim(e.note) LIKE 'sleep exempted:%%')
      ORDER BY e.created_at
 """
