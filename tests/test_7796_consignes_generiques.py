@@ -34,6 +34,16 @@ class ChatInstructionTest(unittest.TestCase):
         self.assertIn("to human:alice or to their desk", text)
         self.assertIn("--assignee <agent-orchestration>", text)
 
+    def test_personal_follow_ups_are_typed_and_self_assigned(self):
+        # #8224 (manaty/ameesh#6403): the avatar's own follow-ups are typed
+        # follow-up, assigned to itself, woken then closed.
+        text = chat.instruction("human:alice", "chat-alice")
+        self.assertIn("work add --type follow-up --title", text)
+        self.assertIn("--assignee chat-alice`", text)
+        self.assertIn("ameesh work wake <id> --at", text)
+        self.assertIn("ameesh work close <id> --done", text)
+        self.assertIn("ameesh work close <id> --abandoned", text)
+
 
 if __name__ == "__main__":
     unittest.main()
