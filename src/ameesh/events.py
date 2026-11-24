@@ -36,6 +36,9 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        deny rules, digest; no credentials)
   agent.read           one allowed MCP read of an avatar: tool, target
                        identifiers and outcome; never the content (#7859)
+  agent.session_forgotten  the session an avatar's human attaches to was
+                       forgotten by the runner (agent, session, human, reason;
+                       read by the `attached_session_forgotten` alert, #8204)
   agent.retired        an agent taken out of the active registry, and
   agent.restored       brought back (#3460, written with the gesture)
   host.memory_unavailable  a persona memory repository could not be opened on
