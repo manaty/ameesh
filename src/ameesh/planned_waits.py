@@ -490,6 +490,31 @@ def expired_window(holds: dict | None, now: float, *, events=()) -> float | None
     return max(dues)
 
 
+def open_window(holds: dict | None, now: float, *, events=()) -> float | None:
+    """#8199 : l'échéance d'une fenêtre d'observation **non échue** du lot.
+
+    `holds` est l'entrée d'un lot dans `active_holds` (`{auteur: hold}`).
+    Rend la plus proche échéance encore à venir d'une fenêtre de pilote, ou
+    None. Le repli du découpage s'en sert (débit et remplissage de file) :
+    une fenêtre déclarée veut dire « aucune relance avant l'échéance », même
+    si la file reste vide. Une échéance illisible ne tient rien (le sens sûr
+    est le repli, comme `expired_window`).
+    """
+    pilots = [hold for hold in (holds or {}).values() if hold.get("pilot")]
+    if not pilots:
+        return None
+    from .debit import wake_state
+    wake = wake_state({**event, "at_ts": event.get("at_ts", event.get("created_ts"))}
+                      for event in events)
+    dues = []
+    for hold in pilots:
+        window, due_ts = observation_for_hold(hold, wake=wake)
+        if window is None or due_ts is None or float(due_ts) <= float(now):
+            continue
+        dues.append(float(due_ts))
+    return min(dues) if dues else None
+
+
 #: #5758 : une transition **automatique** de l'outillage — quorum d'avis,
 #: gel, désignation, sync — n'est pas un geste : elle ne lève pas un hold de
 #: pilote. L'outil signe ces écritures sous son nom (`work.SYSTEM_SENDER` =

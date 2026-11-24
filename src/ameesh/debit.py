@@ -2622,6 +2622,7 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
              open_lots: Iterable[Mapping[str, Any]] = (),
              roadmap_notes: Iterable[Mapping[str, Any]] = (),
              roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None,
+             window_waits: Iterable[Mapping[str, Any]] = (),
              losses: Iterable[Mapping[str, Any]] = (),
              now: float, window_s: float,
              repos_part: float | None, repos_s: float | None,
@@ -2679,16 +2680,22 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       (#6010). `roadmap_exhausted` : les verdicts déjà calculés par
       `_roadmap_verdicts` (une seule lecture pour `build` et la capacité) ;
       absent, ils sont recalculés depuis `roadmap_notes` et `open_lots`.
+    * `window_waits` : les fenêtres d'observation déjà lues par `build`
+      (`{lot, due_ts, …}`) ; #8199 : une fenêtre **non échue** sur le lot de
+      découpage tient le repli jusqu'à son échéance, comme une note de
+      mouvement fraîche — sauf si un lot démarrable ou retenu par l'empreinte
+      attend, dont la prise reste un geste dû.
     * `losses` : la perte au reset par compte, comme `ameesh accounts`.
     * `gating_ok` : faux quand une lecture dont dépend l'alerte a échoué
       (lots ouverts, notes, tenues de budget, historique) ; la mesure reste
       rendue, mais aucune alerte n'est levée sur une lecture incomplète.
 
     Une alerte par projet quand `idle_share ≥ repos_part`, qu'aucun lot de
-    découpage n'a moins de `file_decoupage.FALLBACK_S` et que le projet n'est
-    pas silencieux : une route épuisée n'est pas une alerte, sauf si un lot
-    démarrable ou retenu par la garde d'empreinte y attend encore (#6215,
-    #4561). C'est cette alerte qui fait sortir `--check` 2."""
+    découpage n'a moins de `file_decoupage.FALLBACK_S` (ni de fenêtre
+    d'observation non échue, #8199) et que le projet n'est pas silencieux :
+    une route épuisée n'est pas une alerte, sauf si un lot démarrable ou
+    retenu par la garde d'empreinte y attend encore (#6215, #4561). C'est
+    cette alerte qui fait sortir `--check` 2."""
     from . import file_decoupage
     from . import projects as projects_mod
     from . import sous_utilisation
@@ -2702,6 +2709,12 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     else:
         exhausted = {str(project): dict(entry)
                      for project, entry in roadmap_exhausted.items()}
+    # #8199 : une fenêtre d'observation non échue sur le lot de découpage tient
+    # le repli jusqu'à son échéance (le pilote a daté l'attente). La lecture
+    # vient de `build` (`window_waits`) ; une échéance passée ne tient rien.
+    windows = {int(row["lot"]): dict(row) for row in window_waits or ()
+               if row.get("lot") is not None
+               and float(row.get("due_ts") or 0.0) > now}
     for name, why in _review_seats(roadmap_notes, exhausted,
                                      open_lots).items():
         held.setdefault(name, why)
@@ -2875,6 +2888,13 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         entry["footprint_lots"] = sorted(footprint_by.get(project, []),
                                          key=lambda row: row["lot"])
         entry["decoupage"] = decoupage.get(project)
+        # #8199 : la fenêtre est attachée au lot de découpage pour que le texte
+        # dise pourquoi le repli est tenu, et non « sans mouvement ».
+        window = (windows.get(int(entry["decoupage"]["lot"]))
+                  if entry["decoupage"] is not None else None)
+        if window is not None:
+            entry["decoupage"]["window"] = {
+                "due_ts": float(window["due_ts"]), "due": window.get("due")}
         projects_out.append(entry)
         fresh = entry["decoupage"] is not None and (
             entry["decoupage"].get("quiet_s") or 0.0) < file_decoupage.FALLBACK_S
@@ -2883,10 +2903,13 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         # garde d'empreinte est du travail réel : l'alerte le nomme et porte
         # son geste (#4561).
         pending = entry["startable_lots"] or entry["footprint_lots"]
+        # #8199 : une fenêtre non échue tait le repli (quiet_s ne le voyait
+        # pas), mais jamais la prise d'un lot qui attend.
+        fallback_held = window is not None and not pending
         if (gating_ok and repos_part is not None and entry["wakeable"]
                 and entry["idle_share"] >= float(repos_part)
                 and (entry["roadmap_exhausted"] is None or pending)
-                and not fresh):
+                and not fresh and not fallback_held):
             alerts.append({
                 "project": project, "idle": entry["idle"],
                 "wakeable": entry["wakeable"], "idle_share": entry["idle_share"],
@@ -3181,16 +3204,23 @@ _SPLIT_SOURCES_SQL = """
 """
 
 #: #7848 : le dernier mouvement utile de chaque lot de découpage ouvert —
-#: une note de son assigné (le pilote), ou la création d'un lot qui le cite
-#: (`#<id>` dans le titre, le corps ou la source). Les notes automatiques
-#: (`ameesh`, `ameesh:*` : réveils, repli) n'en sont pas : elles ne disent
-#: rien du découpage. Sans mouvement, `moved_ts` est NULL et l'âge fait foi.
+#: une note `roadmap:` de son assigné (le pilote), ou la création d'un lot qui
+#: le cite (`#<id>` dans le titre, le corps ou la source). Les notes
+#: automatiques (`ameesh`, `ameesh:*` : réveils, repli) n'en sont pas : elles
+#: ne disent rien du découpage.
+#: #8199 : une note `hold:`/`unhold:` ou une note de veille du pilote n'est
+#: pas un mouvement non plus — #8035 (49 h) et #8082 étaient devenus « frais »
+#: sur une note de 00:22Z/00:25Z, et l'alerte de découpage se taisait pendant
+#: que 580 h-agent dormaient. Seule une note `roadmap:` (avec le préfixe
+#: `hold:`/`unhold:` facultatif de #8198, même filtre que `_ROADMAP_SQL`)
+#: compte comme geste sur la feuille de route. Sans mouvement, `moved_ts` est
+#: NULL et l'âge fait foi.
 _SPLIT_MOVES_SQL = """
     SELECT s.id,
            extract(epoch FROM greatest(
                (SELECT max(e.created_at) FROM work_item_events e
                  WHERE e.work_item_id = s.id
-                   AND coalesce(btrim(e.note), '') <> ''
+                   AND ltrim(e.note) ~* '^(?:(?:un)?hold:\\s*)?roadmap\\s*:'
                    AND e.actor = s.assignee
                    AND e.actor <> 'ameesh' AND e.actor NOT LIKE 'ameesh:%%'),
                (SELECT max(w.created_at) FROM work_items w
@@ -3465,7 +3495,8 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
                                        canons=canons, unreadable=unreadable,
                                        roadmap_notes=roadmap_notes,
                                        roadmap_error=roadmap_error,
-                                       roadmap_exhausted=roadmap_exhausted)
+                                       roadmap_exhausted=roadmap_exhausted,
+                                       window_waits=report.get("window_waits"))
     report["totals"]["capacity_alerts"] = len(report["capacity"]["alerts"])
     report["unreadable"] = list(dict.fromkeys(list(report["unreadable"]) + unreadable))
     return report
@@ -3581,7 +3612,8 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
                   canons=None, unreadable: list,
                   roadmap_notes: Iterable[Mapping[str, Any]] | None = None,
                   roadmap_error: str | None = None,
-                  roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None) -> dict:
+                  roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None,
+                  window_waits: Iterable[Mapping[str, Any]] | None = None) -> dict:
     """#3256 B : lit ce que `capacity` calcule. Chaque lecture en échec est
     nommée dans `unreadable` ; si l'une de celles dont dépend l'alerte manque
     (agents, lots ouverts, démarrables, notes, tenues de budget, historique),
@@ -3590,7 +3622,9 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
     #6215 : `read` fournit les notes et les verdicts de feuille de route déjà
     lus (`roadmap_notes`, `roadmap_exhausted`) et l'échec éventuel de cette
     lecture (`roadmap_error`) ; sans eux (appel direct), la lecture et le
-    calcul restent locaux, comme avant."""
+    calcul restent locaux, comme avant. #8199 : `window_waits` sont les
+    fenêtres d'observation déjà lues par `build` — une fenêtre non échue sur
+    le lot de découpage tient le repli jusqu'à son échéance."""
     from . import file_decoupage
     from . import host_lifecycle
     from . import mechanics
@@ -3702,6 +3736,7 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
     out = capacity(agents=listing, turns=turns, startable=startable,
                    footprint=footprint, open_lots=lots,
                    roadmap_notes=notes, roadmap_exhausted=roadmap_exhausted,
+                   window_waits=list(window_waits or ()),
                    losses=losses, now=now,
                    window_s=int(hours) * 3600,
                    repos_part=rule.repos_part if rule else None,
@@ -3789,6 +3824,10 @@ def _capacity_text(cap: Mapping[str, Any] | None) -> list[str]:
             if (decoupage.get("quiet_s") is not None
                     and decoupage.get("quiet_s") != decoupage.get("age_s")):
                 text += ", dernier mouvement il y a %s" % _duration(decoupage["quiet_s"])
+            window = decoupage.get("window") or {}
+            if window.get("due"):
+                # #8199 : le repli est tenu par une fenêtre datée, pas muet.
+                text += ", fenêtre d'observation jusqu'à %s" % window["due"]
             parts.append(text + ")")
         if row.get("roadmap_exhausted") and excluded != "feuille de route épuisée":
             parts.append("feuille de route épuisée")

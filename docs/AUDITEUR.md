@@ -115,7 +115,11 @@ d'observation** — une attente voulue et datée (`"hold: fenêtre : <motif>"`
 avec `--wake-at`) ; jusqu'à l'échéance, le débit la liste à part
 (`window_waits`, hors `slow_waits`) et `--check` ne sort pas 2 : rien n'est
 actionnable avant. À l'échéance, le hold redevient une attente ordinaire et
-le réveil échu la signale. Une simple
+le réveil échu la signale. #8199 : tant qu'elle court, une fenêtre
+d'observation non échue tient aussi le **repli du découpage** (§2.2 de la
+spec #3256) : ni le débit ni le remplissage de file ne réclament de lots au
+pilote avant l'échéance, même si la file reste vide ; un lot démarrable ou
+retenu par l'empreinte qui attend encore reste, lui, un geste dû. Une simple
 mention d'une règle ou d'une consigne de l'owner, ou d'une décision déjà
 signée, ne classe pas l'attente humaine ; un `hold_undeployed` ne l'est jamais
 (canon §11 bis). #7847 : un `hold_undeployed` n'est reconnu que si le `#N`
@@ -139,8 +143,10 @@ découpage ouvert et son âge (`decoupage`), la feuille de route notée épuisé
 compte de forfait (`plan_loss_at_reset`, le calcul d'`ameesh accounts` ; une
 fenêtre échue n'annonce rien et ne périme pas une fenêtre encore ouverte,
 #7522).
-Les relecteurs, les pilotes, l'auditeur, mesh-design et les agents en pause
-ne sont pas réveillables et n'y comptent pas. Une famille exclue des prises
+Les relecteurs, les pilotes, l'auditeur, mesh-design, les agents en pause et
+ceux dont la fiche dit `auth_blocked` (L226b : aucun tour avant le retour
+d'un compte sain, #8199) ne sont pas réveillables et n'y comptent pas. Une
+famille exclue des prises
 (`auto_take.excluded_families` du canon, #5005) ne compte pas non plus tant
 que l'exclusion court : c'est une capacité volontairement écartée, pas une
 perte. Seuls les agents **au repos** comptent les heures-agent : le temps
@@ -161,10 +167,13 @@ attente de plus de 2 h. Le geste dépend de l'état :
 - aucun lot de découpage : le pilote du projet doit en recevoir un (spec
   `docs/design/3256-debit-file.md` §2.2, #4273) ; s'il manque, l'auditeur le
   signale au pilote ;
-- un lot de découpage est sans mouvement depuis plus d'une heure (ni note de
-  son pilote, ni lot créé qui le cite, `capacity…decoupage.quiet_s`, #7848)
-  sans lot démarrable : le **repli** de la spec §2.2, geste de niveau 1
-  ci-dessous.
+- un lot de découpage est sans mouvement depuis plus d'une heure (seules
+  comptent une note `roadmap:` de son pilote — préfixe `hold:`/`unhold:`
+  admis, #8198 — ou la création d'un lot qui le cite ; #7848, #8199 : une
+  note `hold:`/`unhold:` ordinaire ou de veille ne remet pas le compteur à
+  zéro) sans lot démarrable : le **repli** de la spec §2.2, geste de niveau 1
+  ci-dessous. Une fenêtre d'observation non échue sur le lot tient ce repli
+  jusqu'à son échéance (#8199).
 
 Une feuille de route notée épuisée (`roadmap: épuisée <projet>` sur le lot de
 découpage) retire le projet de l'alerte et de ses heures au repos. Une mesure
@@ -800,7 +809,7 @@ FIN
 | orchestrateur muet avec du courrier | `agent-mail send <orchestrateur> "…"` | aucun |
 | « Idle with an actionable lot: … » (`idle_actionable_lot`, #408) : un agent au repos détient un lot `intake`/`build` et les réveils de son exécuteur (règle 1) sont restés sans effet | **relancer, pas seulement nommer** : `agent-mail send <agent> "…" --lot <lot>` (ce qui est attendu sur le lot, ou qu'il note pourquoi il ne peut pas avancer : `ameesh work note <lot> "hold: <raison>"`) ; exécuteur pas vivant : `ameesh resume <agent>` d'abord ; s'il ne peut pas prendre le lot : `ameesh work assign <lot> <agent>` | `ameesh work assign <lot> <ancien>` |
 | « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
-| lot de découpage sans mouvement depuis plus d'une heure (note du pilote ou lot créé qui le cite, #7848) sans lot démarrable créé (`capacity.alerts`, repli de la spec #3256 §2.2) | créer lui-même les lots démarrables du projet, d'au plus une journée chacun, depuis la feuille de route citée par le lot de découpage : `ameesh work add --app <projet> --estimate <durée> …`, puis les nommer dans une note du lot de découpage ; il ne touche ni au code ni à la priorité des lots du pilote | `ameesh work close <lot>` |
+| lot de découpage sans mouvement depuis plus d'une heure (seule une note `roadmap:` du pilote — préfixe `hold:`/`unhold:` admis — ou un lot créé qui le cite compte, #7848, #8199 ; une note `hold:`/`unhold:` ordinaire ou de veille ne compte pas ; une fenêtre d'observation non échue tient le repli jusqu'à son échéance) sans lot démarrable créé (`capacity.alerts`, repli de la spec #3256 §2.2) | créer lui-même les lots démarrables du projet, d'au plus une journée chacun, depuis la feuille de route citée par le lot de découpage : `ameesh work add --app <projet> --estimate <durée> …`, puis les nommer dans une note du lot de découpage ; il ne touche ni au code ni à la priorité des lots du pilote | `ameesh work close <lot>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
 | avis dû depuis plus de 2 h sur la tête gelée (`reviews_by_reviewer`) | relancer le relecteur avec la liste de ses avis dus (le débit la porte : `agent-mail send <relecteur> "…" --lot <lot>`) ; au repos, `ameesh resume <relecteur>` ; s'il est marqué `en pause : …`, ne pas le relancer : le pilote désigne un autre relecteur de la même famille ou attend la levée (`agent-mail send mesh-design …`) | le verdict rendu, la redésignation, ou la levée de la pause |
