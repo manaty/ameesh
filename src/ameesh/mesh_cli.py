@@ -5075,8 +5075,8 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
 
     pw_wait = work_sub.add_parser(
         "wait", help=("#8197: a follow-up waits on someone (blocked, journaled with "
-                      "who and since), or reopens with --clear; a note by its assignee "
-                      "or a human also reopens it"))
+                      "who and since), or reopens with --clear; any note without a wake "
+                      "also reopens it, except the mechanics' own"))
     pw_wait.add_argument("id", type=int)
     pw_wait.add_argument("--on", default=None, metavar="WHO",
                          help="who or what is awaited (a person, a lot), free text")

@@ -71,21 +71,31 @@ class FollowUpWaitTest(PgTestCase):
         with self.assertRaisesRegex(work.WorkError, "closed"):
             work_follow_ups.wait(self.db, lot["id"], "x", actor="avatar")
 
-    def test_note_by_assignee_or_human_reopens_wake_note_does_not(self):
+    def waiting(self):
         lot = self.follow_up()
         work_follow_ups.wait(self.db, lot["id"], "Sébastien", actor="avatar")
-        # a wake re-armed while waiting keeps the wait
+        return lot
+
+    def test_wake_note_keeps_the_wait(self):
+        lot = self.waiting()
         work.note(self.db, lot["id"], "still nothing, check tomorrow", actor="avatar",
                   wake_ts=time.time() + 86400)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "blocked")
-        # another agent's note does not take the follow-up out of waiting
-        work.note(self.db, lot["id"], "seen", actor="other")
+
+    def test_mechanics_note_keeps_the_wait(self):
+        lot = self.waiting()
+        work.note(self.db, lot["id"], "issue manaty/ameesh#1 synchronised", actor="ameesh")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "blocked")
-        work.note(self.db, lot["id"], "Sébastien answered", actor="avatar")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
-        work_follow_ups.wait(self.db, lot["id"], "Sébastien", actor="avatar")
-        work.note(self.db, lot["id"], "done on my side", actor="human:smichea")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_third_party_note_without_wake_reopens(self):
+        for actor in ("other", "github-watch", "avatar", "human:smichea"):
+            with self.subTest(actor=actor):
+                lot = self.waiting()
+                work.note(self.db, lot["id"], "Sébastien answered on the issue", actor=actor)
+                self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+                self.assertIn(("waiting cleared by a note of %s" % actor, "ameesh"),
+                              [(e["note"], e["actor"])
+                               for e in work.events(self.db, lot["id"])])
 
     def test_inventory_grouped_by_subject_with_wake_and_issue(self):
         work_subjects.add(self.db, "pricing-v2", "Pricing v2", project=APP)

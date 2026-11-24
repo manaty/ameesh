@@ -5715,11 +5715,13 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
             storage.of(db).work.note(item_id, item["state"], text, actor, **options)
     from . import work_follow_ups
     if work_follow_ups.reopens(item, actor, wake=wake_ts is not None):
-        # #8197 : la note de l'assigné ou de son humain rouvre le suivi en
-        # attente ; une note qui arme un réveil attend encore.
+        # #8197 : une note rouvre le suivi en attente ; une note qui arme un
+        # réveil attend encore, une note de la mécanique ne compte pas.
         try:
-            move(db, item_id, lifecycle.REQUESTED, note="waiting cleared by a note",
-                 actor=actor)
+            # le move est la conséquence mécanique de la note, pas un geste de
+            # statut de son auteur (pas de marque « non-assignee »)
+            move(db, item_id, lifecycle.REQUESTED,
+                 note="waiting cleared by a note of %s" % actor, actor=SYSTEM_SENDER)
         except WorkError:
             # moved meanwhile (closed, reopened): nothing left to reopen
             if (get(db, item_id) or {}).get("state") == lifecycle.BLOCKED:

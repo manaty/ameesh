@@ -6,9 +6,9 @@ Un suivi (`follow-up`) en attente reprend l'état `blocked` du cycle de vie,
 sans nouvel état ni colonne : `ameesh work wait <id> --on <qui>` le déplace en
 `blocked` avec la note `waiting on: <qui>`. `waiting_on` est la dernière de ces
 notes, `since` l'entrée dans l'attente courante (lus dans le journal du lot).
-`work wait <id> --clear`, ou une note de l'assigné ou d'un humain, le rouvre
-(`intake`) ; une note qui arme un réveil le laisse en attente (on attend
-encore, on contrôlera plus tard).
+`work wait <id> --clear`, ou une note de qui que ce soit, le rouvre (`intake`) ;
+une note qui arme un réveil le laisse en attente (on attend encore, on
+contrôlera plus tard), une note automatique de la mécanique (`ameesh`) aussi.
 
 `ameesh work list --assignee <agent> --type follow-up [--by-subject] [--json]`
 rend les suivis ouverts de l'agent, groupés par sujet (#8193), en une lecture.
@@ -19,13 +19,15 @@ import time
 
 from . import storage
 from .db import Db
-from .work import WorkError
+from .work import SYSTEM_SENDER, WorkError
 
 FOLLOW_UP = "follow-up"
 #: la note d'attente ; `waiting_on` est le texte qui la suit
 WAITING_PREFIX = "waiting on: "
 #: une attente nomme une personne ou un lot, pas un paragraphe
 WAITING_ON_MAX = 200
+#: l'auteur des notes automatiques de la mécanique, qui ne rouvrent rien
+MECHANICS_ACTOR = SYSTEM_SENDER
 #: le groupe des suivis sans sujet
 NO_SUBJECT = "sans sujet"
 
@@ -78,12 +80,13 @@ def clear(db: Db, item_id: int, *, actor: str = "", why: str = "") -> dict:
 
 
 def reopens(item: dict, actor: str, *, wake: bool) -> bool:
-    """Une note rouvre-t-elle ce suivi en attente ? Celle de l'assigné ou d'un
-    humain, sans réveil armé ; jamais celle du système ou d'un autre agent."""
+    """Une note rouvre-t-elle ce suivi en attente ? Toute note sans réveil armé,
+    quel qu'en soit l'auteur : la réponse attendue arrive souvent hors du mesh,
+    par la veille GitHub ou un autre agent (pilote, 24/11). Jamais une note
+    automatique de la mécanique (`MECHANICS_ACTOR`)."""
     if item.get("type") != FOLLOW_UP or item.get("state") != "blocked" or wake:
         return False
-    actor = (actor or "").strip()
-    return bool(actor) and (actor == item.get("assignee") or actor.startswith("human:"))
+    return (actor or "").strip() not in ("", MECHANICS_ACTOR)
 
 
 def _iso(ts: float | None) -> str | None:

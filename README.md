@@ -161,8 +161,8 @@ pricing-v2` for an existing lot. `ameesh work list --subject pricing-v2` (also
 
 A follow-up waiting on someone: `ameesh work wait <id> --on "Sébastien"
 [--wake-in 2d]` (state `blocked`, who and since kept in its journal);
-`ameesh work wait <id> --clear`, or a note by its assignee or a human, reopens
-it (a note arming a wake keeps it waiting). One read lists an agent's open
+`ameesh work wait <id> --clear`, or any note, reopens it (a note arming a
+wake, or an automatic note of the mechanics, keeps it waiting). One read lists an agent's open
 follow-ups by subject, with `waiting_on`, `since`, `next_wake`, `subject` and
 `issue_ref`: `ameesh work list --assignee <agent> --type follow-up --by-subject
 [--json]` (follow-ups without a subject come last, under "sans sujet").
