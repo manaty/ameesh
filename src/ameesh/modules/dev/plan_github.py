@@ -153,23 +153,34 @@ class Gh:
             raise GithubError(re.sub(r"^git-merge ?: ", "", str(exc))) from exc
         self.timeout = float(timeout)
 
-    def run(self, argv: list[str], stdin: str | None = None) -> tuple[int, str, str]:
+    def run(self, argv: list[str], stdin: str | None = None,
+            timeout: float | None = None) -> tuple[int, str, str]:
         from ...github_budget import reserve_reason
         reason = reserve_reason(argv, env=self.env)
         if reason:
             return 75, "", reason
+        limit = self.timeout if timeout is None else float(timeout)
         try:
             proc = subprocess.run([self.path, *argv], input=stdin, capture_output=True,
-                                  text=True, timeout=self.timeout, env=self.env)
+                                  text=True, timeout=limit, env=self.env)
         except subprocess.TimeoutExpired:
-            return 124, "", "timed out (%ss)" % self.timeout
+            return 124, "", "timed out (%ss)" % limit
         except OSError as exc:
             return 127, "", str(exc)
         return proc.returncode, proc.stdout, proc.stderr
 
 
-def _call(gh, argv: list[str], stdin: str | None = None) -> str:
-    code, out, err = gh.run(argv, stdin)
+#: sentinelle : `_call` ne transmet pas `timeout` aux faux `gh` des tests qui
+#: ne le connaissent pas, sauf quand l'appelant en demande un.
+_DEFAULT_TIMEOUT = object()
+
+
+def _call(gh, argv: list[str], stdin: str | None = None,
+          timeout=_DEFAULT_TIMEOUT) -> str:
+    if timeout is _DEFAULT_TIMEOUT:
+        code, out, err = gh.run(argv, stdin)
+    else:
+        code, out, err = gh.run(argv, stdin, timeout=timeout)
     if code != 0:
         raise GithubError("gh %s: exit code %d: %s" % (
             " ".join(argv[:3]), code, " ".join((err or out or "—").split())[:300]))
@@ -184,9 +195,9 @@ def _json(gh, argv: list[str], stdin: str | None = None):
         raise GithubError("gh %s: unreadable response" % " ".join(argv[:3])) from exc
 
 
-def _lines(gh, argv: list[str]) -> list[dict]:
+def _lines(gh, argv: list[str], timeout=_DEFAULT_TIMEOUT) -> list[dict]:
     """Sortie `--jq '.[] | @json'` : un objet JSON par ligne."""
-    out = _call(gh, argv)
+    out = _call(gh, argv, timeout=timeout)
     rows = []
     for line in out.splitlines():
         if line.strip():
@@ -1671,6 +1682,17 @@ def _with_tasks(view: Desired, numbers: dict) -> str:
     return "\n".join(lines)
 
 
+#: #8243 : une page d'issues par appel `gh`, un délai propre à cette lecture
+#: (une page peut être lente : 100 corps), et une borne de sécurité (jamais
+#: une limite du dépôt). La liste était une seule invocation `--paginate` sous
+#: le délai unique de 60 s : 65 pages pour manaty/ameesh, 71 s, donc en échec
+#: permanent. Chaque page est maintenant un appel borné séparément, si bien
+#: que sa durée et le délai ne dépendent plus de la taille du dépôt.
+ISSUES_PAGE = 100
+ISSUES_MAX_PAGES = 1000
+ISSUES_PAGE_TIMEOUT = 120.0
+
+
 class _Repo:
     """Opérations REST (`gh api`) sur un dépôt ; écritures refusées en essai."""
 
@@ -1717,10 +1739,27 @@ class _Repo:
     def issues(self) -> list[dict]:
         """TOUTES les issues du dépôt (sans filtre de label) : une issue se
         retrouve par son marqueur, même si son label `ameesh` a été retiré
-        dans GitHub (sinon la projection suivante créerait un doublon)."""
-        rows = _lines(self.gh, [
-            "api", "--paginate", "repos/%s/issues?state=all&per_page=100" % self.repo,
-            "--jq", ".[] | @json"])
+        dans GitHub (sinon la projection suivante créerait un doublon).
+
+        #8243 : page par page, un appel `gh` par page avec le délai propre à
+        # cette lecture. Le délai borne donc chaque page, jamais la liste
+        # entière ; `--paginate` tenait les 65 pages du dépôt sous un seul
+        # délai de 60 s et échouait toujours (71 s mesurées). L'ordre est
+        # explicite pour que la pagination reste stable pendant la lecture, et
+        # la fin se reconnaît à une page courte.
+        """
+        rows: list[dict] = []
+        for page in range(1, ISSUES_MAX_PAGES + 1):
+            path = ("repos/%s/issues?state=all&sort=created&direction=asc"
+                    "&per_page=%d&page=%d" % (self.repo, ISSUES_PAGE, page))
+            chunk = _lines(self.gh, ["api", path, "--jq", ".[] | @json"],
+                           timeout=ISSUES_PAGE_TIMEOUT)
+            rows.extend(chunk)
+            if len(chunk) < ISSUES_PAGE:
+                break
+        else:
+            raise GithubError("gh api repos/%s/issues: more than %d pages"
+                              % (self.repo, ISSUES_MAX_PAGES))
         return [r for r in rows if not r.get("pull_request")]
 
     def create(self, payload: dict) -> dict:
@@ -3075,6 +3114,82 @@ def _tally_lots(report: dict) -> dict:
     return report
 
 
+#: #8243 : passes consécutives en échec avant de prévenir le détenteur du
+#: bail, et état local qui les compte d'un processus à l'autre. La minuterie
+#: de rôle relance `ameesh notify --once --only issues` : un compteur en
+#: mémoire repartirait de zéro à chaque passage, et la panne resterait
+#: silencieuse.
+PROJECTION_FAILURES = 3
+PROJECTION_STATE = "github-projection.json"
+
+
+def _projection_state_path(cfg) -> str | None:
+    state_dir = str(getattr(cfg, "state_dir", "") or "").strip()
+    return os.path.join(state_dir, PROJECTION_STATE) if state_dir else None
+
+
+@contextlib.contextmanager
+def _projection_state_lock(path: str):
+    fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _projection_state_read(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _projection_advance(entry, *, failed: bool | None, now: float,
+                        alerted: float | None = None) -> dict:
+    """L'état d'un dépôt après une passe : `failures`, `since`, `alerted_since`.
+
+    `failed=True` compte une panne, `failed=False` remet à zéro après un
+    succès, `failed=None` garde le compteur (pour marquer l'alerte envoyée).
+    """
+    entry = dict(entry or {})
+    if failed is True:
+        entry["failures"] = int(entry.get("failures") or 0) + 1
+        if not entry.get("since"):
+            entry["since"] = float(now)
+    elif failed is False:
+        entry = {}
+    if alerted is not None and entry:
+        entry["alerted_since"] = float(alerted)
+    return entry
+
+
+def project_pilot(cfg, db, project: str, *, log=None) -> str | None:
+    """#8243 : le pilote d'un projet, destinataire d'une panne de projection.
+
+    Même lecture que l'alerte de base du veilleur de CI (#2935) : le rôle
+    `orchestrateur` du projet vient du canon, avec le repli « tous les
+    orchestrateurs ». Aucun pilote lisible : None, l'appelant le dit et
+    n'invente jamais de destinataire.
+    """
+    from ... import alert_briefs, canon as canon_mod
+    try:
+        pilots = alert_briefs.project_pilots(
+            project, storage.of(db).operations.listing(), cfg=cfg, db=db,
+            canons=canon_mod.load_configured(cfg))
+    except Exception as exc:  # noqa: BLE001 - une lecture impossible ne lève pas
+        if log:
+            log("GitHub issues: pilot of project %s unreadable (%s)"
+                % (project, _one_line(exc)))
+        return None
+    return pilots[0] if pilots else None
+
+
 class Projector:
     """La projection automatique des lots en issues (L126), menée par `ameesh
     notify` à chaque passage, seulement sur l'hôte désigné (`github.host`) :
@@ -3083,7 +3198,14 @@ class Projector:
     issue_ref) déclenche le tour de son projet au passage suivant sa
     création. Journal sobre : ce qui change, chaque refus, retenue ou erreur
     une seule fois. Une erreur (GitHub, `gh`, base) ne lève jamais : le
-    projet attend un intervalle."""
+    projet attend un intervalle.
+
+    #8243 : une passe en échec est comptée d'un processus à l'autre ; à
+    `PROJECTION_FAILURES` passes consécutives, le détenteur du bail
+    (`AMEESH_ROLE`) est alerté, le pilote du projet en repli, une seule fois
+    par panne ; un succès remet le compteur à zéro. La projection de
+    manaty/ameesh avait échoué en silence dix heures.
+    """
 
     def __init__(self, cfg, *, dry_run: bool = False, log=None, gh=None, clock=None):
         self.cfg = cfg
@@ -3096,11 +3218,105 @@ class Projector:
         self.backoff: dict = {}
         self.said: set = set()
         self.skip: set = set()
+        #: repli quand l'état de l'hôte manque ou ne s'écrit pas : le compteur
+        #: vit alors le temps du processus, sans faire échouer la projection.
+        self.failures: dict = {}
 
     def _once(self, key, text: str) -> None:
         if key not in self.said:
             self.said.add(key)
             self.log(text)
+
+    def _projection_state(self, repo: str, *, failed: bool | None = None,
+                          now: float = 0.0, alerted: float | None = None) -> dict:
+        """Lit et avance le compteur de pannes d'un dépôt, sans jamais lever."""
+        path = _projection_state_path(self.cfg)
+        if path is None or not os.path.isdir(os.path.dirname(path)):
+            entry = _projection_advance(self.failures.get(repo), failed=failed,
+                                        now=now, alerted=alerted)
+            if entry:
+                self.failures[repo] = entry
+            else:
+                self.failures.pop(repo, None)
+            return entry
+        try:
+            with _projection_state_lock(path):
+                data = _projection_state_read(path)
+                entry = _projection_advance(data.get(repo), failed=failed,
+                                            now=now, alerted=alerted)
+                if entry or repo in data:
+                    if entry:
+                        data[repo] = entry
+                    else:
+                        data.pop(repo, None)
+                    _atomic_write(path, data)
+            return entry
+        except Exception as exc:  # noqa: BLE001 - un état illisible ne lève pas
+            self._once(("state", repo, _one_line(exc)),
+                       "GitHub issues %s: failure counter unavailable (%s)"
+                       % (repo, _one_line(exc)))
+            entry = _projection_advance(self.failures.get(repo), failed=failed,
+                                        now=now, alerted=alerted)
+            if entry:
+                self.failures[repo] = entry
+            else:
+                self.failures.pop(repo, None)
+            return entry
+
+    def _alert_outage(self, db, project: str, repo: str, now: float,
+                      detail: str) -> None:
+        """#8243 : prévenir le détenteur du bail après `PROJECTION_FAILURES`.
+
+        Le destinataire est le rôle qui a autorisé la passe
+        (`AMEESH_ROLE`, posé par `role run`) : c'est lui qui détient le bail
+        de la projection. Hors minuterie de rôle, le pilote du projet est le
+        repli. Une alerte par panne : la clé d'idempotence porte le début de
+        la série, et `alerted_since` évite de redemander l'envoi à chaque
+        passage. Aucun destinataire lisible : le journal le dit, sans en
+        inventer un.
+        """
+        if self.dry_run:
+            return
+        entry = self._projection_state(repo, failed=True, now=now)
+        failures = int(entry.get("failures") or 0)
+        if failures < PROJECTION_FAILURES:
+            return
+        since = float(entry.get("since") or now)
+        if entry.get("alerted_since") == since:
+            return
+        holder = (os.environ.get(role_run.ENV_ROLE) or "").strip()
+        to = holder or project_pilot(self.cfg, db, project, log=self.log)
+        if not to:
+            self._once(("no-recipient", repo, since),
+                       "GitHub issues %s (%s): %d consecutive failures, no lease "
+                       "holder or project pilot to alert" % (repo, project, failures))
+            return
+        host = getattr(self.cfg, "host", None) or "?"
+        text = ("Projection GitHub arrêtée : %s (projet %s) a échoué %d passes "
+                "consécutives depuis %s sur %s (bail %s).\n"
+                "Dernière erreur : %s\n"
+                "À vérifier : journal de ameesh-role-issues et taille du dépôt ; "
+                "la projection reprend au prochain passage réussi."
+                % (repo, project, failures,
+                   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)),
+                   host, holder or "—", detail))
+        from ... import mail
+        try:
+            mail.send(db, work_mod.SYSTEM_SENDER, to, text, kind="event",
+                      payload={"github_projection_failure": {
+                          "repo": repo, "project": project, "failures": failures,
+                          "host": host, "role": holder or None},
+                          "urgent": True},
+                      idempotency_key="github-projection-failure:%s:%d" % (
+                          hashlib.sha256(repo.casefold().encode("utf-8")).hexdigest(),
+                          int(since)))
+        except Exception as exc:  # noqa: BLE001 - une alerte manquée ne lève pas
+            self.log("GitHub issues %s: projection alert not sent (%s)"
+                     % (repo, _one_line(exc)))
+            return
+        self._projection_state(repo, now=now, alerted=since)
+        self.log("GitHub issues %s (%s): %d consecutive failures; %s alerted"
+                 % (repo, project, failures, to))
 
     def tick(self, db, now: float | None = None) -> list[dict]:
         now = float(self.clock() if now is None else now)
@@ -3152,11 +3368,15 @@ class Projector:
                                       local_host=here, now=now)
             except Exception as exc:  # noqa: BLE001 - GitHub, gh, base : jamais fatal
                 self.backoff[name] = now + settings.interval
-                self._once(("error", name, _one_line(exc)),
+                detail = _one_line(exc)
+                self._once(("error", name, detail),
                            "GitHub issues %s (%s): failed, retrying in %d s: %s"
-                           % (name, repo, int(settings.interval), _one_line(exc)))
+                           % (name, repo, int(settings.interval), detail))
+                self._alert_outage(db, name, repo, now, detail)
                 continue
             self.last[name] = now
+            if not self.dry_run:
+                self._projection_state(repo, failed=False, now=now)
             if report["errors"]:
                 # une écriture refusée n'est pas retentée à chaque passage
                 self.backoff[name] = now + settings.interval
