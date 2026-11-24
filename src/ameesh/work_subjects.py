@@ -78,10 +78,24 @@ def close(db: Db, slug: str, *, project: str | None = None, actor: str = "") -> 
     return storage.of(db).work.subject_close(subject["id"], actor=actor) or subject
 
 
-def for_lot(db: Db, slug: str, *, app: str | None) -> dict:
-    """Le sujet auquel rattacher un lot du projet `app` : connu, ouvert, du
-    même projet que le lot."""
-    subject = get(db, slug, project=(app or "").strip() or None)
+def lot_project(item: dict) -> str:
+    """Le projet effectif d'un lot pour son sujet : `app`, sinon `workstream`
+    (même repli que la garde des modules, 0363) ; '' sans projet."""
+    return ((item.get("app") or "").strip()
+            or (item.get("workstream") or "").strip())
+
+
+def for_lot(db: Db, slug: str, *, project: str) -> dict:
+    """Le sujet auquel rattacher un lot du projet `project` : connu, ouvert, du
+    même projet que le lot. Un lot sans projet n'a pas de sujet : le chercher
+    dans tous les projets rattacherait le lot à un sujet d'un autre."""
+    project = (project or "").strip()
+    if not project:
+        raise WorkError("subject %s: the lot has no project (app or workstream); set it "
+                        "first (ameesh work set-app)" % slug)
+    subject = get(db, slug, project=project)
+    if subject["project"] != project:
+        raise _unknown(slug, project)
     if subject["state"] != "open":
         raise WorkError("subject %s is closed: reopen is not supported, create another "
                         "subject with \"ameesh work subject add\"" % subject["slug"])
@@ -94,7 +108,7 @@ def attach(db: Db, item_id: int, slug: str | None, *, actor: str = "") -> dict:
     item = work.get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    subject = for_lot(db, slug, app=item.get("app")) if slug else None
+    subject = for_lot(db, slug, project=lot_project(item)) if slug else None
     row = storage.of(db).work.subject_attach(
         item_id, subject["id"] if subject else None,
         note="subject: %s" % subject["slug"] if subject else "subject: detached",

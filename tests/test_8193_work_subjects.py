@@ -92,6 +92,48 @@ class SubjectStoreTest(_SubjectBase):
         self.assertEqual([s["slug"] for s in work_subjects.list_subjects(
             self.db, project=APP, open_only=True)], [])
 
+    def test_effective_project_and_no_cross_project_attach(self):
+        # B P2 ameesh-cx2 #46162 : un lot sans `app`, de projet `workstream`,
+        # ne se rattache pas au sujet homonyme d'un autre projet.
+        work_subjects.add(self.db, "pricing-v2", "Ailleurs", project="t-other")
+        lot = self.lot(app="")
+        self.db.execute("UPDATE work_items SET workstream = %s WHERE id = %s",
+                        (APP, lot["id"]))
+        with self.assertRaisesRegex(work.WorkError, "work subject add"):
+            work_subjects.attach(self.db, lot["id"], "pricing-v2")
+        with self.assertRaisesRegex(work.WorkError, "work subject add"):
+            work_subjects.attach(self.db, lot["id"], "t-other:pricing-v2")
+        self.assertEqual(work_subjects.lots(self.db, "t-other:pricing-v2")[1], [])
+        # le sujet du projet `workstream` est accepté
+        work_subjects.add(self.db, "pricing-v2", "Ici", project=APP)
+        work_subjects.attach(self.db, lot["id"], "pricing-v2")
+        _, rows = work_subjects.lots(self.db, "%s:pricing-v2" % APP)
+        self.assertEqual([r["id"] for r in rows], [lot["id"]])
+        # un lot sans aucun projet n'a pas de sujet
+        bare = self.lot(app="")
+        with self.assertRaisesRegex(work.WorkError, "no project"):
+            work_subjects.attach(self.db, bare["id"], "pricing-v2")
+
+    def test_previous_writers_ignore_subject_id(self):
+        # CONTRIBUTING « Compatibilité N-1 » (#5690) : un écrivain N-1 ne
+        # connaît pas `subject_id` (0608).
+        self.previous_insert("work_items", {"title": "Lot N-1", "app": APP,
+                                            "type": "evolution"},
+                             added=["subject_id"])
+        old = self.db.query("SELECT id FROM work_items WHERE title = 'Lot N-1'")[0]["id"]
+        self.assertIsNone(self.db.query(
+            "SELECT subject_id FROM work_items WHERE id = %s", (old,))[0]["subject_id"])
+        self.assertEqual(work.get(self.db, old)["title"], "Lot N-1")
+        work_subjects.add(self.db, "pricing-v2", "Pricing v2", project=APP)
+        self.assertEqual(work_subjects.lots(self.db, "pricing-v2")[1], [])
+        # le nouveau code le rattache ; une mise à jour N-1 garde le rattachement
+        work_subjects.attach(self.db, old, "pricing-v2")
+        self.previous_update("work_items", {"title": "Lot N-1 renommé"},
+                             where={"id": old}, added=["subject_id"])
+        _, rows = work_subjects.lots(self.db, "pricing-v2")
+        self.assertEqual([(r["id"], r["title"]) for r in rows], [(old, "Lot N-1 renommé")])
+        self.assertEqual(work_subjects.filtered(self.db, "pricing-v2")[0]["id"], old)
+
     def test_workpackage_card_is_a_subject(self):
         storage.of(self.db).packages.upsert({
             "id": "WP-EPIC", "kind": "epic", "title": "Épique", "parent": None,

@@ -2284,7 +2284,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             subject = None
             if getattr(args, "subject", None):
                 from . import work_subjects
-                subject = work_subjects.for_lot(db, args.subject, app=args.app)
+                subject = work_subjects.for_lot(
+                    db, args.subject,
+                    project=work_subjects.lot_project(
+                        {"app": args.app, "workstream": args.workstream}))
             # #506: read before the lot exists (it makes its project known)
             introduced = (work_projects.introduction(cfg, db, args.app, creator)
                           if args.new_project and args.app else "")
