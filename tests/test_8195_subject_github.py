@@ -153,6 +153,23 @@ class SubjectEpicTest(_SubjectBase):
         self.assertNotIn("ameesh-agents-1", body)
         self.assertIn("<!-- ameesh:subject=%d -->" % subject["id"], body)
         self.assertIn("(subject #%d)" % subject["id"], body)
+        # projection : même garde sur la réécriture
+        second = work.add(self.db, title="Autre", app=APP, actor="human:proprio", footprint=[])
+        work_subjects.attach(self.db, second["id"], "ameesh-agents-1")
+        cfg = mock.Mock(host="ameesh-agents-1", forge_hosts=())
+        with mock.patch.object(plan_github, "settings_of", return_value=plan_github.Settings()):
+            report = subject_github.sync(cfg, self.db, gh, written={}, cache=ctx.cache)
+        self.assertEqual((report["updated"], report["errors"]), (1, []))
+        body = next(i for i in gh.repo(REPO)["issues"] if i["number"] == 812)["body"]
+        self.assertIn("ameesh #%d — Autre" % second["id"], body)
+        self.assertNotIn("ameesh-agents-1", body)
+        # création : même garde
+        later, _ = work_subjects.add(self.db, "ameesh-agents-1-bis", "Neutre bis", project=APP)
+        created = subject_github.create_epic(self.db, ctx, later, REPO)
+        number = int(created["github_ref"].rsplit("#", 1)[1])
+        body = next(i for i in gh.repo(REPO)["issues"] if i["number"] == number)["body"]
+        self.assertIn("(subject #%d)" % later["id"], body)
+        self.assertNotIn("ameesh-agents-1", body)
         # terme exclu de l'organisation, même en privé ; la section entière est
         # contrôlée : un champ non filtré refuse l'écriture sans recopier le terme
         guard = plan_github.Guard(exclude_terms=("TPK",))
