@@ -403,22 +403,69 @@ def _topology(db, project=None):
     return rc.topology_for(db)
 
 
+def _newer_reports(rows, host) -> list[dict]:
+    """The attestations newer than the baseline that still report ``host``.
+
+    #8188: the retained baseline must be the newest staging report that names
+    the host. A newer attestation that reports it means the tag set used to
+    choose is incomplete: declaring would name a release older than the
+    report that called for the gesture.
+    """
+    out = []
+    for data in rows:
+        reportes = data.get("reportes") if isinstance(data, dict) else None
+        if isinstance(reportes, dict) and host in reportes:
+            out.append(data)
+    return out
+
+
+def _report_name(data) -> str:
+    """`<sha12> (<date>)` of a staging attestation, for a refusal message."""
+    sha = str(data.get("sha") or "")[:12] or "unknown commit"
+    date = str(data.get("date") or "") or "unknown date"
+    return "%s (%s)" % (sha, date)
+
+
 def baseline(db, project, host) -> dict | None:
     """The tagged staging attestation that reports ``host``, or None.
 
     None when the host is not reported by the latest tagged attestation
     (already proved, or no tagged proof at all): there is nothing to catch
     up). An unreadable history raises ReleaseError for the explicit gesture.
+
+    #8188: the tags are read after a fetch of the project's remote. The clone
+    of the host that runs the command may lag the release tags (BG named
+    v1.68.0 while v1.71.0 was active); a declaration never names a version
+    from a stale tag set. A failed fetch is an explicit refusal, and a newer
+    attestation still reporting the host refuses the declaration rather than
+    naming an older release.
     """
     from . import release_cutoff as rc
     rows = _rows(db, strict=True)
+    if not rows:
+        return None
+    try:
+        rc.fetch(project.repo, project.remote, project.target)
+    except rc.ReleaseError as exc:
+        raise rc.ReleaseError(
+            "staging catch-up baseline: cannot refresh the release tags of %s "
+            "from %s: %s" % (getattr(project, "name", project), project.remote,
+                             exc)) from exc
     chosen = _tagged(rows, rc._tags_by_commit(project))
     if chosen is None:
         return None
-    _index, tag, data = chosen
+    index, tag, data = chosen
     deferred = _deferred(data, _topology(db, project))
     if host not in deferred:
         return None
+    newer = _newer_reports(rows[:index], host)
+    if newer:
+        raise rc.ReleaseError(
+            "staging catch-up baseline: %s is still reported by newer "
+            "attestation(s) %s than the latest tagged one (%s, %s): the "
+            "declaration would name an older release, refusing"
+            % (host, ", ".join(_report_name(row) for row in newer),
+               tag["tag"], str(data.get("sha") or "")[:12]))
     return {"sha": data.get("sha") or "", "tag": str(tag.get("tag") or ""),
             "version": str(tag.get("version") or ""),
             "date": str(data.get("date") or ""),
