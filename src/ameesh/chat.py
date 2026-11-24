@@ -92,11 +92,11 @@ VEILLE_MAX_DEFER_S = 900.0
 #: bornes de la période demandée par `--veille-every`
 VEILLE_EVERY_MIN_S = 5.0
 VEILLE_EVERY_MAX_S = 3600.0
-#: #8235 : intervalle minimal entre deux lectures des réveils programmés de
-#: l'agent par la veille ; le bail de livraison est celui de l'exécuteur
-#: (#2466/#2614), un claim non consommé expire et le réveil revient.
-WAKE_CHECK_S = 10.0
+#: #8235 : bail de livraison des réveils programmés de l'agent, celui de
+#: l'exécuteur (#2466/#2614) ; un claim non consommé expire et le réveil
+#: revient. Le bail tenu par la veille est renouvelé au quart de sa durée.
 WAKE_CLAIM_TTL = 120.0
+WAKE_CLAIM_RENEW_S = WAKE_CLAIM_TTL / 4.0
 
 
 def is_chat_agent(row: dict | None) -> bool:
@@ -972,9 +972,13 @@ class ScheduledWakes:
     veille du chat le fait avec les mêmes opérations que `runner.py`
     (`lot_sessions.due_wakes/claim_wake/consume_wake`, #2466) et le même bail
     de livraison : un claim non consommé (session fermée, écriture
-    impossible, arrêt) expire et le réveil est délivré de nouveau. C'est la
-    consommation qui écrit la ligne `wake: scheduled wake delivered` au
-    journal du lot (#2614).
+    impossible, arrêt) expire et le réveil est délivré de nouveau. Le
+    détenteur renouvelle son bail (`claim_ttl_s=0`, #2614) tant qu'il
+    attend le moment de servir. C'est la consommation qui écrit la ligne
+    `wake: scheduled wake delivered` au journal du lot (#2614).
+
+    Aucune de ces opérations ne touche la base hors du fil de la veille
+    (`Veille._loop`) : le fil du terminal ne lit que la mémoire.
     """
 
     def __init__(self, sessions, name: str, *, claim_ttl: float = WAKE_CLAIM_TTL):
@@ -986,6 +990,13 @@ class ScheduledWakes:
 
     def claim(self, lot: int, now: float) -> dict | None:
         return self.sessions.claim_wake(self.name, int(lot), now, self.claim_ttl)
+
+    def renew(self, taken: dict) -> bool:
+        """#2614 : un renouvellement du bail tenu (`claim_ttl_s=0`). Faux
+        quand l'échéance n'est plus la sienne (consommée, annulée, reposée,
+        lot réassigné ou fini) ; une base en panne lève."""
+        got = self.sessions.claim_wake(self.name, int(taken["id"]), time.time(), 0.0)
+        return bool(got) and abs(float(got["wake_ts"]) - float(taken["wake_ts"])) < 0.001
 
     def consume(self, taken: dict) -> bool:
         return bool(self.sessions.consume_wake(
@@ -1081,10 +1092,16 @@ class Veille:
 
     Un fil lit la base — décisions en attente adressées à `human`, courrier
     non lu qui ouvrirait un tour pour `name`, réveils programmés échus de son
-    agent (#8235) — et retient la ligne à servir ; le proxy du terminal
-    (`serve_pty`) la sert quand `$human` ne tape pas. La première lecture est
-    un repère : les décisions et le courrier déjà là sont ceux du démarrage,
-    que la consigne fait présenter au premier tour.
+    agent (#8235) — et retient la ligne à servir, réveil réclamé compris ; le
+    proxy du terminal (`serve_pty`) la sert depuis la mémoire quand `$human`
+    ne tape pas. La première lecture est un repère : les décisions et le
+    courrier déjà là sont ceux du démarrage, que la consigne fait présenter
+    au premier tour.
+
+    Aucune opération de base n'a lieu hors du fil `_loop` : le fil du
+    terminal (`due`/`delivered`) ne lit et n'écrit que la mémoire, sinon une
+    base lente ou injoignable gèlerait la session humaine et deux fils
+    partageraient une connexion.
 
     Bornes : une lecture par `every` (aucune sonde de CI), rien tant que rien
     n'est nouveau, deux services espacés d'au moins `min_interval`, et pas
@@ -1116,10 +1133,9 @@ class Veille:
         self._baseline = False
         self._text: str | None = None
         self._text_at: float | None = None
-        self._wake_row: dict | None = None
         self._wake_seen_at: float | None = None
-        self._wake_checked = float("-inf")
         self._claimed_wake: dict | None = None
+        self._served_wake: dict | None = None
         self._draft_open = False
         self._tail = b""             # dernier octet de la lecture précédente
         self._last_human = 0.0
@@ -1160,30 +1176,100 @@ class Veille:
             self._draft_open = not _draft_submitted(self._tail + data)
             self._tail = data[-1:]
 
-    def _due_wake(self, now: float) -> dict | None:
-        """#8235 : le premier réveil programmé échu de l'agent, relu au plus
-        toutes les `WAKE_CHECK_S` secondes (aucune sonde en boucle serrée).
+    def _wake_ready_locked(self, now: float) -> bool:
+        """#8235 : la garde de frappe d'un réveil retenu. Le brouillon humain
+        et la garde d'état `Stop` sont relus par l'appelant. Passé `max_defer`
+        depuis la première lecture, on sert quand même : une session occupée
+        n'affame pas un rendez-vous."""
+        if self._draft_open:
+            return False
+        seen = self._wake_seen_at if self._wake_seen_at is not None else now
+        if now - seen >= self.max_defer:
+            return True
+        return (now - self._last_human >= self.idle
+                and (self._last_served is None
+                     or now - self._last_served >= self.min_interval))
 
-        La lecture ne réclame rien : `due` ne réclame qu'au moment de servir,
-        après la garde d'état, pour ne pas tenir un bail pendant qu'un
-        brouillon humain ou un tour en cours retient la ligne."""
+    def _pump_wakes(self, now: float | None = None) -> None:
+        """#8235 : la passe des réveils programmés, dans le fil de la veille
+        (`_loop`), seul à toucher la base.
+
+        Elle consomme le réveil servi depuis la dernière passe, renouvelle le
+        bail du réveil retenu (`claim_ttl_s=0`, comme l'exécuteur #2614) ou
+        réclame le premier réveil échu quand la garde d'état est ouverte. Le
+        fil du terminal ne lit que la mémoire (`due`) et ne fait que marquer
+        le réveil servi (`delivered`) : une base lente ou injoignable ne gèle
+        jamais la session humaine, et une connexion n'est jamais partagée
+        entre deux fils."""
         if self.wakes is None:
-            return None
-        if now - self._wake_checked < WAKE_CHECK_S:
-            return self._wake_row
-        self._wake_checked = now
+            return
+        now = self.now() if now is None else float(now)
+        with self._lock:
+            served, claimed = self._served_wake, self._claimed_wake
+        if served is not None:
+            # un réveil a été écrit dans le pty : la consommation se fait ici,
+            # jamais avant l'écriture. Un échec laisse le bail expirer et le
+            # réveil revenir ; on ne retente pas aveuglément (une échéance
+            # reposée ou réassignée entre-temps ne doit pas être consommée).
+            try:
+                consumed = self.wakes.consume(served)
+            except Exception as exc:  # noqa: BLE001 — la veille ne casse pas la session
+                consumed = False
+                self.log("veille: scheduled wake for lot #%s not consumed (%s)"
+                         % (served.get("id"), exc))
+            with self._lock:
+                if self._served_wake is served:
+                    self._served_wake, self._wake_seen_at = None, None
+            if not consumed:
+                self.log("veille: scheduled wake for lot #%s left armed: it will "
+                         "be redelivered" % served.get("id"))
+            return
+        if claimed is not None:
+            try:
+                ours = self.wakes.renew(claimed)
+            except Exception as exc:  # noqa: BLE001 — base en panne : le bail court encore
+                self.log("veille: scheduled wake for lot #%s not renewed (%s)"
+                         % (claimed.get("id"), exc))
+                return
+            if not ours:
+                with self._lock:
+                    if self._claimed_wake is claimed:
+                        self._claimed_wake, self._wake_seen_at = None, None
+                self.log("veille: scheduled wake for lot #%s no longer ours"
+                         % claimed.get("id"))
+            return
         try:
             rows = self.wakes.due(time.time())
         except Exception as exc:  # noqa: BLE001 — la veille ne casse pas la session
             self.log("veille: scheduled wakes unreadable (%s)" % exc)
-            self._wake_row = self._wake_seen_at = None
-            return None
-        self._wake_row = rows[0] if rows else None
-        if self._wake_row is None:
-            self._wake_seen_at = None
-        elif self._wake_seen_at is None:
-            self._wake_seen_at = now
-        return self._wake_row
+            return
+        if not rows:
+            with self._lock:
+                self._wake_seen_at = None
+            return
+        with self._lock:
+            if self._wake_seen_at is None:
+                self._wake_seen_at = now
+            ready = self._wake_ready_locked(now)
+        if not ready:
+            return
+        # garde d'état relue juste avant la réclamation, comme pour une ligne
+        # ordinaire : on ne tient pas un bail pendant un tour en cours
+        if self.phase() != PHASE_STOP:
+            return
+        row = rows[0]
+        try:
+            taken = self.wakes.claim(int(row["id"]), time.time())
+        except Exception as exc:  # noqa: BLE001
+            self.log("veille: scheduled wake for lot #%s not claimed (%s)"
+                     % (row["id"], exc))
+            return
+        if taken is None:
+            # course perdue (un autre livreur l'a réclamé) : la lecture
+            # suivante le reverra s'il est encore échu
+            return
+        with self._lock:
+            self._claimed_wake = taken
 
     def due(self, now: float | None = None) -> str | None:
         """La ligne à servir maintenant, ou None (rien de nouveau, frappe
@@ -1191,39 +1277,25 @@ class Veille:
         Passé `max_defer` depuis l'arrivée de la nouvelle, on sert quand même :
         une session occupée ne doit pas affamer la veille.
 
-        #8235 : un réveil programmé échu passe avant les nouvelles ordinaires ;
-        il est réclamé juste avant d'être servi (bail de livraison), puis
-        consommé par `delivered` une fois la ligne écrite dans le pty."""
+        #8235 : un réveil programmé retenu par `_loop` passe avant les
+        nouvelles ordinaires ; il est déjà réclamé (bail de livraison).
+        `delivered` le marque servi, puis `_loop` le consomme. Aucune lecture
+        ni écriture de la base ici : le fil du terminal ne lit que la mémoire.
+        """
         now = self.now() if now is None else float(now)
         with self._lock:
             # brouillon humain ouvert : on ne l'écrase pas, même au-delà de
             # `max_defer` ; il se ferme sur Entrée ou Ctrl-C
             if self._draft_open:
                 return None
-            wake = self._due_wake(now)
-            if wake is not None:
-                seen = self._wake_seen_at if self._wake_seen_at is not None else now
-                if now - seen >= self.max_defer \
-                        or (now - self._last_human >= self.idle
-                            and (self._last_served is None
-                                 or now - self._last_served >= self.min_interval)):
-                    # garde d'état relue juste avant la réclamation, comme pour
-                    # une ligne ordinaire
-                    if self.phase() == PHASE_STOP:
-                        taken = None
-                        try:
-                            taken = self.wakes.claim(int(wake["id"]), time.time())
-                        except Exception as exc:  # noqa: BLE001
-                            self.log("veille: scheduled wake for lot #%s not claimed "
-                                     "(%s)" % (wake["id"], exc))
-                        if taken is not None:
-                            self._claimed_wake = taken
-                            self._wake_row = self._wake_seen_at = None
-                            self._last_served = now
-                            return wake_line(taken)
-                        # course perdue (un autre détenteur l'a réclamé) : la
-                        # lecture suivante le reverra s'il est encore échu
-                        self._wake_row = None
+            wake = self._claimed_wake
+            if wake is not None and self._wake_ready_locked(now):
+                # garde d'état relue juste avant l'écriture, comme pour une
+                # ligne ordinaire
+                if self.phase() != PHASE_STOP:
+                    return None
+                self._last_served = now
+                return wake_line(wake)
             text = self._text
             if not text:
                 return None
@@ -1244,21 +1316,18 @@ class Veille:
             return text
 
     def delivered(self) -> None:
-        """#8235 : la ligne vient d'être écrite dans le pty — si c'était un
-        réveil réclamé, l'échéance est consommée (le stockage écrit alors la
-        ligne `wake: scheduled wake delivered` au journal du lot).
+        """#8235 : la ligne vient d'être écrite dans le pty. Si c'était un
+        réveil réclamé, il devient « servi » : `_loop` le consommera à sa
+        passe suivante (le stockage écrit alors la ligne
+        `wake: scheduled wake delivered` au journal du lot).
 
-        Un échec ne lève jamais : le bail expire et le réveil revient ; un
-        doublon signalé vaut mieux qu'une échéance perdue."""
+        Aucune opération de base ici : le fil du terminal ne touche que la
+        mémoire. La consommation, dans `_loop`, ne lève jamais : son échec
+        laisse le bail expirer et le réveil revenir."""
         with self._lock:
             taken, self._claimed_wake = self._claimed_wake, None
-        if taken is None or self.wakes is None:
-            return
-        try:
-            self.wakes.consume(taken)
-        except Exception as exc:  # noqa: BLE001
-            self.log("veille: scheduled wake for lot #%s not consumed (%s)"
-                     % (taken.get("id"), exc))
+            if taken is not None:
+                self._served_wake = taken
 
     def pending_text(self) -> str | None:
         with self._lock:
@@ -1272,6 +1341,16 @@ class Veille:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+    def _wait(self) -> float:
+        """#8235 : le pas du fil de veille. Un réveil retenu ou servi (en
+        attente de consommation) est traité au quart du bail (#2614) même
+        quand `--veille-every` est plus long ; sinon la lecture garde son
+        rythme."""
+        with self._lock:
+            if self._claimed_wake is not None or self._served_wake is not None:
+                return min(self.every, WAKE_CLAIM_RENEW_S)
+        return self.every
 
     def _loop(self) -> None:
         from . import db as db_mod
@@ -1291,12 +1370,13 @@ class Veille:
             except Exception as exc:  # noqa: BLE001
                 self.wakes = None
                 self.log("veille: scheduled wakes unavailable (%s)" % exc)
-            while not self._stop.wait(self.every):
+            while not self._stop.wait(self._wait()):
                 try:
                     self.observe(decisions.pending(db, human=self.human),
                                  mail.unread_active(db, self.name))
                 except Exception as exc:  # noqa: BLE001 — on réessaiera au tour suivant
                     self.log("veille: reading decisions and mail failed (%s)" % exc)
+                self._pump_wakes()
         finally:
             try:
                 db.close()

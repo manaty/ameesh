@@ -5,9 +5,12 @@ Un agent `chat-*` n'est mené par aucun exécuteur : ses réveils programmés
 n'étaient jamais réclamés ni consommés, et `follow_up_unfollowed` finissait
 par le dire (#8196). La veille de `ameesh chat` les délivre désormais avec les
 mêmes opérations et le même bail que `runner.py` (`due_wakes`, `claim_wake`,
-`consume_wake`) : elle réclame l'échéance au moment de servir, l'écrit dans la
-conversation, puis la consomme — la consommation écrit la ligne
-`wake: scheduled wake delivered` au journal du lot.
+`consume_wake`) : le fil de la veille (`Veille._loop`, exercé ici par
+`_pump_wakes`) réclame l'échéance quand la garde d'état est ouverte et
+renouvelle son bail ; le fil du terminal l'écrit dans la conversation
+(`due`) puis la marque servie (`delivered`), et la passe suivante la consomme
+— la consommation écrit la ligne `wake: scheduled wake delivered` au journal
+du lot. Aucune opération de base n'a lieu dans le fil du terminal.
 """
 from __future__ import annotations
 
@@ -20,6 +23,14 @@ from .support import PgTestCase
 
 HUMAN = "human:alice"
 NAME = "chat-alice"
+
+
+class _Clock:
+    def __init__(self, start=1000.0):
+        self.t = float(start)
+
+    def __call__(self) -> float:
+        return self.t
 
 
 class ChatWakeCase(PgTestCase):
@@ -36,9 +47,9 @@ class ChatWakeCase(PgTestCase):
         work.schedule_wake(self.db, lot, due, text="fournisseur", actor=NAME)
         return lot
 
-    def veille(self, *, phase=None) -> chat.Veille:
+    def veille(self, *, phase=None, now=time.monotonic) -> chat.Veille:
         return chat.Veille(
-            self.cfg, HUMAN, NAME, now=time.monotonic, log=lambda text: None,
+            self.cfg, HUMAN, NAME, now=now, log=lambda text: None,
             phase=phase or (lambda: chat.PHASE_STOP),
             wakes=chat.ScheduledWakes(storage.of(self.db).lot_sessions, NAME))
 
@@ -50,6 +61,12 @@ class ChatWakeCase(PgTestCase):
                              (lot,))
         return rows[0]["wake_claim_at"] if rows else None
 
+    def claim_age(self, lot: int) -> float:
+        rows = self.db.query(
+            "SELECT extract(epoch from clock_timestamp() - wake_claim_at)::float8"
+            "       AS age FROM work_items WHERE id = %s", (lot,))
+        return rows[0]["age"]
+
     def notes(self, lot: int) -> list[str]:
         return [e.get("note") or "" for e in work.events(self.db, lot)]
 
@@ -60,16 +77,24 @@ class ChatWakeDeliveryTest(ChatWakeCase):
         veille = self.veille()
         veille.observe([], [])                       # la première lecture est un repère
 
+        self.assertIsNone(veille.due(), "le fil du terminal ne lit pas la base")
+        veille._pump_wakes()                         # la passe de `_loop`
+        self.assertIsNotNone(veille._claimed_wake, "réveil échu réclamé")
+        self.assertIsNotNone(self.wake_at(lot), "réclamé, pas encore consommé")
+        self.assertIsNotNone(self.wake_claim(lot))
+
         line = veille.due()
         self.assertIsNotNone(line)
         self.assertIn("[veille ameesh]", line)
         self.assertIn("#%d" % lot, line)
         self.assertIn("Rappeler le fournisseur", line)
         self.assertIn("réveil programmé", line)
-        self.assertIsNotNone(self.wake_at(lot), "réclamé, pas encore consommé")
-        self.assertIsNotNone(self.wake_claim(lot))
 
-        veille.delivered()
+        veille.delivered()                           # écrit dans le pty
+        self.assertIsNone(veille._claimed_wake)
+        self.assertIsNotNone(veille._served_wake)
+        self.assertIsNotNone(self.wake_at(lot), "consommé à la passe suivante")
+        veille._pump_wakes()                         # consommation, dans `_loop`
         self.assertIsNone(self.wake_at(lot), "la consommation efface l'échéance")
         self.assertTrue(any(n.startswith("wake: scheduled wake delivered")
                             for n in self.notes(lot)))
@@ -79,6 +104,7 @@ class ChatWakeDeliveryTest(ChatWakeCase):
         lot = self.arm(time.time() + 3600)
         veille = self.veille()
         veille.observe([], [])
+        veille._pump_wakes()
         self.assertIsNone(veille.due())
         self.assertIsNotNone(self.wake_at(lot))
         self.assertIsNone(self.wake_claim(lot))
@@ -89,39 +115,66 @@ class ChatWakeDeliveryTest(ChatWakeCase):
             storage.of(self.db).lot_sessions.claim_wake(NAME, lot, time.time()))
         veille = self.veille()
         veille.observe([], [])
+        veille._pump_wakes()
+        self.assertIsNone(veille._claimed_wake)
         self.assertIsNone(veille.due(), "le bail d'un autre livreur est respecté")
+
+    def test_a_held_claim_is_renewed_on_each_pass(self):
+        lot = self.arm(time.time() - 1)
+        veille = self.veille()
+        veille._pump_wakes()
+        self.assertIsNotNone(veille._claimed_wake)
+        # le bail aurait expiré depuis longtemps sans renouvellement
+        self.db.execute(
+            "UPDATE work_items SET wake_claim_at = clock_timestamp()"
+            " - interval '10 minutes' WHERE id = %s", (lot,))
+        veille._pump_wakes()
+        self.assertIsNotNone(veille._claimed_wake, "le bail tenu est renouvelé")
+        self.assertLess(self.claim_age(lot), 60.0)
+        self.assertIn("#%d" % lot, veille.due())
 
     def test_a_human_draft_holds_the_wake_without_claiming_it(self):
         lot = self.arm(time.time() - 1)
-        veille = self.veille()
+        clock = _Clock(1000.0)
+        veille = self.veille(now=clock)
         veille.observe([], [])
         veille.note_human(1000.0, b"un brouillon")
-        self.assertIsNone(veille.due(now=2000.0))
+        veille._pump_wakes()
+        self.assertIsNone(veille._claimed_wake)
         self.assertIsNone(self.wake_claim(lot), "aucun bail n'est pris d'avance")
+        self.assertIsNone(veille.due(now=1000.0))
         veille.note_human(1000.0, b"\r")            # Entrée ferme le brouillon
-        self.assertIsNotNone(veille.due(now=2000.0))
+        clock.t = 1005.0
+        veille._pump_wakes()
+        self.assertIsNotNone(veille._claimed_wake)
+        self.assertIsNotNone(veille.due(now=1005.0))
 
     def test_a_busy_harness_holds_the_wake_without_claiming_it(self):
         lot = self.arm(time.time() - 1)
         phase = {"value": chat.PHASE_BUSY}
         veille = self.veille(phase=lambda: phase["value"])
         veille.observe([], [])
-        self.assertIsNone(veille.due())
+        veille._pump_wakes()
+        self.assertIsNone(veille._claimed_wake)
         self.assertIsNone(self.wake_claim(lot))
         phase["value"] = chat.PHASE_STOP
+        veille._pump_wakes()
         self.assertIn("#%d" % lot, veille.due())
 
     def test_a_failed_consume_leaves_the_wake_armed(self):
         lot = self.arm(time.time() - 1)
         veille = self.veille()
         veille.observe([], [])
+        veille._pump_wakes()
         self.assertIsNotNone(veille.due())
 
         class Boom:
             def consume(self, taken):
                 raise RuntimeError("base en panne")
         veille.wakes = Boom()
-        veille.delivered()          # ne lève pas ; le bail expirera
+        veille.delivered()
+        veille._pump_wakes()        # ne lève pas ; le bail expirera
+        self.assertIsNone(veille._served_wake)
         self.assertIsNotNone(self.wake_at(lot))
 
     def test_without_a_wake_source_nothing_changes(self):
@@ -130,8 +183,50 @@ class ChatWakeDeliveryTest(ChatWakeCase):
                              log=lambda text: None,
                              phase=lambda: chat.PHASE_STOP)
         veille.observe([], [])
+        veille._pump_wakes()
         self.assertIsNone(veille.due())
         self.assertIsNotNone(self.wake_at(lot))
+
+    def test_the_serve_path_touches_no_storage(self):
+        """B/P2 #8235 : `due` et `delivered` ne doivent appeler aucune
+        opération de base — une source de réveils qui échoue à tout appel le
+        prouve. Seule la passe de `_loop` (`_pump_wakes`) la consulte."""
+        class Boom:
+            def __init__(self):
+                self.calls: list[str] = []
+
+            def _boom(self, name):
+                self.calls.append(name)
+                raise AssertionError("%s called from the terminal thread" % name)
+
+            def due(self, *args, **kwargs):
+                self._boom("due")
+
+            def claim(self, *args, **kwargs):
+                self._boom("claim")
+
+            def renew(self, *args, **kwargs):
+                self._boom("renew")
+
+            def consume(self, *args, **kwargs):
+                self._boom("consume")
+
+        wakes = Boom()
+        veille = chat.Veille(object(), HUMAN, NAME, now=lambda: 2000.0,
+                             log=lambda text: None,
+                             phase=lambda: chat.PHASE_STOP, wakes=wakes)
+        veille.observe([], [])
+        self.assertIsNone(veille.due())              # rien de retenu
+        veille.delivered()                           # rien de servi
+        # l'état qu'une passe de `_loop` aurait posé en mémoire
+        veille._claimed_wake = {"id": 42, "title": "t", "state": "build",
+                                "wake_ts": 1.0}
+        self.assertIn("#42", veille.due())
+        veille.delivered()
+        self.assertIsNotNone(veille._served_wake)
+        self.assertEqual(wakes.calls, [], "aucun appel de base dans le fil du pty")
+        veille._pump_wakes()                         # la passe de `_loop`, elle, le fait
+        self.assertEqual(wakes.calls, ["consume"])
 
 
 class ChatWakeAlertTest(ChatWakeCase):
@@ -151,8 +246,10 @@ class ChatWakeAlertTest(ChatWakeCase):
         self.assertEqual(reasons, [])
         veille = self.veille()
         veille.observe([], [])
+        veille._pump_wakes()
         self.assertIsNotNone(veille.due())
         veille.delivered()
+        veille._pump_wakes()
         [alert] = [a for a in check(self.db, listing, now + 60) if a.get("lot") == lot]
         self.assertEqual(alert["reason"], "delivered_without_note")
 
