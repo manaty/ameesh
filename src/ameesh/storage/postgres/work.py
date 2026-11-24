@@ -3219,6 +3219,8 @@ class WorkItems(interface.WorkItems):
             f"       bool_or(coalesce(to_jsonb(work_items)->>'legacy_state', state) = 'promoted') AS promoted"
             "  FROM work_items"
             f" WHERE assignee IN (%s) AND coalesce(to_jsonb(work_items)->>'legacy_state', state) NOT IN ('merged', 'closed')"
+            # #8191: a follow-up stays with its stopped agent (_release_agent); counting it would relock forever.
+            "   AND type <> 'follow-up'"
             " GROUP BY assignee" % ", ".join(["%s"] * len(names)), tuple(names))
         return {row["assignee"]: {"open": bool(row["open"]),
                                   "promoted": bool(row["promoted"])} for row in rows}

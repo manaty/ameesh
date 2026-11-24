@@ -69,6 +69,20 @@ class FollowUpTest(PgTestCase):
         self.assertIsNone(work.get(self.db, code["id"])["assignee"])
         self.assertEqual(work.get(self.db, follow_up["id"])["assignee"], "avatar")
 
+    def test_stopped_agent_holding_only_a_follow_up_is_not_held(self):
+        self.follow_up()
+        registry.set_status(self.db, "avatar", "stopped", stop_reason="manuel")
+        self.assertEqual(work.held_lots(self.db, ["avatar"]), {})
+        code = work.add(self.db, title="Development", app="ameesh",
+                        assignee="avatar", actor="avatar", footprint=[])
+        self.assertEqual(work.held_lots(self.db, ["avatar"]),
+                         {"avatar": {"open": True, "promoted": False}})
+        storage.of(self.db).work.release_agent(
+            "avatar", reason="manual stop", actor="human:owner",
+            stopped_with=work.RELEASABLE_STOP_REASONS)
+        self.assertIsNone(work.get(self.db, code["id"])["assignee"])
+        self.assertEqual(work.held_lots(self.db, ["avatar"]), {})
+
     def test_assignment_is_required(self):
         with self.assertRaisesRegex(work.WorkError, "requires an assignee"):
             self.follow_up(assignee=None)
