@@ -12,7 +12,7 @@ référence `owner/repo#N` dans `work_subjects.github_ref` (0608).
   d'un sujet né sans `--github`.
 
 Le corps du ticket reçoit UNE section délimitée par marqueurs
-(`<!-- ameesh:subject=<slug> -->` … `<!-- ameesh:subject-end=<slug> -->`)
+(`<!-- ameesh:subject=<id> -->` … `<!-- ameesh:subject-end=<id> -->`, id du sujet)
 qui liste les lots du sujet et leur état. Elle est réécrite par la projection
 (`plan_github.Projector`, hôte `github.host`) dès qu'un lot est ajouté ou
 change d'état ; le texte hors marqueurs n'est jamais modifié. Le marqueur
@@ -33,8 +33,10 @@ from . import plan_github, storage
 from . import work_lifecycle as lifecycle
 from .work import WorkError
 
-BEGIN = "<!-- ameesh:subject=%s -->"
-END = "<!-- ameesh:subject-end=%s -->"
+#: marqueurs par id du sujet, jamais par slug : un slug n'est pas contrôlé à
+#: sa création et ne doit pas passer dans GitHub sans la garde (B impl-11)
+BEGIN = "<!-- ameesh:subject=%d -->"
+END = "<!-- ameesh:subject-end=%d -->"
 #: la marque cherchée par la veille GitHub pour reconnaître une épique de sujet
 BEGIN_PREFIX = "<!-- ameesh:subject="
 #: lots listés au plus dans une section (le corps d'un ticket est borné)
@@ -81,8 +83,9 @@ def read_issue(gh, repo: str, number: int) -> dict:
 
 # -- la section ----------------------------------------------------------------
 
-def _section_re(slug: str):
-    return re.compile(re.escape(BEGIN % slug) + r".*?" + re.escape(END % slug), re.S)
+def _section_re(subject_id: int):
+    return re.compile(re.escape(BEGIN % subject_id) + r".*?" + re.escape(END % subject_id),
+                      re.S)
 
 
 def _done(item: dict) -> bool:
@@ -96,40 +99,53 @@ def _title(text: str, guard, public: bool) -> str:
     return plan_github._quiet(plan_github._cut(text, TITLE_MAX))
 
 
+def _clean(text: str, guard, public: bool) -> bool:
+    return not guard.problems(text, public=public)
+
+
 def render(subject: dict, lots: list[dict], *, guard, public: bool) -> str:
-    """La section du sujet : ses lots, cochés une fois terminés."""
+    """La section du sujet : ses lots, cochés une fois terminés. Chaque champ
+    libre (titres, slug, issue_ref) passe la garde ; la section entière la
+    repasse avant de sortir (refus sans recopier le texte en cause)."""
+    sid = int(subject["id"])
     slug = subject["slug"]
-    lines = [BEGIN % slug,
+    name = "`%s`" % slug if _clean(slug, guard, public) else "#%d" % sid
+    lines = [BEGIN % sid,
              "### ameesh lots — %s" % _title(subject.get("title"), guard, public),
-             "_Maintained by ameesh (subject `%s`): rewritten when a lot is added or "
-             "changes state. Edit outside these markers._" % slug, ""]
+             "_Maintained by ameesh (subject %s): rewritten when a lot is added or "
+             "changes state. Edit outside these markers._" % name, ""]
     for item in lots[:MAX_LOTS]:
         state = item.get("legacy_state") or item.get("state") or "?"
         issue = (item.get("issue_ref") or "").strip()
-        issue = " · %s" % issue if plan_github._ref_parts(issue) else ""
+        issue = (" · %s" % issue if plan_github._ref_parts(issue)
+                 and _clean(issue, guard, public) else "")
         lines.append("- [%s] ameesh #%d — %s (%s)%s" % (
             "x" if _done(item) else " ", int(item["id"]),
             _title(item.get("title"), guard, public), state, issue))
     if len(lots) > MAX_LOTS:
-        lines.append("- … %d more lots (`ameesh work subject show %s`)"
-                     % (len(lots) - MAX_LOTS, slug))
+        lines.append("- … %d more lots (`ameesh work subject show`)" % (len(lots) - MAX_LOTS))
     if not lots:
         lines.append("_No lots yet._")
-    lines.append(END % slug)
-    return "\n".join(lines)
+    lines.append(END % sid)
+    section = "\n".join(lines)
+    problems = guard.problems(section, public=public)
+    if problems:
+        raise WorkError("subject #%d: section not published (%s)" % (sid, ", ".join(problems)))
+    return section
 
 
-def splice(body: str | None, slug: str, section: str) -> str:
+def splice(body: str | None, subject_id: int, section: str) -> str:
     """Le corps avec la section du sujet remplacée (ou ajoutée en fin) ; le
     texte hors marqueurs est rendu tel quel. Un marqueur orphelin (section
     abîmée à la main) est refusé plutôt que de deviner où elle finit."""
     body = body or ""
-    pattern = _section_re(slug)
+    subject_id = int(subject_id)
+    pattern = _section_re(subject_id)
     if pattern.search(body):
         return pattern.sub(lambda _m: section, body, count=1)
-    if BEGIN % slug in body or END % slug in body:
-        raise WorkError("subject %s: the section markers of the issue are damaged (one "
-                        "is missing); restore or delete both markers" % slug)
+    if BEGIN % subject_id in body or END % subject_id in body:
+        raise WorkError("subject #%d: the section markers of the issue are damaged (one "
+                        "is missing); restore or delete both markers" % subject_id)
     if not body.strip():
         return section
     return body.rstrip("\n") + "\n\n" + section + "\n"
@@ -170,7 +186,7 @@ def write_section(db, ctx: Context, subject: dict, repo: str, number: int,
     body = issue.get("body") or ""
     if section is None:
         section = section_for(db, ctx, subject, repo)
-    new = splice(body, subject["slug"], section)
+    new = splice(body, subject["id"], section)
     if new == body:
         return False
     code, out, err = ctx.gh.run(["api", "-X", "PATCH", "repos/%s/issues/%d" % (repo, number),

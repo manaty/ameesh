@@ -161,7 +161,7 @@ pricing-v2` for an existing lot. `ameesh work list --subject pricing-v2` (also
 A subject can adopt an existing GitHub issue as its epic (`work subject add
 <slug> --title … --github owner/repo#N`, refused if the mesh's GitHub identity
 cannot read it) or create one later (`work subject project <slug> --repo
-owner/repo`). Its body gets a section between `<!-- ameesh:subject=<slug> -->`
+owner/repo`). Its body gets a section between `<!-- ameesh:subject=<id> -->`
 markers listing the lots and their state, rewritten by the GitHub projection;
 text outside the markers is never touched. Closing the issue on GitHub closes
 the subject (read by the GitHub watch of the repository).

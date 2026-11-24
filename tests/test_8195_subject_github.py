@@ -59,8 +59,8 @@ class SubjectEpicTest(_SubjectBase):
         self.assertEqual(row["github_ref"], "%s#812" % REPO)
         body = self.body()
         self.assertTrue(body.startswith(HUMAN + "\n\n"))
-        self.assertIn("<!-- ameesh:subject=pricing-v2 -->", body)
-        self.assertIn("<!-- ameesh:subject-end=pricing-v2 -->", body)
+        self.assertIn("<!-- ameesh:subject=%d -->" % self.subject["id"], body)
+        self.assertIn("<!-- ameesh:subject-end=%d -->" % self.subject["id"], body)
         self.assertIn("- [ ] ameesh #%d — Grille tarifaire (intake)" % first["id"], body)
         # idempotent : même référence, aucune nouvelle écriture
         self.gh.reset_calls()
@@ -106,7 +106,7 @@ class SubjectEpicTest(_SubjectBase):
         work.close(self.db, a["id"], abandoned=True, actor="human:proprio")
         self.assertEqual(subject_github.sync(None, self.db, self.gh, written=written, cache=cache)["updated"], 1)
         self.assertIn("- [x] ameesh #%d — Grille tarifaire (closed)" % a["id"], self.body())
-        self.assertEqual(self.body().count("<!-- ameesh:subject=pricing-v2 -->"), 1)
+        self.assertEqual(self.body().count("<!-- ameesh:subject=%d -->" % self.subject["id"]), 1)
 
     def test_human_edit_after_the_pre_check_is_kept(self):
         # B ameesh-dev3 #233701 : la CLI pré-contrôle (1re lecture) ; une édition
@@ -138,10 +138,40 @@ class SubjectEpicTest(_SubjectBase):
         ctx = subject_github.Context(None, self.db, self.gh, local_host="ameesh-agents-1")
         self.assertIn("host name", ctx.guard.problems("voir ameesh-agents-1", public=True))
 
+    def test_slug_and_issue_ref_pass_the_guard(self):
+        # B P1 mty-amh-impl-11 (17add0e0) : le slug n'entre ni dans les
+        # marqueurs ni dans le texte sans la garde ; issue_ref non plus.
+        gh = fake([(812, "", "open"), (814, "", "open")], visibility="public")
+        ctx = subject_github.Context(None, self.db, gh, local_host="ameesh-agents-1")
+        subject, _ = work_subjects.add(self.db, "ameesh-agents-1", "Neutre", project=APP)
+        item = work.add(self.db, title="Neutre", app=APP, actor="human:proprio", footprint=[])
+        work_subjects.attach(self.db, item["id"], "ameesh-agents-1")
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("ameesh-agents-1/x#3", item["id"]))
+        subject_github.adopt(self.db, ctx, subject, "%s#812" % REPO)
+        body = next(i for i in gh.repo(REPO)["issues"] if i["number"] == 812)["body"]
+        self.assertNotIn("ameesh-agents-1", body)
+        self.assertIn("<!-- ameesh:subject=%d -->" % subject["id"], body)
+        self.assertIn("(subject #%d)" % subject["id"], body)
+        # terme exclu de l'organisation, même en privé ; la section entière est
+        # contrôlée : un champ non filtré refuse l'écriture sans recopier le terme
+        guard = plan_github.Guard(exclude_terms=("TPK",))
+        lots = [dict(id=1, title="Neutre", state="intake", issue_ref="")]
+        text = subject_github.render(dict(id=5, slug="tpk", title="Neutre"), lots,
+                                     guard=guard, public=False)
+        self.assertNotIn("tpk", text.casefold())
+        with mock.patch.object(subject_github, "_title", return_value="TPK"):
+            with self.assertRaises(work.WorkError) as caught:
+                subject_github.render(dict(id=5, slug="ok", title="x"), lots,
+                                      guard=guard, public=False)
+        self.assertNotIn("TPK", str(caught.exception))
+        self.assertEqual(next(i for i in gh.repo(REPO)["issues"]
+                              if i["number"] == 814)["body"], "")
+
     def test_damaged_markers_are_refused_not_guessed(self):
         with self.assertRaisesRegex(work.WorkError, "damaged"):
-            subject_github.splice("x <!-- ameesh:subject=pricing-v2 --> y", "pricing-v2", "S")
-        self.assertEqual(subject_github.splice("", "s", "S"), "S")
+            subject_github.splice("x <!-- ameesh:subject=7 --> y", 7, "S")
+        self.assertEqual(subject_github.splice("", 7, "S"), "S")
 
     def test_secret_like_title_is_withheld_and_mentions_quieted(self):
         gh = fake([(812, "", "open")], visibility="public")
@@ -230,7 +260,8 @@ class SubjectEpicCliTest(_SubjectBase):
         with open(path, encoding="utf-8") as handle:
             body = json.load(handle)["repos"][REPO]["issues"][0]["body"]
         self.assertTrue(body.startswith(HUMAN))
-        self.assertIn("<!-- ameesh:subject=pricing-v3 -->", body)
+        subject_id = work_subjects.get(self.db, "pricing-v3", project=APP)["id"]
+        self.assertIn("<!-- ameesh:subject=%d -->" % subject_id, body)
         self.assertEqual(self.mesh("work", "subject", "add", "later", "--title", "Later",
                                    "--app", APP, env=env).returncode, 0)
         project = self.mesh("work", "subject", "project", "later", "--app", APP,
