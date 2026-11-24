@@ -1640,6 +1640,13 @@ def split_weights(modules: list[str], driver: str, card: dict | None) -> dict[st
     découpage-ci ne s'applique qu'aux parts psycopg d'une suite déjà complète
     (paquet, main, release), où aucune sélection ne dépend des poids et où la
     table psycopg a été mesurée sur la même suite sans couverture.
+
+    #3754/#8208 : la conversion n'a de sens que si la table ne couvre pas
+    tous les modules découpés et que la carte en comble les trous. Quand
+    elle les couvre tous, il n'y a plus deux échelles à raccorder : la table
+    est déjà à l'échelle du job (relevé de flux de ci-full), et le `surcout`
+    de la carte ne faisait que gonfler uniformément toutes les parts (3,45x
+    sur le paquet h-03) sans changer leur affectation ni leur équilibre.
     """
     mesurees = (json.loads(parts.TABLE.read_text(encoding="utf-8"))
                 if parts.TABLE.exists() else {})
@@ -1647,7 +1654,9 @@ def split_weights(modules: list[str], driver: str, card: dict | None) -> dict[st
                 if isinstance(v, dict) and d != "tests"}
     complete: dict[str, dict[str, float]] = {}
     for d, valeurs in statique.items():
-        facteur = _overhead(card, d)
+        # La conversion n'est due que si cette table-là doit être mêlée aux
+        # durées de carte, c'est-à-dire s'il lui manque un module découpé.
+        facteur = _overhead(card, d) if any(m not in valeurs for m in modules) else 1.0
         complete[d] = {m: (float(v) * facteur if isinstance(v, (int, float)) else v)
                        for m, v in valeurs.items()}
     for module, info in (card or {}).get("modules", {}).items():
