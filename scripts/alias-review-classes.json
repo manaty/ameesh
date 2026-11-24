@@ -1,8 +1,16 @@
 {
   "classes": {
     "src/ameesh/connectors/git_merge.py": {
-      "class": "light",
-      "rule": []
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/actions*.py",
+        "src/ameesh/connectors/**",
+        "src/ameesh/module_actions.py",
+        "src/ameesh/avatar_connectors.py",
+        "src/ameesh/serve_actions.py",
+        "src/ameesh/spend.py",
+        "src/ameesh/modules/dev/git_merge.py"
+      ]
     },
     "src/ameesh/lot_class.py": {
       "class": "sensitive",
@@ -25,6 +33,8 @@
         "src/ameesh/freeze_checks.py",
         "src/ameesh/freeze_gate.py",
         "src/ameesh/github_identity.py",
+        "src/ameesh/credential_gate*.py",
+        "src/ameesh/pre_act.py",
         "src/ameesh/packet_candidates.py",
         "src/ameesh/verdict_carry.py",
         "scripts/paquet-candidats.py",
@@ -62,6 +72,8 @@
         "src/ameesh/freeze_checks.py",
         "src/ameesh/freeze_gate.py",
         "src/ameesh/github_identity.py",
+        "src/ameesh/credential_gate*.py",
+        "src/ameesh/pre_act.py",
         "src/ameesh/packet_candidates.py",
         "src/ameesh/verdict_carry.py",
         "scripts/paquet-candidats.py",
@@ -79,8 +91,16 @@
       ]
     },
     "src/ameesh/modules/dev/git_merge.py": {
-      "class": "light",
-      "rule": []
+      "class": "sensitive",
+      "rule": [
+        "src/ameesh/actions*.py",
+        "src/ameesh/connectors/**",
+        "src/ameesh/module_actions.py",
+        "src/ameesh/avatar_connectors.py",
+        "src/ameesh/serve_actions.py",
+        "src/ameesh/spend.py",
+        "src/ameesh/modules/dev/git_merge.py"
+      ]
     },
     "src/ameesh/modules/dev/lot_class.py": {
       "class": "sensitive",
@@ -103,6 +123,8 @@
         "src/ameesh/freeze_checks.py",
         "src/ameesh/freeze_gate.py",
         "src/ameesh/github_identity.py",
+        "src/ameesh/credential_gate*.py",
+        "src/ameesh/pre_act.py",
         "src/ameesh/packet_candidates.py",
         "src/ameesh/verdict_carry.py",
         "scripts/paquet-candidats.py",
@@ -140,6 +162,8 @@
         "src/ameesh/freeze_checks.py",
         "src/ameesh/freeze_gate.py",
         "src/ameesh/github_identity.py",
+        "src/ameesh/credential_gate*.py",
+        "src/ameesh/pre_act.py",
         "src/ameesh/packet_candidates.py",
         "src/ameesh/verdict_carry.py",
         "scripts/paquet-candidats.py",
@@ -194,6 +218,8 @@
         "src/ameesh/freeze_checks.py",
         "src/ameesh/freeze_gate.py",
         "src/ameesh/github_identity.py",
+        "src/ameesh/credential_gate*.py",
+        "src/ameesh/pre_act.py",
         "src/ameesh/packet_candidates.py",
         "src/ameesh/verdict_carry.py",
         "scripts/paquet-candidats.py",
@@ -231,6 +257,8 @@
         "src/ameesh/freeze_checks.py",
         "src/ameesh/freeze_gate.py",
         "src/ameesh/github_identity.py",
+        "src/ameesh/credential_gate*.py",
+        "src/ameesh/pre_act.py",
         "src/ameesh/packet_candidates.py",
         "src/ameesh/verdict_carry.py",
         "scripts/paquet-candidats.py",
@@ -254,6 +282,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -265,6 +294,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -276,6 +306,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -287,6 +318,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -298,6 +330,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -309,6 +342,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -320,6 +354,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -331,6 +366,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -342,6 +378,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -353,6 +390,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -364,6 +402,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -375,6 +414,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -417,6 +457,8 @@
         "src/ameesh/freeze_checks.py",
         "src/ameesh/freeze_gate.py",
         "src/ameesh/github_identity.py",
+        "src/ameesh/credential_gate*.py",
+        "src/ameesh/pre_act.py",
         "src/ameesh/packet_candidates.py",
         "src/ameesh/verdict_carry.py",
         "scripts/paquet-candidats.py",
@@ -454,6 +496,8 @@
         "src/ameesh/freeze_checks.py",
         "src/ameesh/freeze_gate.py",
         "src/ameesh/github_identity.py",
+        "src/ameesh/credential_gate*.py",
+        "src/ameesh/pre_act.py",
         "src/ameesh/packet_candidates.py",
         "src/ameesh/verdict_carry.py",
         "scripts/paquet-candidats.py",
@@ -477,6 +521,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -488,6 +533,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -499,6 +545,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -510,6 +557,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -521,6 +569,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -532,6 +581,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -543,6 +593,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -554,6 +605,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -565,6 +617,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -576,6 +629,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -587,6 +641,7 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
@@ -598,12 +653,13 @@
         "src/ameesh/migrations.py",
         "src/ameesh/db.py",
         "src/ameesh/storage/**",
+        "src/ameesh/modules/dev/storage/**",
         "deploy/sql/**",
         "**/*.sql"
       ]
     }
   },
-  "policy_ref": "462c534b675ff931e4de21820d06608ae8077853",
+  "policy_ref": "a4e78c3f6086ea54e2a64b8c46470cc090db7516",
   "project": "ameesh",
   "version": 1
 }
