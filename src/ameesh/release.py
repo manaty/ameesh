@@ -1002,8 +1002,9 @@ def _catchup(cfg, args) -> int:
 
     The four `vm.sh` steps stay the avatar's manual gesture; this command
     records its outcome as a durable `staging.catchup` event, with the host,
-    the active commit read from `controler`, the attested tag, the author and
-    the owner right read from the project configuration. A declaration is a
+    the active commit read from `controler`, the attested tag (the release
+    tags are refreshed from the remote first, #8188), the author and the
+    owner right read from the project configuration. A declaration is a
     trace, not a proof: the guard keeps the lag until a staging attestation
     reads the host. `ok` is refused after the right's expiry or if its signed
     decision is withdrawn or superseded.

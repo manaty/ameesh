@@ -189,7 +189,10 @@ class WakeMissingFamilyTest(_ActivationFixture, PgTestCase):
         self.assertEqual(set(designated(item)), {"r1"})
         # #7745 : le manque se dit par delta et nomme les familles recevables.
         self.assertIn("1 independent review(s) missing by author delta", out["why"])
-        self.assertIn("eligible families: claude", out["why"])
+        # #8209 : claude, déjà assis (r1), ne reste pas « éligible » ; la
+        # famille en pause est nommée comme celle qui manque.
+        self.assertIn("eligible families: none", out["why"])
+        self.assertIn("families without an available reviewer: codex", out["why"])
         self.assertTrue(registry.get(self.db, "r2")["operator_paused"])
         self.assertTrue(registry.get(self.db, "r3")["operator_paused"])
         self.assertEqual(self.lifts("r2"), [])
