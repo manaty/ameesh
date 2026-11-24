@@ -21,7 +21,9 @@ n'autorise qu'UNE tentative.
   ou du grant recontrôlées en SQL après le dernier verrou, à l'heure réelle
   de la base (règle de 0011_receipts.sql) ; ENSUITE seulement
   appelle le connecteur, clé d'idempotence = `action_id` ; enregistre
-  `confirmed | failed | unknown`. Exception, délai dépassé, perte de
+  `confirmed | failed | unknown`. Un échec de transport déclaré avant
+  l'écriture de la requête (`NotSentError`) est certain → `failed` (« not
+  sent »), rejouable ; toute autre exception, un délai dépassé, une perte de
   connexion → `unknown`. Si l'issue ne peut pas être enregistrée, l'action
   reste `launched` et sera traitée comme inconnue (`recover`). Un appel
   abandonné après son délai qui rend plus tard une issue CERTAINE l'inscrit
@@ -75,7 +77,7 @@ import time
 from . import connectors as connectors_mod
 from . import db as db_mod
 from . import authority, fil, jcs, receipts, spend as spend_mod, standing_policy, storage, work
-from .connectors import ACTION_CLASSES, SEVERITY, Action, ConnectorError, Outcome
+from .connectors import ACTION_CLASSES, SEVERITY, Action, ConnectorError, NotSentError, Outcome
 from .db import Db, DbError
 from .modules import registry
 
@@ -1013,6 +1015,10 @@ def _call(connector, action: Action, timeout: float, late=None) -> Outcome:
     if not done:
         return Outcome.unknown("timeout exceeded (%gs): outcome unknown" % timeout)
     if error is not None:
+        if isinstance(error, NotSentError):
+            # #8212 : le connecteur déclare n'avoir rien envoyé (DNS, connexion,
+            # poignée de main TLS avant la requête) : échec certain, rejouable.
+            return Outcome.failed("not sent: %s" % _one_line(error))
         return Outcome.unknown("%s during the call: %s" % (type(error).__name__, _one_line(error)))
     if not isinstance(value, Outcome):
         return Outcome.unknown("unreadable connector response: %r" % (value,))
@@ -1053,17 +1059,22 @@ def _late_db(db: Db):
 def _record_late(db: Db, action_id: str, attempt: int, value, error, *, by: str) -> None:
     """Issue rendue APRÈS le délai par l'appel abandonné (dans son fil).
 
-    Certaine (`confirmed` | `failed`) : elle règle l'inconnue par une
-    transition conditionnelle (`ameesh_action_settle`, `unknown` → issue :
-    action ET tentative `attempt` encore `unknown`), avec la référence
-    externe. Jamais d'écrasement : si une réconciliation, une nouvelle
-    tentative ou un humain a tranché entre-temps, l'issue tardive est
+    Certaine (`confirmed` | `failed`, ou une exception `NotSentError`) : elle
+    règle l'inconnue par une transition conditionnelle (`ameesh_action_settle`,
+    `unknown` → issue : action ET tentative `attempt` encore `unknown`), avec
+    la référence externe. Jamais d'écrasement : si une réconciliation, une
+    nouvelle tentative ou un humain a tranché entre-temps, l'issue tardive est
     seulement journalisée (`late_ignored`). Incertaine : journalisée
     (`late_unknown`), rien ne change.
     """
     if error is not None:
-        outcome = Outcome.unknown("%s after the timeout: %s" % (type(error).__name__,
-                                                               _one_line(error)))
+        if isinstance(error, NotSentError):
+            # #8212 : même tard, le connecteur affirme qu'aucun octet n'est
+            # parti : l'inconnue se règle `failed`, la même action se rejoue.
+            outcome = Outcome.failed("not sent: %s" % _one_line(error))
+        else:
+            outcome = Outcome.unknown("%s after the timeout: %s" % (
+                type(error).__name__, _one_line(error)))
     elif not isinstance(value, Outcome):
         outcome = Outcome.unknown("unreadable late connector response: %r" % (value,))
     else:

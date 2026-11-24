@@ -707,8 +707,10 @@ target, args, amount, currency, policy_version}))`.
    l'action) ou le montant est réservé sur le grant (approbation permanente,
    §8.3).
 3. L'appel passe la **clé d'idempotence = `action_id`** au connecteur.
-4. Résultat certain → `confirmed` | `failed`. Pas de résultat (coupure, délai)
-   → `unknown`.
+4. Résultat certain → `confirmed` | `failed`. Un échec de transport ANTÉRIEUR
+   à l'écriture de la requête (résolution de nom, connexion refusée ou expirée,
+   poignée de main TLS), déclaré par `NotSentError`, est certain → `failed`
+   (« not sent »), rejouable. Pas de résultat (coupure, délai) → `unknown`.
 5. `unknown` : pas de nouvelle tentative automatique. Si le connecteur déclare
    `dedupe: guaranteed`, une nouvelle tentative de la même action (nouveau reçu,
    même `action_id`) est permise. Sinon `ameesh action reconcile` appelle
