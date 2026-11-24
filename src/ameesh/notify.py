@@ -156,6 +156,8 @@ SKIPPABLE_PASSES = ("issues", "github-watch", "ci", "alerts")
 #: L94 : la sous-utilisation (forfait perdu, agents au repos, orchestrateur
 #: tenu, hôte à vide) est poussée comme la surcharge.
 DEFAULT_TYPES = ("stopped_with_mail", "avatar_failover", "orphan_lot",
+                 # #8204 : l'humain apprend que la session de son avatar est perdue
+                 "attached_session_forgotten",
                  "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
@@ -392,6 +394,8 @@ TYPE_LABELS = {
     "engagement_overdue": "commitment or due date passed",
     "long_turn": "long turn",
     "session_too_big": "session too big",
+    # #8204 : la session d'un avatar, celle à laquelle son humain s'attache
+    "attached_session_forgotten": "avatar session forgotten",
     "stale_lot": "stale {work}",
     # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
     # humains si le type est dans `notify.types`

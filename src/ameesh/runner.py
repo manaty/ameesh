@@ -1388,12 +1388,17 @@ class AgentWorker(threading.Thread):
         if ouverte:
             self._installe_hook_preuve(cwd)
 
-    def _fil_note(self, text: str, *, meta: dict | None = None) -> None:
-        """Trace d'audit dans le fil du projet de l'agent (R12) ; ne lève jamais."""
+    def _fil_note(self, text: str, *, meta: dict | None = None,
+                  recipients: list[str] | None = None) -> None:
+        """Trace d'audit dans le fil du projet de l'agent (R12) ; ne lève jamais.
+
+        `recipients` : les destinataires nommés de la note (#8204 : l'humain
+        dont l'avatar a perdu sa session), aucun par défaut."""
         try:
             chantier = (self.agent or {}).get("chantier") or ""
             project = fil.project_for(self.cfg, chantier)
-            fil.record(self.cfg, self.db, sender=self.name, recipients=[], text=text,
+            fil.record(self.cfg, self.db, sender=self.name, recipients=list(recipients or []),
+                       text=text,
                        ts=time.time(), project=project,
                        meta=dict(meta or {}, audit="runner"))
         except Exception as exc:  # une trace ne casse jamais un tour
@@ -2782,6 +2787,59 @@ class AgentWorker(threading.Thread):
         from .exploitation import effective_policy
         return effective_policy(self.cfg, self.agent or {})
 
+    #: #8204 : type d'événement d'une session d'avatar oubliée, relu par
+    #: l'alerte `attached_session_forgotten`
+    ATTACHED_FORGOTTEN_EVENT = "agent.session_forgotten"
+
+    def _attached_human(self) -> str | None:
+        """#8204 : l'humain qui s'attache à la session de cet agent, ou None.
+
+        La session d'un avatar (fiche `avatar:` au canon, ou relève
+        `preference` qui porte sa conversation) est son lien avec son humain.
+        Ne lève jamais : un canon illisible ne fait pas d'avatar, mais la
+        relève du registre suffit."""
+        row = self.agent or {}
+        human = str(row.get("responsible") or "") or None
+        if fil.avatar_conversation(row):
+            return human or "?"
+        try:
+            from . import avatars
+            if avatars.is_avatar(self.cfg, self.name):
+                return avatars.human_of(self.cfg, self.name) or human or "?"
+        except Exception as exc:  # noqa: BLE001 — la lecture ne casse jamais un oubli
+            log_async("[%s] avatar card unreadable (%s)" % (self.name, exc))
+        return None
+
+    def _signal_attached_forgotten(self, session: str | None, why: str) -> bool:
+        """#8204 (gap 6 de #6403) : l'oubli de la session à laquelle un humain
+        s'attache n'est jamais silencieux.
+
+        Une ligne de journal ne suffit pas : une note de fil adressée à
+        l'humain responsable, et un événement `agent.session_forgotten` que
+        l'alerte `attached_session_forgotten` relit. Sans effet pour un agent
+        qui n'est pas un avatar. Ne lève jamais. Rend True si le signal est dû."""
+        human = self._attached_human()
+        if human is None:
+            return False
+        session = session or "?"
+        log_async("[%s] session %s, which human %s attaches to, forgotten: %s"
+                  % (self.name, session, human, why))
+        self._fil_note(
+            "Session %s of avatar %s forgotten (%s): this is the session %s attaches "
+            "to; the next turn opens a new one. Readopt the old session with "
+            "`ameesh adopt %s --session %s` if it must be kept."
+            % (session, self.name, why, human, self.name, session),
+            meta={"action": "session-humaine-oubliee", "session": session,
+                  "human": human},
+            recipients=[human] if human.startswith("human:") else [])
+        try:
+            events_mod.record(self.db, self.ATTACHED_FORGOTTEN_EVENT, "agent:" + self.name,
+                              agent=self.name, session=session, human=human,
+                              reason=why[:300])
+        except Exception as exc:  # noqa: BLE001 — la note de fil reste
+            log_async("[%s] forgotten session event not recorded (%s)" % (self.name, exc))
+        return True
+
     def session_max_tokens(self, harness: str | None = None) -> float:
         """Seuil de rotation sur la taille (L11) d'une session, par harnais.
 
@@ -3998,6 +4056,7 @@ class AgentWorker(threading.Thread):
         # L81 (étude §6.1) : l'ancienne session ne sera plus reprise, son cumul
         # de relu n'a plus à être gardé.
         self._resident_reread.pop(ancienne or "", None)
+        self._signal_attached_forgotten(ancienne, "session rotation (%s)" % raison)
         self._fil_note(
             "Session rotation (%s)%s: the old id (%s) is kept in "
             "`session-history.jsonl`; the new session starts from the summary below.\n\n%s"
@@ -4344,6 +4403,7 @@ class AgentWorker(threading.Thread):
                     self.resume_continuation = False
         log_async("[%s] session %s closed: lot #%s is finished"
                   % (self.name, session or "?", lot))
+        self._signal_attached_forgotten(session, "lot #%s is finished" % lot)
         self._fil_note(
             "Session %s closed at the lot's end: lot #%s is finished; a new "
             "session opens on the next turn's brief." % (session or "?", lot),
@@ -4471,6 +4531,7 @@ class AgentWorker(threading.Thread):
         self._resume_drop()
         log_async("[%s] session %s had no lot: forgotten, never shared with a lot"
                   % (self.name, session or "?"))
+        self._signal_attached_forgotten(session, "it had no lot, the turn is on a lot")
         self._fil_note("Session %s had no lot (opened by a turn whose lot was "
                        "unknown): forgotten, it will never be shared between lots."
                        % (session or "?"), meta={"action": "session-sans-lot",
@@ -4902,6 +4963,7 @@ class AgentWorker(threading.Thread):
             self.session_turns = 0
             self.session_tokens = 0.0
             self._context_session_forget()
+            self._signal_attached_forgotten(refusee, motif)
             suite = "new session opened on the resume brief"
         log_async("[%s] %s: %s" % (self.name, motif, suite))
         self._fil_note(note.replace("{suite}", suite),

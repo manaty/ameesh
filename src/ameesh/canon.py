@@ -4734,6 +4734,26 @@ class _Loader:
                      "`fresh_session: true` requires no session rotation, but "
                      "`session_policy: %s` asks for one" % session_policy,
                      **where, **subject)
+        if "avatar" in (fiche.data or {}):
+            # #8204 (gap 6 de #6403) : la session d'un avatar est le lien avec
+            # son humain ; elle ne tourne jamais, quel que soit le lot du
+            # tour. La fiche d'avatar déclare donc `session_policy: jamais`
+            # sans l'écrire (l'onboarding la pose) ; une fiche qui demande une
+            # rotation ou une session neuve à chaque tour est refusée.
+            if fresh_session:
+                self.add("avatar-session-policy", ERROR,
+                         "avatar %s: `fresh_session: true` would drop the session its "
+                         "human attaches to; an avatar keeps one session "
+                         "(`session_policy: jamais`)" % fiche.title,
+                         **where, **subject)
+                fresh_session = False
+            if session_policy not in (None, "jamais"):
+                self.add("avatar-session-policy", ERROR,
+                         "avatar %s: `session_policy: %s` would rotate the session its "
+                         "human attaches to; an avatar keeps one session "
+                         "(`session_policy: jamais`)" % (fiche.title, session_policy),
+                         **where, **subject)
+            session_policy = "jamais"
         context_max_tokens = None
         raw = fiche.data.get("context_max_tokens")
         if raw is not None:
