@@ -1410,6 +1410,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         # au-delà invisible et l'alerte proposait un lot que `work assign`
         # refuse ensuite (#3185/#4699).
         lots = storage.of(db).operations.open_lots_activity(None)
+    # #8194 : un suivi ouvert n'occupe ni n'offre rien
+    lots = [lot for lot in lots if not lifecycle.is_follow_up(lot)]
     # #1608 : la liste garde les lots retenus par une attente et les classe
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).

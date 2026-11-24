@@ -509,7 +509,9 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                     "project": project,
                     "planned_wait": waits.get(rid),
                     "dependencies": dependencies.get(rid, []),
-                    "stale": None if rid in waits else
+                    # #8194 : un suivi n'est jamais inerte (même règle que
+                    # `stagnant_lots`, lue par `plan.annotate`, work list/show, l'API)
+                    "stale": None if rid in waits or lifecycle.is_follow_up(row) else
                              stale(row.get("state") or "", last, now, threshold),
                     "unreadable": None}
     return out
@@ -545,7 +547,9 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     rows = []
     out = []
     for r in open_items:
-        if r.get("last_activity_ts") is None or sous_utilisation.is_backlog_item(r):
+        # #8194 : un suivi n'a pas de mouvement de lot à attendre : jamais inerte
+        if (r.get("last_activity_ts") is None or sous_utilisation.is_backlog_item(r)
+                or lifecycle.is_follow_up(r)):
             continue
         try:
             idle = now - float(r["last_activity_ts"])

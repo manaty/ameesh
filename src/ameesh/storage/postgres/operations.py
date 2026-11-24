@@ -273,8 +273,10 @@ class Operations(interface.Operations):
                    WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
                                      THEN r.session_work_item::bigint END) sw ON true
               LEFT JOIN LATERAL (
+                  -- #8194 : un suivi n'occupe pas l'agent (ici, `al`, `ac`)
                   SELECT w.id, w.title, w.state FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
+                     AND """ + lifecycle.not_follow_up_sql("w") + """
                    ORDER BY w.updated_at DESC, w.id DESC LIMIT 1) aw ON true
               LEFT JOIN LATERAL (
                   -- L165b : les lots qui occupent l'agent (ni en attente d'un
@@ -282,6 +284,7 @@ class Operations(interface.Operations):
                   -- attend son geste (gel, correction due) l'occupe
                   SELECT count(*) AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
+                     AND """ + lifecycle.not_follow_up_sql("w") + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
                           OR """ + owed_by_assignee("w") + """)
                      AND NOT """ + start_defers("w", "j.today") + """
@@ -305,6 +308,7 @@ class Operations(interface.Operations):
                   SELECT count(*)""" + review_due + """ AS n, min(w.id) AS lot_id
                     FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
+                     AND """ + lifecycle.not_follow_up_sql("w") + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
                           OR """ + owed_by_assignee("w") + """)
                      AND NOT """ + start_defers("w", "j.today") + """

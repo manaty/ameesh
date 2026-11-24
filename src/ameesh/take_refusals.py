@@ -103,7 +103,8 @@ def _unassigned(db) -> list[dict]:
     seen: set[int] = set()
     for row in st.operations.open_lots_activity(None) or ():
         ident = int(row["id"])
-        if row.get("assignee") or row.get("type") == "improvement":
+        if (row.get("assignee") or row.get("type") == "improvement"
+                or lifecycle.is_follow_up(row)):
             continue
         if row.get("state") not in lifecycle.ACTIVE:
             continue
@@ -226,7 +227,8 @@ class _Context:
         if not lots:
             return {}
         try:
-            all_lots = self.st.operations.open_lots_activity(None) or ()
+            all_lots = [lot for lot in self.st.operations.open_lots_activity(None) or ()
+                        if not lifecycle.is_follow_up(lot)]
             return self.su.footprint_blockers(self.db, lots, all_lots)
         except Exception:  # noqa: BLE001 - une empreinte illisible ne devine pas
             return {}
@@ -547,6 +549,8 @@ def _history_episodes(db, since: float, until: float) -> list[dict]:
         " FROM work_items"
         " WHERE created_at <= to_timestamp(%s)"
         " AND (closed_at IS NULL OR closed_at >= to_timestamp(%s))"
+        # #8194 : un suivi n'est jamais offert à la file : aucun épisode
+        " AND " + lifecycle.not_follow_up_sql() +
         " ORDER BY id", (float(until), float(since)))
     by_item: dict[int, list] = {}
     ids = [int(item["id"]) for item in items]

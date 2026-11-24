@@ -3098,7 +3098,8 @@ _ITEMS_SQL = f"""
            extract(epoch FROM w.created_at)::float8 AS created_ts,
            w.branch, w.branch_target
       FROM work_items w
-     WHERE (EXISTS (SELECT 1 FROM work_item_milestones m
+     WHERE {lifecycle.not_follow_up_sql("w")}
+       AND (EXISTS (SELECT 1 FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.at > to_timestamp(%s))
          OR EXISTS (SELECT 1 FROM work_item_events e
                      WHERE e.work_item_id = w.id AND e.created_at > to_timestamp(%s)))
@@ -3659,7 +3660,10 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
     store = storage.of(db)
     horizon = now - EVENT_DAYS * 86400
     listing = attempt("agents", store.operations.listing, [])
-    lots = attempt("open lots", lambda: store.operations.open_lots_activity(None), [])
+    # #8194 : un suivi ouvert n'est ni démarrable ni en cours
+    lots = [lot for lot in attempt("open lots",
+                                   lambda: store.operations.open_lots_activity(None), [])
+            if not lifecycle.is_follow_up(lot)]
     if lots:
         sources = attempt("split lot sources", lambda: {
             int(row["id"]): row["source"] for row in _rows(
