@@ -298,42 +298,47 @@ class LotSessions(interface.LotSessions):
         return {"id": row["id"], "state": row["state"], "title": row["title"],
                 "wake_ts": float(row["wake_ts"])}
 
-    def consume_wake(self, name, lot, wake_ts):
+    def consume_wake(self, name, lot, wake_ts, served_at=None):
         """#2466 : le harnais du tour est lancé — l'échéance réclamée est
         consommée ; une échéance reposée entre-temps est conservée.
 
         #2614 : la ligne `wake: scheduled wake delivered` est écrite ici, dans
         la même transaction, une seule fois par réveil réellement délivré.
-        #8235 (B #46312) : elle est datée du début de la délivrance (le claim),
-        soit l'instant où le tour a lu le réveil, et non de la consommation —
-        une note de l'assigné écrite entre l'écriture et la consommation doit
-        compter comme une suite donnée au réveil."""
+        #8235 (B #46338) : `served_at` est l'instant mural où la ligne a été
+        écrite dans le pty (remis par `Veille.delivered`, après l'écriture) ;
+        la ligne de délivrance en est datée. Il n'est jamais déduit du bail
+        `wake_claim_at`, antérieur à la remise et renouvelé entre-temps. Sans
+        `served_at` (exécuteur, appel direct), la date reste celle de la
+        consommation."""
         if not has_wake_at(self.db):
             return False
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT id, extract(epoch from wake_claim_at)::float8 AS claim_ts,"
-                "       CASE WHEN state = 'delivered' THEN"
-                "        coalesce(to_jsonb(work_items)->>'legacy_state', state)"
-                "        ELSE state END AS state"
-                "  FROM work_items"
+                "UPDATE work_items SET wake_at = NULL, wake_claim_at = NULL,"
+                "       updated_at = now()"
                 " WHERE id = %s AND assignee = %s"
                 "   AND abs(extract(epoch from wake_at) - %s::float8) < 0.001"
                 "   AND wake_claim_at IS NOT NULL"
-                " FOR UPDATE", (int(lot), name, float(wake_ts)))
+                " RETURNING id, CASE WHEN state = 'delivered' THEN"
+                " coalesce(to_jsonb(work_items)->>'legacy_state', state)"
+                " ELSE state END AS state", (int(lot), name, float(wake_ts)))
             if not rows:
                 return False
-            tx.execute(
-                "UPDATE work_items SET wake_at = NULL, wake_claim_at = NULL,"
-                "       updated_at = now() WHERE id = %s", (int(lot),))
-            tx.execute(
-                "INSERT INTO work_item_events"
-                " (work_item_id, state, note, actor, created_at)"
-                " VALUES (%s, %s, %s, %s, to_timestamp(%s))",
-                (int(lot), rows[0]["state"],
-                 "wake: scheduled wake delivered at %s (due %s)"
-                 % (_moment(time.time()), _moment(wake_ts)),
-                 "ameesh", float(rows[0]["claim_ts"])))
+            note = ("wake: scheduled wake delivered at %s (due %s)"
+                    % (_moment(time.time()), _moment(wake_ts)))
+            if served_at is None:
+                tx.execute(
+                    "INSERT INTO work_item_events"
+                    " (work_item_id, state, note, actor)"
+                    " VALUES (%s, %s, %s, %s)",
+                    (int(lot), rows[0]["state"], note, "ameesh"))
+            else:
+                tx.execute(
+                    "INSERT INTO work_item_events"
+                    " (work_item_id, state, note, actor, created_at)"
+                    " VALUES (%s, %s, %s, %s, to_timestamp(%s))",
+                    (int(lot), rows[0]["state"], note, "ameesh",
+                     float(served_at)))
             return True
 
     def purge(self, name=None):

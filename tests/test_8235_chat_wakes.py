@@ -181,14 +181,16 @@ class ChatWakeDeliveryTest(ChatWakeCase):
         self.assertIsNone(self.wake_at(lot), "le réveil rendu est consommé")
 
     def test_a_note_between_serve_and_consume_counts(self):
-        """B/P2 #46312 (ameesh-dev3) : la délivrance est datée du claim, donc
-        une note écrite après la ligne du pty et avant la consommation compte."""
+        """B/P2 #46312 (ameesh-dev3) : une note écrite après la ligne du pty
+        et avant la consommation compte, et la délivrance est datée de la remise."""
         lot = self.arm(time.time() - 1)
         veille = self.veille()
         veille.observe([], [])
         veille._pump_wakes()                         # réclamation
         self.assertIn("#%d" % lot, veille.due())     # ligne écrite dans le pty
         veille.delivered()
+        served_at = veille._served_wake["served_at"]
+        time.sleep(0.02)
         work.note(self.db, lot, "j'ai fait le geste", actor=NAME)
         veille._pump_wakes()                         # consommation, plus tard en vrai
         self.assertIsNone(work.get(self.db, lot).get("wake_ts"))
@@ -197,6 +199,50 @@ class ChatWakeDeliveryTest(ChatWakeCase):
         self.assertEqual(len(rows), 1)
         self.assertIsNotNone(rows[0]["noted_ts"],
                              "la note entre écriture et consommation est vue")
+        self.assertAlmostEqual(rows[0]["delivered_ts"], served_at, delta=0.01)
+        self.assertGreater(rows[0]["noted_ts"], rows[0]["delivered_ts"])
+
+    def test_a_note_before_the_serve_does_not_count(self):
+        """B/P2 #46338 (ameesh-cx2) : le bail est antérieur à la remise ; une
+        note écrite avant l'écriture dans le pty ne compte pas."""
+        lot = self.arm(time.time() - 1)
+        veille = self.veille()
+        veille.observe([], [])
+        veille._pump_wakes()                         # réclamation
+        time.sleep(0.02)
+        work.note(self.db, lot, "note avant affichage", actor=NAME)
+        self.assertIn("#%d" % lot, veille.due())
+        veille.delivered()
+        veille._pump_wakes()
+        rows = [r for r in storage.of(self.db).work.follow_up_watch()
+                if int(r["id"]) == lot]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["noted_ts"],
+                          "une note antérieure à la remise ne compte pas")
+
+    def test_a_renewal_after_the_serve_does_not_lose_the_note(self):
+        """B/P2 #46338 (ameesh-cx2) : le renouvellement du bail après la
+        remise ne déplace pas la date de délivrance ; la note reste vue."""
+        lot = self.arm(time.time() - 1)
+        veille = self.veille()
+        veille.observe([], [])
+        veille._pump_wakes()                         # réclamation
+        self.assertIn("#%d" % lot, veille.due())
+        veille.delivered()
+        served_at = veille._served_wake["served_at"]
+        time.sleep(0.02)
+        work.note(self.db, lot, "j'ai fait le geste", actor=NAME)
+        time.sleep(0.02)
+        renewal = time.time()
+        taken = storage.of(self.db).lot_sessions.claim_wake(NAME, lot, renewal, 0.0)
+        self.assertIsNotNone(taken, "le bail est renouvelé après la remise")
+        veille._pump_wakes()                         # consommation ensuite
+        rows = [r for r in storage.of(self.db).work.follow_up_watch()
+                if int(r["id"]) == lot]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["noted_ts"], "la note post-remise reste vue")
+        self.assertAlmostEqual(rows[0]["delivered_ts"], served_at, delta=0.01)
+        self.assertLess(rows[0]["delivered_ts"], renewal - 0.01)
 
     def test_a_busy_harness_holds_the_wake_without_claiming_it(self):
         lot = self.arm(time.time() - 1)

@@ -1000,7 +1000,8 @@ class ScheduledWakes:
 
     def consume(self, taken: dict) -> bool:
         return bool(self.sessions.consume_wake(
-            self.name, int(taken["id"]), float(taken["wake_ts"])))
+            self.name, int(taken["id"]), float(taken["wake_ts"]),
+            served_at=taken.get("served_at")))
 
 
 def wake_line(taken: dict) -> str:
@@ -1325,11 +1326,12 @@ class Veille:
 
     def delivered(self) -> None:
         """#8235 : la ligne vient d'être écrite dans le pty. Si c'était le
-        réveil que la dernière `due` a rendu, il devient « servi » : `_loop`
-        le consommera à sa passe suivante (le stockage écrit alors la ligne
-        `wake: scheduled wake delivered` au journal du lot). Un réveil
-        simplement retenu, ou réclamé entre `due` et l'écriture, n'est pas
-        promu : seule la ligne réellement rendue compte.
+        réveil que la dernière `due` a rendu, il devient « servi » avec
+        l'instant mural de la remise (`served_at`) : `_loop` le consommera à
+        sa passe suivante (le stockage écrit alors la ligne
+        `wake: scheduled wake delivered` au journal du lot, datée de cet
+        instant). Un réveil simplement retenu, ou réclamé entre `due` et
+        l'écriture, n'est pas promu : seule la ligne réellement rendue compte.
 
         Aucune opération de base ici : le fil du terminal ne touche que la
         mémoire. La consommation, dans `_loop`, ne lève jamais : son échec
@@ -1340,7 +1342,7 @@ class Veille:
                 return
             if self._claimed_wake is served:
                 self._claimed_wake = None
-            self._served_wake = served
+            self._served_wake = dict(served, served_at=time.time())
 
     def pending_text(self) -> str | None:
         with self._lock:

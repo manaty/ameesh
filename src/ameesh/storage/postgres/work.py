@@ -2283,10 +2283,12 @@ class WorkItems(interface.WorkItems):
         est écrite par `consume_wake`, une ligne `wake: cancelled` par
         `schedule_wake` : le journal dit quand le réveil a cessé d'être armé.
 
-        #8235 (B #46312) : la ligne de délivrance est datée du début de la
-        délivrance (le claim), pas de la consommation ; une note de l'assigné
-        est comptée depuis cet instant, jamais depuis l'id de la ligne — une
-        note écrite entre l'écriture dans le pty et la consommation compte."""
+        #8235 (B #46338) : la ligne de délivrance est datée de la remise
+        réelle (`served_at`, après l'écriture dans le pty), pas du bail ni de
+        la consommation ; une note de l'assigné est comptée depuis cet
+        instant, jamais depuis l'id de la ligne — une note écrite entre
+        l'écriture et la consommation compte, une note antérieure à la remise
+        ne compte pas."""
         if not has_wake_at(self.db):
             return []
         delivered = "wake: scheduled wake delivered%"
