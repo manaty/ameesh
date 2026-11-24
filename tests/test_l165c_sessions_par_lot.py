@@ -457,6 +457,29 @@ class StockageTest(_Base):
         work.note(self.db, lot, "roadmap: épuisée ameesh", actor="pilote4901")
         self.assertNotIn(lot, {r["id"] for r in self.st.actionable("pilote4901")})
 
+    def test_decoupage_rouvert_sous_un_hold_reveille_le_pilote(self):
+        """#8198 : la règle 1 lit la sentinelle enveloppée comme le sommeil.
+
+        `roadmap: épuisée` puis `unhold: roadmap: rouverte` : le sommeil lit
+        la réouverture et lève les dormeurs ; la règle 1 doit réveiller le
+        pilote au lieu de ne voir que l'épuisement (revue #8198, B). La forme
+        inverse `unhold: roadmap: épuisée` garde le lot silencieux.
+        """
+        self.bail("pilote8198")
+        lot = work.add(self.db, title="Découper la feuille de route",
+                       source="file-decoupage:ameesh", app="ameesh",
+                       assignee="pilote8198", force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        work.note(self.db, lot, "hold: feuille de route vide", actor="pilote8198")
+        work.note(self.db, lot, "roadmap: épuisée ameesh", actor="pilote8198")
+        self.assertNotIn(lot, {r["id"] for r in self.st.actionable("pilote8198")})
+        work.note(self.db, lot, "unhold: roadmap: rouverte ameesh",
+                  actor="human:owner")
+        self.assertIn(lot, {r["id"] for r in self.st.actionable("pilote8198")})
+        work.note(self.db, lot, "unhold: roadmap: épuisée ameesh",
+                  actor="human:owner")
+        self.assertNotIn(lot, {r["id"] for r in self.st.actionable("pilote8198")})
+
     def test_note_epuisee_ne_suspend_pas_un_lot_ordinaire(self):
         self.bail("agent4901")
         lot = work.add(self.db, title="Travail ordinaire", app="ameesh",

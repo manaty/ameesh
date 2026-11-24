@@ -222,8 +222,11 @@ class LotSessions(interface.LotSessions):
         # déclarant la feuille de route épuisée. Le lot reste ouvert, mais ne
         # doit plus réveiller le pilote par la règle 1. Même lecture que le
         # sommeil : dernière note du projet, dans l'ordre du journal.
+        # #8198 : cette lecture passe par le même helper que `roadmap_notes`,
+        # `wrapped` compris (`hold: roadmap: …`), sinon le quatrième lecteur
+        # de la sentinelle diverge des trois autres.
         from ... import file_decoupage
-        from .work import WorkItems
+        from ... import work as work_mod
         projects = {}
         for row in rows:
             source = row.pop("roadmap_source", None) or ""
@@ -231,10 +234,9 @@ class LotSessions(interface.LotSessions):
                 projects[row["id"]] = source[len(file_decoupage.SOURCE_PREFIX):]
         if not projects:
             return rows
-        notes = {item_id: [] for item_id in projects}
-        for event in WorkItems(self.db).events_noted(
-                file_decoupage.ROADMAP_PREFIX, 0, ids=list(projects)):
-            notes[event["work_item_id"]].append(event)
+        notes = {item_id: work_mod.events_noted(
+                     self.db, item_id, file_decoupage.ROADMAP_PREFIX, wrapped=True)
+                 for item_id in projects}
         return [row for row in rows if row["id"] not in projects or
                 not file_decoupage.exhausted(notes[row["id"]], projects[row["id"]])]
 

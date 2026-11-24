@@ -123,8 +123,8 @@ comme avant.
 #8198 : le pilote note souvent sa raison sous `hold:` (et sa levée sous
 `unhold:`), la sentinelle vivant alors dans cette raison —
 `hold: roadmap: épuisée <projet> — …`. Le préfixe `hold:`/`unhold:` est donc
-facultatif devant `roadmap:`, lu par le sommeil, le débit et le journal du lot
-(les trois lecteurs), sans changer le sens de la dernière note.
+facultatif devant `roadmap:`, lu par le sommeil, le débit, le journal du lot et
+la règle 1 (les quatre lecteurs), sans changer le sens de la dernière note.
 
 ### 2.4 Acceptation de A
 

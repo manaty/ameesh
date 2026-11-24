@@ -6,7 +6,9 @@ Le pilote note sa raison sous `hold:` (et sa levée sous `unhold:`) :
 cacher la sentinelle. Témoins : la fonction partagée
 `file_decoupage.roadmap_state`, le verdict du débit `_roadmap_verdicts`, la
 lecture du journal (`work.events_noted` avec `wrapped`, donc
-`roadmap_notes`) et la requête `_ROADMAP_SQL` du débit.
+`roadmap_notes`) et la requête `_ROADMAP_SQL` du débit. Le quatrième lecteur,
+la règle 1 (`lot_sessions.actionable`, #4901), est couvert par
+`tests/test_l165c_sessions_par_lot.py`.
 
 Une note dont le corps ne commence pas par `roadmap:` reste ignorée : le
 préfixe de retenue est facultatif, il ne déplace pas la sentinelle.
