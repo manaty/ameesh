@@ -80,6 +80,9 @@
 --   * série interne de sondes saines d'une ligne `failing` (#8200), lue par
 --     la sonde seule :
 --       credential_health.healthy_streak, credential_health.healthy_probe_at
+--   * sujets de lots (#8193, 0608), lus par `ameesh work subject` et
+--     `work list --subject`, sans lecteur superviseur pour l'instant :
+--       work_subjects.*, work_items.subject_id
 --
 --   * CONTENUS — texte libre écrit par les agents ou les humains : corps et
 --     charges des messages, consignes, extraits de fil, arguments et notes
