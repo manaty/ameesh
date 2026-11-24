@@ -180,6 +180,24 @@ class ChatWakeDeliveryTest(ChatWakeCase):
         veille._pump_wakes()
         self.assertIsNone(self.wake_at(lot), "le réveil rendu est consommé")
 
+    def test_a_note_between_serve_and_consume_counts(self):
+        """B/P2 #46312 (ameesh-dev3) : la délivrance est datée du claim, donc
+        une note écrite après la ligne du pty et avant la consommation compte."""
+        lot = self.arm(time.time() - 1)
+        veille = self.veille()
+        veille.observe([], [])
+        veille._pump_wakes()                         # réclamation
+        self.assertIn("#%d" % lot, veille.due())     # ligne écrite dans le pty
+        veille.delivered()
+        work.note(self.db, lot, "j'ai fait le geste", actor=NAME)
+        veille._pump_wakes()                         # consommation, plus tard en vrai
+        self.assertIsNone(work.get(self.db, lot).get("wake_ts"))
+        rows = [r for r in storage.of(self.db).work.follow_up_watch()
+                if int(r["id"]) == lot]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["noted_ts"],
+                             "la note entre écriture et consommation est vue")
+
     def test_a_busy_harness_holds_the_wake_without_claiming_it(self):
         lot = self.arm(time.time() - 1)
         phase = {"value": chat.PHASE_BUSY}

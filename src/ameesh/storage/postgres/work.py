@@ -2281,7 +2281,12 @@ class WorkItems(interface.WorkItems):
         """#8196 : les suivis ouverts et leur réveil (alerte
         `follow_up_unfollowed`). Une ligne `wake: scheduled wake delivered`
         est écrite par `consume_wake`, une ligne `wake: cancelled` par
-        `schedule_wake` : le journal dit quand le réveil a cessé d'être armé."""
+        `schedule_wake` : le journal dit quand le réveil a cessé d'être armé.
+
+        #8235 (B #46312) : la ligne de délivrance est datée du début de la
+        délivrance (le claim), pas de la consommation ; une note de l'assigné
+        est comptée depuis cet instant, jamais depuis l'id de la ligne — une
+        note écrite entre l'écriture dans le pty et la consommation compte."""
         if not has_wake_at(self.db):
             return []
         delivered = "wake: scheduled wake delivered%"
@@ -2303,7 +2308,8 @@ class WorkItems(interface.WorkItems):
             "                      ORDER BY e.id DESC LIMIT 1) x ON true"
             "  LEFT JOIN LATERAL (SELECT min(e.created_at) AS created_at"
             "                       FROM work_item_events e"
-            "                      WHERE e.work_item_id = w.id AND e.id > d.id"
+            "                      WHERE e.work_item_id = w.id"
+            "                        AND e.created_at > d.created_at"
             "                        AND e.actor = w.assignee) n ON true"
             " WHERE w.type = %%s AND w.state NOT IN %s"
             " ORDER BY w.id" % _CLOSED,

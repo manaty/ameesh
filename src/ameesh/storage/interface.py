@@ -6526,7 +6526,10 @@ class LotSessions(Domain):
         encore celle qui a été réclamée (`wake_ts`) et sous claim — une
         nouvelle échéance posée entre-temps est conservée. Rend False sinon.
         #2614 : la consommation écrit au journal, dans la même transaction, la
-        ligne `wake: … delivered …` — un témoin par réveil réellement délivré."""
+        ligne `wake: … delivered …` — un témoin par réveil réellement délivré.
+        #8235 : cette ligne est datée du début de la délivrance (le claim),
+        pour qu'une note de l'assigné écrite entre l'écriture et la
+        consommation compte comme une suite donnée au réveil."""
 
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
