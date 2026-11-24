@@ -3063,15 +3063,23 @@ def unit_environment(environ: dict, home: Path) -> dict:
 
     Celui de l'appelant (DSN, configuration, forge, `AGENT_MAIL_NAME`), sans
     le jeton de bail de la session ni les variables du tour. L'époque d'un
-    `AMEESH_ROLE` est gardée : c'est le bail du rôle, pas une session. Les
-    worktrees vont au dossier du tic (#5204, #6814) : le TMPDIR d'un tour peut
-    être vidé à sa fin.
+    `AMEESH_ROLE` est gardée : c'est le bail du rôle, pas une session. Son
+    hôte est posé s'il manque (#8255) : la lignée même-hôte de #4245 ne peut
+    couvrir une réélection du rôle pendant les tests que si le geste dit sur
+    quel hôte il tourne. Les worktrees vont au dossier du tic (#5204, #6814) :
+    le TMPDIR d'un tour peut être vidé à sa fin.
     """
     env = {key: value for key, value in environ.items()
            if key not in TURN_ENV and not key.startswith(TURN_ENV_PREFIX)}
     if not env.get("AMEESH_ROLE"):
         for key in SESSION_LEASE_ENV:
             env.pop(key, None)
+    else:
+        # #8255 : l'unité tourne sur cet hôte. Sans `AMEESH_ROLE_HOST`, une
+        # commande de rôle n'a pas de lignée à présenter (`_same_host`) et
+        # perd la composition sur une simple réélection du même hôte.
+        host = (env.get("AMEESH_ROLE_HOST") or "").strip() or socket.gethostname()
+        env["AMEESH_ROLE_HOST"] = host.split(".", 1)[0]
     tmp = home / auto.SCOPE_TMPDIR
     for key in ("TMPDIR", "TMP", "TEMP"):
         env[key] = str(tmp)
