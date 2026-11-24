@@ -207,6 +207,26 @@ class TestOnlyCorrectorTest(PgTestCase):
         self.assertFalse(out["ok"], out)
         self.assertEqual([row["actor"] for row in out["accepted"]], ["dev1"])
 
+    def test_squashed_correction_after_a_prior_freeze_keeps_the_family_excluded(self):
+        # #8230 (témoin mty-amh-impl-13) : cx2 corrige après avoir lu un gel
+        # antérieur ; son correctif produit est un reçu publié, sorti de
+        # l'ascendance par un squash à contenu identique. Sans citation, rien
+        # ne prouve sa réécriture : cx2 reste auteur, codex reste exclu.
+        work.milestone(self.db, self.lot, "frozen", sha=self.author_commit,
+                       actor="author")
+        work.milestone(self.db, self.lot, "verdict", sha=self.author_commit,
+                       actor="cx2", verdict="blocked")
+        self.freeze(["src/ameesh/work.py"])
+        tree = self.repo.git("rev-parse", "HEAD^{tree}")
+        squashed = self.repo.git("commit-tree", tree, "-p", self.base,
+                                "-m", "consolidated product")
+        self.repo.git("reset", "--hard", squashed)
+        self.receipt("author", "deepseek", [squashed])
+        self.freeze(["tests/test_product.py"])
+        out = self.gate()
+        self.assertFalse(out["ok"], out)
+        self.assertIn("cx2", {row["name"] for row in out["authors"]})
+
     def test_designation_keeps_the_family_and_excludes_manual_self_verdict(self):
         fixer = {"name": "cx2", "family": "codex", "test_only": True}
         out = rd.select(required=2,
