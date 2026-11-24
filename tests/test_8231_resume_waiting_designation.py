@@ -69,6 +69,41 @@ class ResumeWaitingTest(base._ActivationFixture, PgTestCase):
             act.designate_deferred = original
         self.assertEqual(calls, [self.lot])
 
+    def replay(self, outcomes, steps):
+        """`steps` : un geste avant chaque passe ; rend les `attempted`."""
+        memo: dict = {}
+        calls = iter(outcomes)
+
+        def deferred(cfg, db, lot, freeze, **kwargs):
+            outcome = next(calls)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        attempted = []
+        with mock.patch.object(act, "designate_deferred", side_effect=deferred):
+            for step in steps:
+                step()
+                attempted.append(act.resume_waiting(self.cfg, self.db,
+                                                    memo=memo)["attempted"])
+        return attempted
+
+    def test_candidate_leaving_then_returning_is_replayed(self):
+        self.waiting_freeze()
+        waiting = {"state": rd.WAITING, "reviewers": [], "why": "corrector"}
+        attempted = self.replay([waiting, waiting], [
+            lambda: self.resume("r2"), lambda: self.pause("r2"),
+            lambda: self.resume("r2")])
+        self.assertEqual(attempted, [1, 0, 1])
+
+    def test_transient_error_does_not_freeze_the_memo(self):
+        self.waiting_freeze()
+        self.resume("r2")
+        waiting = {"state": rd.WAITING, "reviewers": [], "why": "corrector"}
+        attempted = self.replay([RuntimeError("git read"), waiting],
+                                [lambda: None, lambda: None])
+        self.assertEqual(attempted, [1, 1])
+
     def test_resumable_ignores_author_and_seated_families(self):
         payload = {"authors": [{"name": "a", "family": "deepseek"}],
                    "reviewers": [{"name": "r1", "family": "claude"}]}

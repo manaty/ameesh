@@ -5447,7 +5447,12 @@ def resume_waiting(cfg, db, *, memo: Optional[dict] = None,
                 continue
             names = _resumable(effective[2], pools[project])
             signature = (int(freeze["id"]), int(effective[0]), tuple(names))
-            if not names or memo.get(lot) == signature:
+            if not names:
+                # B mty-amh-docs-01 : le candidat parti, son retour est une
+                # situation nouvelle, rejouée même à signature identique.
+                memo.pop(lot, None)
+                continue
+            if memo.get(lot) == signature:
                 continue
             if out["attempted"] >= limit:
                 break
@@ -5455,6 +5460,8 @@ def resume_waiting(cfg, db, *, memo: Optional[dict] = None,
             memo[lot] = signature
             result = designate_deferred(cfg, db, lot, freeze)
         except Exception as exc:  # noqa: BLE001 - un lot n'arrête pas la passe
+            # un échec transitoire ne fige pas la situation : passe suivante
+            memo.pop(lot, None)
             out["errors"].append("#%d: %s: %s" % (lot, type(exc).__name__,
                                                   str(exc)[:160]))
             continue
