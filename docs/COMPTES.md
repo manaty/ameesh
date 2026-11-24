@@ -657,16 +657,28 @@ dates, not the turn-refreshed `checked_at`.
 **End of turn.** A failed turn whose error, short answer (600 characters at
 most) or stderr tail (this turn's output only: `stderr.log` is appended to by
 every turn) is an authentication failure
-(`ameesh.auth_failure.classify`) is neither a fast failure nor replayed: the
-turn's account is marked `failing` (source `turn`), the consigne goes back to
-pending, the agent goes `blocked` with `status_text` "`auth_blocked:
-<harness>/<account>`" and `last_error` "`auth_blocked: <reason>`". A turn that
+(`ameesh.auth_failure.classify`) — HTTP 401, `authentication_error`, "Please
+run /login", gcloud "Reauthentication failed", or the harness saying the login
+"reached its time limit" / "cannot be renewed" (#8180) — is neither a fast
+failure nor replayed: the turn's account is marked `failing` (source `turn`),
+the consigne goes back to pending, the agent goes `blocked` with `status_text`
+"`auth_blocked: <harness>/<account>`" and `last_error` "`auth_blocked:
+<reason>`". Since #8180 the reason already ends with the account's real login
+command (§ 6), without waiting for the sentinel's next probe. A turn that
 fails otherwise (429, context, exit code) takes the usual path.
 
 **Failover.** The account choice (§ 2 and § 4, `accounts.choose`) is
 restricted to **healthy** accounts: a `failing` account is never chosen, not
 even by session continuity. The next turn starts on a healthy account, with
 the usual session resume or rotation, and the block is lifted.
+
+Since #8180, the same holds for a login whose absolute forecast expiry
+(`expires_at`, § 6) is **passed** while the row still says `healthy`: on a
+reading the sentinel still refreshes, it is read as failing (`accounts list`
+shows `expired`, never `ok`) and is never chosen, even by continuity. An
+account that expires **before** the end of the next turn (the host default
+`turn_max_seconds`) stays usable but is ranked last, behind the accounts that
+outlive the turn; it is chosen only when no account does.
 
 **Never a paid fallback**: an account above its cap stays out, and a
 harness with a plan account never falls back to a pay-per-token API key
@@ -684,16 +696,20 @@ unblocks. If every account is at its cap, failing or not, it is the usual
 budget pause; once it lifts, an account still failing puts the
 `auth_blocked` mark (and its alert) back.
 
-**Recovery.** After the reconnection (`claude /login` in the account's
-folder, `gcloud auth login`…), the L226a sentinel sees the account healthy
+**Recovery.** Reconnect with the command the alert names: for Claude
+`ameesh accounts login claude <account> --token-file FILE` — the native
+`claude auth login` is a paste-back flow refused on a distant host (#8110) —,
+for Codex `ameesh accounts login codex <account>`, else `gcloud auth login`,
+`gh auth login`… The L226a sentinel then sees the account healthy
 and records it — only if its probe is healthy AND the credential's
 fingerprint differs from the last failure's, whenever that credential was
 installed (a turn launched with A can fail after the owner installed B: B is
 cleared). Rewriting the same revoked token, or a failure recorded without
 a fingerprint, is no proof: the account stays `failing`. A failure a turn
-detected names no fix command: the sentinel's next probe adds the account's
-command to its reason (the owner's alert shows it), without touching the
-failure itself. The sentinel's write
+detects already carries the account's login command in its reason (#8180: the
+runner adds it at once, without waiting for the probe); the sentinel's next
+probe may rewrite the reason, without touching the failure itself. The
+sentinel's write
 is conditional on the `failures` count it read, so a failure a turn records
 during the probe is never overwritten. Without the sentinel, or in those
 cases, declare it by hand:
@@ -703,7 +719,9 @@ ameesh accounts healthy claude secondaire   # declared account
 ameesh accounts healthy claude              # harness without declared accounts
 ```
 
-`ameesh accounts list --json` shows the table (`credentials`).
+`ameesh accounts list --json` shows the table (`credentials`) and, per row,
+the effective `credential_state` (`failing`/`expired`/`healthy`/`unknown`),
+`credential_ok`, `credential_reason` and `usable` (#8180).
 
 ## 6. Credential sentinel (L226a)
 
@@ -712,8 +730,8 @@ writes the result to `credential_health` (`source = 'sentinel'`):
 
 | harness | probe | forecast expiry | fix command in the alert |
 |---|---|---|---|
-| `claude` | per declared account (or default dir): `claude auth status` in its config dir says `loggedIn`. An expired access token (`expiresAt`) is **not** a failure: it lapses after a short idle time and is refreshed on use | `refreshTokenExpiresAt` | `CLAUDE_CONFIG_DIR=<dir> claude auth login` |
-| `codex` | per declared account: `auth.json` has a refresh token or an API key | — | `CODEX_HOME=<dir> codex login` |
+| `claude` | per declared account (or default dir): `claude auth status` in its config dir says `loggedIn`. An expired access token (`expiresAt`) is **not** a failure: it lapses after a short idle time and is refreshed on use. The refresh token expiry is **absolute**: `refreshTokenExpiresAt` is set at login and is not extended by use (#8110) | `refreshTokenExpiresAt` (absolute) | `ameesh accounts login claude <account> --token-file FILE` |
+| `codex` | per declared account: `auth.json` has a refresh token or an API key | — | `ameesh accounts login codex <account>` |
 | `gcloud` | `gcloud auth print-access-token` | last interactive login (mtime of `credentials.db`) + Workspace session length | `gcloud auth login --update-adc` |
 | `gh` | `gh auth status` | — | `gh auth login -h github.com` |
 | `scw` | `scw account project list` | — | `scw init` |
@@ -745,7 +763,9 @@ Alerts, computed by `ameesh notify` from the table (all hosts):
   start of failure), and it resolves when the credential is `healthy` again;
 * `credential_expiring` (pushed by default): a healthy credential's forecast
   expiry is less than `warn_hours` away (default 24 h). This warns before
-  gcloud asks to log in again in the middle of a release;
+  gcloud asks to log in again in the middle of a release. For Claude the
+  forecast is absolute — set at login, not extended by use — and the detail
+  says so;
 * `credential_probe_stale` (pushed by default): no probe reading of a
   non-failing (host, harness) pair for three probe periods (30 min): the
   timer is stopped, so an expiry would now be silent. Repeated turn failures
@@ -755,6 +775,12 @@ Alerts, computed by `ameesh notify` from the table (all hosts):
   row is read through its probe date alone: an N-1 kept failure writes no
   heartbeat, so it is named by `credential_failing`, not by this guard; a
   new sentinel `touch` gives it a probe heartbeat again.
+
+Since #8180 these four credential alerts are **not filtered by
+`notify.types`**: `auth_blocked`, `credential_failing`, `credential_expiring`
+and `credential_probe_stale` are always delivered to their responsible. A
+host whose configuration omitted them is exactly how the 23/11 incident
+stayed silent.
 
 Setup: the host update installs and enables the timer, idempotently —
 `deploy/mise-a-jour/vm.sh agents installer` on an agent VM,

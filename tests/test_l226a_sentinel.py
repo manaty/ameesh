@@ -63,7 +63,9 @@ class ProbeClaudeTest(unittest.TestCase):
         profile = self._profile("b", refreshToken="x")
         v = sentinel.probe_claude(profile, NOW, run=self._status(logged_in=False, code=1))
         self.assertEqual(v.state, "failing")
-        self.assertIn("CLAUDE_CONFIG_DIR=%s claude auth login" % profile.path, v.text())
+        # #8180 : la voie réelle d'une reconnexion distante est l'import d'un
+        # setup-token, jamais le flux paste-back `claude auth login`.
+        self.assertIn("ameesh accounts login claude b --token-file FILE", v.text())
 
     def test_expired_refresh_token_fails(self):
         profile = self._profile("c", refreshToken="x", refreshTokenExpiresAt=(NOW - 1) * 1000)
@@ -99,7 +101,9 @@ class ProbeCodexTest(unittest.TestCase):
         profile = self._profile({"tokens": {}})
         v = sentinel.probe_codex(profile, NOW)
         self.assertEqual(v.state, "failing")
-        self.assertIn("CODEX_HOME=%s codex login" % profile.path, v.text())
+        # #8180 : le geste nommé est la commande distante d'ameesh, pas un
+        # `codex login` local qui ne dit pas le dossier du compte.
+        self.assertIn("ameesh accounts login codex a", v.text())
 
 
 class ProbeCommandsTest(unittest.TestCase):
@@ -342,8 +346,7 @@ class ReviewR1Test(unittest.TestCase):
         same = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "x"}}), NOW)
         rows, creds = self._check(failing, [same])
         creds.report.assert_not_called()
-        path = os.path.join(self.tmp, "a")
-        expected = "invalid api key; fix: CODEX_HOME=%s codex login" % path
+        expected = "invalid api key; fix: ameesh accounts login codex a"
         creds.annotate.assert_called_once_with("h1", "codex", "a", expected,
                                                expect_failures=2)
         self.assertEqual(rows[0]["reason"], expected)
@@ -449,7 +452,7 @@ class ReviewR1Test(unittest.TestCase):
         with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
             v = sentinel.probe_claude(profile, NOW, run=run)
         self.assertEqual(v.state, "healthy")
-        self.assertIn("fix: CLAUDE_CONFIG_DIR=%s claude auth login" % profile.path, v.text())
+        self.assertIn("fix: ameesh accounts login claude e --token-file FILE", v.text())
         creds = mock.Mock()
         creds.listing.return_value = [{
             "host": "h1", "harness": "claude", "account": "e", "state": "healthy",
@@ -459,18 +462,23 @@ class ReviewR1Test(unittest.TestCase):
                                return_value=SimpleNamespace(credentials=creds)):
             [alert] = exploitation._credentials(object(), NOW)
         self.assertEqual(alert["type"], "credential_expiring")
-        self.assertIn("claude auth login", alert["detail"])
+        self.assertIn("ameesh accounts login claude e --token-file FILE", alert["detail"])
+        # #8180 (audit 24/11) : l'échéance Claude est absolue, pas prolongée
+        # par l'usage — l'inconnue de #8110.
+        self.assertIn("absolute", alert["detail"])
 
-    def test_p2_fix_commands_quote_paths(self):
+    def test_p2_fix_commands_name_the_real_remote_path(self):
+        # #8180 : le flux natif `claude auth login` est un paste-back refusé
+        # à distance (#8110) ; le geste owner est `ameesh accounts login`.
         home = os.path.join(self.tmp, "account a")
-        os.makedirs(home)
+        os.makedirs(home, mode=0o700, exist_ok=True)
         claude = accounts.Profile("claude", "q", path=home)
         run = mock.Mock(return_value=(0, json.dumps({"loggedIn": False})))
         with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
             v = sentinel.probe_claude(claude, NOW, run=run)
-        self.assertIn("CLAUDE_CONFIG_DIR='%s' claude auth login" % home, v.text())
+        self.assertIn("ameesh accounts login claude q --token-file FILE", v.text())
         codex = sentinel.probe_codex(accounts.Profile("codex", "q", path=home), NOW)
-        self.assertIn("CODEX_HOME='%s' codex login" % home, codex.text())
+        self.assertIn("ameesh accounts login codex q", codex.text())
 
     def test_p2_non_object_auth_json_is_unknown_and_later_probes_run(self):
         profile = self._codex([1])

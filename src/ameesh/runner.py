@@ -11486,11 +11486,18 @@ class AgentWorker(threading.Thread):
                 self.fast_failure = False
                 nom_harnais = harness
                 account = auth_failure.account_name(compte)
+                # #8180 : le motif nomme tout de suite le compte et le geste de
+                # reconnexion (le tour ne se contente pas d'attendre la sonde).
+                motif = raison_auth
+                geste = sentinel.login_command(nom_harnais, account,
+                                               getattr(compte, "kind", ""))
+                if geste and geste not in motif:
+                    motif = "%s; fix: %s" % (motif, geste)
                 # #210 : l'empreinte du jeton du tour (lue au lancement, pas
                 # maintenant) — la sentinelle ne lève l'échec que pour un autre
                 self._avec_reprise("account health", auth_failure.report, self.db,
                                    self.cfg.host, nom_harnais, account, "failing",
-                                   reason=raison_auth, source="turn", fingerprint=empreinte)
+                                   reason=motif, source="turn", fingerprint=empreinte)
                 if self._session_en_attente is not None:
                     self._avec_reprise("turn session", self._enregistre_session)
                 texte = auth_failure.status_text(nom_harnais, account)
@@ -11498,11 +11505,11 @@ class AgentWorker(threading.Thread):
                     "end of turn", registry.end_turn,
                     self.db, self.name, self.runner.runner_id, self.epoch,
                     status="blocked", status_text=texte,
-                    error="%s %s" % (auth_failure.STATUS_PREFIX, raison_auth), cost_usd=cost,
+                    error="%s %s" % (auth_failure.STATUS_PREFIX, motif), cost_usd=cost,
                     turn_id=self._turn_id)
                 self.last_activity = time.monotonic()
                 self._turn_end_mono = self.last_activity  # #3451
-                self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
+                self._auth_note(nom_harnais, account, motif, texte, turn=True)
                 return False
             # #4164 : le compte fournisseur n'a plus de crédit — pas une panne
             # passagère ni un échec rapide : le compte passe `exhausted`, la

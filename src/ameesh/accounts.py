@@ -2552,7 +2552,7 @@ def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
 
 
 def rank(items: list[Profile], evaluations: dict, now: float, *,
-         paced: bool = True) -> list[Profile]:
+         paced: bool = True, demote=()) -> list[Profile]:
     """Les comptes plaçables, du premier à consommer au dernier (0034 amendée).
 
     Clé (#1561, #1580, #1789, #1566 N1) : d'abord un relevé **courant** — un
@@ -2607,8 +2607,16 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
     usable = [(i, p) for i, p in enumerate(items)
               if placeable(evaluations[p.name], now)
               and (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
-    return [p for _i, p in sorted(
+    ordered = [p for _i, p in sorted(
         usable, key=lambda pair: _rank_key(pair[1], evaluations, now) + (pair[0],))]
+    # #8180 : un compte dont le login expire avant la fin du plafond de tour
+    # reste utilisable, mais derrière ceux qui survivront au tour. À défaut,
+    # il est choisi (dernier), jamais inventé : rien n'est écarté ici.
+    if demote:
+        late = [p for p in ordered if p.name in demote]
+        if late:
+            ordered = [p for p in ordered if p.name not in demote] + late
+    return ordered
 
 
 def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
@@ -2981,8 +2989,21 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         row = store.active(host, harness) or {"account": items[0].name, "forced": False}
         active_name = row.get("account") if row.get("account") in names else items[0].name
     active = by_name(items, active_name) or items[0]
-    # L226b : un compte en échec d'authentification n'est jamais choisi
+    # L226b : un compte en échec d'authentification n'est jamais choisi.
+    # #8180 : `failing` inclut désormais un login dont l'échéance absolue est
+    # passée sur un relevé encore rafraîchi par la sonde — la rotation ne vise
+    # plus un compte mort avant que la sonde n'ait écrit `failing`.
     sick = auth_failure.failing(db, host, harness)
+    # #8180 : un compte qui expire avant la fin du plafond de tour est
+    # déclassé (dernier), sans être écarté : un tour commencé sur lui
+    # échouerait à l'échéance. `turn_max_seconds` est le défaut de l'hôte :
+    # ce choix ne lit pas la ligne de l'agent.
+    try:
+        turn_cap = float(getattr(cfg, "turn_max_seconds", 0.0) or 0.0) if cfg else 0.0
+        expiring_soon = auth_failure.expiring(db, host, harness, now=now,
+                                              horizon=now + max(0.0, turn_cap))
+    except db_mod.DbError:
+        expiring_soon = set()
     # #4166 : un compte fournisseur épuisé n'est jamais choisi non plus. Un
     # autre compte déclaré du harnais le remplace (le repli, sans geste) ; s'il
     # n'en reste aucun, le compte épuisé est rendu tel quel pour que la garde
@@ -3156,6 +3177,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                  and last_switch.get('to_account') == own.name
                  and 0 <= now - float(last_switch['at_ts']) < 2 * 3600)
         if (dwell and own in candidates and own.name not in ecartes
+                and own.name not in expiring_soon
                 and own_ev.unpaced_ok and not own_ev.problems and placeable(own_ev, now)
                 and not any(g.used_at(now) >= 1 for g in own_ev.gauges)):
             target = planned_account
@@ -3163,7 +3185,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 for profile in items:
                     ev(profile)
                 alternatives = rank([p for p in candidates if p.name != own.name
-                                     and p.name not in ecartes], cache, now)
+                                     and p.name not in ecartes], cache, now,
+                                    demote=expiring_soon)
                 target = alternatives[0].name if alternatives else None
             if target and target != own.name:
                 why = ('hysteresis: stay on %s for at least 2 h after switch #%s; '
@@ -3173,7 +3196,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                               retained={'account': own.name, 'target': target,
                                         'switch_id': last_switch['id'], 'reason': why})
         if (own is not None and own in candidates and own.name not in ecartes
-                and own.name not in epuises and own_ev.ok and near is None
+                and own.name not in epuises and own.name not in expiring_soon
+                and own_ev.ok and near is None
                 and (not planned_account or planned_account == own.name)):
             return Choice(own, active, kept=True,
                           why="continuity: the session stays on %s, under its "
@@ -3202,11 +3226,12 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         rankable = ([p for p in candidates if p.name != own.name]
                     if near is not None else candidates)
         # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
-        ranked = rank(rankable, cache, now)
+        ranked = rank(rankable, cache, now, demote=expiring_soon)
         if not ranked and not paced:
             # L226b: past its pace a healthy account stays usable, never past an
             # absolute rule
-            ranked = rank(rankable, cache, now, paced=False)
+            ranked = rank(rankable, cache, now, paced=False,
+                          demote=expiring_soon)
         beyond = False
         if not ranked and critical:
             # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
@@ -3219,7 +3244,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                                                      record=False, critical=True,
                                                      reserve=margin, probe=False)
             # le rythme tient ici même garde désactivée (#324 r1)
-            ranked = rank(rankable, relaxed, now)
+            ranked = rank(rankable, relaxed, now, demote=expiring_soon)
             if ranked:
                 beyond = True
                 cache = relaxed
@@ -3701,6 +3726,18 @@ def report(cfg, db, book, *, now: float | None = None,
     shell = os.environ if environ is None else environ
     effective = declared_environ(cfg, shell)
     store = storage.of(db).accounts if db is not None else None
+    # #8180 : la santé de connexion de chaque compte, pour que l'état affiché
+    # ne soit pas seulement celui des jauges (un login expiré disait « ok »).
+    cred_store = storage.of(db).credentials if db is not None else None
+    health: dict[str, dict] = {}
+    for harness in declared:
+        if cred_store is None:
+            health[harness] = {}
+            continue
+        try:
+            health[harness] = cred_store.health(cfg.host, harness)
+        except db_mod.DbError:
+            health[harness] = {}
     rows: list[dict] = []
     for harness, items in declared.items():
         if harnesses and harness not in harnesses:
@@ -3734,6 +3771,12 @@ def report(cfg, db, book, *, now: float | None = None,
                 result.reason = "gauge readings unreadable: %s" % exc
             evaluations[profile.name] = result
             hold = holds.get(profile.name) or {}
+            sante = health.get(harness, {}).get(profile.name) or {}
+            effective_sante = auth_failure.effective(sante, now) or {}
+            credential_state = effective_sante.get("state") or ""
+            if credential_state == "failing":
+                credential_state = ("expired" if auth_failure.expired(sante, now)
+                                    else "failing")
             rows.append({
                 "harness": harness,
                 "account": profile.name,
@@ -3751,6 +3794,15 @@ def report(cfg, db, book, *, now: float | None = None,
                 "forced_until": ((active or {}).get("forced_until")
                                  if profile.name == active_name else None),
                 "ok": result.ok,
+                # #8180 : la santé de connexion, lue dans `credential_health`.
+                # `credential_ok` est faux pour un login `failing` ou expiré :
+                # le compte ne peut recevoir aucun tour, même sous son seuil.
+                "credential": (dict(sante) if sante else None),
+                "credential_state": credential_state,
+                "credential_ok": credential_state not in ("failing", "expired"),
+                "credential_reason": effective_sante.get("reason") or "",
+                "usable": bool(result.ok and credential_state
+                               not in ("failing", "expired")),
                 "reason": result.reason,
                 "problems": list(result.problems),
                 "hold_until": hold.get("until_ts"),
@@ -3846,11 +3898,17 @@ def _forecast(rows: list[dict], items: list[Profile], now: float,
         row["expires_in_s"] = (found[0] - now) if found is not None else None
         row["next"] = False
         row["why"] = ""
-    ranked = rank(items, evaluations, now)
-    forced = [row for row in rows if row["forced"]]
+    # #8180 : la prochaine session ne vise pas un login expiré ou en échec,
+    # même si ses jauges sont sous le seuil.
+    by_account = {row["account"]: row for row in rows}
+    healthy_items = [p for p in items
+                     if by_account.get(p.name, {}).get("credential_ok", True)]
+    ranked = rank(healthy_items, evaluations, now)
+    forced = [row for row in rows if row["forced"] and row["credential_ok"]]
     target = forced[0]["account"] if forced else (ranked[0].name if ranked else None)
     for row in rows:
-        row["next"] = row["account"] == target and row["ok"]
+        row["next"] = (row["account"] == target and row["ok"]
+                       and row["credential_ok"])
         if row["next"]:
             row["why"] = ("forced (ameesh accounts use)" if forced
                           else reason_of(ranked, evaluations, now))
@@ -3883,7 +3941,13 @@ def format_rows(rows: list[dict]) -> str:
     lines = ["%-9s %-14s %-7s %-8s %s" % ("harness", "account", "active", "state", "gauges")]
     for row in rows:
         actif = ("forced" if row["forced"] else "yes") if row["active"] else ""
-        etat = "ok" if row["ok"] else "limit" if not row["problems"] else "invalid"
+        # #8180 : l'état dit d'abord la santé de connexion — un compte dont le
+        # login est expiré est inutilisable, pas « ok » parce que ses jauges
+        # sont sous le seuil.
+        credential_state = row.get("credential_state") or ""
+        etat = (credential_state if credential_state in ("failing", "expired")
+                else "ok" if row["ok"] else "limit" if not row["problems"]
+                else "invalid")
         gauges = ", ".join(
             "%s %.0f%% (pace %.0f%%%s%s%s)%s" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
@@ -3924,6 +3988,10 @@ def format_rows(rows: list[dict]) -> str:
             lines.append("%-9s %-14s %-7s %-8s ↳ key %s carried by the executor, "
                          "not verifiable from this shell"
                          % ("", "", "", "", row["key_env_unverified"]))
+        if credential_state in ("failing", "expired"):
+            lines.append("%-9s %-14s %-7s %-8s ↳ login unusable (%s): %s" % (
+                "", "", "", "", credential_state,
+                row.get("credential_reason") or "the credential is not usable"))
         if row["reason"]:
             lines.append("%-9s %-14s %-7s %-8s ↳ %s" % ("", "", "", "", row["reason"]))
         if row.get("pace_raises"):
