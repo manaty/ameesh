@@ -56,6 +56,19 @@ class FollowUpTest(PgTestCase):
         self.assertEqual(ordinary["assignee"], "avatar")
         self.assertTrue(work_footprints.is_exempt({"type": "follow-up"}))
 
+    def test_stopped_agent_returns_code_and_keeps_personal_follow_ups(self):
+        follow_up = self.follow_up()
+        code = work.add(self.db, title="Development", app="ameesh",
+                        assignee="avatar", actor="avatar", footprint=[])
+        registry.set_status(self.db, "avatar", "stopped", stop_reason="manuel")
+        for dry_run in (True, False):
+            released = storage.of(self.db).work.release_agent(
+                "avatar", reason="manual stop", actor="human:owner",
+                stopped_with=work.RELEASABLE_STOP_REASONS, dry_run=dry_run)
+            self.assertEqual([row["id"] for row in released], [code["id"]])
+        self.assertIsNone(work.get(self.db, code["id"])["assignee"])
+        self.assertEqual(work.get(self.db, follow_up["id"])["assignee"], "avatar")
+
     def test_assignment_is_required(self):
         with self.assertRaisesRegex(work.WorkError, "requires an assignee"):
             self.follow_up(assignee=None)

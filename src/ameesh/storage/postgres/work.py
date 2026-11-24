@@ -3274,10 +3274,11 @@ class WorkItems(interface.WorkItems):
                     or rows[0]["stop_reason"] not in tuple(stopped_with)):
                 return []
         out: list[dict] = []
-        # 1. lots ouverts : file d'équipe (assignee = NULL)
+        # 1. Development lots return to the team; personal follow-ups stay assigned.
         rows = self.db.query(
             "SELECT %s FROM work_items WHERE assignee = %%s"
             f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
+            "   AND type <> 'follow-up'"
             " ORDER BY id%s" % (item_columns(self.db), lock), (agent,))
         for row in rows:
             if dry_run:
@@ -3288,6 +3289,7 @@ class WorkItems(interface.WorkItems):
                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
                 " WHERE id = %%s AND assignee = %%s"
                 f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
+                "   AND type <> 'follow-up'"
                 " RETURNING %s" % item_columns(self.db), (int(row["id"]), agent))
             if not updated:
                 continue

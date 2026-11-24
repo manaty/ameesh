@@ -92,6 +92,9 @@ begin
     end if;
 end $$;
 
+-- ameesh: constraint not tightened
+-- Every pre-existing type satisfies the first disjunct. Only the newly admitted
+-- follow-up type is constrained; previous code could not create such a row.
 alter table work_items add constraint work_items_follow_up_personal check (
     type <> 'follow-up' or (
         nullif(btrim(assignee), '') is not null
