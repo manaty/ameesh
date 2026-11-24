@@ -6324,10 +6324,13 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     la tête et dont l'acteur était relecteur désigné de ce gel. Une forge
     muette sur un commit absent localement est un doute (`doubts_out`).
     #8228 : un correctif de relecteur **gelé** puis reporté auteur (#2924) et
-    dont la réécriture est prouvée (reçu exact ou citation) sort des auteurs
-    quand aucun autre commit de la plage courante ne le porte : il reste dans
-    `correctors`, famille vide, et sa famille redevient éligible. Un doute
-    (`unresolved`, `stacked_lot`) ne retire jamais l'auteur.
+    dont la réécriture par l'auteur est prouvée par sa citation (#7252) sort
+    des auteurs quand aucun autre commit de la plage courante ne le porte : il
+    reste dans `correctors`, famille vide, et sa famille redevient éligible. Un
+    simple squash/consolidation à contenu identique ne prouve pas la
+    réécriture (#3518) ; la réémission verbatim par la référence (#4387) est
+    dispensée en amont par `_carried_from_previous`. Un doute (`unresolved`,
+    `stacked_lot`) ne retire jamais l'auteur.
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -6699,6 +6702,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         if not key or key == author_name.casefold():
             continue
         if not str(row.get("rewritten") or "").strip():
+            continue
+        # #3518 : la disparition topologique du commit du relecteur (squash,
+        # consolidation à contenu identique) ne prouve pas une réécriture de
+        # l'auteur ; le contenu survit et #2924 garde alors sa famille exclue.
+        # Cette levée exige la citation de l'auteur (#7252) ; la réémission
+        # verbatim par la référence (#4387) est déjà dispensée par
+        # `_carried_from_previous`.
+        if not str(row.get("cited") or "").strip():
             continue
         if row.get("unresolved") or row.get("stacked_lot"):
             continue
