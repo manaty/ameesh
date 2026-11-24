@@ -2008,7 +2008,26 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
         return None
     freeze = plan_git.latest_freeze(marks or ())
     frozen = str((freeze or {}).get("sha") or "").strip()
+    # #8236 : un lot du canon (gel manaty/home, #2603) n'a pas de `pr_ref`
+    # avant sa fermeture ; `repository()` ne reconnaît donc pas son dépôt et
+    # la porte restait « inconclusive » sur un lot ouvert. La marque machine
+    # du gel nomme ce dépôt : son clone local (canon configuré ou clone
+    # déclaré) est une piste de plus. Le commit exact décide toujours.
+    extra_paths: tuple = ()
+    if frozen:
+        named = ""
+        try:
+            from . import review_authors
+            named = review_authors.freeze_repository(freeze)
+        except Exception:  # noqa: BLE001 - marque illisible : autres pistes
+            named = ""
+        if named:
+            try:
+                extra_paths = tuple(lot_class.named_repo_paths(cfg, item, named))
+            except Exception:  # noqa: BLE001 - config illisible : autres pistes
+                extra_paths = ()
     repo, resolved = (lot_class.repo_for_freeze(db, cfg, item, frozen,
+                                                extra_paths=extra_paths,
                                                 overview=overview)
                       if frozen else ("", ""))
     if resolved:
