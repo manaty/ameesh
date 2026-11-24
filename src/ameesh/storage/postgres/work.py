@@ -806,7 +806,7 @@ class WorkItems(interface.WorkItems):
                     raise DbError("reference %s is already carried by lot #%d"
                                   % (issue_ref, int(duplicate[0]["id"])))
             behind = (WorkItems(tx)._pending(assignee, None)
-                      if queued_note is not None and assignee else None)
+                      if queued_note is not None and assignee and type != "follow-up" else None)
             if behind is not None:
                 assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
                                   else (None, queued_note.format(lot=behind)))
@@ -848,7 +848,7 @@ class WorkItems(interface.WorkItems):
                     if exempted:
                         WorkItems(tx)._warn_human_wait_overlap(
                             item["id"], "intake", exempted, actor)
-            elif assignee:
+            elif assignee and type != "follow-up":
                 # #4818 : sans empreinte, le plafond de lots en vol du dépôt
                 # garde encore la création attribuée
                 exempted = WorkItems(tx)._footprint_guard(item["id"])
@@ -1611,6 +1611,7 @@ class WorkItems(interface.WorkItems):
         self.db.query(PENDING_LOCK, (assignee,))
         rows = self.db.query(
             "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
+            "   AND type <> 'follow-up'"
             "   AND state NOT IN %s AND state NOT IN %s"
             "   AND NOT %s"
             "   AND id <> %%s ORDER BY id LIMIT 1" % (
@@ -3218,6 +3219,8 @@ class WorkItems(interface.WorkItems):
             f"       bool_or(coalesce(to_jsonb(work_items)->>'legacy_state', state) = 'promoted') AS promoted"
             "  FROM work_items"
             f" WHERE assignee IN (%s) AND coalesce(to_jsonb(work_items)->>'legacy_state', state) NOT IN ('merged', 'closed')"
+            # #8191: a follow-up stays with its stopped agent (_release_agent); counting it would relock forever.
+            "   AND type <> 'follow-up'"
             " GROUP BY assignee" % ", ".join(["%s"] * len(names)), tuple(names))
         return {row["assignee"]: {"open": bool(row["open"]),
                                   "promoted": bool(row["promoted"])} for row in rows}
@@ -3273,10 +3276,11 @@ class WorkItems(interface.WorkItems):
                     or rows[0]["stop_reason"] not in tuple(stopped_with)):
                 return []
         out: list[dict] = []
-        # 1. lots ouverts : file d'équipe (assignee = NULL)
+        # 1. Development lots return to the team; personal follow-ups stay assigned.
         rows = self.db.query(
             "SELECT %s FROM work_items WHERE assignee = %%s"
             f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
+            "   AND type <> 'follow-up'"
             " ORDER BY id%s" % (item_columns(self.db), lock), (agent,))
         for row in rows:
             if dry_run:
@@ -3287,6 +3291,7 @@ class WorkItems(interface.WorkItems):
                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
                 " WHERE id = %%s AND assignee = %%s"
                 f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
+                "   AND type <> 'follow-up'"
                 " RETURNING %s" % item_columns(self.db), (int(row["id"]), agent))
             if not updated:
                 continue

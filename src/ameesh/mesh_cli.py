@@ -16,7 +16,7 @@
                                                 does a valid approval exist?
   agent-mesh cost report | cost spent <agent|all> [s] | cost over <agent>
                                                 turn costs and plan gauges
-  agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
+  agent-mesh work add --title T [--type bug|evolution|follow-up] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work wake <id> --at ISO | --in DURATION | --cancel   scheduled wake, even under hold (#2466)
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
@@ -2273,21 +2273,24 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             introduced = (work_projects.introduction(cfg, db, args.app, creator)
                           if args.new_project and args.app else "")
             minutes = estimates.parse(args.estimate) if args.estimate else None
-            warn_estimate = estimates.check(db, args.actor, minutes)
+            warn_estimate = (estimates.check(db, args.actor, minutes)
+                             if args.type != "follow-up" else None)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
                      if args.assignee else None)
             # #2988 : tête relue, détection d'une revue et voisins calculés
             # AVANT `work.add` — la recherche git ne doit pas tourner dans
             # `work._create`, appelé aussi par incident.py, assignments.py et
             # review_lot.py. Le segment est préfixé à la note de création.
-            try:
-                segment, infos = intake_neighbors.creation_note(
-                    db, cfg, app=args.app or "", title=args.title,
-                    body=args.body or "", source=args.source or "",
-                    issue_ref=args.issue_ref or "",
-                    reviewed_head=args.reviewed_head)
-            except intake_neighbors.IntakeNeighborsError as exc:
-                raise work.WorkError(str(exc)) from None
+            segment, infos = "", {}
+            if args.type != "follow-up":
+                try:
+                    segment, infos = intake_neighbors.creation_note(
+                        db, cfg, app=args.app or "", title=args.title,
+                        body=args.body or "", source=args.source or "",
+                        issue_ref=args.issue_ref or "",
+                        reviewed_head=args.reviewed_head)
+                except intake_neighbors.IntakeNeighborsError as exc:
+                    raise work.WorkError(str(exc)) from None
             note = "; ".join(part for part in (segment, introduced) if part)
             # #4173 : l'empreinte d'intake (chemins cités), écrite par la
             # création même ; jamais d'échec de la création pour l'estimer.
@@ -2295,7 +2298,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # les deux tentatives de création
             from . import work_footprints
             impact = None
-            if not work._is_vehicle_branch(args.branch):
+            if args.type != "follow-up" and not work._is_vehicle_branch(args.branch):
                 impact = work_footprints.analyze_for_creation(
                     cfg, db, app=args.app or "", title=args.title, body=args.body or "",
                     branch_target=args.target or "")
@@ -2370,16 +2373,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("executor : %s (external, reserved; not assigned — L165 does not "
                       "take it)" % item["external_executor"])
             # L157b : l'estimation de référence, LUE dans la table de l'auditeur
-            ref = estimates.proposal(db, type=item.get("type"), size=item.get("change_size"),
-                                     assignee=item.get("assignee"))
-            print("reference: %s" % estimates.proposal_label(ref))
-            # L157c: planned dates at the p80, in the assignee's queue ordered
-            # at the median (only with a published reference table)
-            from . import lot_schedule
-            scheduled = lot_schedule.schedule_new(db, item, actor=args.actor)
-            if scheduled:
-                print("planned  : %s → %s (%s)" % (
-                    scheduled["planned_start"], scheduled["planned_end"], scheduled["source"]))
+            if item["type"] != "follow-up":
+                ref = estimates.proposal(db, type=item.get("type"), size=item.get("change_size"),
+                                         assignee=item.get("assignee"))
+                print("reference: %s" % estimates.proposal_label(ref))
+                # L157c: planned dates at the p80, in the assignee's queue ordered
+                # at the median (only with a published reference table)
+                from . import lot_schedule
+                scheduled = lot_schedule.schedule_new(db, item, actor=args.actor)
+                if scheduled:
+                    print("planned  : %s → %s (%s)" % (
+                        scheduled["planned_start"], scheduled["planned_end"], scheduled["source"]))
             if warn_estimate:
                 print("warning: %s" % estimates.missing(item["id"]), file=sys.stderr)
             # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne
@@ -2799,25 +2803,26 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("unique_ref"):
                 print("unique-ref: %s (durable idempotency key, #6090)"
                       % item["unique_ref"])
-            from . import intake_neighbors
-            reviewed = intake_neighbors.format_reviewed_line(item.get("reviewed"))
-            if reviewed:
-                print("reviewed : %s" % reviewed)
-            if item.get("reviewer") == work.REVIEWER_NONE:
-                print("reviewer : — (verdict not required, #1979)")
-            else:
-                from .work_reviewers import designated
-                if designated(item):
-                    print("reviewer : %s (designated for the review, #2076)" %
-                          ", ".join(designated(item)))
-            floor = item.get("reviews_floor") or {}
-            if floor.get("floor"):
-                print("floor    : %d review(s) of distinct families (by %s, %s; #3183)" % (
-                    floor["floor"], floor.get("actor") or "?",
-                    _fmt_moment(floor.get("at_ts"))))
-            elif floor.get("error"):
-                print("floor    : unreadable (%s): the gate requires two reviews"
-                      % floor["error"])
+            if item["type"] != "follow-up":
+                from . import intake_neighbors
+                reviewed = intake_neighbors.format_reviewed_line(item.get("reviewed"))
+                if reviewed:
+                    print("reviewed : %s" % reviewed)
+                if item.get("reviewer") == work.REVIEWER_NONE:
+                    print("reviewer : — (verdict not required, #1979)")
+                else:
+                    from .work_reviewers import designated
+                    if designated(item):
+                        print("reviewer : %s (designated for the review, #2076)" %
+                              ", ".join(designated(item)))
+                floor = item.get("reviews_floor") or {}
+                if floor.get("floor"):
+                    print("floor    : %d review(s) of distinct families (by %s, %s; #3183)" % (
+                        floor["floor"], floor.get("actor") or "?",
+                        _fmt_moment(floor.get("at_ts"))))
+                elif floor.get("error"):
+                    print("floor    : unreadable (%s): the gate requires two reviews"
+                          % floor["error"])
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -2837,24 +2842,25 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("wake_ts"):
                 print("wake     : %s (scheduled wake)"
                       % _fmt_moment(float(item["wake_ts"])))
-            est = item["estimate"]
-            print("estimate : %s%s" % (est["label"], "".join([
-                " (source: %s)" % est["source"] if est.get("source") else "",
-                " — by %s, on %s" % (est["by"] or "?", _fmt_moment(est["at_ts"]))
-                if est.get("minutes") else "",
-                "" if est.get("started_ts") is None
-                else " — measured start %s" % _fmt_moment(est["started_ts"])])))
-            print("reference: %s%s" % (
-                estimates.proposal_label(item["estimate_reference"]),
-                " — size %s" % estimates.SIZE_LABELS.get(item["change_size"])
-                if item.get("change_size") else ""))
-            if item["measure"]:
-                print("phases   : %s" % lot_measures.describe_phases(item["measure"]))
-                print("size     : %s" % lot_measures.describe_size(item["measure"]))
-            if len(item["estimates"]) > 1:
-                print("estimates: %s" % " → ".join(
-                    "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")
-                    for e in item["estimates"]))
+            if item["type"] != "follow-up":
+                est = item["estimate"]
+                print("estimate : %s%s" % (est["label"], "".join([
+                    " (source: %s)" % est["source"] if est.get("source") else "",
+                    " — by %s, on %s" % (est["by"] or "?", _fmt_moment(est["at_ts"]))
+                    if est.get("minutes") else "",
+                    "" if est.get("started_ts") is None
+                    else " — measured start %s" % _fmt_moment(est["started_ts"])])))
+                print("reference: %s%s" % (
+                    estimates.proposal_label(item["estimate_reference"]),
+                    " — size %s" % estimates.SIZE_LABELS.get(item["change_size"])
+                    if item.get("change_size") else ""))
+                if item["measure"]:
+                    print("phases   : %s" % lot_measures.describe_phases(item["measure"]))
+                    print("size     : %s" % lot_measures.describe_size(item["measure"]))
+                if len(item["estimates"]) > 1:
+                    print("estimates: %s" % " → ".join(
+                        "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")
+                        for e in item["estimates"]))
             if item.get("state") == "closed":
                 delivered = next((m.get("sha") for m in item.get("milestones", [])
                                   if m.get("kind") == "delivered" and m.get("sha")), "")
@@ -2945,7 +2951,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             print("created  : %s   updated: %s   closed: %s" % (
                 _fmt_moment(item.get("created_ts")), _fmt_moment(item.get("updated_ts")),
                 _fmt_moment(item.get("closed_ts"))))
-            if item["delays"]:
+            if item["delays"] and item["type"] != "follow-up":
                 _print_delays(item["delays"])
             # #2786 : un gel qui ne nomme pas un commit hexadécimal (HEAD,
             # une branche, un sha vide) n'est jamais une preuve de livraison :

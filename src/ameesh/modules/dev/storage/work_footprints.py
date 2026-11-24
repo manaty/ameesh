@@ -237,7 +237,8 @@ _VEHICLE = ("(coalesce(btrim({o}.branch), '')"
 #: push. Un lot de la file d'amélioration (`improvement`) est du code, pris
 #: par `auto_take` comme un autre (B de cx1 sur 176dc95) : il suit la règle
 #: commune. Même règle que `ameesh.work_footprints.is_exempt`.
-_EXEMPT = ("(" + _VEHICLE + " OR coalesce({o}.source, '') = 'decision'"
+_EXEMPT = ("(" + _VEHICLE + " OR {o}.type = 'follow-up'"
+           " OR coalesce({o}.source, '') = 'decision'"
            " OR starts_with(coalesce({o}.source, ''), 'file-decoupage:'))")
 
 
