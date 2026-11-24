@@ -17,6 +17,14 @@ doute au gel, sans exclure ; la lecture de la transaction (`fetch=False`,
 #3836) n'interroge jamais la forge et dit la citation non préparée ; le
 prefetch hors transaction, sur la plage gelée, la prépare et l'exclusion tient
 alors sans réseau.
+
+#8224/#8228 : quand le correctif du relecteur avait lui-même été gelé comme
+tête, `_carried_from_previous` le reportait auteur (#2924) et sa famille
+restait interdite malgré la réécriture citée. Un acteur prouvé réécrit, sans
+autre commit dans la plage courante, sort des auteurs et reste correcteur ;
+sans preuve de réécriture, le report d'auteur demeure (pas de blanchiment).
+#8230 : la preuve vaut par commit : un correctif ancien reporté, non prouvé
+réécrit, garde son acteur auteur même quand un autre correctif est cité.
 """
 from __future__ import annotations
 
@@ -119,6 +127,20 @@ class _Fixture:
             head_b = self.repo.commit(message, agent="author")
         self._receipt("author", "deepseek", [head_b])
         return fix, head_b
+
+    def _freeze_fix(self, fix):
+        """Le correctif du relecteur est lui-même une tête gelée (#8224).
+
+        Cas vivant #8224 : le gel #46196 porte le commit f42d2abce du
+        correcteur, puis l'auteur le réécrit et le cite en #46201. La poussée
+        est relevée sur la branche du lot (`branch_heads`) : la citation est
+        alors une correction publiée, pas une sonde locale (#6934).
+        """
+        self.db.execute(
+            "INSERT INTO work_item_branch_heads (work_item_id, branch, sha)"
+            " VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+            (self.lot, "lot/8224", fix))
+        return self._milestone("frozen", fix)
 
     def _remote_rewrite(self):
         """Le correctif de cx3 n'existe que sur la forge, pas dans le clone lu.
@@ -653,6 +675,106 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
         self.assertEqual([call.args[1] for call in forge.call_args_list],
                          ["439699307871"])
 
+    def test_a_rewritten_correction_frozen_as_a_head_leaves_the_authors(self):
+        # #8224/#8228 : le correctif de cx3 avait lui-même été gelé (#46196).
+        # `_carried_from_previous` le portait auteur de la tête (#2924) avec sa
+        # famille codex ; la désignation rendait donc « forbidden author
+        # families: claude, deepseek ; eligible: none ». La preuve de
+        # réécriture (#7252, citation de l'auteur) doit le sortir des auteurs.
+        fix, head_b = self._rewrite()
+        self._freeze_fix(fix)
+        authors, correctors, out = self._select(head_b)
+        self.assertEqual([row["name"] for row in authors], ["author"])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["family"], "")
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head_b)
+        # §2 : la famille codex redevient éligible, un autre agent relit.
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        names = [row["name"] for row in out["reviewers"]]
+        self.assertIn("r2", names)
+        self.assertNotIn("cx3", names)
+
+    def test_without_rewrite_proof_the_carried_author_is_kept(self):
+        # Témoin négatif : le reçu exact du correctif donne sa famille, mais
+        # sans citation ni verdict qui porte la preuve de réécriture, le report
+        # d'auteur de #2924 reste, le blanchiment de la famille est impossible
+        # (canon §2).
+        fix, head_b = self._rewrite(cite=False)
+        self._receipt("cx3", "codex", [fix])
+        self.db.execute(
+            "DELETE FROM work_item_milestones"
+            " WHERE work_item_id = %s AND kind = 'verdict'", (self.lot,))
+        self._freeze_fix(fix)
+        authors, correctors, out = self._select(head_b)
+        self.assertIn("cx3", [row["name"] for row in authors])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"author": "deepseek", "cx3": "codex"})
+        self.assertIn("codex", [row["family"] for row in correctors])
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertIn("codex", out["why"])
+
+    def test_a_second_commit_of_the_actor_keeps_it_author(self):
+        # Un acteur qui a aussi un commit non réécrit dans la plage courante
+        # reste auteur : la preuve de réécriture ne vise que le commit retiré.
+        fix, _head_b = self._rewrite()
+        self._freeze_fix(fix)
+        self.repo.write("src/ameesh/mail.py", "lot\nautre correction cx3\n")
+        head_c = self.repo.commit("cx3: autre correction", agent="cx3")
+        self._receipt("cx3", "codex", [head_c])
+        authors, _correctors, out = self._select(head_c)
+        self.assertIn("cx3", [row["name"] for row in authors])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"author": "deepseek", "cx3": "codex"})
+        self.assertIn("codex", out["why"])
+
+    def _two_corrections(self, *, cite_old):
+        """#8230 : cx3 corrige deux fois (F0 gelé, puis F1), l'auteur reprend
+        les deux contenus dans un seul commit qui cite F1, et F0 si `cite_old`."""
+        self.repo.write("src/ameesh/other.py", "cx3 ancien correctif\n")
+        old_fix = self.repo.commit("cx3: correctif ancien", agent="cx3")
+        # Le reçu de F0 date de deux jours : hors de la fenêtre des verdicts,
+        # aucune preuve topologique ne le nomme (seule la citation compte).
+        self._receipt("cx3", "codex", [old_fix])
+        self.db.execute(
+            "UPDATE provenance_receipts SET at = now() - interval '2 days'"
+            " WHERE sha = %s", (old_fix,))
+        self._freeze_fix(old_fix)
+        self._milestone("verdict", old_fix, actor="cx3", verdict="blocked")
+        # F1 sans reçu (poussé hors du hook, #7252) : sa ligne est la citation.
+        self.repo.write("src/ameesh/mail.py", "lot\ncx3 petit correctif\n")
+        fix = self.repo.commit("cx3: correctif de relecture", agent="cx3")
+        self._freeze_fix(fix)
+        self.repo.git("reset", "--hard", self.head_a)
+        self.repo.write("src/ameesh/other.py", "cx3 ancien correctif\n")
+        self.repo.write("src/ameesh/mail.py",
+                        "lot\ncx3 petit correctif\nauteur : reprise\n")
+        cited = fix[:12] + (" et %s" % old_fix[:12] if cite_old else "")
+        head_b = self.repo.commit(
+            "author: reprise du correctif\n\nB #40556 : le correctif du"
+            " relecteur %s est retiré de l'historique et remplacé par cette"
+            " réécriture d'auteur." % cited, agent="author")
+        self._receipt("author", "deepseek", [head_b])
+        return head_b
+
+    def test_an_uncited_older_correction_keeps_the_corrector_author(self):
+        # #8230 : la preuve de réécriture vaut par commit. Le correctif ancien
+        # F0 de cx3, gelé puis repris sans citation ni reçu qui le prouve
+        # réécrit, survit : F1 cité ne blanchit pas la famille codex.
+        authors, _correctors, out = self._select(
+            self._two_corrections(cite_old=False))
+        self.assertIn("cx3", [row["name"] for row in authors], out)
+        self.assertNotEqual(out["state"], rd.DESIGNATED, out)
+
+    def test_every_carried_correction_proven_leaves_the_authors(self):
+        # #8230 : F0 et F1 tous deux cités : chaque commit reporté est prouvé
+        # réécrit, cx3 sort des auteurs et sa famille redevient éligible (§2).
+        authors, correctors, out = self._select(
+            self._two_corrections(cite_old=True))
+        self.assertEqual([row["name"] for row in authors], ["author"])
+        self.assertIn("cx3", [row["name"] for row in correctors])
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertNotIn("cx3", [row["name"] for row in out["reviewers"]])
 
 class ForgeCitationResolutionTest(unittest.TestCase):
     def test_hex_suffix_in_a_word_is_not_a_commit_citation(self):

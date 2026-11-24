@@ -127,6 +127,11 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #8193 (0608) : sujets de lots (et `work_items.subject_id`), lus par
+    # `ameesh work subject`/`work list --subject` ; aucun lecteur superviseur
+    # pour l'instant, aucun GRANT modifié.
+    "work_subjects": {"id", "project", "slug", "title", "author", "state", "github_ref",
+                      "created_at", "closed_at", "closed_by"},
     # #8200 (0607) : série interne de sondes saines d'une credential gardée
     # `failing` (gh/scw), lue par la sonde seule ; aucun lecteur superviseur.
     "credential_health": {"healthy_streak", "healthy_probe_at"},
@@ -269,7 +274,8 @@ FERMEES = {
                                 "registered_at", "consumed_at", "consumed_host"},
     # #1922 (0452) : registre Process des workflows (révision/étape, reçus d'étape) —
     # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
-    "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},
+    "work_items": {"workflow_ref", "workflow_stage", "workflow_version",
+                   "subject_id"},  # #8193 (0608), voir work_subjects
     "work_item_events": {"command_id", "evidence", "workflow_stage", "workflow_version"},
     # #1104 (0438) : la borne d'activation du rattrapage des relectures après
     # fusion est un état interne, lu par les exécuteurs et non par le rôle

@@ -244,7 +244,10 @@ class FakeGh:
         #: L126 : `fail(argv)` vrai → l'appel échoue (panne de GitHub simulée)
         self.fail = fail
 
-    def run(self, argv: list, stdin: str | None = None) -> tuple[int, str, str]:
+    def run(self, argv: list, stdin: str | None = None,
+            timeout: float | None = None) -> tuple[int, str, str]:
+        # `timeout` : #8243, la lecture des issues passe le délai de sa page ;
+        # le faux n'attend jamais, il accepte le paramètre comme `Gh.run`.
         if self.fail is not None and self.fail(list(argv)):
             self.state.setdefault("calls", []).append(list(argv))
             return 1, "", "gh: Server Error (HTTP 502)"

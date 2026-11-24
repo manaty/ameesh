@@ -51,7 +51,6 @@ DECLARE
     rel record;
     fn text;
     definition text;
-    original_path text;
     old_text text;
     new_text text;
     pair text[];
@@ -87,18 +86,14 @@ BEGIN
         fn := pair[1];
         old_text := pair[2];
         new_text := replace(old_text, pair[3], format('%I.%I', mod, pair[3]));
-        SELECT pg_get_functiondef(p.oid),
-               (SELECT substring(setting FROM 13) FROM unnest(p.proconfig) setting
-                 WHERE setting LIKE 'search_path=%')
-          INTO definition, original_path FROM pg_proc p
+        SELECT pg_get_functiondef(p.oid) INTO definition FROM pg_proc p
          WHERE p.oid=to_regprocedure(format('%I.%I()', core, fn));
         IF definition IS NULL OR strpos(definition, old_text) = 0 THEN
             RAISE EXCEPTION 'dev/0002 unrecognised function %: missing %', fn, old_text;
         END IF;
+        -- pg_get_functiondef carries SET search_path with each element quoted;
+        -- re-applying the proconfig text as one literal would make it one schema.
         EXECUTE replace(definition, old_text, new_text);
-        IF original_path IS NOT NULL THEN
-            EXECUTE format('ALTER FUNCTION %I.%I() SET search_path TO %L', core, fn, original_path);
-        END IF;
     END LOOP;
     FOREACH t IN ARRAY names LOOP
         EXECUTE format('DROP VIEW %I.%I', core, t);

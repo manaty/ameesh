@@ -70,7 +70,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    delays timeline link_package by_package close_merged close
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
-                   overdue_delegations returned_delegations backlog_add
+                   overdue_delegations returned_delegations follow_up_watch backlog_add
                    backlog_basket_add backlog auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
                    (Postgres optional: issue_refs)
@@ -3470,6 +3470,13 @@ class WorkItems(Domain):
         """Délégations rendues au délégant depuis `since_ts`."""
 
     @abc.abstractmethod
+    def follow_up_watch(self) -> list[dict]:
+        """#8196 : les suivis ouverts (`type = follow-up`) avec leur réveil
+        (`wake_ts`), la dernière délivrance (`delivered_ts`), le dernier
+        désarmement — délivrance ou annulation — (`disarmed_ts`) et la
+        première ligne de l'assigné après la délivrance (`noted_ts`)."""
+
+    @abc.abstractmethod
     def events(self, item_id: int, limit: int | None) -> list[dict]:
         """Journal du lot, du plus récent au plus ancien."""
 
@@ -3574,6 +3581,35 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def by_package(self, package_id: str) -> list[dict]:
         """Les lots rattachés à cette fiche, tous états confondus, par id."""
+
+    # -- sujets (#8193, 0608) -------------------------------------------------
+    @abc.abstractmethod
+    def subject_add(self, project: str, slug: str, title: str, *,
+                    author: str) -> tuple[dict, bool]:
+        """Crée le sujet `slug` du projet ; idempotent sur (projet, slug) :
+        rend (ligne, True) à la création, (ligne existante, False) sinon."""
+
+    @abc.abstractmethod
+    def subjects(self, *, project: str | None = None, slug: str | None = None,
+                 open_only: bool = False) -> list[dict]:
+        """Les sujets, filtrés par projet, slug et état ouvert ; par projet et slug."""
+
+    @abc.abstractmethod
+    def subject_close(self, subject_id: int, *, actor: str) -> dict | None:
+        """Clôt le sujet (idempotent : un sujet clos garde sa date) ; None s'il
+        n'existe pas."""
+
+    @abc.abstractmethod
+    def subject_attach(self, item_id: int, subject_id: int | None, *,
+                       note: str, actor: str) -> dict | None:
+        """Rattache le lot au sujet (None : le détache), journalise ; None si
+        le lot n'existe pas. UNE transaction."""
+
+    @abc.abstractmethod
+    def subject_items(self, *, subject_id: int | None = None,
+                      package_id: str | None = None) -> list[dict]:
+        """Les lots du sujet, ou de la fiche WorkPackage (`package_id` ou son
+        parent), tous états confondus, par id."""
 
     @abc.abstractmethod
     def record_packet(self, package_id: int, *, branch: str, base_sha: str,
