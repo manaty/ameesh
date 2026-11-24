@@ -77,6 +77,9 @@
 --     jeton de rafraîchissement ou d'une clé : ne le révèle pas, mais
 --     reconnaîtrait un jeton fuité ; inutile à la supervision :
 --       credential_health.failing_fingerprint
+--   * série interne de sondes saines d'une ligne `failing` (#8200), lue par
+--     la sonde seule :
+--       credential_health.healthy_streak, credential_health.healthy_probe_at
 --
 --   * CONTENUS — texte libre écrit par les agents ou les humains : corps et
 --     charges des messages, consignes, extraits de fil, arguments et notes

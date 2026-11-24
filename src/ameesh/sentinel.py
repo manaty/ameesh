@@ -21,7 +21,7 @@ account, is not used on this host: it is skipped. A probe that cannot conclude
 (timeout, unreadable file) reports `unknown`, never a verdict.
 
 A `failing` credential (detected by a turn, L226b, or by an earlier probe) is
-only cleared by a positive proof of a fresh login: a healthy probe AND a
+cleared by a positive proof of a fresh login: a healthy probe AND a
 credential that is not the one which failed. Each failure records the
 fingerprint of the credential then in place (`fingerprint`: the refresh token
 of `.credentials.json` or `auth.json`, the key, or the whole gcloud
@@ -33,14 +33,23 @@ fingerprint, or `unknown`, leaves the failure in place. The clearing
 write is conditional (`expect_failures`): a failure a turn records between
 the probe's read and its write is never overwritten.
 
-The server relay account is an exception: a positive authenticated balance
-response can clear a transient provider refusal with the same key, after
-one sentinel interval of backoff. It retains the conditional write above.
+A server-verified probe is an exception (#8200): `gh auth status` and
+`scw account project list` ask the service on every pass, so a healthy answer
+is the server's own proof. A refusal can then be transient (the same
+credential is accepted again) and is lifted after two healthy probes of that
+credential, at least fifteen minutes apart (`Credentials.probe_streak`).
+`claude` and `codex` read a local presence and keep the guard; `gcloud` can
+answer from a cached access token, so it keeps it too.
+
+The server relay account is another exception: a positive authenticated
+balance response can clear a transient provider refusal with the same key,
+after one sentinel interval of backoff. It retains the conditional write
+above.
 
 A CLI probe (gcloud, gh, scw) that exits non-zero is `failing` only when its
 output says the credential is refused; a network error (DNS, timeout, 5xx)
-or anything unrecognized is `unknown` (#210 r4): a credential failure is
-cleared only by another credential, a transient one would never clear.
+or anything unrecognized is `unknown` (#210 r4): an `unknown` is never a
+verdict, so it neither becomes a failure nor clears one.
 
 The `reason` of a failing credential carries the exact command that fixes it:
 the owner's alert (`credential_failing`, pushed by `ameesh notify`) shows it.
@@ -74,6 +83,15 @@ ACCOUNT_WARN_HOURS = 30 * 24.0
 DEFAULT_GCLOUD_SESSION_HOURS = 16.0
 PROBE_TIMEOUT_S = 30
 PROBES = ("claude", "codex", "gcloud", "gh", "scw")
+#: #8200 : sondes qui interrogent le service à chaque passe ; un verdict sain
+#: est la preuve du serveur, pas une présence locale (`claude`, `codex`) ni un
+#: jeton peut-être encore en cache (`gcloud`).
+SERVER_VERIFIED = ("gh", "scw")
+#: #8200 : nombre de sondes saines consécutives qui lèvent un échec gardé…
+SERVER_HEAL_PROBES = 2
+#: … et espacement minimal entre deux sondes comptées. La minuterie de 10 min
+#: fait donc tomber la seconde ~20 min après la première.
+SERVER_HEAL_INTERVAL_S = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -565,7 +583,9 @@ def kept_failure(current: dict, verdict: Verdict) -> str:
     credential than the LAST failure's (fingerprints differ), replaces it —
     whenever that credential was installed (#210 r4: B installed while a turn
     with A still ran, then A failed). No fingerprint on either side: no
-    proof, kept."""
+    proof, kept. A server-verified probe can also clear the failure after
+    spaced healthy probes (#8200): `check` counts them (`probe_streak`) and
+    then treats the verdict as clearing."""
     if current.get("state") != "failing" or verdict.state == "failing":
         return ""
     failed = current.get("failing_fingerprint")
@@ -583,9 +603,10 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
     """Probes every credential and reports it; the rows, with `previous`.
 
     A credential already `failing` stays so unless the probe proves a fresh
-    login (`kept_failure`): the row then carries `kept` and its `probed_at`
-    is stamped (#8062: the probe's own heartbeat, which a `turn` write never
-    refreshes). A write other than
+    login (`kept_failure`), or, for a server-verified probe (`gh`, `scw`), two
+    spaced healthy probes prove the service accepts it again (#8200): the row
+    then carries `kept` and its `probed_at` is stamped (#8062: the probe's own
+    heartbeat, which a `turn` write never refreshes). A write other than
     `failing` is conditional on the failure count read (`expect_failures`): a
     failure recorded meanwhile by a turn wins."""
     from . import storage
@@ -601,6 +622,22 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
                "expires_at": verdict.expires_at, "previous": None}
         current = (known.get(verdict.harness) or {}).get(verdict.account) or {}
         kept = kept_failure(current, verdict)
+        if kept and not dry_run and verdict.harness in SERVER_VERIFIED:
+            # #8200: a server-verified healthy probe counts toward the
+            # recovery series; the second one, spaced, lifts the failure.
+            # Any other kept verdict (unknown) breaks the series, and the
+            # update stamps the probe heartbeat (no `touch` below for these).
+            streak = storage.of(db).credentials.probe_streak(
+                cfg.host, verdict.harness, verdict.account,
+                healthy=verdict.state == "healthy",
+                interval=SERVER_HEAL_INTERVAL_S,
+                expect_failures=int(current.get("failures") or 0))
+            if verdict.state == "healthy" and streak is not None:
+                if streak >= SERVER_HEAL_PROBES:
+                    kept = ""
+                else:
+                    kept += ("; server-verified healthy probe %d/%d counted — "
+                             "a spaced one clears it" % (streak, SERVER_HEAL_PROBES))
         if kept:
             row.update(state="failing", previous="failing", kept=kept)
             reason = current.get("reason") or ""
@@ -614,12 +651,13 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
                         expect_failures=int(current.get("failures") or 0))
             else:
                 row["reason"] = reason or row["reason"]
-            if not dry_run:
+            if not dry_run and verdict.harness not in SERVER_VERIFIED:
                 # #8062 : la sonde a bien relu l'identifiant (même échec, ou
                 # verdict non concluant) : `probed_at` est son battement propre,
                 # que les écritures `turn` ne touchent pas, et
                 # `credential_probe_stale` le lit. L'état, le nombre d'échecs et
-                # `failing_since` ne changent pas.
+                # `failing_since` ne changent pas. Pour `gh`/`scw`, c'est
+                # `probe_streak` qui a déjà estampillé ce battement (#8200).
                 storage.of(db).credentials.touch(
                     cfg.host, verdict.harness, verdict.account,
                     expect_failures=int(current.get("failures") or 0))

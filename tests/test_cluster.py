@@ -127,6 +127,9 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #8200 (0607) : série interne de sondes saines d'une credential gardée
+    # `failing` (gh/scw), lue par la sonde seule ; aucun lecteur superviseur.
+    "credential_health": {"healthy_streak", "healthy_probe_at"},
     # #7631 (0586) : l'accord déjà cité par un geste (agent, seq → kind, ref)
     # est une autorité interne à la porte ; le rôle superviseur ne le lit pas,
     # aucun GRANT modifié.

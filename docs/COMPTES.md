@@ -724,8 +724,13 @@ probe that cannot conclude (timeout, unreadable file) writes `unknown`,
 which is never a verdict. The same goes for a CLI probe (gcloud, gh, scw)
 that exits non-zero without saying its credential is refused: a network
 error (DNS, timeout, 5xx) or an unrecognized output is `unknown`, never
-`failing` — a `failing` credential only clears with another credential, so
-a transient error must not become one. The whole output is read (a refusal
+`failing`, so a transient error must not become one. A `failing` credential
+clears with another credential (a fresh login), except for the server-verified
+probes: `gh auth status` and `scw account project list` ask the service on
+every pass, so two healthy answers of the same credential, at least fifteen
+minutes apart, also lift a refusal that was transient (the probe counts them
+in `healthy_streak`/`healthy_probe_at`; a `failing` or `unknown` answer
+breaks the series). The whole output is read (a refusal
 can come before many lines of other accounts). The fingerprint of gh and scw
 is that of the credential in effect: `GH_TOKEN` / `GITHUB_TOKEN`, or
 `SCW_SECRET_KEY`, when set (they override the store), else the store file. The sentinel reads names, paths and dates only and

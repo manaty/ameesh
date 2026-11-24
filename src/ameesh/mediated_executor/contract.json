@@ -4954,6 +4954,7 @@
     "annotate",
     "health",
     "listing",
+    "probe_streak",
     "probe_transition",
     "report",
     "touch"
