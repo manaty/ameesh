@@ -1449,6 +1449,110 @@ class Leases(interface.Leases):
         )
         return rows[0]["lease_expires_ts"] if rows else None
 
+    def renew_many(self, owner, leases) -> dict[str, float] | None:
+        """#8166 : les gardes de `renew`, ligne par ligne, en une requête.
+
+        Verrous pris dans l'ordre des noms (aucun interblocage entre deux
+        exécuteurs), échéance recontrôlée avec `clock_timestamp()` sous le
+        verrou, jamais raccourcie (`GREATEST`, #3115). Un bail perdu, échu ou
+        d'une autre époque n'est simplement pas rendu."""
+        if not leases:
+            return {}
+        names = [str(name) for name, _, _ in leases]
+        rows = self.db.query(
+            """
+            WITH demande AS (
+                SELECT * FROM unnest(%s::text[], %s::bigint[], %s::float8[])
+                       AS d(name, epoch, ttl)
+            ), verrou AS (
+                SELECT name, lease_owner, lease_epoch, lease_expires_at
+                  FROM agent_registry WHERE name = ANY(%s::text[])
+                 ORDER BY name FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET lease_expires_at = GREATEST(
+                       r.lease_expires_at,
+                       clock_timestamp() + make_interval(secs => demande.ttl)),
+                   last_seen        = now(),
+                   updated_at       = now()
+              FROM verrou JOIN demande ON demande.name = verrou.name
+             WHERE r.name = verrou.name
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = demande.epoch
+               AND verrou.lease_expires_at > clock_timestamp()
+            RETURNING r.name, extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+            """,
+            (names, [int(epoch) for _, epoch, _ in leases],
+             [float(ttl) for _, _, ttl in leases], names, owner),
+        )
+        return {row["name"]: row["lease_expires_ts"] for row in rows}
+
+    #: #8166 : colonnes du registre écrites sans changer ce qu'une passe au
+    #: repos décide (bail, présence, horodatages) : hors de l'empreinte.
+    IDLE_VOLATILE = ("lease_expires_at", "last_seen", "updated_at", "runner_seen_at",
+                     "runner_seen_host", "runner_seen_owner", "lease_wait_since",
+                     "last_event_at", "status_since", "status_reason_since")
+
+    #: Cycle de vie des hôtes : seules les colonnes que juge
+    #: `host_claims_closed` (mode, génération, prises, retrait) ; sondes et
+    #: tentatives de crochet (`hook_attempt_at`, `return_probe`) bougent en
+    #: transition sans rien décider. Lues par `to_jsonb` : une colonne absente
+    #: (schéma en retard) vaut null au lieu de lever 42703.
+    def idle_signatures(self, names) -> dict | None:
+        from .lot_sessions import _CLOSED
+        from .work import has_wake_at
+        names = sorted({str(n) for n in names})
+        if not names:
+            return {"host": "", "agents": {}}
+        wake = ("(SELECT extract(epoch from min(w.wake_at))::float8 FROM work_items w"
+                "  WHERE w.assignee = r.name AND w.wake_at IS NOT NULL"
+                "    AND w.state NOT IN " + _CLOSED + ")"
+                if has_wake_at(self.db) else "NULL::float8")
+        rows = self.db.query(
+            """
+            WITH actif AS (
+                SELECT m.recipient, count(*)::bigint AS n, max(m.id) AS dernier
+                  FROM agent_mailbox m
+                 WHERE m.recipient = ANY(%s::text[]) AND m.delivered_at IS NULL
+                   AND NOT """ + PASSIVE_SQL.format(t="m") + """
+                 GROUP BY m.recipient
+            ), agents AS (
+                SELECT r.name,
+                       md5((to_jsonb(r) - %s::text[])::text
+                           || ':' || coalesce(a.n, 0) || ':' || coalesce(a.dernier, 0)
+                           || ':' || coalesce(""" + wake + """::text, '')) AS sig,
+                       (coalesce(a.n, 0) > 0 OR r.pending_prompt IS NOT NULL) AS pending,
+                       """ + wake + """ AS wake_ts
+                  FROM agent_registry r LEFT JOIN actif a ON a.recipient = r.name
+                 WHERE r.name = ANY(%s::text[])
+            )
+            SELECT a.name, a.sig, a.pending, a.wake_ts,
+                   (SELECT md5(coalesce(string_agg(
+                               jsonb_build_object('h', j->'host', 'm', j->'mode',
+                                   'g', j->'generation', 'c', j->'claims_open',
+                                   's', j->'release_state', 'e', j->'release_epoch',
+                                   'r', j->'release_generation')::text,
+                               ',' ORDER BY j->>'host'), ''))
+                      FROM host_lifecycle c CROSS JOIN LATERAL to_jsonb(c) AS j) AS host_sig
+              FROM agents a
+             UNION ALL
+            SELECT NULL, NULL, NULL, NULL,
+                   (SELECT md5(coalesce(string_agg(
+                               jsonb_build_object('h', j->'host', 'm', j->'mode',
+                                   'g', j->'generation', 'c', j->'claims_open',
+                                   's', j->'release_state', 'e', j->'release_epoch',
+                                   'r', j->'release_generation')::text,
+                               ',' ORDER BY j->>'host'), ''))
+                      FROM host_lifecycle c CROSS JOIN LATERAL to_jsonb(c) AS j)
+             WHERE NOT EXISTS (SELECT 1 FROM agents)
+            """,
+            (names, list(self.IDLE_VOLATILE), names),
+        )
+        host_sig = rows[0]["host_sig"] if rows else ""
+        return {"host": host_sig or "",
+                "agents": {row["name"]: {"sig": row["sig"], "pending": bool(row["pending"]),
+                                         "wake_ts": row["wake_ts"]}
+                           for row in rows if row.get("name")}}
+
     def release(self, name, owner, epoch) -> bool:
         rows = self.db.query(
             """

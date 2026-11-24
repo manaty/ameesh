@@ -116,6 +116,7 @@ class SelectionTest(unittest.TestCase):
             return db
 
         with mock.patch.object(peek, "INTERVAL", 0.01), \
+                mock.patch.object(peek, "REFRESH", 0), \
                 mock.patch.object(peek.db_mod, "connect", side_effect=connect) as opened_connect, \
                 mock.patch.object(peek.storage, "of",
                                   return_value=mock.Mock(operations=operations)):
@@ -211,7 +212,7 @@ class DatabaseTest(PgTestCase):
         self.assertNotIn("PRIVATE", json.dumps(data))
         self.assertNotIn("PRIVATE", self.db.query("SELECT payload FROM agent_peek")[0]["payload"]["events"][0]["summary"])
         self.assertTrue(peek.snapshot(self.db, "peek-worker", human="human:owner",
-                                     now=data["captured_ts"]+46)["stale"])
+                                     now=data["captured_ts"] + peek.STALE_AFTER + 1)["stale"])
 
     def test_lease_fencing_and_old_host_or_epoch_never_reused(self):
         self.assertTrue(self.store.publish_peek("peek-worker", "runner", 7, self.payload))

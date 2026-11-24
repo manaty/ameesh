@@ -955,6 +955,12 @@ class AgentWorker(threading.Thread):
         self._heartbeat_done: threading.Event | None = None
         self._renew_lock = threading.Lock()
         self._preparation_phase: tuple[str, float] | None = None
+        #: #8166 : au repos (`_idle_sleep`), le battement groupé renouvelle
+        self._resting = False
+        #: #8166 : au repos couvert par la passe groupée (`_idle_pace`), et la
+        #: génération de son empreinte au début de la dernière passe
+        self._idle_gated = False
+        self._idle_mark: int | None = None
         #: #5826 : harnais lancés ; une phase qui en contient un repart à zéro
         self._launches = 0
         #: r3 : les appels de renouvellement détachés (sans réponse dans
@@ -2098,6 +2104,13 @@ class AgentWorker(threading.Thread):
             phase = getattr(self, "_preparation_phase", None)
             if self.watchdog_stop.is_set() or self.lease_lost.is_set():
                 return
+            couvert = self._group_beat_margin()
+            if couvert is not None:
+                # #8166 : au repos, le battement groupé de l'exécuteur
+                # renouvelle ; ce fil ne reprend la main qu'au tiers du bail
+                # restant (une tranche pleine pour son propre appel, #2139)
+                attente = min(interval, couvert)
+                continue
             if phase is not None:
                 elapsed = _clock_of(self).monotonic() - phase[1]
                 borne = self._preparation_bound()
@@ -11959,7 +11972,9 @@ class AgentWorker(threading.Thread):
             self._peek_publisher = Publisher(
                 self.cfg, agent=self.name, owner=self.runner.runner_id, epoch=self.epoch,
                 cwd=lambda: self.agent.get("cwd") or "",
-                reader=lambda: getattr(self, "_peek_reader", None), warn=log_async)
+                reader=lambda: getattr(self, "_peek_reader", None), warn=log_async,
+                # #8166 : au repos, ni git ni écriture si rien n'a bougé
+                active=lambda: getattr(self, "proc", None) is not None)
 
     def _close_peek(self) -> None:
         publisher = getattr(self, "_peek_publisher", None)
@@ -12023,6 +12038,99 @@ class AgentWorker(threading.Thread):
             return pas
         return min(pas, max(1.0, self.lease_ttl / 3.0))
 
+    def _idle_generation(self) -> int | None:
+        generation = getattr(self.runner, "idle_generation", None)
+        return generation(self.name) if callable(generation) else None
+
+    def _idle_pace(self) -> float:
+        """#8166 : le pas de repos ; couvert par la passe groupée, le filet.
+
+        Couvert : passe groupée vivante, rien en attente pour l'agent
+        (courrier actif, consigne, ni état local de `LOCAL_PENDING`), empreinte inchangée depuis le début de la
+        passe, rôle non élu (sa relève est vue au pas ordinaire, §11 : moins
+        de cinq minutes). Le pas est alors `IDLE_SAFETY_S`, raccourci aux
+        échéances connues sans requête : réveil programmé, relance au repos,
+        premier réveil de lot inactif. Sinon : `_idle_wait`, comme avant."""
+        self._idle_gated = False
+        pas = self._idle_wait()
+        runner = self.runner
+        alive = getattr(runner, "idle_sweep_alive", None)
+        if not callable(alive) or not alive():
+            return pas
+        if (self.agent or {}).get("releve") == "election":
+            return pas
+        if self._local_work_pending():
+            return pas  # B P2 dev3 : travail en attente hors de la base
+        row = runner.idle_row(self.name)
+        wake_ts = (row or {}).get("wake_ts")
+        if wake_ts is not None and float(wake_ts) <= time.time():
+            # B P2 dev3 (2) : réveil programmé dû — pas encore réclamé (lecture
+            # bridée à SCHEDULED_WAKE_CHECK_S), réclamé ailleurs ou masquant un
+            # réveil futur (min) : le pas ordinaire, jamais le filet
+            return pas
+        self._idle_gated = True  # avant le contrôle : un changement ensuite réveille
+        mark = getattr(self, "_idle_mark", None)
+        if row is None or row.get("pending") or mark is None or self._idle_generation() != mark:
+            self._idle_gated = False
+            return pas
+        return min(max(pas, float(runner.IDLE_SAFETY_S)), self._idle_deadlines(row))
+
+    #: #8166 (B P2 dev3) : états locaux d'un travail en attente, absents de
+    #: la base donc de l'empreinte — suite après plafond, tour retenu (budget,
+    #: fenêtre courte), reprise d'attach, consigne à restaurer, réveil
+    #: programmé réclamé, session à enregistrer.
+    LOCAL_PENDING = ("suite", "_retenue", "_reprise_attach", "_consigne_a_restaurer",
+                     "_wake_claim", "_session_en_attente")
+
+    def _local_work_pending(self) -> bool:
+        return any(getattr(self, nom, None) for nom in self.LOCAL_PENDING)
+
+    def _sweep_covers(self) -> bool:
+        """#8166 : la passe groupée a-t-elle réussi récemment ? (sans requête)"""
+        alive = getattr(self.runner, "idle_sweep_alive", None)
+        return callable(alive) and bool(alive())
+
+    def _idle_deadlines(self, row: dict) -> float:
+        """#8166 : délai jusqu'à la prochaine échéance connue sans requête."""
+        now_wall, now = time.time(), time.monotonic()
+        delais = [float("inf")]
+        wake_ts = row.get("wake_ts")
+        if wake_ts is not None:
+            # B P2 cx2 : devenu dû depuis la garde de `_idle_pace` (deux
+            # lectures de l'horloge), il reste une échéance (plancher 50 ms)
+            delais.append(max(0.05, float(wake_ts) - now_wall + 0.05))
+        nudge = getattr(self.runner, "idle_nudge", None)
+        if not getattr(self, "nudged", True) and isinstance(nudge, (int, float)) and nudge > 0:
+            reste = self.last_activity + float(nudge) - now
+            if reste > 0:
+                delais.append(reste + 0.05)
+        try:
+            if self.lot_wake_enabled():
+                base = self.mail_batch() + float(getattr(self.cfg, "lot_wake_margin", 60.0))
+                reste = self.last_activity + base - now
+                if reste > 0:
+                    delais.append(reste + 0.05)
+        except Exception:  # noqa: BLE001 - une doublure sans réglage : le filet suffit
+            pass
+        return max(0.05, min(delais))
+
+    def _group_beat_margin(self) -> float | None:
+        """#8166 : délai avant que ce worker au repos doive renouveler lui-même.
+
+        None si le battement groupé ne le couvre pas (tour, préparation,
+        exécuteur sans battement groupé) ou si le bail est déjà au tiers
+        restant : le fil du worker renouvelle alors, comme avant."""
+        if not getattr(self, "_resting", False):
+            return None
+        beat = getattr(self.runner, "group_beat_alive", None)
+        if not callable(beat) or not beat():
+            return None
+        ttl = float(self.lease_ttl or 0)
+        if ttl <= 0 or self.lease_deadline <= 0:
+            return None
+        marge = self.lease_deadline - _clock_of(self).time() - ttl / 3.0
+        return marge if marge > 0 else None
+
     def _idle_sleep(self, pas: float) -> bool:
         """#8152 (B impl-11) : dort `pas` en entier, renouvellements compris.
 
@@ -12038,17 +12146,31 @@ class AgentWorker(threading.Thread):
         fin = horloge.monotonic() + max(0.0, pas)
         tranche = max(1.0, self.lease_ttl / 3.0)
         runner = self.runner
-        while True:
-            reste = fin - horloge.monotonic()
-            if reste <= 0:
-                return False
-            if self.wake.wait(timeout=self.wait_timeout(min(reste, tranche))):
-                return True
-            if (self.stopping.is_set() or self.lease_lost.is_set()
-                    or self.deadline_passed()
-                    or getattr(runner, "stop", _NEVER).is_set()
-                    or getattr(runner, "draining", _NEVER).is_set()):
-                return False
+        couvert = getattr(self, "_idle_gated", False)
+        if couvert:
+            # #8166 (B P2 cx2) : couvert par la passe groupée, le sommeil long
+            # relit sa santé (sans requête) : passe groupée en panne ou bloquée,
+            # la passe suivante repart au pas ordinaire
+            tranche = min(tranche, 3 * float(getattr(runner, "IDLE_SWEEP_S", 10.0)))
+        # #8166 : au repos, le battement groupé renouvelle ce bail
+        self._resting = True
+        try:
+            while True:
+                reste = fin - horloge.monotonic()
+                if reste <= 0:
+                    return False
+                if self.wake.wait(timeout=self.wait_timeout(min(reste, tranche))):
+                    return True
+                if (self.stopping.is_set() or self.lease_lost.is_set()
+                        or self.deadline_passed()
+                        or getattr(runner, "stop", _NEVER).is_set()
+                        or getattr(runner, "draining", _NEVER).is_set()):
+                    return False
+                if couvert and not self._sweep_covers():
+                    return False
+        finally:
+            self._resting = False
+            self._idle_gated = False
 
     def _admission_priority(self) -> None:
         """#4602 : applique au fil la classe de la passe qui commence.
@@ -12123,6 +12245,9 @@ class AgentWorker(threading.Thread):
                 # L72 : une base injoignable n'arrête plus le worker (son fil
                 # mourait sur l'exception) : tours suspendus, attente
                 # croissante, reprise d'elle-même au retour de la base.
+                # #8166 : génération de l'empreinte au début de la passe ; un
+                # changement pendant la passe réveille le worker ensuite
+                self._idle_mark = self._idle_generation()
                 try:
                     # #8152 : les primaires lus du registre servent toute la passe
                     with agent_names.pass_scope():
@@ -12212,7 +12337,7 @@ class AgentWorker(threading.Thread):
                     self._deferral_over()  # #1914 : plus rien à prendre
                     self._resident_between_turns()  # L76 : mort, sommeil
                     admission_lock.reset()  # #4602 : la passe prioritaire est finie
-                    self._idle_sleep(self._until_due(self._idle_wait()))
+                    self._idle_sleep(self._until_due(self._idle_pace()))
                     self.wake.clear()
                     continue
                 try:
@@ -14378,6 +14503,199 @@ class Runner:
         cfg = getattr(self, "cfg", None)
         return bool((getattr(cfg, "idle_passes_per_s", 0.0) or 0.0) > 0
                     or (getattr(cfg, "idle_poll_max", 0.0) or 0.0) > 0)
+
+    # -- passe de repos groupée (#8166) -------------------------------------
+    #: Pas de la passe de repos de l'exécuteur : une requête pour tous ses
+    #: workers (courrier actif, ligne du registre, réveils programmés, cycle
+    #: de vie des hôtes) ; un worker n'est réveillé que si son empreinte
+    #: change. Délai de reprise de ce que NOTIFY ne porte pas : ce pas.
+    IDLE_SWEEP_S = 10.0
+    #: Filet : un worker couvert par la passe groupée refait au plus tard sa
+    #: passe complète à ce pas (réveil de lot inactif au-delà du premier,
+    #: admission, retrait de l'hôte non vu par l'empreinte). 128 agents :
+    #: ~0,14 passe/s au lieu de 2,8.
+    IDLE_SAFETY_S = 900.0
+
+    def idle_sweep_alive(self) -> bool:
+        vu = getattr(self, "_idle_sweep_seen", None)
+        return vu is not None and time.monotonic() - vu <= 3 * self.IDLE_SWEEP_S
+
+    def idle_generation(self, name: str) -> int | None:
+        """#8166 : génération de l'empreinte de `name` (None : pas encore lue)."""
+        gens = getattr(self, "_idle_gens", None)
+        return None if gens is None else gens.get(name)
+
+    def idle_row(self, name: str) -> dict | None:
+        rows = getattr(self, "_idle_rows", None)
+        return None if rows is None else rows.get(name)
+
+    def start_idle_sweep(self) -> None:
+        """#8166 : la passe de repos groupée ; exécuteur médié : chaque worker
+        garde son pas (pas de requête groupée dans le contrat distant)."""
+        if storage.is_remote(self.db) or getattr(self.db.cfg, "backend", "") == "mediated":
+            return
+        threading.Thread(target=self._idle_sweep_loop, name="idle-sweep",
+                         daemon=True).start()
+
+    def _idle_sweep_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                self.idle_sweep_once()
+            except Exception as exc:  # panne : les workers reprennent leur pas
+                message = "idle sweep failed (%s): workers keep their own pace" % (
+                    db_mod.explain(exc) if isinstance(exc, db_mod.DbError)
+                    else type(exc).__name__)
+                if message != getattr(self, "_idle_sweep_error", None):
+                    log_async(message)
+                self._idle_sweep_error = message
+            self.stop.wait(self.IDLE_SWEEP_S)
+        self._idle_sweep_seen = None
+
+    def idle_sweep_once(self) -> None:
+        """#8166 : lit les empreintes de tous les workers, réveille ceux dont
+        l'empreinte a changé depuis le début de leur dernière passe."""
+        with self.lock:
+            workers = dict(self.workers)
+        lu = storage.of(self.db).leases.idle_signatures(list(workers))
+        if lu is None:
+            self._idle_sweep_seen = None
+            return
+        gens = dict(getattr(self, "_idle_gens", None) or {})
+        sigs = getattr(self, "_idle_sigs", None) or {}
+        hote = getattr(self, "_idle_host_sig", None)
+        tous = hote is not None and lu["host"] != hote
+        rows = lu["agents"]
+        for name, row in rows.items():
+            avant = sigs.get(name)
+            if name not in gens:
+                gens[name] = 0
+            elif tous or row["sig"] != avant:
+                gens[name] += 1
+        self._idle_gens = {n: g for n, g in gens.items() if n in rows}
+        self._idle_sigs = {n: r["sig"] for n, r in rows.items()}
+        self._idle_rows = rows
+        self._idle_host_sig = lu["host"]
+        self._idle_sweep_error = None
+        self._idle_sweep_seen = time.monotonic()
+        for name, worker in workers.items():
+            if (getattr(worker, "_idle_gated", False)
+                    and self._idle_gens.get(name) != getattr(worker, "_idle_mark", None)):
+                worker.wake.set()
+
+    # -- battement groupé (#8166) ------------------------------------------
+    #: Un worker au repos est renouvelé par le battement groupé dès qu'il a
+    #: consommé un tiers de son bail ; le tour du battement vaut un sixième du
+    #: plus court bail tenu (borné ici) : renouvelé avec au moins la moitié
+    #: du bail restante, avant que son propre fil ne reprenne au tiers.
+    GROUP_BEAT_MIN_S = 0.5
+    GROUP_BEAT_MAX_S = 30.0
+    GROUP_BEAT_IDLE_S = 1.0
+
+    def group_beat_alive(self) -> bool:
+        """#8166 : le battement groupé tourne-t-il (et a-t-il battu récemment) ?
+
+        Un battement bloqué au-delà de deux tours n'est plus réputé vivant :
+        chaque worker reprend son propre renouvellement."""
+        vu = getattr(self, "_group_beat_seen", None)
+        if vu is None:
+            return False
+        return time.monotonic() - vu <= 2 * self.GROUP_BEAT_MAX_S + 5.0
+
+    def start_group_beat(self) -> None:
+        """#8166 : un seul renouvellement pour les baux des workers au repos.
+
+        Avant : chaque worker ouvrait au tiers de son bail une connexion, un
+        contrôle de schéma et un UPDATE (128 agents, bail de 180 s : ~2
+        connexions et ~6 requêtes par seconde). Exécuteur médié : chaque
+        worker garde son battement (une requête par opération, sans lot)."""
+        if storage.is_remote(self.db) or getattr(self.db.cfg, "backend", "") == "mediated":
+            return
+        self._group_beat_seen = time.monotonic()
+        threading.Thread(target=self._group_beat_loop, name="group-beat",
+                         daemon=True).start()
+
+    def _group_beat_loop(self) -> None:
+        while not self.stop.is_set():
+            self._group_beat_seen = time.monotonic()
+            try:
+                tour = self.group_beat_once()
+            except Exception as exc:  # le battement groupé ne tombe jamais
+                log_async("group heartbeat failed (%s): workers renew alone"
+                          % type(exc).__name__)
+                tour = self.GROUP_BEAT_MIN_S * 4
+            self.stop.wait(tour)
+        self._group_beat_seen = None
+
+    def group_beat_once(self) -> float:
+        """#8166 : renouvelle d'un coup les baux au repos entamés d'un tiers ;
+        rend l'attente avant le tour suivant (un sixième du plus court bail
+        tenu).
+
+        Seul un renouvellement réussi est appliqué (échéance jamais
+        raccourcie, même époque, bail non perdu) : un bail absent du retour
+        (perdu, renommé, panne) n'est pas déclaré perdu ici — le fil du
+        worker reprend au tiers restant et tranche, avec les gardes de
+        `renew`."""
+        with self.lock:
+            workers = list(self.workers.values())
+        dus, ttls = [], []
+        for worker in workers:
+            ttl = float(worker.lease_ttl or 0)
+            if ttl <= 0 or worker.lease_deadline <= 0 or worker.lease_lost.is_set():
+                continue
+            # le tour suit tous les baux : un worker en tour peut s'endormir
+            # avant le tour suivant
+            ttls.append(ttl)
+            if not getattr(worker, "_resting", False):
+                continue
+            if worker.lease_deadline - _clock_of(worker).time() < ttl * 2.0 / 3.0:
+                dus.append((worker, int(worker.epoch), ttl))
+        # sans bail tenu, relu à la seconde : un worker qui arrive (prise de
+        # bail) est vu avant son premier tiers ; rien n'est lu en base
+        tour = (min([self.GROUP_BEAT_MAX_S] + [t / 6.0 for t in ttls]) if ttls
+                else self.GROUP_BEAT_IDLE_S)
+        tour = max(self.GROUP_BEAT_MIN_S, tour)
+        if not dus:
+            return tour
+        budget = min(w.call_budget() for w, _, _ in dus)
+        result: dict = {}
+
+        def call() -> None:
+            try:
+                with db_mod.application("lease", "group"):
+                    connection = closing(db_mod.connect(self.db.cfg, writer=False))
+                with connection as renew_db:
+                    migrations.require_compatible_writer(renew_db)
+                    result["expires"] = storage.of(renew_db).leases.renew_many(
+                        self.runner_id, [(w.name, e, t) for w, e, t in dus])
+            except Exception as exc:
+                result["error"] = exc
+            # comme `_renew_call` : un appel arrivé (même en erreur) a pu
+            # valider en base ; la borne locale va jusqu'à ce moment + ttl
+            for w, _, _ in dus:
+                w.lease_held_until = max(w.lease_held_until, w._held_until())
+
+        thread = threading.Thread(target=call, daemon=True, name="group-beat-call")
+        for w, _, _ in dus:
+            w.renewals = [t for t in w.renewals if t.is_alive()] + [thread]
+        thread.start()
+        thread.join(timeout=budget)
+        expires = result.get("expires")
+        if thread.is_alive() or not isinstance(expires, dict):
+            if "error" in result:
+                log_async("group heartbeat: %s — workers renew alone"
+                          % db_mod.explain(result["error"]))
+            return tour
+        for w, epoch, _ in dus:
+            echeance = expires.get(w.name)
+            if echeance is None:
+                continue
+            with w._renew_lock:
+                if w.lease_lost.is_set() or int(w.epoch) != epoch:
+                    continue
+                w.lease_deadline = max(w.lease_deadline, float(echeance))
+                w.lease_held_until = max(w.lease_held_until, w._held_until())
+        return tour
 
     def _wake_workers(self) -> None:
         """#4515 : réveille chaque worker (écoute rétablie, porte fermée)."""
@@ -17511,6 +17829,8 @@ class Runner:
         # orphelins de ses tours (codes de sortie), et les suit.
         self.background.start_monitor(self.stop)
         self.start_suite_cap()
+        self.start_group_beat()  # #8166 : baux des workers au repos
+        self.start_idle_sweep()  # #8166 : une passe de repos pour tous
         if not self.background.subreaper:
             log_async("background work of turns: no subreaper on this OS, "
                       "exit codes unknown")

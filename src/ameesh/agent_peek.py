@@ -29,7 +29,18 @@ MAX_ITEMS = 50
 TAIL_BYTES = 262144
 MAX_LINE = 65536
 INTERVAL = 15
-STALE_AFTER = 45
+#: #8166 : une capture identique à la dernière publiée n'est pas réécrite ; le
+#: producteur la confirme au plus tard tous les `REFRESH` secondes. Au repos
+#: (aucun harnais), git n'est relancé que si HEAD ou l'index ont bougé, ou au
+#: plus tard à `REFRESH`.
+REFRESH = 300
+#: Garantie de fraîcheur (#8166) : un aperçu non périmé a été confirmé il y a
+#: au plus `STALE_AFTER` secondes par un producteur vivant ; ses événements
+#: datent d'au plus `INTERVAL` secondes, son espace de travail aussi pendant un
+#: tour, et au repos du dernier mouvement de HEAD ou de l'index (au plus
+#: `REFRESH`). Avant #8166 : 45 s, une écriture et deux appels git toutes les
+#: 15 s par agent, même au repos.
+STALE_AFTER = REFRESH + 2 * INTERVAL
 #: Bound of the stored JSONB payload (`CHECK` of migration 0436).
 MAX_PAYLOAD_BYTES = 131072
 #: Bound of the HTTP answer: the payload plus the snapshot's bounded metadata
@@ -136,6 +147,64 @@ def workspace(cwd):
                 "scope": "tracked changes against HEAD"}
 
 
+def git_marks(cwd):
+    """#8166 : empreinte sans processus de HEAD et de l'index (dépôt ou worktree).
+
+    `None` si illisible : l'appelant relance alors git."""
+    try:
+        dot = os.path.join(cwd, ".git")
+        if not os.path.lexists(dot):
+            # hors dépôt, ou sous-dossier d'un dépôt : rien de bon marché à
+            # surveiller, git repasse à `REFRESH` (ou pendant un tour)
+            return (cwd, None, ())
+        if os.path.isfile(dot):  # worktree : « gitdir: <chemin> »
+            with open(dot, encoding="utf-8") as stream:
+                line = stream.readline().strip()
+            if not line.startswith("gitdir:"):
+                return None
+            dot = os.path.join(cwd, line[len("gitdir:"):].strip())
+        marks = []
+        for name in ("HEAD", "index"):
+            try:
+                st = os.stat(os.path.join(dot, name))
+                marks.append((st.st_mtime_ns, st.st_size, st.st_ino))
+            except FileNotFoundError:
+                marks.append(None)
+        head = os.path.join(dot, "HEAD")
+        with open(head, encoding="utf-8") as stream:
+            ref = stream.readline().strip()
+        if ref.startswith("ref:"):
+            # la branche courante avance sans toucher HEAD (commit) ; un
+            # worktree partage les refs du dépôt commun (`commondir`)
+            common = dot
+            try:
+                with open(os.path.join(dot, "commondir"), encoding="utf-8") as stream:
+                    common = os.path.join(dot, stream.readline().strip())
+            except OSError:
+                pass
+            for base in (dot, common):
+                try:
+                    st = os.stat(os.path.join(base, ref[4:].strip()))
+                    marks.append((st.st_mtime_ns, st.st_size, st.st_ino))
+                    break
+                except OSError:
+                    continue
+            else:
+                marks.append(None)  # ref empaquetée : HEAD et l'index suffisent
+        return (cwd, ref, tuple(marks))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def file_mark(path):
+    """#8166 : (taille, mtime, inode) d'un fichier, `None` s'il manque."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns, st.st_ino)
+
+
 def sanitise(payload):
     """Allowlist and bounds, applied on publication AND on export."""
     payload = payload if isinstance(payload, dict) else {}
@@ -158,9 +227,19 @@ def sanitise(payload):
 
 class Publisher:
     """One daemon per live worker, one guarded connection, no model calls."""
-    def __init__(self, cfg, *, agent, owner, epoch, cwd, reader, warn=None):
+    def __init__(self, cfg, *, agent, owner, epoch, cwd, reader, warn=None, active=None):
         self.cfg, self.agent, self.owner, self.epoch = cfg, agent, owner, epoch
         self.cwd, self.reader, self.warn = cwd, reader, warn or (lambda _: None)
+        #: #8166 : un harnais tourne-t-il ? Sans doublure, toujours (git à
+        #: chaque capture, comme avant).
+        self.active = active or (lambda: True)
+        #: #8166 : dernières captures, pour ne relancer git ni réécrire à
+        #: l'identique (voir `REFRESH`).
+        self._workspace = self._workspace_mark = None
+        self._events = self._events_mark = None
+        self._published = None
+        self._published_at = float("-inf")
+        self._workspace_at = float("-inf")
         self.stop = threading.Event()
         #: #5981 : la session de publication est gardée d'une capture à l'autre.
         #: Une connexion neuve toutes les 15 s par worker saturait la base
@@ -197,12 +276,16 @@ class Publisher:
         try:
             while True:
                 try:
-                    db = self._connection(cfg)
-                    payload = sanitise({"workspace": workspace(self.cwd()), "events":
-                        selected_events(os.path.join(cfg.agent_dir(self.agent), "events.jsonl"), self.reader())})
-                    if not storage.of(db).operations.publish_peek(
-                            self.agent, self.owner, self.epoch, payload):
-                        break  # lease fenced: never overwrite a successor's snapshot
+                    payload = self._capture(cfg)
+                    now = time.monotonic()
+                    if (payload != self._published or failing
+                            or now - self._published_at >= REFRESH
+                            or self.stop.is_set()):
+                        db = self._connection(cfg)
+                        if not storage.of(db).operations.publish_peek(
+                                self.agent, self.owner, self.epoch, payload):
+                            break  # lease fenced: never overwrite a successor's snapshot
+                        self._published, self._published_at = payload, now
                     failing = False
                 except Exception:
                     # No exception text: a transport error can contain credentials.
@@ -216,6 +299,24 @@ class Publisher:
                 self.stop.wait(INTERVAL)  # close wakes one final capture, still fenced
         finally:
             self._drop_connection()
+
+
+    def _capture(self, cfg):
+        """#8166 : la capture, sans git ni relecture du journal s'ils n'ont pas bougé."""
+        now = time.monotonic()
+        cwd = self.cwd()
+        mark = git_marks(cwd) if cwd and os.path.isabs(cwd) else None
+        if (self.active() or mark is None or mark != self._workspace_mark
+                or now - self._workspace_at >= REFRESH):
+            self._workspace = workspace(cwd)
+            self._workspace_mark, self._workspace_at = mark, now
+        path = os.path.join(cfg.agent_dir(self.agent), "events.jsonl")
+        reader = self.reader()
+        events_mark = (file_mark(path), id(reader))
+        if self._events is None or events_mark != self._events_mark:
+            self._events = selected_events(path, reader)
+            self._events_mark = events_mark
+        return sanitise({"workspace": self._workspace, "events": self._events})
 
 
 def snapshot(db, agent, *, human, limit=10, now=None):
