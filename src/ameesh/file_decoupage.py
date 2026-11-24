@@ -252,6 +252,11 @@ def wakeable(listing: list, canons, *, configured: bool, closed_hosts=()) -> lis
     « feuille de route épuisée » ne doit jamais retirer un siège de relecture
     (§2.3, `AUDITEUR.md` « Capacité au repos »). Le rôle est lu sur la fiche
     (`review_designation.reviewer_role`), pas sur le nom.
+
+    #8199 : un agent dont le `status_text` dit `auth_blocked` (L226b) ne prend
+    aucun tour avant le retour d'un compte sain ; il n'est pas une capacité,
+    même si son statut est resté `idle`. Une pause courte (marqueur d'échec
+    d'un tour, `rate_limited` d'une minute) reste, elle, réveillable (#4491).
     """
     from .chat import is_chat_agent
     from . import review_designation as rd
@@ -267,6 +272,14 @@ def wakeable(listing: list, canons, *, configured: bool, closed_hosts=()) -> lis
         if (row.get("mode") or "execute") != "execute":
             continue
         if su._state(row) in ("stopped", "paused"):
+            continue
+        # #8199 (partie b de #8201) : un agent dont la ligne dit `auth_blocked`
+        # (L226b, `status_text` préfixé) ne prend aucun tour tant que le
+        # compte n'est pas sain — même si son statut est resté `idle`. Le
+        # compter diluerait la part au repos et le découpage ouvrirait des
+        # lots pour une capacité qui ne peut pas les porter.
+        if str(row.get("status_text") or "").strip().lower().startswith(
+                rd.AUTH_BLOCKED_PREFIX):
             continue
         critical, _unknown = su.critical_verdict(row, canons, configured=configured)
         if critical:
@@ -598,16 +611,37 @@ def _created_since(db, lots: list, project: str, split: dict, waits: dict) -> li
     return out
 
 
+def _observation_until(db, lot: int, now: float, *, cfg=None) -> float | None:
+    """#8199 : l'échéance d'une fenêtre d'observation non échue sur le lot.
+
+    La lecture est celle du débit (`planned_waits.active_holds` sur le journal
+    ciblé du lot, puis `open_window`) : une seule règle pour les deux replis.
+    Une lecture en échec ne devine rien — pas de fenêtre — et le repli garde
+    son cours."""
+    from . import planned_waits
+    try:
+        events = list(storage.of(db).progress.lot_hold_events(
+            [int(lot)], planned_waits.HOLD_NOTE_PATTERNS))
+        holds = planned_waits.active_holds(db, events, cfg=cfg)
+    except Exception:  # noqa: BLE001 - lecture nommée ailleurs, sens sûr
+        return None
+    return planned_waits.open_window(holds.get(int(lot)), now, events=events)
+
+
 def _fallback(db, project: str, split: dict, created: list, now: float, *,
-              actor: str, listing: list, canons=None) -> dict | None:
+              actor: str, listing: list, canons=None, cfg=None) -> dict | None:
     """Repli (§2.2, 3) : un seul courrier à l'auditeur, marqué sur le lot.
 
     #7661 : l'auditeur est l'agent dont la fiche du canon déclare le rôle
     (`roles: [auditeur]`), jamais un nom de persona. Sans ce rôle, le repli
-    n'a pas de destinataire : rien n'est inventé et rien n'est marqué."""
+    n'a pas de destinataire : rien n'est inventé et rien n'est marqué.
+    #8199 : une fenêtre d'observation non échue sur le lot tient le repli
+    jusqu'à son échéance — le pilote a daté l'attente."""
     from . import alert_briefs, mail
     lot = int(split["id"])
     if created or now - float(split.get("created_ts") or now) < FALLBACK_S:
+        return None
+    if _observation_until(db, lot, now, cfg=cfg) is not None:
         return None
     if work.events_noted(db, lot, FALLBACK_MARK):
         return None
@@ -1656,7 +1690,7 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
             continue
         done = _fallback(db, project, split,
                          _created_since(db, lots, project, split, waits), now,
-                         actor=actor, listing=listing, canons=canons)
+                         actor=actor, listing=listing, canons=canons, cfg=cfg)
         if done:
             out.append(dict(done, kind="fallback", project=project))
     return out

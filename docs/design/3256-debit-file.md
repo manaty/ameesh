@@ -129,6 +129,18 @@ La lecture du journal (`ROADMAP_NOTE_RE`) applique le même filtre que le SQL
 du débit (`~*`, `roadmap\s*:`) : casse et blancs libres, sinon le sommeil et
 la règle 1 verraient moins que le débit (revue B).
 
+#8199 : le **mouvement** du lot de découpage (§2.2, repli) se lit sur les
+mêmes notes que la feuille de route : seule une note `roadmap:` du pilote
+(préfixe `hold:`/`unhold:` admis, #8198) ou la création d'un lot qui cite le
+découpage compte comme geste ; une note `hold:`/`unhold:` ordinaire ou de
+veille ne remet pas `quiet_s` à zéro. C'est ce silence qui avait laissé
+#8035 dormir 49 h (580 h-agent) après une note de hold de 00:22Z. Une
+**fenêtre d'observation non échue** (`hold: fenêtre : …`, #4235) tient le
+repli jusqu'à son échéance, sans jamais taire la prise d'un lot démarrable
+ou retenu par l'empreinte. Le débit (`capacity.alerts`) et le remplissage de
+file (`file_decoupage`) appliquent la même règle ; un agent dont la fiche
+dit `auth_blocked` n'est pas une capacité réveillable (#8201 b).
+
 ### 2.4 Acceptation de A
 
 - Un projet sans lot démarrable, avec 20 % d'agents au repos depuis 30 min,
@@ -191,7 +203,10 @@ manaty/ameesh#6123.)
 
 `ameesh debit --check` sort 2 quand `idle_share` atteint ou dépasse 0,20
 depuis 30 min et qu'aucun lot de découpage n'a moins d'une heure, comme pour
-une attente de plus de 2 h sans geste.
+une attente de plus de 2 h sans geste. Le mouvement se lit comme au §2.2
+(note `roadmap:` ou lot citant le découpage, #8199) et une fenêtre
+d'observation non échue tient le repli jusqu'à son échéance, sauf si un lot
+démarrable ou retenu par l'empreinte attend encore.
 
 ### 3.2 La consigne de l'auditeur
 
