@@ -1993,7 +1993,7 @@ class DevWork(DevDomain):
         # ~7 500 lots ouverts (plan mesuré : 16 ms par candidat) ; les colonnes
         # sont celles que lisent `occupying`/`exempt`/le plafond.
         sql = ("WITH open_items AS MATERIALIZED ("
-               " SELECT id, app, state, assignee, source, branch FROM work_items"
+               " SELECT id, type, app, state, assignee, source, branch FROM work_items"
                "  WHERE state NOT IN " + self._core()._CLOSED + ") "
                "SELECT w.*,"
                f"       (w.state = '{lifecycle.IN_PROGRESS}' AND " + self._core().requeued_sql("w") + ") AS returned_to_queue,"

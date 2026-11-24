@@ -806,7 +806,7 @@ class WorkItems(interface.WorkItems):
                     raise DbError("reference %s is already carried by lot #%d"
                                   % (issue_ref, int(duplicate[0]["id"])))
             behind = (WorkItems(tx)._pending(assignee, None)
-                      if queued_note is not None and assignee else None)
+                      if queued_note is not None and assignee and type != "follow-up" else None)
             if behind is not None:
                 assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
                                   else (None, queued_note.format(lot=behind)))
@@ -848,7 +848,7 @@ class WorkItems(interface.WorkItems):
                     if exempted:
                         WorkItems(tx)._warn_human_wait_overlap(
                             item["id"], "intake", exempted, actor)
-            elif assignee:
+            elif assignee and type != "follow-up":
                 # #4818 : sans empreinte, le plafond de lots en vol du dépôt
                 # garde encore la création attribuée
                 exempted = WorkItems(tx)._footprint_guard(item["id"])
@@ -1611,6 +1611,7 @@ class WorkItems(interface.WorkItems):
         self.db.query(PENDING_LOCK, (assignee,))
         rows = self.db.query(
             "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
+            "   AND type <> 'follow-up'"
             "   AND state NOT IN %s AND state NOT IN %s"
             "   AND NOT %s"
             "   AND id <> %%s ORDER BY id LIMIT 1" % (
