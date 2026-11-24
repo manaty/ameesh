@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Postgres driver: credential health per host, harness and account
-(L226a/L226b, migrations 0060, 0068 and 0604).
+(L226a/L226b, migrations 0060, 0068, 0604 and 0607).
 
 Only account NAMES pass here, never a secret.
 """
@@ -51,6 +51,7 @@ class Credentials(interface.Credentials):
             "   last_failure_at = case when excluded.state = 'failing' then now()"
             "     else credential_health.last_failure_at end,"
             "   failing_fingerprint = excluded.failing_fingerprint,"
+            "   healthy_streak = 0, healthy_probe_at = null,"
             "   failures = credential_health.failures + excluded.failures"
             " where excluded.state = 'failing' or %s::int is null"
             "    or credential_health.failures = %s::int"
@@ -91,6 +92,41 @@ class Credentials(interface.Credentials):
             "   and (%s::int is null or failures = %s::int) returning account",
             (host, harness, account or "", expect_failures, expect_failures))
         return bool(rows)
+
+    def probe_streak(self, host, harness, account, *, healthy, interval,
+                     expect_failures=None) -> int | None:
+        # #8200 : la sonde a relu l'identifiant sans preuve de credential
+        # neuve. Pour `gh`/`scw`, un verdict sain est la preuve du serveur :
+        # il compte une sonde de la série, espacée d'au moins `interval`
+        # secondes ; un verdict non concluant rompt la série. L'ancre repart
+        # si `last_failure_at` est plus récent qu'elle, pour qu'un échec
+        # écrit par un N-1 (qui ne connaît pas ces colonnes) ne soit pas levé
+        # par une série commencée avant lui. `probed_at` reste le battement
+        # de la sonde (#8062).
+        rows = self.db.query(
+            "update credential_health set"
+            " checked_at = now(), probed_at = now(),"
+            " healthy_streak = case"
+            "   when %s::boolean is false then 0"
+            "   when healthy_probe_at is null"
+            "     or healthy_probe_at < last_failure_at then 1"
+            "   when now() - healthy_probe_at >= make_interval(secs => %s)"
+            "     then healthy_streak + 1"
+            "   else healthy_streak end,"
+            " healthy_probe_at = case"
+            "   when %s::boolean is false then null"
+            "   when healthy_probe_at is null"
+            "     or healthy_probe_at < last_failure_at then now()"
+            "   when now() - healthy_probe_at >= make_interval(secs => %s)"
+            "     then now()"
+            "   else healthy_probe_at end"
+            " where host = %s and harness = %s and account = %s"
+            "   and state = 'failing'"
+            "   and (%s::int is null or failures = %s::int)"
+            " returning healthy_streak",
+            (bool(healthy), float(interval), bool(healthy), float(interval),
+             host, harness, account or "", expect_failures, expect_failures))
+        return int(rows[0]["healthy_streak"]) if rows else None
 
     def health(self, host, harness) -> dict:
         rows = self.db.query(_ROW + " where host = %s and harness = %s order by account",
