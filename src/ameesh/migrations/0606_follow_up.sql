@@ -103,3 +103,24 @@ alter table work_items add constraint work_items_follow_up_personal check (
         and state in ('intake', 'blocked', 'closed')
     )
 );
+
+-- ameesh: trigger compatible with previous code (it only skips clearing the
+-- assignee of a follow-up, a row the previous code never creates).
+-- N-1 (B #46116): an executor still on the previous version releases a
+-- stopped agent's lots without filtering follow-ups. Clearing a follow-up's
+-- assignee is skipped (the row is left untouched, RETURNING yields nothing),
+-- so that sweep still returns the development lots instead of aborting on the
+-- constraint above.
+create or replace function work_items_keep_follow_up_assignee() returns trigger
+language plpgsql as $$
+begin
+    return null;
+end $$;
+
+drop trigger if exists work_items_keep_follow_up_assignee on work_items;
+create trigger work_items_keep_follow_up_assignee
+before update of assignee on work_items
+for each row
+when (old.type = 'follow-up' and new.type = 'follow-up'
+      and nullif(btrim(new.assignee), '') is null)
+execute function work_items_keep_follow_up_assignee();

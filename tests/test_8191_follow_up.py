@@ -102,11 +102,36 @@ class FollowUpTest(PgTestCase):
 
     def test_sql_cannot_offer_a_follow_up_to_the_team(self):
         lot = self.follow_up()
-        with self.assertRaises(DbError):
-            self.db.execute("UPDATE work_items SET assignee = NULL WHERE id = %s",
-                            (lot["id"],))
+        for assignee in (None, " "):
+            self.db.execute("UPDATE work_items SET assignee = %s WHERE id = %s",
+                            (assignee, lot["id"]))
+            self.assertEqual(work.get(self.db, lot["id"])["assignee"], "avatar")
         with self.assertRaises(DbError):
             self.db.execute("INSERT INTO work_items (type, title) VALUES ('follow-up', 'missing owner')")
+
+    def test_previous_release_sql_returns_code_and_keeps_follow_up(self):
+        # N-1: the release gesture of 46f197f53e4d, without the follow-up filter.
+        follow_up = self.follow_up()
+        code = work.add(self.db, title="Development", app="ameesh",
+                        assignee="avatar", actor="avatar", footprint=[])
+        released = []
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT id FROM work_items WHERE assignee = %s"
+                "   AND state NOT IN ('delivered', 'delivered', 'closed')"
+                " ORDER BY id FOR NO KEY UPDATE", ("avatar",))
+            for row in rows:
+                updated = tx.query(
+                    "UPDATE work_items SET assignee = NULL, updated_at = now(),"
+                    "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+                    " WHERE id = %s AND assignee = %s"
+                    "   AND state NOT IN ('delivered', 'delivered', 'closed')"
+                    " RETURNING id", (int(row["id"]), "avatar"))
+                released.extend(r["id"] for r in updated)
+        self.assertEqual({r["id"] for r in rows}, {follow_up["id"], code["id"]})
+        self.assertEqual(released, [code["id"]])
+        self.assertIsNone(work.get(self.db, code["id"])["assignee"])
+        self.assertEqual(work.get(self.db, follow_up["id"])["assignee"], "avatar")
 
     def test_sql_cannot_enter_development_cycle(self):
         lot = self.follow_up()
