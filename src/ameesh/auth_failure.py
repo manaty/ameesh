@@ -41,9 +41,13 @@ PATTERNS: tuple[tuple[re.Pattern, str], ...] = tuple(
         # limite et ne se renouvellera plus (rotation vers un compte dont le
         # login était expiré, incident avatar-smichea du 23/11). C'est une
         # panne d'authentification, pas un échec rapide : l'agent doit passer
-        # `auth_blocked` et reprendre seul après une reconnexion.
+        # `auth_blocked` et reprendre seul après une reconnexion. Le motif est
+        # ancré sur la forme du fournisseur : « failed to authenticate » seul
+        # est générique (un serveur MCP ou un outil tiers le dit aussi) et
+        # condamnerait un compte sain (verdict B de auditeur, 24/11).
         (r"this login reached its time limit|cannot be renewed"
-         r"|failed to authenticate", "login expired"),
+         r"|failed to authenticate[.:][^\n]{0,40}\bapi error:?\s*401\b",
+         "login expired"),
     ))
 
 

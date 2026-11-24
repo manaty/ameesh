@@ -42,6 +42,23 @@ class ClassifyExpiredLoginTest(unittest.TestCase):
         answer = ("The provider said: " + EXPIRED_MESSAGE + " ") * 20
         self.assertIsNone(auth_failure.classify(error="success", result=answer))
 
+    def test_a_third_party_auth_failure_is_not_the_login(self):
+        # Verdict B de l'auditeur (24/11) : « failed to authenticate » seul
+        # est générique — un serveur MCP ou un outil tiers le dit aussi, et
+        # kept_failure condamnerait alors un compte sain. Le motif est ancré
+        # sur la forme du fournisseur.
+        for message in ("MCP server x: failed to authenticate",
+                        "gh: failed to authenticate"):
+            for field in ("error", "result", "stderr_tail"):
+                self.assertIsNone(auth_failure.classify(**{field: message}),
+                                  (message, field))
+
+    def test_the_provider_401_form_is_the_login(self):
+        message = 'Failed to authenticate. API Error: 401 {"type": "error"}'
+        for field in ("error", "result", "stderr_tail"):
+            self.assertIn(auth_failure.classify(**{field: message}),
+                          ("http 401", "login expired"), field)
+
 
 class _Health(_AuthBase):
     """A codex harness with two accounts, as the choice sees it."""
