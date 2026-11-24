@@ -253,7 +253,9 @@ A declared value takes precedence over the agent's imperative setting
 existing resolution unchanged. Attribute all four keys to the card, not to the
 release's package version: enable them only in a release that lists them here.
 An unreadable value or a contradictory `fresh_session: true` with a rotating
-`session_policy` is a card error, so the agent is not claimable. The wait after
+`session_policy` is a card error, so the agent is not claimable. An avatar card
+(`avatar:` block) declares `session_policy: jamais` without writing it; a
+rotating policy or `fresh_session: true` on it is a card error (#8204). The wait after
 a failure is interrupted by shutdown and draining; graceful stop remains the
 core's responsibility. The optional `harness` argument of the internal
 `context_max_tokens()` helper is not frozen by this contract: a declared cap
