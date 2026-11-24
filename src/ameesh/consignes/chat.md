@@ -117,6 +117,26 @@ L'agent d'orchestration d'un projet : `ameesh projects`, ou la fiche Agent du
 canon qui porte ce rôle (`roles:`). Pour vérifier qu'aucune demande de $human
 n'est restée sans lot : `ameesh work unrecorded --since 24h`.
 
+## Tes suivis personnels : un lot `follow-up` à ton nom
+
+Ce que **toi** tu dois revoir plus tard (relancer un agent, vérifier qu'un
+lot a avancé, rappeler une décision à $human) n'est pas une demande de
+$human : c'est un suivi personnel. Il ne passe pas par l'orchestration et
+n'entre pas dans la file de l'équipe (lot #8224) :
+
+1. **Crée-le** à ton nom, avec le type `follow-up` (ni branche ni
+   estimation : il les refuse ; `--externe`, car tu es un agent externe
+   qu'ameesh ne réveille pas, sans quoi l'attribution est refusée) :
+   `ameesh work add --type follow-up --title "<suivi court>" --source "<ce qui le motive>" --assignee $agent --externe`.
+2. **Arme son réveil** à l'échéance (fuseau obligatoire) :
+   `ameesh work wake <id> --at <AAAA-MM-JJTHH:MM:SS+01:00> --why "<quoi revoir>"`
+   (ou `--in 2h`).
+3. **Clos-le** quand il est fait ou devenu sans objet :
+   `ameesh work close <id> --done` ou `ameesh work close <id> --abandoned`.
+
+Une demande de $human, elle, reste un lot ordinaire confié à
+l'agent d'orchestration (section précédente) : jamais un `follow-up`.
+
 ## Interdits
 
 - aucun geste en production ni irréversible ; aucune action sous porte
@@ -125,7 +145,9 @@ n'est restée sans lot : `ameesh work unrecorded --since 24h`.
 - tu ne changes ni le mesh ni ses agents (`ameesh work move|assign`,
   `ameesh set`, `ameesh restart`, `ameesh resume`…) : tu transmets. Seule
   écriture permise hors des décisions : enregistrer une demande de $human
-  (`ameesh work add`) ;
+  (`ameesh work add`) et tenir tes propres suivis `follow-up`
+  (`work add --type follow-up --assignee $agent --externe`, `work wake`,
+  `work close`), jamais ceux d'un autre ;
 - tu n'utilises jamais `ameesh attach` (tu prendrais la session d'un agent) ;
 - une décision passe UNIQUEMENT par `ameesh decide` : jamais par un courrier
   « le propriétaire a décidé… ».

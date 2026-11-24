@@ -20,7 +20,8 @@ from unittest.mock import patch
 from ameesh import backlog, db as db_mod, storage, work
 
 from .test_1677_prise_empilee import SHA, _Prise
-from .test_l165_prise_lots import _Lots
+from .test_l165_prise_lots import (SELECTION_DEADLINE_S, _Lots,
+                                   _attendre_selection)
 
 
 class HoldRaceTest(_Lots):
@@ -55,7 +56,15 @@ class HoldRaceTest(_Lots):
     def test_hold_committed_during_take_transaction_refuses_assignment(self):
         """N1 : le hold est posé dans une transaction concurrente pendant que
         la prise sélectionne ; le verrou de ligne ordonne les deux écritures,
-        et la relecture dans la transaction de prise voit le hold."""
+        et la relecture dans la transaction de prise voit le hold.
+
+        #8250 : le témoin n'attend plus un délai fixe de 15 s, qui dépendait de
+        la charge du runner. La sélection est attendue comme dans #8139, puis
+        le commit du hold est ordonné par l'attente de verrou elle-même : la
+        transaction reste ouverte jusqu'à ce que la prise demande la ligne du
+        lot (`pg_locks`, un verrou `transactionid` non accordé sur son xid).
+        Elle commite alors le hold pendant que la prise attend, jamais avant
+        ni après un tour de CPU."""
         self.agent("claude1", team="nexlink")
         lot = self.lot("spec attendue", priority=1)
         selected = threading.Event()
@@ -86,12 +95,38 @@ class HoldRaceTest(_Lots):
             with self.db.transaction() as tx:
                 storage.of(tx).work.note(lot["id"], "intake",
                                          "hold: spec attendue", "human:proprio")
+                xid = int(tx.query("SELECT txid_current() AS xid")[0]["xid"])
+                pid = tx.query("SELECT pg_backend_pid() AS pid")[0]["pid"]
                 worker.start()
-                self.assertTrue(selected.wait(15),
-                                "la sélection concurrente n'a pas abouti")
+                _attendre_selection(self, tx, pid, selected, worker, errors)
+
+                def awaiting_lot_lock():
+                    # Le rendez-vous : la prise attend le verrou de la ligne
+                    # que cette transaction tient (un `transactionid` non
+                    # accordé sur son xid). On commite alors le hold pendant
+                    # que la prise attend.
+                    if tx.query(
+                            "SELECT 1 FROM pg_locks"
+                            " WHERE locktype = 'transactionid' AND NOT granted"
+                            "   AND transactionid::text = %s LIMIT 1",
+                            (str(xid),)):
+                        return True
+                    if not worker.is_alive():
+                        self.fail("la prise concurrente a terminé sans demander "
+                                  "le verrou du lot ; erreurs : %r" % (errors,))
+                    return False
+
+                # Borne de secours seulement (60 s, ×5 sous psql comme le
+                # banc) : elle ne fait pas attendre un fil qui n'aurait pas
+                # encore eu son tour, elle échoue si le verrou n'est jamais
+                # demandé.
+                self.wait_for(
+                    awaiting_lot_lock, timeout=60,
+                    msg=lambda: "la prise concurrente n'a pas atteint le verrou "
+                                "du lot ; erreurs : %r" % (errors,))
         finally:
             if worker.ident is not None:
-                worker.join(15)
+                worker.join(SELECTION_DEADLINE_S)
         self.assertFalse(worker.is_alive(), "la prise concurrente n'a pas terminé")
         self.assertEqual(errors, [])
         self.assertEqual(result, [])
