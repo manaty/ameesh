@@ -22,8 +22,12 @@ from ameesh.runner import AgentWorker, Reprise, Runner
 
 from .support import PgTestCase
 
-TIMEOUT = ('psql : psql: error: connection to server at "10.0.0.1", port 5432 '
-           'failed: timeout expired')
+#: #8207 : la panne est simulée par `PanneDb` ; le texte reprenait mot pour mot
+#: un incident réel (10.0.0.1, 2026-10-10) et se lisait dans les journaux de
+#: série comme une vraie base injoignable. Le préfixe et une adresse TEST-NET-1
+#: (RFC 5737, jamais routée) rendent la simulation reconnaissable.
+TIMEOUT = ('[simulé test_l72] psql : psql: error: connection to server at '
+           '"192.0.2.1", port 5432 failed: timeout expired')
 
 
 class PanneDb:

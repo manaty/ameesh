@@ -269,6 +269,14 @@ CONTRACT_MODULES = ("tests.test_l161f_plan", "tests.test_cluster")
 #: ne consomme plus la borne des suivants (h-07, test_7665 puis six modules
 #: jamais lancés).
 CONTRACT_TAIL_MIN_S = 60
+#: #8207 : part maximale d'un module dans la queue de la passe. La répartition
+#: par module ignorait les `parallel` lanes : à 240 s restantes, quinze modules
+#: recevaient 16 s alors que deux lanes laissaient environ 150 s de travail ;
+#: des contrats de 17 à 59 s étaient coupés et la passe sortait non concluante
+#: avec 100 à 150 s de borne encore libres (h-01, h-02, h-03 du 24/11). Un
+#: module peut donc prendre jusqu'à 90 s dans la queue, jamais plus de la
+#: moitié de ce qui reste : l'autre lane garde de quoi lancer les suivants.
+CONTRACT_TAIL_MODULE_S = 90
 #: #7740 : témoins globaux qu'une empreinte touche, en plus de la sélection
 #: des voisins : une migration change les rôles et le schéma, un stockage
 #: change le contrat des écrivains, `alert_briefs.py` porte les alertes de
@@ -3255,8 +3263,8 @@ def run_declared_contracts(worktree: Path, modules: list[str], *, end: float,
 
 
 def contract_tail_share(remaining: int, pending_after: int,
-                        budget: float) -> int:
-    """#7950 : la part d'un contrat quand la borne globale va couper la passe.
+                        budget: float, parallel: int = 1) -> int:
+    """#7950/#8207 : la part d'un contrat quand la borne globale va couper la passe.
 
     Hors de la fin de passe, le module garde le temps restant : les contrats
     mesurés (les plus longs d'abord) ont besoin de leur durée entière. Quand
@@ -3264,11 +3272,24 @@ def contract_tail_share(remaining: int, pending_after: int,
     `CONTRACT_TAIL_MIN_S` secondes), le temps restant est réparti entre les
     modules pas encore partis : un module long ne consomme plus la borne des
     suivants (h-07 : test_7665, puis six modules jamais lancés).
+
+    #8207 : à plusieurs lanes, répartir par module ignorait le parallélisme.
+    La part se calcule par vague (`ceil(pending / parallel)`) et un module
+    peut réclamer jusqu'à `CONTRACT_TAIL_MODULE_S` secondes — sans jamais
+    dépasser la moitié du reste — pour qu'un contrat de 20 à 60 s ne soit
+    pas coupé alors que la borne a encore 100 à 150 s de marge. À une seule
+    lane, la répartition égale d'origine est conservée.
     """
     if pending_after <= 0 or remaining > max(CONTRACT_TAIL_MIN_S,
                                              int(budget) // 5):
         return remaining
-    return max(1, remaining // (pending_after + 1))
+    if parallel <= 1:
+        return max(1, remaining // (pending_after + 1))
+    waves = max(1, (pending_after + 1 + parallel - 1) // parallel)
+    part = max(1, remaining // waves)
+    minimum = min(CONTRACT_TAIL_MODULE_S,
+                  max(remaining // 2, remaining - CONTRACT_TAIL_MIN_S))
+    return min(remaining, max(part, minimum))
 
 
 def run_contract_modules(worktree: Path, modules: list[str], *,
@@ -3304,7 +3325,8 @@ def run_contract_modules(worktree: Path, modules: list[str], *,
             remaining = int(end - time.monotonic())
             if remaining <= 0:
                 return budget_spent("contrats", [module], budget=budget)
-            share = contract_tail_share(remaining, pending_after, budget)
+            share = contract_tail_share(remaining, pending_after, budget,
+                                        parallel)
             result = run_tests(worktree, "contrats " + module, [module],
                                timeout=share, heavy=True, wall=remaining,
                                failfast=True)

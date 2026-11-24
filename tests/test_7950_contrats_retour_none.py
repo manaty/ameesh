@@ -142,6 +142,47 @@ class NeverLaunchedTest(unittest.TestCase):
         self.assertEqual([timeout for _, timeout, _ in seen], [20, 20, 20])
         self.assertEqual([wall for _, _, wall in seen], [60, 40, 20])
 
+    def test_tail_share_accounts_for_the_parallel_lanes(self):
+        """#8207 : deux lanes laissent la place à une part plus longue.
+
+        Dans h-01, h-02 et h-03 (24/11), la part par module valait
+        `restant / (modules + 1)` alors que deux modules tournaient : à 240 s
+        restantes, 15 modules recevaient 16 s et les contrats de 17 à 59 s
+        étaient coupés avec 100 à 150 s de borne encore libres.
+        """
+        # 15 modules, deux lanes = 8 vagues : 240 // 8 = 30 s, mais un module
+        # mesuré/absent de la table des durées peut prendre jusqu'à 90 s.
+        self.assertEqual(auto.contract_tail_share(240, 14, 1200, 2), 90)
+        # La réserve de 60 s pour la suite laisse 89 s au module en cours.
+        self.assertEqual(auto.contract_tail_share(149, 3, 1200, 2), 89)
+        # Jamais plus de la moitié du reste : l'autre lane doit pouvoir partir.
+        self.assertEqual(auto.contract_tail_share(60, 5, 1200, 2), 30)
+        # Une seule lane : la répartition égale d'origine est conservée.
+        self.assertEqual(auto.contract_tail_share(60, 2, 1200, 1), 20)
+
+    def test_parallel_tail_does_not_cut_a_module_that_fits_the_lanes(self):
+        seen: list[int] = []
+
+        def execute(*args, **kwargs):
+            seen.append(kwargs["timeout"])
+            return auto.TestRun("contrats", [args[2][0]], 0, "OK", 0.0)
+
+        with mock.patch.object(auto, "contract_order",
+                               side_effect=lambda _, modules: modules), \
+                mock.patch.object(auto, "run_tests", side_effect=execute), \
+                mock.patch.object(auto, "save_test_log",
+                                  side_effect=lambda run: run):
+            auto.run_contract_modules(
+                Path("."),
+                ["tests.test_a", "tests.test_b", "tests.test_c", "tests.test_d"],
+                end=time.monotonic() + 60, parallel=2)
+
+        self.assertEqual(len(seen), 4)
+        # Avant #8207 : 60 // (4, 3, 2, 1) = 15, 15, 20, 60 s. La part par
+        # vague donne ~30 s aux deux premiers modules, qui tournent ensemble,
+        # et la fin du reste aux suivants (20 s de tolérance d'horloge).
+        self.assertGreaterEqual(min(seen), 20)
+
 
 class StartedAndCutTest(unittest.TestCase):
     """Une série lancée puis coupée n'est pas une série non lancée."""
