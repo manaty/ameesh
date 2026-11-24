@@ -70,7 +70,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    delays timeline link_package by_package close_merged close
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
-                   overdue_delegations returned_delegations backlog_add
+                   overdue_delegations returned_delegations follow_up_watch backlog_add
                    backlog_basket_add backlog auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
                    (Postgres optional: issue_refs)
@@ -3468,6 +3468,13 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def returned_delegations(self, since_ts: float) -> list[dict]:
         """Délégations rendues au délégant depuis `since_ts`."""
+
+    @abc.abstractmethod
+    def follow_up_watch(self) -> list[dict]:
+        """#8196 : les suivis ouverts (`type = follow-up`) avec leur réveil
+        (`wake_ts`), la dernière délivrance (`delivered_ts`), le dernier
+        désarmement — délivrance ou annulation — (`disarmed_ts`) et la
+        première ligne de l'assigné après la délivrance (`noted_ts`)."""
 
     @abc.abstractmethod
     def events(self, item_id: int, limit: int | None) -> list[dict]:
