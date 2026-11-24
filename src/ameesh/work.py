@@ -5713,6 +5713,17 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
         else:
             actor = check_wait_note(cfg, db, actor, note_text, item_id=item_id)
             storage.of(db).work.note(item_id, item["state"], text, actor, **options)
+    from . import work_follow_ups
+    if work_follow_ups.reopens(item, actor, wake=wake_ts is not None):
+        # #8197 : la note de l'assigné ou de son humain rouvre le suivi en
+        # attente ; une note qui arme un réveil attend encore.
+        try:
+            move(db, item_id, lifecycle.REQUESTED, note="waiting cleared by a note",
+                 actor=actor)
+        except WorkError:
+            # moved meanwhile (closed, reopened): nothing left to reopen
+            if (get(db, item_id) or {}).get("state") == lifecycle.BLOCKED:
+                raise
     return True
 
 

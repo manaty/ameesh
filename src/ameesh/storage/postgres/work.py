@@ -3477,6 +3477,36 @@ class WorkItems(interface.WorkItems):
             % (item_columns(self.db), " OR ".join("(%s)" % c for c in clauses)),
             tuple(params))
 
+    def follow_ups(self, assignee, *, waiting_prefix) -> list[dict]:
+        # #8197 : une lecture. Le sujet par sous-requêtes corrélées (le gabarit
+        # des colonnes n'est pas qualifié, une jointure le rendrait ambigu) ;
+        # l'attente vient du journal, dans le `blocked` courant (événements
+        # `blocked` après le dernier événement d'un autre état) : sa dernière
+        # note `waiting on:` et son premier événement (l'entrée).
+        stretch = ("e.work_item_id = work_items.id AND e.state = 'blocked'"
+                   " AND e.id > coalesce((SELECT max(o.id) FROM work_item_events o"
+                   "  WHERE o.work_item_id = work_items.id AND o.state <> 'blocked'), 0)")
+        return self.db.query(
+            "SELECT %s, subject_id,"
+            " (SELECT s.slug FROM work_subjects s WHERE s.id = work_items.subject_id)"
+            "   AS subject_slug,"
+            " (SELECT s.title FROM work_subjects s WHERE s.id = work_items.subject_id)"
+            "   AS subject_title,"
+            " (SELECT s.github_ref FROM work_subjects s"
+            "   WHERE s.id = work_items.subject_id) AS subject_github_ref,"
+            " CASE WHEN state = 'blocked' THEN"
+            "  (SELECT e.note FROM work_item_events e WHERE %s"
+            "    AND starts_with(e.note, %%s) ORDER BY e.id DESC LIMIT 1)"
+            " END AS waiting_note,"
+            " CASE WHEN state = 'blocked' THEN"
+            "  (SELECT extract(epoch from min(e.created_at))::float8"
+            "     FROM work_item_events e WHERE %s)"
+            " END AS waiting_since_ts"
+            " FROM work_items WHERE type = 'follow-up' AND assignee = %%s"
+            "  AND state <> 'closed' ORDER BY id"
+            % (item_columns(self.db, "work_items"), stretch, stretch),
+            (waiting_prefix, assignee))
+
     def record_packet(self, package_id, *, branch, base_sha, head_sha, units, note, actor, expect_pushed=None):
         return self._dev.record_packet(package_id, branch=branch, base_sha=base_sha, head_sha=head_sha, units=units, note=note, actor=actor, expect_pushed=expect_pushed)
 
