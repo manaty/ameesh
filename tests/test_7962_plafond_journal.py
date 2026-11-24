@@ -126,7 +126,11 @@ class PlafondJournalTest(unittest.TestCase):
         """Un parent setgid donne 02700 ; le mode doit être ramené à 0700."""
         os.makedirs(self.etat)
         os.chmod(self.etat, 0o2700)
-        self.assertEqual(stat.S_IMODE(os.stat(self.etat).st_mode), 0o2700)
+        if stat.S_IMODE(os.stat(self.etat).st_mode) != 0o2700:
+            # Darwin (APFS) ne pose pas S_ISGID sur ce dossier : la
+            # précondition du test est hors de portée du système de
+            # fichiers, pas le comportement du script.
+            self.skipTest("this filesystem cannot hold a setgid directory")
         self.ecrire_inspect()
         proc = self.run_script()
         self.assertEqual(proc.returncode, 0, proc.stderr)

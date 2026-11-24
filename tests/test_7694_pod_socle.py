@@ -705,8 +705,15 @@ class SafeDirectoryTest(unittest.TestCase):
                     mock.patch.dict(os.environ, {"AMEESH_TENANT": ""}):
                 self.assertIsNone(canon._git_safe_directory(repo))
             with mock.patch.object(canon, "POD_CANON_REPO", repo):
-                # pod, mais dépôt étranger : refusé
-                with mock.patch.dict(os.environ, {"AMEESH_TENANT": ALICE}):
+                # pod, mais dépôt étranger : refusé. La configuration Git
+                # globale de l'hôte est neutralisée : la CI macOS y pose
+                # `safe.directory = *`, qui rendrait « autre » sûr et ferait
+                # passer le test pour une raison étrangère à canon (#8203).
+                with mock.patch.dict(
+                        os.environ,
+                        {"AMEESH_TENANT": ALICE,
+                         "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_CONFIG_SYSTEM": os.devnull}):
                     self.assertEqual(canon._git_safe_directory(repo),
                                      os.path.realpath(repo))
                     self.assertIsNone(canon._git_safe_directory(other))
@@ -722,6 +729,8 @@ class SafeDirectoryTest(unittest.TestCase):
             # hors pod, même chemin : le dépôt d'un autre propriétaire est refusé
             with mock.patch.object(canon, "POD_CANON_REPO", repo), \
                     mock.patch.dict(os.environ, {"AMEESH_TENANT": "",
+                                                 "GIT_CONFIG_GLOBAL": os.devnull,
+                                                 "GIT_CONFIG_SYSTEM": os.devnull,
                                                  "GIT_TEST_ASSUME_DIFFERENT_OWNER": "true"}):
                 refus = canon._git(repo, "rev-parse", "--git-dir")
             self.assertNotEqual(refus.returncode, 0)
