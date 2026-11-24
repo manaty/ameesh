@@ -5,13 +5,16 @@ Le pilote note sa raison sous `hold:` (et sa levée sous `unhold:`) :
 `hold: roadmap: épuisée nexlink — …`. Le préfixe de retenue ne doit pas
 cacher la sentinelle. Témoins : la fonction partagée
 `file_decoupage.roadmap_state`, le verdict du débit `_roadmap_verdicts`, la
-lecture du journal (`work.events_noted` avec `wrapped`, donc
-`roadmap_notes`) et la requête `_ROADMAP_SQL` du débit. Le quatrième lecteur,
-la règle 1 (`lot_sessions.actionable`, #4901), est couvert par
+lecture du journal (`file_decoupage.roadmap_notes`, filtre `ROADMAP_NOTE_RE`)
+et la requête `_ROADMAP_SQL` du débit. Le quatrième lecteur, la règle 1
+(`lot_sessions.actionable`, #4901), est couvert par
 `tests/test_l165c_sessions_par_lot.py`.
 
 Une note dont le corps ne commence pas par `roadmap:` reste ignorée : le
-préfixe de retenue est facultatif, il ne déplace pas la sentinelle.
+préfixe de retenue est facultatif, il ne déplace pas la sentinelle. Revue B :
+le journal applique les mêmes règles de casse et de blancs que les parseurs et
+le SQL (`Hold:`, `ROADMAP :`), faute de quoi le sommeil et la règle 1
+verraient moins que le débit.
 """
 from __future__ import annotations
 
@@ -108,6 +111,37 @@ class JournalReaderTest(PgTestCase):
                   "hold: roadmap toujours épuisée nexlink — point de 06:00",
                   actor="pilote")
         self.assertEqual(fd.roadmap_notes(self.db, split), [])
+
+    def test_a_wrapped_reopening_keeps_the_parser_casing_and_spacing(self):
+        """Revue B (#8198) : casse et blancs du parseur valent au journal.
+
+        `Hold:  ROADMAP : épuisée` puis `unhold:  ROADMAP : rouverte` : le
+        parseur et le SQL (`~*`, `roadmap\\s*:`) voient la réouverture ; la
+        lecture du journal doit rendre les mêmes notes, sinon le sommeil et la
+        règle 1 restent sur l'épuisement."""
+        split = self.split()
+        texts = ["Hold:  ROADMAP : épuisée nexlink",
+                 "unhold:  ROADMAP : rouverte nexlink"]
+        work.note(self.db, split, texts[0], actor="pilote")
+        work.note(self.db, split, texts[1], actor="human:owner")
+        notes = fd.roadmap_notes(self.db, split)
+        self.assertEqual([str(row["note"]) for row in notes], texts)
+        self.assertEqual(fd.roadmap_state(notes, "nexlink"), fd.REOPENED_STATE)
+        self.assertFalse(fd.exhausted(notes, "nexlink"))
+
+    def test_the_journal_and_the_debit_sql_read_the_same_notes(self):
+        """Revue B (#8198) : un seul filtre, celui du parseur et du SQL."""
+        split = self.split()
+        notes_in = [("Hold:  ROADMAP : épuisée nexlink", "pilote"),
+                    ("unhold:  ROADMAP : rouverte nexlink", "human:owner"),
+                    ("roadmap : épuisée nexlink", "human:owner"),
+                    ("hold: autre sujet", "pilote")]
+        for text, actor in notes_in:
+            work.note(self.db, split, text, actor=actor)
+        journal = {str(row["note"]) for row in fd.roadmap_notes(self.db, split)}
+        sql = {str(row["note"]) for row in debit._rows(
+            self.db, debit._ROADMAP_SQL, (0.0,))}
+        self.assertEqual(journal, sql)
 
     def test_the_debit_sql_selects_the_hold_sentinel(self):
         split = self.split()

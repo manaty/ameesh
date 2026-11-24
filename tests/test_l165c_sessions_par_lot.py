@@ -480,6 +480,23 @@ class StockageTest(_Base):
                   actor="human:owner")
         self.assertNotIn(lot, {r["id"] for r in self.st.actionable("pilote8198")})
 
+    def test_decoupage_rouvert_casse_et_blancs_mixtes_reveille_le_pilote(self):
+        """Revue B (#8198) : la règle 1 suit la casse et les blancs du parseur.
+
+        `roadmap: épuisée` puis `unhold:  ROADMAP : rouverte` : le SQL du débit
+        (`~*`) et `roadmap_state` voient la réouverture ; la règle 1 doit lire
+        la même note, sinon le lot reste filtré comme épuisé."""
+        self.bail("pilote8198b")
+        lot = work.add(self.db, title="Découper la feuille de route",
+                       source="file-decoupage:ameesh", app="ameesh",
+                       assignee="pilote8198b", force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        work.note(self.db, lot, "roadmap: épuisée ameesh", actor="pilote8198b")
+        self.assertNotIn(lot, {r["id"] for r in self.st.actionable("pilote8198b")})
+        work.note(self.db, lot, "unhold:  ROADMAP : rouverte ameesh",
+                  actor="human:owner")
+        self.assertIn(lot, {r["id"] for r in self.st.actionable("pilote8198b")})
+
     def test_note_epuisee_ne_suspend_pas_un_lot_ordinaire(self):
         self.bail("agent4901")
         lot = work.add(self.db, title="Travail ordinaire", app="ameesh",

@@ -125,6 +125,9 @@ comme avant.
 `hold: roadmap: épuisée <projet> — …`. Le préfixe `hold:`/`unhold:` est donc
 facultatif devant `roadmap:`, lu par le sommeil, le débit, le journal du lot et
 la règle 1 (les quatre lecteurs), sans changer le sens de la dernière note.
+La lecture du journal (`ROADMAP_NOTE_RE`) applique le même filtre que le SQL
+du débit (`~*`, `roadmap\s*:`) : casse et blancs libres, sinon le sommeil et
+la règle 1 verraient moins que le débit (revue B).
 
 ### 2.4 Acceptation de A
 

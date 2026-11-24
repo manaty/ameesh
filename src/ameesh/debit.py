@@ -3154,7 +3154,10 @@ _TURNS_SQL = """
 #: notes par le journal, comme le sommeil — jamais par un tri d'`at_ts` à part.
 #: #8198 : une sentinelle écrite dans la raison d'un `hold:`/`unhold:`
 #: (`hold: roadmap: épuisée …`) est retenue par le même filtre, sinon le débit
-#: ne verrait pas la note que le sommeil lit.
+#: ne verrait pas la note que le sommeil lit. Ce filtre est celui de
+#: `file_decoupage.ROADMAP_NOTE_RE` — préfixe de retenue facultatif, casse et
+#: blancs libres — et les deux se modifient ensemble (revue B : le journal
+#: exact du store voyait moins que ce `~*`).
 _ROADMAP_SQL = """
     SELECT e.id, e.work_item_id, e.note, w.source,
            extract(epoch FROM e.created_at)::float8 AS at_ts

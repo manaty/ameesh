@@ -5755,42 +5755,16 @@ def events(db: Db, item_id: int, limit: int | None = 100) -> list[dict]:
     return storage.of(db).work.events(item_id, limit)
 
 
-#: #8198 : le préfixe de retenue (`hold:`) ou de levée (`unhold:`) qui peut
-#: précéder une note de sentinelle ; le blanc après les deux-points est
-#: facultatif, comme pour `planned_waits._HOLD`.
-_HELD_WRAPPER_RE = re.compile(r"^\s*(?:un)?hold:\s*", re.IGNORECASE)
-
-
 def events_noted(db: Db, item_id: int, prefix: str,
-                 since_ts: float = 0.0, *, wrapped: bool = False) -> list[dict]:
+                 since_ts: float = 0.0) -> list[dict]:
     """Les notes du lot qui commencent par `prefix`, de la plus ancienne à la
     plus récente.
 
     Contrairement à `events`, la lecture n'est pas une fenêtre des N derniers
     événements : une note ancienne reste lisible sous un flot de notes plus
-    récentes (#3279, marque d'armement évincée par les notes `held`).
-
-    `wrapped` (#8198) : lire aussi la même note quand un préfixe de retenue la
-    porte — `hold: <prefix>…` ou `unhold: <prefix>…`, le texte du pilote après
-    le préfixe. Le filtre reste exact : seul le début du corps est comparé,
-    jamais une sous-chaîne."""
-    store = storage.of(db).work
-    rows = list(store.events_noted(prefix, float(since_ts),
-                                   ids=[int(item_id)]) or ())
-    if wrapped:
-        seen = {int(row["id"]) for row in rows}
-        for lead in ("hold:", "unhold:"):
-            for row in store.events_noted(lead, float(since_ts),
-                                          ids=[int(item_id)]) or ():
-                ident = int(row["id"])
-                text = str(row.get("note") or "")
-                match = _HELD_WRAPPER_RE.match(text)
-                if (ident not in seen and match is not None
-                        and text[match.end():].startswith(prefix)):
-                    rows.append(row)
-                    seen.add(ident)
-        rows.sort(key=lambda row: int(row["id"]))
-    return rows
+    récentes (#3279, marque d'armement évincée par les notes `held`)."""
+    return storage.of(db).work.events_noted(prefix, float(since_ts),
+                                            ids=[int(item_id)])
 
 
 #: les jalons et la porte du gel/verdict vivent dans `freeze_gate` (#2873),
