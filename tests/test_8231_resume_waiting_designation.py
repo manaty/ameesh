@@ -26,6 +26,34 @@ class ResumeWaitingTest(base._ActivationFixture, PgTestCase):
         self.db.execute("UPDATE agent_registry SET status = 'idle', status_text = ''"
                         " WHERE name = %s", (name,))
 
+    def decoys(self, count):
+        """Des lots en attente sans gel, d'id supérieur au lot du fixture."""
+        for index in range(count):
+            decoy = self.db.query(
+                "INSERT INTO work_items (title, app, state, assignee)"
+                " VALUES (%s, 'ameesh', 'qa', 'author') RETURNING id",
+                ("decoy %d" % index,))[0]["id"]
+            self.db.execute(
+                "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                " VALUES (%s, 'qa', %s, 'ameesh')",
+                (decoy, 'review-designation:%d:1: {"state": "waiting"}' % decoy))
+
+    def test_departure_and_return_out_of_window_replay(self):
+        """B mty-amh-docs-01 #46318 : départ puis retour du candidat pendant
+        que le lot est hors fenêtre ; le premier examen après le retour
+        rejoue le gel."""
+        self.waiting_freeze()
+        self.decoys(4)
+        self.resume("r2")
+        waiting = {"state": rd.WAITING, "reviewers": [], "why": "corrector"}
+        with mock.patch.object(act, "RESUME_SCAN", 2):
+            attempted = self.replay([waiting, waiting], [
+                lambda: None,              # [lot, d1] : tenté, mémo posé
+                lambda: self.pause("r2"),  # [d2, d3]
+                lambda: self.resume("r2"), # [d4]
+                lambda: None])             # repli [lot, d1] : rejoué
+        self.assertEqual(attempted, [1, 0, 0, 1])
+
     def waiting_freeze(self):
         self.pause("r2")
         _, outcome = self.freeze()
@@ -109,15 +137,7 @@ class ResumeWaitingTest(base._ActivationFixture, PgTestCase):
         cache plus le lot dont la famille revient ; le curseur avance puis se
         replie au bout."""
         self.waiting_freeze()
-        for index in range(2):
-            decoy = self.db.query(
-                "INSERT INTO work_items (title, app, state, assignee)"
-                " VALUES (%s, 'ameesh', 'qa', 'author') RETURNING id",
-                ("decoy %d" % index,))[0]["id"]
-            self.db.execute(
-                "INSERT INTO work_item_events (work_item_id, state, note, actor)"
-                " VALUES (%s, 'qa', %s, 'ameesh')",
-                (decoy, 'review-designation:%d:1: {"state": "waiting"}' % decoy))
+        self.decoys(2)
         self.resume("r2")
         act._write_cursor(self.cfg, act.RESUME_CURSOR, self.lot)
         memo: dict = {}
