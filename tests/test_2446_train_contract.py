@@ -30,9 +30,14 @@ class ContractTest(unittest.TestCase):
         paths = [path for path, _blob in contract.sources]
         self.assertIn(".github/workflows/paquet.yml", paths)
         self.assertIn(".github/workflows/tests.yml", paths)
+        # #8208 : la prévalidation de gel exécute un instantané (commit sans
+        # parent) dont l'arbre est celui de la tête ; `HEAD:` y désigne
+        # l'instantané, pas le commit annoncé. On lit donc le contenu de
+        # l'arbre, seule chose que la CI exécute (`git hash-object`, comme
+        # `train_contracts.stale_pins`).
         for path, blob in contract.sources:
             with self.subTest(path=path):
-                self.assertEqual(plan_git._out(ROOT, "rev-parse", "HEAD:" + path), blob)
+                self.assertEqual(plan_git._out(ROOT, "hash-object", "--", path), blob)
 
     def test_full_packet_matrix_and_aggregate_are_required(self):
         contract, = train_contracts.ameesh()
