@@ -590,8 +590,12 @@ class RunnerTest(_AuthBase):
             self.assertEqual(ligne["status_text"], "auth_blocked: claude/primaire")
             self.assertEqual(ligne["pending_prompt"], "travail")  # consigne remise
             sante = self._health("claude")["primaire"]
-            self.assertEqual((sante["state"], sante["source"], sante["reason"]),
-                             ("failing", "turn", "invalid api key"))
+            self.assertEqual((sante["state"], sante["source"]), ("failing", "turn"))
+            # #8180 : le motif du tour nomme tout de suite la commande de
+            # reconnexion, sans attendre l'annotation de la sonde.
+            self.assertTrue(sante["reason"].startswith("invalid api key; fix: "))
+            self.assertIn("ameesh accounts login claude primaire --token-file FILE",
+                          sante["reason"])
             # next turn: on the healthy account, block lifted
             self.assertIsNotNone(self._suite(worker))
             self.assertEqual(self.turns()[-1]["compte"]["CLAUDE_CONFIG_DIR"],
