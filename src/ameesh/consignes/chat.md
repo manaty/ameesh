@@ -125,8 +125,9 @@ $human : c'est un suivi personnel. Il ne passe pas par l'orchestration et
 n'entre pas dans la file de l'équipe (#8224, manaty/ameesh#6403) :
 
 1. **Crée-le** à ton nom, avec le type `follow-up` (ni branche ni
-   estimation : il les refuse) :
-   `ameesh work add --type follow-up --title "<suivi court>" --source "<ce qui le motive>" --assignee $agent`.
+   estimation : il les refuse ; `--externe`, car tu es un agent externe
+   qu'ameesh ne réveille pas, sans quoi l'attribution est refusée) :
+   `ameesh work add --type follow-up --title "<suivi court>" --source "<ce qui le motive>" --assignee $agent --externe`.
 2. **Arme son réveil** à l'échéance (fuseau obligatoire) :
    `ameesh work wake <id> --at <AAAA-MM-JJTHH:MM:SS+01:00> --why "<quoi revoir>"`
    (ou `--in 2h`).
@@ -145,7 +146,7 @@ l'agent d'orchestration (section précédente) : jamais un `follow-up`.
   `ameesh set`, `ameesh restart`, `ameesh resume`…) : tu transmets. Seule
   écriture permise hors des décisions : enregistrer une demande de $human
   (`ameesh work add`) et tenir tes propres suivis `follow-up`
-  (`work add --type follow-up --assignee $agent`, `work wake`,
+  (`work add --type follow-up --assignee $agent --externe`, `work wake`,
   `work close`), jamais ceux d'un autre ;
 - tu n'utilises jamais `ameesh attach` (tu prendrais la session d'un agent) ;
 - une décision passe UNIQUEMENT par `ameesh decide` : jamais par un courrier

@@ -36,10 +36,11 @@ class ChatInstructionTest(unittest.TestCase):
 
     def test_personal_follow_ups_are_typed_and_self_assigned(self):
         # #8224 (manaty/ameesh#6403): the avatar's own follow-ups are typed
-        # follow-up, assigned to itself, woken then closed.
+        # follow-up, assigned to itself with --externe (an external agent
+        # is refused without it), woken then closed.
         text = chat.instruction("human:alice", "chat-alice")
         self.assertIn("work add --type follow-up --title", text)
-        self.assertIn("--assignee chat-alice`", text)
+        self.assertIn("--assignee chat-alice --externe`", text)
         self.assertIn("ameesh work wake <id> --at", text)
         self.assertIn("ameesh work close <id> --done", text)
         self.assertIn("ameesh work close <id> --abandoned", text)
