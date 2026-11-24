@@ -23,7 +23,7 @@ from ameesh import actions, fil, jcs, receipts, work
 from ameesh import db as db_mod
 from ameesh.actions import ActionError
 from ameesh.connectors import Outcome
-from ameesh.connectors import ConnectorError
+from ameesh.connectors import ConnectorError, NotSentError
 from ameesh.connectors.git_merge import GitMergeConnector, parse_target, resolve_gh
 from ameesh.connectors.shell_noop import ShellNoopConnector
 from ameesh.db import DbError
@@ -104,6 +104,30 @@ class Scripted:
 
     def reconcile(self, action):
         return self.reconciled
+
+
+class NotSentOnce:
+    """Délègue au connecteur, sauf le premier appel : échec avant envoi (#8212)."""
+
+    def __init__(self, inner, detail="connection refused before the request (simulated)"):
+        self.inner = inner
+        self.name = inner.name
+        self.dedupe = inner.dedupe
+        self.timeout = getattr(inner, "timeout", 30.0)
+        self.detail = detail
+        self.calls: list = []
+
+    def classify(self, operation, args):
+        return self.inner.classify(operation, args)
+
+    def execute(self, action, idempotency_key):
+        self.calls.append((action.action_id, idempotency_key, action.attempt))
+        if len(self.calls) == 1:
+            raise NotSentError(self.detail)
+        return self.inner.execute(action, idempotency_key)
+
+    def reconcile(self, action):
+        return self.inner.reconcile(action)
 
 
 class Paused:
@@ -645,6 +669,78 @@ class ActionsCycleTest(ActionsBase):
         self.assertEqual(self.execute(lost)["state"], "unknown")
         self.refused(actions.STATE, actions.cancel, self.db, lost["action_id"])
         self.refused(actions.UNKNOWN_ACTION, actions.cancel, self.db, actions.new_action_id())
+
+
+# --------------------------------------------------------------------------
+# #8212 : échec certain AVANT l'écriture de la requête
+# --------------------------------------------------------------------------
+
+class ActionsNotSentTest(ActionsBase):
+    """Un échec de transport avant envoi (DNS, connexion, poignée de main TLS)
+    est certain : `failed` (« not sent »), rejouable sous le même grant et la
+    même clé d'idempotence. Un délai de lecture après envoi reste `unknown`."""
+
+    def test_echec_avant_envoi_failed_et_retry_standing(self):
+        grant = self.register_grant()
+        connector = NotSentOnce(ShellNoopConnector(self.noop_dir, timeout=10.0))
+        action = self.propose("refund", connector=connector, amount=30, currency="EUR")
+        actions.approve(self.db, action["action_id"], None, standing=True, by="porte")
+        result = self.execute(action, connector)
+        self.assertEqual((result["state"], result["released"]), ("failed", 30))
+        self.assertIn("not sent", result["detail"])
+        self.assertEqual(self.files(), [])                       # rien n'a été écrit
+        self.assertEqual(self.get(action)["state"], "failed")
+        attempt, = actions.attempts(self.db, action["action_id"])
+        self.assertEqual((attempt["state"], attempt["settled_by"]), ("failed", "connector"))
+        self.assertIn("not sent", attempt["error"])
+        self.assertEqual(self.grant_consumed(grant), 0)          # réservation libérée
+        # la MÊME action se rejoue sous le même grant, avec la même clé
+        actions.retry(self.db, action["action_id"], None, standing=True, by="porte")
+        result = self.execute(action, connector)
+        self.assertEqual((result["state"], result["attempt"]), ("confirmed", 2))
+        self.assertEqual([(call[0], call[1]) for call in connector.calls],
+                         [(action["action_id"], action["action_id"])] * 2)
+        self.assertEqual(self.files(), [action["action_id"] + ".json"])
+        self.assertEqual(self.grant_consumed(grant), 30)
+
+    def test_delai_de_lecture_apres_envoi_reste_unknown(self):
+        def read_timeout():
+            raise TimeoutError("timed out while reading the response, after the request")
+
+        connector = Scripted(read_timeout)
+        action = self.propose("send", connector=connector)
+        self.approve(action)
+        result = self.execute(action, connector)
+        self.assertEqual(result["state"], "unknown")
+        self.assertNotIn("not sent", result["detail"])
+        self.assertEqual(self.get(action)["state"], "unknown")
+        self.refused(actions.STATE, self.execute, action, connector)
+
+    def test_echec_avant_envoi_tardif_regle_failed(self):
+        """Le délai de la porte a déjà conclu `unknown` ; le connecteur rend
+        ensuite un `NotSentError` : rien n'est parti, l'inconnue se règle
+        `failed` (même tentative), sans attendre un humain."""
+        def slow_not_sent():
+            time.sleep(1.5)
+            raise NotSentError("connection timed out before the request (simulated)")
+
+        connector = Scripted(slow_not_sent)
+        action = self.propose("send", connector=connector)
+        self.approve(action)
+        self.assertEqual(self.execute(action, connector)["state"], "unknown")
+
+        def settled():
+            row = self.get(action)
+            return row if row["state"] != "unknown" else None
+
+        row = self.wait_for(settled, timeout=15)
+        self.assertEqual((row["state"], row["attempts"]), ("failed", 1))
+        attempt, = actions.attempts(self.db, action["action_id"])
+        self.assertEqual((attempt["state"], attempt["settled_by"]),
+                         ("failed", "connector-late"))
+        self.assertIn("not sent", attempt["error"])
+        self.assertEqual(self.event_names(action),
+                         ["proposed", "approved", "launched", "unknown", "failed"])
 
 
 # --------------------------------------------------------------------------

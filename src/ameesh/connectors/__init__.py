@@ -13,15 +13,18 @@ Un connecteur déclare :
 * `execute(action, idempotency_key)` : l'effet ; la clé est TOUJOURS
   l'`action_id`. Renvoie une `Outcome` : `confirmed`, `failed` (échec
   CERTAIN, aucun effet) ou `unknown`. Dans le doute : `unknown`, jamais
-  `failed` ;
+  `failed`. Un échec de transport ANTÉRIEUR à l'écriture de la requête
+  (résolution de nom, connexion refusée ou expirée, poignée de main TLS)
+  lève `NotSentError` : la porte le règle `failed` (« not sent »), donc
+  rejouable avec la même clé ;
 * `reconcile(action)` : retrouve l'issue par une lecture ; `None` =
   introuvable, une `Outcome` `unknown` = lue mais rien de certain (son
   détail dit pourquoi) : la décision revient à un humain. Même règle
   qu'`execute` : `confirmed` sur preuve, `failed` sur échec certain.
 
 La porte (`ameesh.actions`) appelle `execute` seulement après avoir écrit
-`launched` en base ; une exception, un délai dépassé ou une perte de
-connexion pendant l'appel donnent `unknown`.
+`launched` en base ; une exception autre que `NotSentError`, un délai
+dépassé ou une perte de connexion pendant l'appel donnent `unknown`.
 """
 from __future__ import annotations
 
@@ -38,6 +41,22 @@ DEFAULT_TIMEOUT = 60.0
 
 class ConnectorError(RuntimeError):
     """Connecteur inconnu ou mal configuré (jamais une issue d'action)."""
+
+
+class NotSentError(RuntimeError):
+    """Échec certain AVANT l'écriture de la requête : rien n'a été envoyé.
+
+    Le connecteur la lève quand la résolution de nom, la connexion (refusée
+    ou expirée) ou la poignée de main TLS échoue avant le premier octet de la
+    requête : aucun effet n'a pu se produire. La porte règle alors la tentative
+    `failed` avec le détail « not sent », libère une réservation et autorise
+    `action retry <id> --standing` sous le MÊME `action_id`.
+
+    Ne jamais la lever après l'écriture de la requête : un délai de lecture,
+    une réponse perdue ou toute autre exception restent `unknown`, car l'effet
+    peut avoir eu lieu. (Ce n'est pas une `ConnectorError` : ce n'est ni un
+    connecteur inconnu ni une configuration invalide.)
+    """
 
 
 @dataclass(frozen=True)

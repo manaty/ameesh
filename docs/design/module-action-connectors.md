@@ -24,6 +24,16 @@ return a confirmed or certainly failed outcome, or `None` when it cannot tell.
 A `guaranteed` connector must actually deduplicate that same action key. The
 optional timeout has the same meaning as for built-in connectors.
 
+A transport failure raised **before any byte of the request is written** — name
+resolution, refused or timed-out connection, TLS handshake — is a certain
+failure: raise `ameesh.connectors.NotSentError` (never raise it after sending).
+The gate settles the attempt `failed` with a `not sent` detail, releases a
+standing reservation, and `ameesh action retry <id> --standing` replays the same
+`action_id`, hence the same deduplication key. A read timeout after the request
+was sent, a lost response, or any other exception stays `unknown`, because the
+effect may have happened. A request the external system received and rejected is
+a certain `Outcome.failed`, not `NotSentError`.
+
 Names are global. A module cannot replace `shell-noop`, `git-merge`, or another
 module's connector. Discovery reports the refused module and the collision;
 requesting an unknown connector never imports a path supplied by the canon.
