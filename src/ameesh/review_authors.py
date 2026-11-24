@@ -6323,6 +6323,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     l'abrégé puis rapatrié), descend d'un gel antérieur, n'est plus ancêtre de
     la tête et dont l'acteur était relecteur désigné de ce gel. Une forge
     muette sur un commit absent localement est un doute (`doubts_out`).
+    #8228 : un correctif de relecteur **gelé** puis reporté auteur (#2924) et
+    dont la réécriture par l'auteur est prouvée par sa citation (#7252) sort
+    des auteurs quand aucun autre commit de la plage courante ne le porte : il
+    reste dans `correctors`, famille vide, et sa famille redevient éligible. Un
+    simple squash/consolidation à contenu identique ne prouve pas la
+    réécriture (#3518) ; la réémission verbatim par la référence (#4387) est
+    dispensée en amont par `_carried_from_previous`. Un doute (`unresolved`,
+    `stacked_lot`) ne retire jamais l'auteur.
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -6675,6 +6683,44 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         # doit jamais effacer l'autre famille.
         by_name.setdefault(str(row["name"]), set()).update(
             str(value) for value in values if str(value or "").strip())
+    # #8228 : un correctif de relecteur **prouvé réécrit** par l'auteur (§2,
+    # reçu exact ou citation) n'est pas un contenu de cette tête. Son acteur
+    # sort des auteurs quand aucun **autre** commit de la plage courante ne le
+    # porte ; il reste correcteur, exclu par son nom, et sa famille redevient
+    # éligible. Le report d'auteur de #2924 s'applique à un contenu qui
+    # survit : il ne peut pas contredire la preuve de réécriture. Un doute
+    # (`unresolved`, #4679 ; `stacked_lot`, #5066) ne retire jamais l'auteur.
+    unattached: list = []
+    rewritten_rows = _rewritten_after_freeze(
+        db, item, milestone, repo, head=head, strict=strict,
+        fetch=fetch, recover=recover, commits=commits, provider=provider,
+        reference_author=author_name,
+        unattached=(unattached if doubts_out is not None else None))
+    rewritten_only: set[str] = set()
+    for key, row in rewritten_rows.items():
+        key = str(key or "").strip().lower()
+        if not key or key == author_name.casefold():
+            continue
+        if not str(row.get("rewritten") or "").strip():
+            continue
+        # #3518 : la disparition topologique du commit du relecteur (squash,
+        # consolidation à contenu identique) ne prouve pas une réécriture de
+        # l'auteur ; le contenu survit et #2924 garde alors sa famille exclue.
+        # Cette levée exige la citation de l'auteur (#7252) ; la réémission
+        # verbatim par la référence (#4387) est déjà dispensée par
+        # `_carried_from_previous`.
+        if not str(row.get("cited") or "").strip():
+            continue
+        if row.get("unresolved") or row.get("stacked_lot"):
+            continue
+        if authoring.get(key):
+            continue                  # un commit non réécrit le porte encore
+        rewritten_only.add(key)
+        for name in [name for name in by_name if name.casefold() == key]:
+            by_name.pop(name, None)
+        if commits_out is not None:
+            for name in [name for name in commits_out if name.casefold() == key]:
+                commits_out.pop(name, None)
     # #7745 : la lecture par delta d'auteur. La famille de chaque commit est
     # celle de ses acteurs dans la lecture finale (correcteurs promus et gels
     # antérieurs compris) ; un acteur sans commit de la plage courante — le gel
@@ -6773,28 +6819,37 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                          str(row.get("family") or ""),
                          row.get("families") or (),
                          test_only=bool(row.get("test_only")))
-    # #4457 : un correctif de relecteur poussé **après** la tête gelée puis
+    # #4457/#8228 : un correctif de relecteur poussé **après** la tête gelée puis
     # réécrit par l'auteur n'est dans aucune plage ni aucun gel : son acteur
     # reste exclu par son nom, sans famille (le §2 laisse un autre agent de la
-    # même famille relire). Une trace de correcteur survivante garde, elle, sa
-    # famille : ne jamais l'effacer.
-    unattached: list = []
-    for row in _rewritten_after_freeze(
-            db, item, milestone, repo, head=head, strict=strict,
-            fetch=fetch, recover=recover, commits=commits, provider=provider,
-            reference_author=author_name,
-            unattached=(unattached if doubts_out is not None else None)).values():
-        key = str(row.get("name") or "").strip().lower()
-        if not key or key in corrector_rows:
+    # même famille relire). #8228 : quand ce correctif avait lui-même été gelé
+    # puis reporté par `_carried_from_previous`, la trace survivante portait sa
+    # famille et l'acteur restait auteur ; la preuve de réécriture le retire des
+    # deux, garde son nom de correcteur et rend sa famille éligible. Une trace
+    # de correcteur **non réécrite** garde, elle, sa famille : ne jamais
+    # l'effacer.
+    for key, row in rewritten_rows.items():
+        key = str(key or "").strip().lower()
+        if not key:
             continue
-        corrector_rows[key] = {"name": row["name"], "family": "",
-                               "proven": set(), "test_only": False,
-                               "rewritten": str(row.get("rewritten") or ""),
-                               "cited": str(row.get("cited") or ""),
-                               "unresolved": str(row.get("unresolved") or ""),
-                               "stacked_lot": int(row.get("stacked_lot") or 0),
-                               "stacked_unread": int(row.get("stacked_unread") or 0),
-                               "freeze": int(row.get("freeze") or 0)}
+        existing = corrector_rows.get(key)
+        if existing is not None and key not in rewritten_only:
+            continue
+        if existing is None:
+            existing = {"name": row["name"], "family": "", "proven": set(),
+                        "test_only": False}
+            corrector_rows[key] = existing
+        elif key in rewritten_only:
+            existing["proven"] = set()
+            existing["family"] = ""
+            if families_out is not None:
+                families_out[key] = set()
+        existing["rewritten"] = str(row.get("rewritten") or "")
+        existing["cited"] = str(row.get("cited") or "")
+        existing["unresolved"] = str(row.get("unresolved") or "")
+        existing["stacked_lot"] = int(row.get("stacked_lot") or 0)
+        existing["stacked_unread"] = int(row.get("stacked_unread") or 0)
+        existing["freeze"] = int(row.get("freeze") or 0)
     if doubts_out is not None:
         # #4679 B/P2 : reçus introuvables sans lot, à dire au gel — jamais des
         # correcteurs : ils n'entrent ni dans `corrector_rows` ni dans la porte.
