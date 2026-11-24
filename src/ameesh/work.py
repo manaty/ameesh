@@ -792,7 +792,7 @@ def add(
             return existing
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
-    if footprint is None and not _is_vehicle_branch(branch):
+    if footprint is None and type != "follow-up" and not _is_vehicle_branch(branch):
         # #4818 : l'analyse d'impact (lecture seule, bornée) remplace la
         # seule lecture des chemins cités ; elle est journalisée à la création
         from . import work_footprints
@@ -950,11 +950,18 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             external_executor=None, external_session=None,
             footprint=None, impact=None) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
+    if type == "follow-up":
+        if not assignee:
+            raise WorkError("follow-up requires an assignee; it never enters the team queue")
+        if branch or branch_target or estimate not in (None, "") or size:
+            raise WorkError("follow-up has no branch, estimate or change size")
+        team_queue = False
+        footprint, impact = [], None
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
         minutes = estimates.parse(estimate)
-    if type not in ("bug", "evolution"):
+    if type not in ("bug", "evolution", "follow-up"):
         from .modules import registry as module_registry
         if not module_registry.admits(db, app or workstream or "", type):
             raise WorkError("unknown type %r for project %r: enable its module in the canon"
@@ -2822,7 +2829,8 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     # non plus dans la file d'équipe (#540).
     # #4756 : le lot de découpage non plus — c'est un geste du pilote.
     from .file_decoupage import is_split_lot
-    queued = (None if _is_vehicle_branch(branch or item.get("branch")) or is_split_lot(item)
+    queued = (None if item.get("type") == "follow-up"
+              or _is_vehicle_branch(branch or item.get("branch")) or is_split_lot(item)
               else _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                                 % (check["assignee"], previous or "nobody")))
     # L165 (EP4) : l'attribution est un geste du pilote hors base (elle

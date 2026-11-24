@@ -109,7 +109,8 @@ def is_exempt(row: dict) -> bool:
     (`_EXEMPT`)."""
     from . import packet_guard
     source = str(row.get("source") or "")
-    return (packet_guard.is_packet_branch(row.get("branch") or "")
+    return (row.get("type") == "follow-up"
+            or packet_guard.is_packet_branch(row.get("branch") or "")
             or source == "decision" or source.startswith("file-decoupage:"))
 
 

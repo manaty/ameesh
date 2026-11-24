@@ -147,6 +147,11 @@ python3 -m ameesh.mesh_cli work list      # + column DÉLAI (phase and age, R19)
 python3 -m ameesh.mesh_cli work show 1    # milestones and durations: demande → gel → revue → fusion
 ```
 
+Personal reminders use `ameesh work add --type follow-up --title "Check the answer"
+--app <project> --assignee <avatar>`. An assignee can hold several follow-ups;
+they stay personal and require no estimate, branch or development review.
+Close them with `ameesh work close <id> --done` or `--abandoned`.
+
 Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/ameesh-approve`
 (they only set `PYTHONPATH=src`; nothing is installed into `~/.local/bin`).
 

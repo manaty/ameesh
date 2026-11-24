@@ -98,15 +98,28 @@ SOURCE_PREFIX = "file-decoupage:"
 FALLBACK_S = 3600.0
 #: marque du repli, posée une fois sur le lot de découpage
 FALLBACK_MARK = "repli " + AUDITOR_ROLES[0]
+#: #8198 : le pilote écrit sa raison sous `hold:` (et la levée sous
+#: `unhold:`), et la sentinelle de feuille de route vit dans cette raison :
+#: `hold: roadmap: épuisée nexlink — …`. Le préfixe de retenue est donc
+#: facultatif devant les deux sentinelles, jamais exigé.
+HOLD_WRAPPER = r"(?:(?:un)?hold:\s*)?"
 #: la note du pilote (§1, « Feuille de route épuisée »)
 EXHAUSTED_PREFIX = "roadmap: épuisée"
-EXHAUSTED_RE = re.compile(r"^\s*roadmap\s*:\s*épuisée\s+(\S+)", re.IGNORECASE)
+EXHAUSTED_RE = re.compile(r"^\s*" + HOLD_WRAPPER + r"roadmap\s*:\s*épuisée\s+(\S+)",
+                          re.IGNORECASE)
 #: #4623 : la note qui rouvre la feuille de route ; deux orthographes déclarées
 REOPENED_PREFIX = "roadmap: rouverte"
-REOPENED_RE = re.compile(r"^\s*roadmap\s*:\s*r(?:é)?ouverte\s+(\S+)", re.IGNORECASE)
-#: toutes les notes de feuille de route, lues d'un seul préfixe : les deux
-#: formes sont ensuite départagées par leur ordre dans le journal
-ROADMAP_PREFIX = "roadmap:"
+REOPENED_RE = re.compile(r"^\s*" + HOLD_WRAPPER + r"roadmap\s*:\s*r(?:é)?ouverte\s+(\S+)",
+                         re.IGNORECASE)
+#: toutes les notes de feuille de route, lues par un seul filtre : les deux
+#: formes sont ensuite départagées par leur ordre dans le journal. Le filtre
+#: est celui des deux parseurs ci-dessus et de la requête du débit
+#: (`debit._ROADMAP_SQL` : `ltrim(note) ~* '^(?:(?:un)?hold:\s*)?roadmap\s*:'`) :
+#: préfixe de retenue facultatif, casse et blancs libres. Un `LIKE 'roadmap:%'`
+#: du store, exact et sensible à la casse, ferait diverger le journal (#8198,
+#: revue B).
+ROADMAP_NOTE_RE = re.compile(r"^\s*" + HOLD_WRAPPER + r"roadmap\s*:",
+                             re.IGNORECASE)
 #: raison de la pause opérateur posée par le sommeil, levée par elle seule
 SLEEP_REASON = "roadmap: épuisée %s (#3256 §2.3)"
 #: #4623 : raison journalisée à la levée automatique due à une réouverture
@@ -359,10 +372,16 @@ def roadmap_notes(db, item_id: int) -> list:
     """Les notes de feuille de route du lot, de la plus ancienne à la plus
     récente (#4623).
 
-    Un seul préfixe (`roadmap:`) suffit : les formes épuisée/rouverte sont
-    départagées par `roadmap_state`, dans l'ordre du journal (`id` d'événement,
-    stable et monotone pour un lot)."""
-    return _roadmap_order(work.events_noted(db, int(item_id), ROADMAP_PREFIX))
+    Un seul filtre (`ROADMAP_NOTE_RE`) suffit : les formes épuisée/rouverte
+    sont départagées par `roadmap_state`, dans l'ordre du journal (`id`
+    d'événement, stable et monotone pour un lot). #8198 : la sentinelle peut
+    être écrite dans la raison d'un `hold:`/`unhold:` ; le filtre est celui
+    des parseurs et du SQL du débit — casse et blancs libres —, jamais un
+    `LIKE` de préfixe exact, qui laisserait le journal (et le sommeil) voir
+    moins que le débit (revue B)."""
+    rows = [row for row in work.events(db, int(item_id), None) or ()
+            if ROADMAP_NOTE_RE.match(str((row or {}).get("note") or ""))]
+    return _roadmap_order(rows)
 
 
 def roadmap_state(notes: list, project: str) -> str | None:

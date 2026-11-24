@@ -120,6 +120,15 @@ nouveau. L'alerte `roadmap_exhausted` suit la même règle et disparaît dès la
 réouverture. Le sommeil s'arrête aussi au classement du lot de découpage,
 comme avant.
 
+#8198 : le pilote note souvent sa raison sous `hold:` (et sa levée sous
+`unhold:`), la sentinelle vivant alors dans cette raison —
+`hold: roadmap: épuisée <projet> — …`. Le préfixe `hold:`/`unhold:` est donc
+facultatif devant `roadmap:`, lu par le sommeil, le débit, le journal du lot et
+la règle 1 (les quatre lecteurs), sans changer le sens de la dernière note.
+La lecture du journal (`ROADMAP_NOTE_RE`) applique le même filtre que le SQL
+du débit (`~*`, `roadmap\s*:`) : casse et blancs libres, sinon le sommeil et
+la règle 1 verraient moins que le débit (revue B).
+
 ### 2.4 Acceptation de A
 
 - Un projet sans lot démarrable, avec 20 % d'agents au repos depuis 30 min,
