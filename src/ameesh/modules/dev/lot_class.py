@@ -295,6 +295,48 @@ def declared_repo_paths(cfg, item: dict) -> list[str]:
     return paths
 
 
+def named_repo_paths(cfg, item: dict, slug: str) -> list[str]:
+    """Les clones locaux dont l'`origin` est le dépôt GitHub `slug` (#8236).
+
+    Le gel d'un lot peut désigner un **autre** dépôt que celui de son `app`
+    (`ameesh-freeze-repo:`, #2603/#6735) : un lot du canon a sa tête dans le
+    clone du canon de l'hôte, pas dans celui du projet. `repository()` ne le
+    voit qu'une fois le `pr_ref` écrit — à la fermeture — et la porte restait
+    alors « inconclusive » sur un lot ouvert.
+
+    On lit donc les clones **lisibles** des canons configurés et les clones
+    que l'hôte déclare pour l'app du lot (`declared_repo_paths`), et on ne
+    garde que ceux dont l'origine est ce dépôt. Le chemin n'est qu'une
+    **piste** : l'appelant garde la règle « seul le commit exact décide ».
+    """
+    wanted = str(slug or "").strip().lower()
+    if not wanted or cfg is None:
+        return []
+    paths: list[str] = []
+    try:
+        clones = canon_clones(cfg)
+    except Exception:  # noqa: BLE001 - canons illisibles : les déclarés restent
+        clones = []
+    for path, known in clones:
+        if known == wanted:
+            paths.append(path)
+    try:
+        declared = declared_repo_paths(cfg, item)
+    except Exception:  # noqa: BLE001 - réglages illisibles : les canons restent
+        declared = []
+    for path in declared:
+        if path in paths:
+            continue
+        try:
+            # Le slug est mémorisé par chemin (comme pour les canons) : la
+            # porte lit N lots d'une passe sans relancer un git config.
+            if _canon_slug(path) == wanted:
+                paths.append(path)
+        except Exception:  # noqa: BLE001 - origin illisible : piste suivante
+            continue
+    return paths
+
+
 def project_target(cfg, app: str) -> str:
     """La cible déclarée du projet, ou "" (#6525).
 
