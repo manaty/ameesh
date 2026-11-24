@@ -450,8 +450,16 @@ def _report_quota_wait(cfg, db, project, slot, state, text, cutoff_at, label,
               "completed_at": now, "reset_at": float(reset),
               "resume_at": resume_at, "message": text}
     if cutoff_at is not None:
-        pending = slot.get("pending_nexlink") or {}
-        version = str(pending.get("version") or "quota-wait")
+        # The report keeps the pending candidate's version when the model's
+        # provider knows it (#7660: no client state key in the core).
+        version = "quota-wait"
+        try:
+            provider = release_cutoff.release_provider(project.model)
+            reader = getattr(provider, "pending_version", None)
+            if callable(reader):
+                version = str(reader(slot) or version)
+        except Exception:  # noqa: BLE001 - a report name never masks the wait
+            pass
         try:
             report["report_path"] = release_cutoff.write_report(
                 cfg, project, dict(report, version=version))

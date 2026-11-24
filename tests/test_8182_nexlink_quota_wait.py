@@ -246,6 +246,16 @@ class QuotaReportTest(unittest.TestCase):
         self.assertNotIn("quota_wait_until",
                          rc.load_state(self.cfg)["projects"]["nexlink"])
 
+    def test_the_wait_report_takes_the_pending_version_from_the_module(self):
+        # The core names no client state key (#7660); the module provider
+        # hands it the frozen candidate's version for the report name.
+        rc.save_state(self.cfg, {"schema": rc.SCHEMA, "projects": {
+            "nexlink": {"pending_nexlink": {"version": "11cc"}}}})
+        waited, send = self._report(
+            QUOTA, 1000.0, lambda: quota_probe(1200.0))
+        self.assertTrue(waited)
+        self.assertIn("/11cc-", send.call_args.args[4]["report_path"])
+
 
 class QuotaWaitTest(unittest.TestCase):
     def setUp(self):

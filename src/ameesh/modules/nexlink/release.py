@@ -1382,6 +1382,16 @@ def error_body(slot, text, transient):
             % (" (erreur transitoire)" if transient else "", text))
 
 
+def pending_version(slot):
+    """The version of the frozen candidate a quota wait suspends (#8182).
+
+    The core reads this hook through the release provider, so the state key
+    stays in the module that owns it and no client name enters the core
+    (#7660). Empty when no candidate is pending."""
+    pending = slot.get("pending_nexlink") or {}
+    return str(pending.get("version") or "")
+
+
 def _handoff_body(pending):
     """The durable command sent to the bureau, with its lot when opened."""
     handoff = pending["handoff"]
