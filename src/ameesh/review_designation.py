@@ -1018,17 +1018,30 @@ def _by_delta_select(*, required: int, authors, candidates, families, already,
     # un delta peut n'avoir qu'un avis alors que d'autres familles restent
     # libres pour les autres deltas.
     gaps = review_deltas.uncovered(deltas, families_now + available, required)
+    # #8209 : une famille déjà assise (siège, avis gardé ou désignée à
+    # l'instant) n'est plus « éligible » : un second avis de la même famille
+    # ne compte pas. La sortie nommait sinon la famille qu'elle venait de
+    # pourvoir (« eligible families: claude » avec auditeur/claude désigné),
+    # et le pilote cherchait un second relecteur claude que la porte refuse.
+    seated = set(families_now)
+    remaining = sorted(set(available) - seated)
+    unavailable = sorted(declared - common - seated - set(available))
     why = ("%d independent review(s) missing by author delta "
            "(eligible families: %s; forbidden author families: %s; "
            "uncovered deltas: %s)"
            % (sum(row["missing"] for row in gaps) or required,
-              ", ".join(sorted(set(available) - seat_families)) or "none",
+              ", ".join(remaining) or "none",
               ", ".join(sorted(common)) or "none",
               "; ".join("%d (author families: %s; %d missing)"
                         % (row["index"] + 1,
                            ", ".join(row["families"]) or "none",
                            row["missing"])
                         for row in gaps) or "none"))
+    if unavailable:
+        # #8209 : la famille qui manque, sans relecteur disponible (pause,
+        # sommeil humain, arrêt) : c'est elle qu'il faut attendre ou libérer.
+        why += (" (families without an available reviewer: %s)"
+                % ", ".join(unavailable))
     if fixer_names or hypothetical_names:
         why += (" (corrector(s) excluded: %s)"
                 % (", ".join(sorted(fixer_names | hypothetical_names))))
