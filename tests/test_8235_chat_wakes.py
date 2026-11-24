@@ -149,6 +149,37 @@ class ChatWakeDeliveryTest(ChatWakeCase):
         self.assertIsNotNone(veille._claimed_wake)
         self.assertIsNotNone(veille.due(now=1005.0))
 
+    def test_serving_news_does_not_consume_the_held_wake(self):
+        """B/P1 #46308 : une nouvelle ordinaire servie au-delà de `max_defer`
+        ne doit pas emporter le réveil retenu que `delivered` n'a pas écrit."""
+        lot = self.arm(time.time() - 1)
+        clock = _Clock(1000.0)
+        veille = self.veille(now=clock)
+        veille.observe([], [])
+        veille._pump_wakes()
+        self.assertIsNotNone(veille._claimed_wake, "réveil échu réclamé")
+        # frappe récente : le réveil attend ; une nouvelle plus vieille que
+        # `max_defer` passe quand même (une session occupée n'affame pas la veille)
+        veille.note_human(999.0)
+        veille._text = "[veille ameesh] ligne ordinaire"
+        veille._text_at = 99.0
+        self.assertEqual(veille.due(now=clock.t), "[veille ameesh] ligne ordinaire")
+        veille.delivered()                           # c'est cette ligne qui a été écrite
+        self.assertIsNone(veille._served_wake, "le réveil n'a pas été écrit")
+        self.assertIsNotNone(veille._claimed_wake, "le réveil reste retenu")
+        self.assertIsNotNone(self.wake_at(lot), "rien n'est consommé")
+        self.assertFalse(any(n.startswith("wake: scheduled wake delivered")
+                             for n in self.notes(lot)))
+        veille._pump_wakes()                         # la passe renouvelle le bail
+        self.assertIsNotNone(veille._claimed_wake)
+        self.assertIsNotNone(self.wake_at(lot))
+        # passé `max_defer` depuis la première lecture, le réveil est servi
+        clock.t = 1901.0
+        self.assertIn("#%d" % lot, veille.due(now=clock.t))
+        veille.delivered()
+        veille._pump_wakes()
+        self.assertIsNone(self.wake_at(lot), "le réveil rendu est consommé")
+
     def test_a_busy_harness_holds_the_wake_without_claiming_it(self):
         lot = self.arm(time.time() - 1)
         phase = {"value": chat.PHASE_BUSY}

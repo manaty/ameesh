@@ -1136,6 +1136,9 @@ class Veille:
         self._wake_seen_at: float | None = None
         self._claimed_wake: dict | None = None
         self._served_wake: dict | None = None
+        #: le réveil que la dernière `due` a rendu (et non un réveil réclamé
+        #: entre-temps) ; `delivered` ne promeut que celui-là
+        self._serving: dict | None = None
         self._draft_open = False
         self._tail = b""             # dernier octet de la lecture précédente
         self._last_human = 0.0
@@ -1284,6 +1287,10 @@ class Veille:
         """
         now = self.now() if now is None else float(now)
         with self._lock:
+            # #8235 : `delivered` ne promeut que le réveil que cette lecture a
+            # rendu. Une ligne ordinaire — ou rien — ne doit pas consommer un
+            # réveil retenu, même réclamé entre-temps par `_loop`.
+            self._serving = None
             # brouillon humain ouvert : on ne l'écrase pas, même au-delà de
             # `max_defer` ; il se ferme sur Entrée ou Ctrl-C
             if self._draft_open:
@@ -1295,6 +1302,7 @@ class Veille:
                 if self.phase() != PHASE_STOP:
                     return None
                 self._last_served = now
+                self._serving = wake
                 return wake_line(wake)
             text = self._text
             if not text:
@@ -1316,18 +1324,23 @@ class Veille:
             return text
 
     def delivered(self) -> None:
-        """#8235 : la ligne vient d'être écrite dans le pty. Si c'était un
-        réveil réclamé, il devient « servi » : `_loop` le consommera à sa
-        passe suivante (le stockage écrit alors la ligne
-        `wake: scheduled wake delivered` au journal du lot).
+        """#8235 : la ligne vient d'être écrite dans le pty. Si c'était le
+        réveil que la dernière `due` a rendu, il devient « servi » : `_loop`
+        le consommera à sa passe suivante (le stockage écrit alors la ligne
+        `wake: scheduled wake delivered` au journal du lot). Un réveil
+        simplement retenu, ou réclamé entre `due` et l'écriture, n'est pas
+        promu : seule la ligne réellement rendue compte.
 
         Aucune opération de base ici : le fil du terminal ne touche que la
         mémoire. La consommation, dans `_loop`, ne lève jamais : son échec
         laisse le bail expirer et le réveil revenir."""
         with self._lock:
-            taken, self._claimed_wake = self._claimed_wake, None
-            if taken is not None:
-                self._served_wake = taken
+            served, self._serving = self._serving, None
+            if served is None:
+                return
+            if self._claimed_wake is served:
+                self._claimed_wake = None
+            self._served_wake = served
 
     def pending_text(self) -> str | None:
         with self._lock:
