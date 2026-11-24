@@ -3,9 +3,10 @@
 
 The clone of the host that runs `ameesh release catchup` may lag the release
 tags (BG named v1.68.0 while v1.71.0 was active). `staging_deferred.baseline`
-refreshes the tags from the project's remote before reading them, refuses
-explicitly when that refresh fails, and refuses to declare against an older
-release when a newer attestation already reports the host.
+refreshes the tags from the project's remote before reading them and refuses
+explicitly when that refresh fails. A newer untagged staging run (§11 bis,
+outside the cutoff) still reports a server it cannot root; it does not
+refuse the gesture: the latest *tagged* attestation is the baseline.
 
 The fixture is a real bare origin, a real seed and real clones: no network,
 no host, no database.
@@ -148,20 +149,22 @@ class BaselineTagsTest(GitFixture):
         fetch.assert_not_called()
 
 
-class NewerReportsTest(GitFixture):
-    def test_a_newer_report_refuses_the_older_baseline(self):
+class NewerStagingTest(GitFixture):
+    def test_a_newer_untagged_staging_reporting_the_host_does_not_block(self):
+        """§11 bis packet staging: untagged, and still reports the server.
+
+        The declaration (ok or failed) keeps the latest tagged release as its
+        baseline; it is not refused until the next tagged cutoff.
+        """
         repo = self.clone()
-        self.commit("staged")                    # staged, not tagged yet
+        self.commit("staged")                    # packet staging, no tag
         newer = self.push_main()
         rows = [attestation(newer, reportes={HOST: {"raison": "deferred"}},
                             date="2026-11-24T01:00:00Z"),
                 attestation(self.old, reportes={HOST: {"raison": "deferred"}})]
-        with self.assertRaises(release_cutoff.ReleaseError) as caught:
-            self.baseline(repo, rows)
-        message = str(caught.exception)
-        self.assertIn(newer[:12], message)
-        self.assertIn("2026-11-24T01:00:00Z", message)
-        self.assertIn(OLD_TAG, message)
+        base = self.baseline(repo, rows)
+        self.assertEqual(base["sha"], self.old)
+        self.assertEqual(base["tag"], OLD_TAG)
 
     def test_a_newer_attestation_that_does_not_report_the_host_does_not_block(self):
         repo = self.clone()
