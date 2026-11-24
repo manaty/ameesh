@@ -15,10 +15,14 @@ l'exécuteur de l'hôte d'arrivée.
 from __future__ import annotations
 
 import dataclasses
+import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
-from ameesh import alert_briefs, exploitation, registry, relocation, storage, work
+from ameesh import (alert_briefs, exploitation, mail, notify, registry, relocation,
+                    storage, work)
 from ameesh.notify import Notifier, NotifyConfig
 from ameesh.runner import AgentWorker, Runner
 
@@ -167,6 +171,85 @@ class FollowUpUnfollowedTest(PgTestCase):
         found = [a for a in exploitation.alerts(self.cfg, self.db, now=time.time() + GRACE + 1)
                  if a["type"] == "follow_up_unfollowed"]
         self.assertEqual([a["lot"] for a in found], [lot])
+
+
+class OneBriefPerEpisodeTest(unittest.TestCase):
+    """Relecture ameesh-cx2, B #46282 : un tour ouvert après la levée ne la
+    retire pas. Cycle complet par le notificateur : repos (brief), tour,
+    retour au repos avant l'heure — un seul brief ; le réarmement ou la
+    clôture ferment l'épisode, le suivant est briefé de nouveau."""
+
+    T0 = 1_000_000.0
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.rows = [self.row()]
+        self.store = mock.Mock()
+        self.store.work.follow_up_watch.side_effect = lambda: list(self.rows)
+        for target, attr, value in ((storage, "of", self.store),
+                                    (mail, "send", 1),
+                                    (notify.fil, "record", "thread-id")):
+            patch = mock.patch.object(target, attr, return_value=value)
+            started = patch.start()
+            self.addCleanup(patch.stop)
+            if attr == "send":
+                self.send = started
+        self.notifier = notify.Notifier(
+            SimpleNamespace(canon=(), state_dir=self.tmp.name),
+            notify.parse_config({"default": []}), sender=object(),
+            log=lambda text: None)
+
+    def row(self, **extra):
+        return dict(dict(id=7, title="Check the answer", state="qa",
+                         assignee="avatar", created_ts=self.T0, delivered_ts=None,
+                         noted_ts=None, disarmed_ts=None, wake_ts=None), **extra)
+
+    def agent(self, *, working_since=None):
+        row = dict(name="avatar", team="ameesh", mode="execute", lease_live=True,
+                   status="idle", status_since_ts=self.T0 - 600,
+                   responsible="human:alice")
+        if working_since is not None:
+            row.update(status="running", turn_started_ts=working_since)
+        return row
+
+    def run_pass(self, now, **agent):
+        listing = [self.agent(**agent)]
+        self.store.operations.listing.side_effect = lambda: listing
+        alerts = exploitation._follow_ups_unfollowed(object(), listing, now)
+        self.notifier._brief_agents(object(), alerts, None, now)
+        return alerts
+
+    def briefs(self):
+        return [call.args[2] for call in self.send.call_args_list]
+
+    def test_idle_working_idle_before_the_hour_briefs_once(self):
+        raised = self.T0 + GRACE + 60
+        self.assertTrue(self.run_pass(raised))
+        self.assertEqual(self.briefs(), ["avatar"])
+        # tour ouvert après la levée : l'alerte reste, sa trace aussi
+        self.assertTrue(self.run_pass(raised + 60, working_since=raised + 30))
+        self.assertTrue(self.run_pass(raised + 540))
+        self.assertEqual(self.briefs(), ["avatar"], "une alerte par épisode")
+
+    def test_a_turn_already_running_at_the_raise_still_defers_it(self):
+        self.assertEqual(self.run_pass(self.T0 + GRACE + 60,
+                                       working_since=self.T0 + 30), [])
+        self.assertEqual(self.briefs(), [])
+
+    def test_rearm_then_close_end_the_episode(self):
+        raised = self.T0 + GRACE + 60
+        self.run_pass(raised)
+        self.rows = [self.row(wake_ts=raised + 3600)]
+        self.assertEqual(self.run_pass(raised + 60), [])
+        # le réveil réarmé est délivré sans note : nouvel épisode, nouveau brief
+        delivered = raised + 3600
+        self.rows = [self.row(delivered_ts=delivered, disarmed_ts=delivered)]
+        self.assertTrue(self.run_pass(delivered + GRACE + 60))
+        self.assertEqual(self.briefs(), ["avatar", "avatar"])
+        self.rows = []
+        self.assertEqual(self.run_pass(delivered + GRACE + 120), [])
+        self.assertEqual(self.briefs(), ["avatar", "avatar"])
 
 
 class RoutingTest(unittest.TestCase):
