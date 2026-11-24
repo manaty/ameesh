@@ -545,7 +545,9 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     rows = []
     out = []
     for r in open_items:
-        if r.get("last_activity_ts") is None or sous_utilisation.is_backlog_item(r):
+        # #8194 : un suivi n'a pas de mouvement de lot à attendre : jamais inerte
+        if (r.get("last_activity_ts") is None or sous_utilisation.is_backlog_item(r)
+                or lifecycle.is_follow_up(r)):
             continue
         try:
             idle = now - float(r["last_activity_ts"])
