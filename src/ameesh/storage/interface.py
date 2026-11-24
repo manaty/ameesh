@@ -1774,6 +1774,18 @@ class Credentials(Domain):
         written."""
 
     @abc.abstractmethod
+    def probe_streak(self, host: str, harness: str, account: str, *, healthy: bool,
+                     interval: float, expect_failures: int | None = None) -> int | None:
+        """#8200: one kept probe on a `failing` row whose verdict does not
+        prove a new credential. A `healthy` probe counts toward the recovery
+        series when at least `interval` seconds have passed since the last
+        counted one, and restarts it when a failure newer than that anchor
+        was recorded; any other verdict breaks the series. Stamps the probe
+        heartbeat (`checked_at`, `probed_at`). Returns the new series length
+        (0 included), or None when the row moved (the failure count is no
+        longer `expect_failures`) and nothing was written."""
+
+    @abc.abstractmethod
     def health(self, host: str, harness: str) -> dict[str, dict]:
         """{account: row} for a harness on a host: state, reason, source,
         checked_ts, probed_ts, probe_missing_ts, failing_since_ts, expires_ts,

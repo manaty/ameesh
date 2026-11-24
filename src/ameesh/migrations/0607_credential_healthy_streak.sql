@@ -1,0 +1,24 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- 0607_credential_healthy_streak — #8200 : lever un refus transitoire d'une
+-- credential vérifiée par le serveur.
+--
+-- Une sonde `gh` ou `scw` interroge le service à chaque passe : un verdict
+-- sain est la preuve du serveur lui-même, pas une simple présence locale
+-- comme `claude`/`codex` (#210 r4). Un refus transitoire du service (le même
+-- jeton est ensuite accepté) laissait pourtant la ligne `failing` à vie,
+-- faute de credential neuve à présenter. La sonde compte désormais deux
+-- sondes saines consécutives espacées d'au moins quinze minutes ; la seconde
+-- lève l'échec.
+--
+-- `healthy_streak` est le nombre de sondes saines comptées depuis le dernier
+-- échec, `healthy_probe_at` la date de la dernière comptée (l'espacement se
+-- mesure depuis elle). Un `report` (échec, sain, inconnu) remet la série à
+-- zéro ; la sonde la redémarre aussi quand `last_failure_at` est plus récent
+-- que l'ancre, pour qu'un échec écrit par un N-1 (qui ne connaît pas ces
+-- colonnes) ne soit pas levé par une série commencée avant lui.
+--
+-- Migration ADDITIVE et compatible N-1 : l'ancien code ne lit ni n'écrit ces
+-- colonnes ; un `report` ancien les laisse telles quelles, et la garde
+-- ci-dessus empêche alors la série de traverser son échec.
+alter table credential_health add column if not exists healthy_streak integer not null default 0;
+alter table credential_health add column if not exists healthy_probe_at timestamptz;

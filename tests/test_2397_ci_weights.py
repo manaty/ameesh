@@ -104,6 +104,26 @@ class WeightsScaleTest(unittest.TestCase):
                                "psycopg", card),
             {"test_l116_parts": 10.0, "test_l161e_map": 16.0, "test_canon": 40.0})
 
+    def test_split_weights_table_complete_sans_surcout(self):
+        # #3754/#8208 : quand la table couvre tous les modules découpés, elle
+        # est déjà à l'échelle du job (relevé de flux de ci-full) et ne subit
+        # plus le surcoût de la carte, qui gonflait uniformément toutes les
+        # parts (3,45x sur le paquet h-03) sans changer leur affectation.
+        self.chemin.write_text(json.dumps({
+            "_source": "test",
+            "psycopg": {"test_l116_parts": 5.0, "test_l161e_map": 8.0,
+                        "test_canon": 7.0},
+        }), encoding="utf-8")
+        card = _card({
+            "test_l116_parts": {"durations": {"psycopg": 30.0}},
+            "test_l161e_map": {"durations": {"psycopg": 40.0}},
+            "test_canon": {"durations": {"psycopg": 40.0}},
+        }, surcout={"psycopg": 2.0})
+        self.assertEqual(
+            plan.split_weights(["test_l116_parts", "test_l161e_map", "test_canon"],
+                               "psycopg", card),
+            {"test_l116_parts": 5.0, "test_l161e_map": 8.0, "test_canon": 7.0})
+
     def test_sans_carte_table_brute(self):
         self.assertEqual(plan.weights(["test_l116_parts", "test_l161e_map"], "psql", None),
                          {"test_l116_parts": 10.0, "test_l161e_map": 20.0})
