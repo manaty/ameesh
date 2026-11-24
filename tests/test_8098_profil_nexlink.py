@@ -55,7 +55,13 @@ class NexlinkProfileTest(unittest.TestCase):
               'echo not-node > "$out"\n')
 
     def env(self, **extra) -> dict:
-        env = {"PATH": self.bin + ":/usr/bin:/bin", "TMPDIR": self.tmp,
+        # Les faux binaires d'abord ; le PATH de l'hôte ensuite, pour que
+        # l'outil GNU dont dépend le profil (`sha256sum`, installé par la CI
+        # macOS via coreutils) reste joignable. Un PATH minimal le cachait et
+        # le setup échouait sur « sha256sum: command not found » avant même
+        # de vérifier l'empreinte (#8203).
+        env = {"PATH": self.bin + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+               "TMPDIR": self.tmp,
                "OFFLOAD_CACHE": self.cache, "OFFLOAD_JOB": "j42"}
         env.update(extra)
         return env

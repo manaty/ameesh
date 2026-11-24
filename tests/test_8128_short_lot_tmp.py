@@ -4,7 +4,7 @@
 
 #8020 a donné à chaque lot un sous-dossier temporaire sous le dossier de son
 agent ; son chemin complet dépassait la marge AF_UNIX de `multiprocessing`
-(`len(TMPDIR) + 40 > 107`), et `compileall -j 0` tombait sur
+(`len(TMPDIR) + 40 > 103`), et `compileall -j 0` tombait sur
 « AF_UNIX path too long ». L'alias `~/.t/<mesh>/l<lot>-<empreinte>` pointe le
 dossier géré : quota, verrou, processus et copies Git de #8020 restent
 inchangés, et le chemin court tient la socket du forkserver.
@@ -40,14 +40,16 @@ class _Base(unittest.TestCase):
 
     def setUp(self) -> None:
         # Le banc doit avoir un chemin court : `$TMPDIR` d'une session de lot
-        # est justement le chemin long que ce lot corrige.
+        # est justement le chemin long que ce lot corrige. Le préfixe et le
+        # sous-dossier restent courts pour que la marge AF_UNIX soit vraie
+        # sous Darwin aussi (`/Users/runner` est plus long que `/home`).
         try:
-            self.base = tempfile.mkdtemp(prefix=".ameesh-8128-",
+            self.base = tempfile.mkdtemp(prefix=".a8128-",
                                          dir=os.path.expanduser("~"))
         except OSError:
             self.skipTest("no writable home for a short temporary root")
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
-        self.home = os.path.join(self.base, "home")
+        self.home = os.path.join(self.base, "h")
         os.makedirs(self.home)
         patcher = mock.patch.dict(os.environ, {"HOME": self.home})
         patcher.start()
@@ -160,10 +162,12 @@ class AliasCourtTest(_Base):
 
 
 class MargeCheminTest(unittest.TestCase):
-    def test_marge_af_unix_borne_exactement_107_octets(self):
-        # 67 + marge 40 = 107 : la borne du noyau passe ; 68 la dépasse.
-        self.assertTrue(menage._short_path_ok("x" * 67))
-        self.assertFalse(menage._short_path_ok("x" * 68))
+    def test_marge_af_unix_borne_portative_103_octets(self):
+        # 63 + marge 40 = 103 : `sun_path` de Darwin (104 octets, NUL
+        # compris) passe ; 64 la dépasse. Linux (108) accepte plus, mais la
+        # borne retenue est la plus stricte des deux plateformes.
+        self.assertTrue(menage._short_path_ok("x" * 63))
+        self.assertFalse(menage._short_path_ok("x" * 64))
 
 
 class CheminReelTest(_RealBase):

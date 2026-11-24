@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import stat as stat_mod
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -462,6 +463,9 @@ class CardTest(_TmpMixin, unittest.TestCase):
                          ["a", "c"])
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"),
+                     "deploy/guest/install.sh provisionne un invité Linux "
+                     "(systemd, apt, /proc/meminfo)")
 class InstallScriptTest(unittest.TestCase):
     """L'installation n'applique le groupe que si la fiche le déclare."""
 
