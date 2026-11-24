@@ -10,6 +10,8 @@ import datetime
 import dataclasses
 import hashlib
 import subprocess
+import sys
+import time
 import urllib.request
 import urllib.error
 import json
@@ -585,21 +587,55 @@ def ensure_ref(project, ref, sha):
             project.remote, "%s:%s" % (sha, ref), check=True)
 
 
+#: #8256: a 401 is the API refusing the request before any side effect, so the
+#: command did not run and replaying it is safe for a read or a write. On
+#: 24/11 the same token answered 401 twice (10:40Z, 22:42Z) and was accepted
+#: again seconds later. The waits span ~65 s, longer than both observed
+#: refusals, so one tick crosses the flap instead of alarming the pilot and
+#: waiting for the next one.
+GH_AUTH_RETRY_DELAYS = (2.0, 5.0, 15.0, 40.0)
+
+
 def gh(project, args):
-    # #8182: GH_DEBUG=api makes gh print the refusal's status, headers and
-    # body on stderr. The shared quota detector needs the original response
-    # (a secondary limit's Retry-After is not replayed by /rate_limit).
-    code, out, err = rc.plan_github.Gh(
-        env=dict(os.environ, GH_DEBUG="api")).run(args)
-    if code:
+    """One release `gh` call, replaying a transient HTTP 401 with backoff.
+
+    #8182: `GH_DEBUG=api` makes gh print the refusal's status, headers and
+    body on stderr. The shared quota detector needs the original response (a
+    secondary limit's Retry-After is not replayed by /rate_limit); #8256 uses
+    the same status to tell a transient authentication refusal from any other
+    failure. The command and every HTTP status are journalised; after the
+    last attempt the error names both, plus the attempt count.
+    """
+    command = ("gh " + " ".join(args))[:200]
+    attempts = len(GH_AUTH_RETRY_DELAYS) + 1
+    runner = rc.plan_github.Gh(env=dict(os.environ, GH_DEBUG="api"))
+    for attempt in range(1, attempts + 1):
+        code, out, err = runner.run(args)
+        if not code:
+            if attempt > 1:
+                print("%s: %s: recovered on attempt %d/%d" % (
+                    project.name, command, attempt, attempts),
+                    file=sys.stderr, flush=True)
+            return out
         detail = rc.plan_github.gh_error_line(err, out)
-        error = rc.TransientReleaseError(
-            "Nexlink GitHub operation failed: %s" % detail)
         refusal = rc.plan_github.debug_refusal(err)
-        if refusal is not None:
-            error.github_refusal = refusal
-        raise error
-    return out
+        status = refusal[0] if refusal is not None else None
+        if status != 401 or attempt == attempts:
+            break
+        delay = GH_AUTH_RETRY_DELAYS[attempt - 1]
+        print("%s: %s: HTTP 401 on attempt %d/%d, retry in %gs: %s" % (
+            project.name, command, attempt, attempts, delay, detail),
+            file=sys.stderr, flush=True)
+        time.sleep(delay)
+    if status is None:
+        text = "Nexlink GitHub operation failed: %s: %s" % (command, detail)
+    else:
+        text = ("Nexlink GitHub operation failed: %s: HTTP %d after %d "
+                "attempt(s): %s" % (command, status, attempt, detail))
+    error = rc.TransientReleaseError(text)
+    if refusal is not None:
+        error.github_refusal = refusal
+    raise error
 
 
 def runs(project, workflow, ref, sha):
