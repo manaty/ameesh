@@ -22,7 +22,9 @@ compatible : voir « Contrat 1.12 »), puis par les prises d'hôte lues par un
 runner médié (#7799, version `1.13.0`, compatible : voir « Contrat 1.13 »),
 puis par le plancher d'avis d'un lot (#8101, version `1.14.0`), puis par le
 courrier du jour et les actifs servis avant le stock (#8112, version
-`1.15.0`, compatible : voir « Contrat 1.15 »).
+`1.15.0`, compatible : voir « Contrat 1.15 »), puis par la date réelle de
+remise du réveil programmé (#8235, version `1.16.0`, compatible : voir
+« Contrat 1.16 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -1090,3 +1092,24 @@ ensuite. Un ancien serveur répond `404 op_not_allowed` ; le client lève
 filtrée sur l'appareil — le tour n'est pas tué, mais un stock de plus de 200
 passifs continue de retarder le courrier du jour jusqu'au déploiement du
 serveur. Un client d'avant 1.15 ignore simplement l'opération.
+
+### Contrat 1.16 : date réelle de remise du réveil (#8235)
+
+Le suivi d'un agent de conversation (`chat-*`) se juge sur ce que l'assigné a
+écrit **après** la remise de son réveil : `follow_up_watch` compte les notes
+depuis la ligne `wake: scheduled wake delivered`. Cette ligne était datée de
+la consommation, jusqu'à un pas de veille après l'écriture dans le pty ; une
+note écrite dans l'intervalle était donc ignorée et `delivered_without_note`
+se levait à tort. La dater du bail `wake_claim_at` ne convient pas non plus :
+le bail précède la remise et il est renouvelé entre-temps.
+
+Le contrat 1.16 ajoute à `lot_sessions.consume_wake` le paramètre facultatif
+`served_at` (epoch, nombre ou `null`) : c'est l'instant mural où la veille a
+écrit la ligne du réveil dans le pty, capturé après l'écriture. La ligne de
+journal est datée de cet instant ; sans lui (exécuteur, appel direct), elle
+reste datée de la consommation. Aucun autre changement d'opération.
+
+Déploiement : serveur d'abord. Un ancien client omet `served_at` et garde le
+comportement d'avant ; un ancien serveur refuse l'argument facultatif s'il
+est envoyé, mais seule la veille locale du serveur le renseigne — les
+exécuteurs distants ne l'utilisent pas et n'ont rien à déployer.
