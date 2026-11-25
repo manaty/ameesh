@@ -158,7 +158,7 @@ class FailureKindsTest(unittest.TestCase):
 
 
 class BaseRedLotTest(unittest.TestCase):
-    def call(self, outputs):
+    def call(self, outputs, sender=None):
         calls = []
 
         def fake(cmd, *, input_text=None, timeout=None, **_kw):
@@ -168,7 +168,8 @@ class BaseRedLotTest(unittest.TestCase):
         with mock.patch.object(auto, "run_command", side_effect=fake):
             lot = auto.base_red_lot(OWN, name="h-test", carrier=9,
                                     base_sha=BASE, target="main",
-                                    driver="psycopg", log=lambda _l: None)
+                                    driver="psycopg", sender=sender,
+                                    log=lambda _l: None)
         return lot, calls
 
     def test_ouvre_le_lot_avec_la_cle_durable(self) -> None:
@@ -181,6 +182,16 @@ class BaseRedLotTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--see-also") + 1], "9")
         self.assertIn(BASE, body)
         self.assertIn("psycopg", body)
+
+    def test_estimation_presente_sous_un_agent(self) -> None:
+        # B mty-amh-qa-01 : sous le tic, `--from mesh-design` est un agent
+        # enregistré ; sans estimation, L157 refuse la création du lot.
+        _lot, calls = self.call(["lot #77 created in intake: Rouge"],
+                                sender="mesh-design")
+        cmd = calls[0][0]
+        self.assertEqual(cmd[cmd.index("--actor") + 1], "mesh-design")
+        self.assertEqual(cmd[cmd.index("--estimate") + 1], "2h")
+        self.assertIn("--estimate-source", cmd)
 
     def test_relance_un_lot_existant(self) -> None:
         lot, calls = self.call([

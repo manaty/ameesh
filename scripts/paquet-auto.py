@@ -6328,6 +6328,10 @@ def notify_flaky(name: str, carrier: int, tests: list[str],
 #: de la base ; `packet_red` la relit pour classer le même rouge en CI.
 BASE_RED_REF = "paquet-rouge-base:"
 BASE_RED_LOT_RE = re.compile(r"#(\d+) (created|already exists)")
+#: L157 : un agent (le composeur passe `--from mesh-design`) ne crée pas de
+#: lot sans estimation ; forfait d'un test dépendant de l'environnement.
+BASE_RED_ESTIMATE = "2h"
+BASE_RED_ESTIMATE_SOURCE = "forfait #8262 : correction d'un test rouge sur la base"
 
 
 def base_red_lot(test: str, *, name: str, carrier: int, base_sha: str,
@@ -6357,6 +6361,8 @@ def base_red_lot(test: str, *, name: str, carrier: int, base_sha: str,
              "--type", "bug", "--priority", "1",
              "--source", "paquet-auto (#8262), rouge de la base",
              "--unique-ref", BASE_RED_REF + test,
+             "--estimate", BASE_RED_ESTIMATE,
+             "--estimate-source", BASE_RED_ESTIMATE_SOURCE,
              "--see-also", str(carrier), "--body", "-"] + actor,
             input_text=body, timeout=GIT_TIMEOUT)
     except PaquetAutoError as exc:
