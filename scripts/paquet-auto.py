@@ -893,6 +893,11 @@ class TestRun:
     #: #4221 : tests rouges sur la tête mais verts sur tous les préfixes de
     #: l'empilement (instables) : non concluants, ils ne retirent aucune unité.
     flaky_tests: list[str] = field(default_factory=list)
+    #: #8262 : tests rouges sur la tête **et** sur la base exacte du paquet,
+    #: même classe d'échec : rouges de la base, défauts du test (canon §3) ;
+    #: non concluants, ils ne retirent aucune unité et ne retiennent pas le
+    #: paquet. Un lot de déblocage les porte.
+    base_red: list[str] = field(default_factory=list)
     #: #4887 : les modules directs de l'unité (ses propres tests et ses voisins
     #: sélectionnés), tels que la série devait les jouer ; vide pour les contrats.
     direct: list[str] = field(default_factory=list)
@@ -1011,7 +1016,7 @@ class TestRun:
         """
         if self.returncode == 0:
             return False
-        if self.flaky_tests:
+        if self.flaky_tests or self.base_red:
             return False
         if self.timed_out or self.returncode != 1:
             return False
@@ -1044,7 +1049,7 @@ class TestRun:
 
     @property
     def inconclusive(self) -> bool:
-        if self.flaky_tests:
+        if self.flaky_tests or self.base_red:
             return True
         if self.timed_out or self.returncode not in (0, 1):
             return True
@@ -1068,6 +1073,10 @@ class TestRun:
             return ("test(s) rouge(s) sur la tête mais vert(s) sur tous les "
                     "préfixes (instable) : %s"
                     % ", ".join(self.flaky_tests[:3]))
+        if self.base_red:
+            return ("test(s) rouge(s) aussi sur la base du paquet, même classe "
+                    "d'échec (rouge de la base, défaut du test) : %s"
+                    % ", ".join(self.base_red[:3]))
         # #7950 : un None ne dit pas la même chose selon que la série n'est
         # jamais partie ou qu'elle a été coupée ; le journal doit le dire.
         if self.not_started:
@@ -2772,6 +2781,21 @@ def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
     lui préexiste. Les modules sont rejoués dans un worktree détaché de la base.
     #4463 : `wall` borne le rejeu en temps mural (`run_tests(wall=…)`).
     """
+    walled = {"wall": wall} if wall is not None else {}
+    found = base_failure_kinds(worktree, base_sha, modules, timeout=timeout,
+                               **walled)
+    return None if found is None else set(found)
+
+
+def base_failure_kinds(worktree: Path, base_sha: str, modules: list[str], *,
+                       timeout: int,
+                       wall: int | None = None) -> dict[str, str] | None:
+    """#8262 : `{test: classe d'échec}` des `modules` rouges sur la base.
+
+    Même rejeu que `base_failures` (worktree détaché de la base exacte, même
+    pilote `test_driver` et même environnement que les séries du paquet) ;
+    None si le rejeu n'est pas concluant (base absente, coupé, rc inattendu).
+    """
     if not base_sha or not modules:
         return None
     parent = temporary_parent()
@@ -2786,12 +2810,12 @@ def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
         present = [module for module in modules
                    if (path / (module.replace(".", "/") + ".py")).is_file()]
         if not present:
-            return set()
+            return {}
         walled = {"wall": wall} if wall is not None else {}
         run = run_tests(path, "base", present, timeout=timeout, **walled)
         if run.inconclusive:
             return None
-        return {failure["test"] for failure in unittest_failures(run.output, _unusable(run))}
+        return failure_kinds(run.output, _unusable(run))
     finally:
         remove_worktree(worktree, path)
 
@@ -3641,7 +3665,8 @@ def prepublication_contracts(worktree: Path, *, base: str,
                 if child.real_failure and not child.inconclusive:
                     child_state = "failed"
                 elif (child.green and child.finished and not child.inconclusive
-                      and not child.skipped and child.tests > 0 and not child.flaky_tests):
+                      and not child.skipped and child.tests > 0 and not child.flaky_tests
+                      and not child.base_red):
                     child_state = "passed"
                 # #6274 : un lanceur déclaré n'atteste que les modules que
                 # son flux a réellement joués ; les autres restent non concluants.
@@ -3993,6 +4018,29 @@ def unittest_failures(output: str,
         if found:
             module = found.group(1)
         out.append({"test": test, "module": module})
+    return out
+
+
+def failure_kinds(output: str,
+                  unusable_engines: frozenset = frozenset()) -> dict[str, str]:
+    """#8262 : la classe d'échec (`FAIL`, `ERROR`) de chaque test rouge.
+
+    Mêmes noms et mêmes exclusions d'environnement que `unittest_failures` :
+    un rouge de la base ne vaut pour un rouge du paquet que si c'est le même
+    test **et** la même classe d'échec.
+    """
+    out: dict[str, str] = {}
+    for match in FAIL_LINE_RE.finditer(output or ""):
+        kind, test = match.group(1), match.group(2).strip()
+        if not test or test in out:
+            continue
+        if kind == "ERROR":
+            rest = (output or "")[match.end():]
+            end = BLOCK_END_RE.search(rest)
+            block = rest[:end.start()] if end else rest
+            if TestRun._error_is_environment(block, unusable_engines):
+                continue
+        out[test] = kind
     return out
 
 
@@ -4571,16 +4619,19 @@ def budget_spent(label: str, modules: list[str], *,
 
 
 def _consign_flaky(red: list[tuple[TestRun, list[dict]]],
-                   runs: list[TestRun], names: list[str],
-                   ) -> list[tuple[TestRun, list[dict]]]:
+                   runs: list[TestRun], names: list[str], *,
+                   base: bool = False) -> list[tuple[TestRun, list[dict]]]:
     """#4221/#7239 : consigne des tests verts au rejeu comme non concluants.
 
     Retire de `red` les échecs dont le nom est dans `names` : une série qui ne
     garde aucun rouge devient non concluante (`flaky_tests`), une série mixte
     est scindée en un rouge réel et une série instable consignée à part. Rend
     `red` sans ces échecs ; `runs` porte les séries non concluantes.
+
+    #8262 : `base=True` consigne de même des rouges de la base (`base_red`).
     """
     flaky_names = set(names)
+    field_name = "base_red" if base else "flaky_tests"
     kept: list[tuple[TestRun, list[dict]]] = []
     for run, found in red:
         names_here = sorted({_failure_name(failure) for failure in found
@@ -4595,19 +4646,84 @@ def _consign_flaky(red: list[tuple[TestRun, list[dict]]],
             # rouge, l'instable est consigné à part.
             kept.append((run, left))
             runs.append(TestRun(
-                label="%s (instable)" % run.label,
+                label="%s (%s)" % (run.label,
+                                   "rouge de la base" if base else "instable"),
                 modules=sorted({"tests." + str(failure.get("module"))
                                 for failure in found
                                 if failure.get("module")
                                 and _failure_name(failure) in names_here}),
                 returncode=1,
-                output="tests rouges sur la tête mais verts sur tous les "
-                       "préfixes : %s" % ", ".join(names_here),
-                seconds=0.0, flaky_tests=names_here,
-                log_path=run.log_path))
+                output=("tests rouges sur la tête et sur la base du paquet, "
+                        "même classe d'échec : %s" if base else
+                        "tests rouges sur la tête mais verts sur tous les "
+                        "préfixes : %s") % ", ".join(names_here),
+                seconds=0.0, log_path=run.log_path,
+                **{field_name: names_here}))
         else:
-            run.flaky_tests = names_here
+            setattr(run, field_name, names_here)
     return kept
+
+
+def _owned_base_red(worktree: Path, red: list[tuple[TestRun, list[dict]]],
+                    pending: list, contract: TestRun, *, base_sha: str,
+                    skip: set[str], timeout: int, deadline: float | None,
+                    guard, log, on_base) -> list[str]:
+    """#8262 : les rouges propres/de contrat aussi rouges sur la base.
+
+    Les rouges de voisins ont déjà leur rejeu de base (#4025) et sont exclus,
+    comme les rouges consignés non attribués (`skip`) et les identités
+    opaques d'un lanceur déclaré (`FlowTestRun`, sans rejeu `unittest`).
+    Rend les noms rouges sur la tête **et** sur la base avec la même classe
+    d'échec ; [] si le rejeu n'est pas concluant (canon §3 : rien n'est
+    classé, le geste antérieur s'applique).
+    """
+    neighbors = {id(run): neighbor
+                 for _unit, run, _found, _proper, _mine, neighbor in pending}
+    head_kinds: dict[str, str] = {}
+    for run, found in red:
+        if isinstance(run, FlowTestRun):
+            continue
+        kinds = failure_kinds(run.output, _unusable(run))
+        neighbor = neighbors.get(id(run), set()) if run is not contract else set()
+        for failure in found:
+            name, module = _failure_name(failure), failure.get("module")
+            if not name or not module or name in skip or module in neighbor:
+                continue
+            if name in kinds:
+                head_kinds.setdefault(name, kinds[name])
+    if not head_kinds or not base_sha:
+        return []
+    if guard is not None:
+        guard()
+    limit = series_timeout(timeout, deadline)
+    if limit is not None and deadline is not None:
+        # même partage que le rejeu des voisins (#4887) : la moitié du temps
+        # restant, le reste aux préfixes qui attribuent ce qui reste rouge.
+        left = max(1, int(deadline - time.monotonic()))
+        limit = min(limit, max(30, left // 2))
+    walled = {"wall": limit} if deadline is not None and limit else {}
+    modules = sorted({"tests." + str(TEST_MODULE_RE.search(name).group(1))
+                      for name in head_kinds if TEST_MODULE_RE.search(name)})
+    at_base = (None if limit is None else
+               on_base(worktree, base_sha, modules, timeout=limit, **walled))
+    if at_base is None or not isinstance(at_base, dict):
+        # un ensemble de noms sans classe d'échec ne prouve pas le même rouge
+        log("tests ciblés : rejeu sur la base %s des rouges propres/de "
+            "contrat non concluant — attribution inchangée"
+            % (base_sha[:12] or "?"))
+        return []
+    same = sorted(name for name, kind in head_kinds.items()
+                  if at_base.get(name) == kind)
+    other = sorted(name for name, kind in head_kinds.items()
+                   if name in at_base and at_base[name] != kind)
+    if other:
+        log("tests ciblés : %d test(s) rouge(s) sur la base avec une autre "
+            "classe d'échec (non concluant pour la base, attribution "
+            "inchangée) : %s" % (len(other), ", ".join(other[:5])))
+    log("tests ciblés : rouges propres/de contrat rejoués sur la base %s : "
+        "%d sur %d aussi rouge(s), même classe d'échec"
+        % (base_sha[:12], len(same), len(head_kinds)))
+    return same
 
 
 def check_local_tests(worktree: Path, composition: Composition, *,
@@ -4619,8 +4735,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                       deadline: float | None = None,
                       contract_report: ContractPass | None = None,
                       legacy_contracts: bool = False,
-                      unit_tree=None) -> tuple[list[TestRun], list[int],
-                                               list[Removal]]:
+                      unit_tree=None, owned_on_base=None,
+                      ) -> tuple[list[TestRun], list[int], list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
@@ -4662,6 +4778,15 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     l'a sélectionné ; un rouge partagé reste à l'attribution et à la ci-full.
     Un rouge de module voisin aussi rouge sur la base (`base_failures`,
     injectable par `on_base`) ne compte pas : environnement ou préexistant.
+
+    #8262 : un rouge **propre** ou de **contrat** est rejoué de même sur la
+    base exacte du paquet avant tout retrait (`base_failure_kinds`,
+    injectable par `owned_on_base`). Rouge aussi sur la base, même test et
+    même classe d'échec (`FAIL`/`ERROR`) : rouge de la base, défaut du test
+    (canon §3), consigné non concluant (`base_red`), sans retrait ni arrêt.
+    Classe différente, rejeu coupé ou non concluant : rien n'est classé, le
+    geste antérieur s'applique (h-09/h-10 du 24/11 : test_7652, rouge sur
+    main, imputé aux unités).
 
     #7740 : chaque série d'unité est jouée sur son **préfixe composé**
     (`unit.commit`, l'empilement jusqu'à elle), dans un worktree détaché
@@ -5028,6 +5153,24 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     else:
         log("tests contrats : vert (%d modules, %d tests)"
             % (len(modules), contract.tests))
+    base_red = _owned_base_red(
+        worktree, red, pending, contract, base_sha=base_sha,
+        skip=unattributed, timeout=timeout, deadline=deadline, guard=guard,
+        log=log, on_base=owned_on_base or base_failure_kinds)
+    if base_red:
+        log("tests ciblés : %d rouge(s) propre(s)/de contrat aussi rouge(s) "
+            "sur la base %s, même classe d'échec : rouge(s) de la base, "
+            "consigné(s) non concluant(s) (canon §3), aucun retrait : %s"
+            % (len(base_red), base_sha[:12], ", ".join(base_red[:5])))
+        red = _consign_flaky(red, runs, base_red, base=True)
+        gone = set(base_red)
+        own = {lot: [failure for failure in found
+                     if _failure_name(failure) not in gone]
+               for lot, found in own.items()}
+        own = {lot: found for lot, found in own.items()
+               if found or lot in unparsed_lots}
+        contract_left = [found for run, found in red if run is contract]
+        contract_red = bool(contract_left and contract_left[0])
     if not red:
         return runs, [], []
     failures: list[dict] = []
@@ -6181,6 +6324,95 @@ def notify_flaky(name: str, carrier: int, tests: list[str],
     return ""
 
 
+#: #8262 : préfixe de la clé durable (#6090) du lot de déblocage d'un rouge
+#: de la base ; `packet_red` la relit pour classer le même rouge en CI.
+BASE_RED_REF = "paquet-rouge-base:"
+BASE_RED_LOT_RE = re.compile(r"#(\d+) (created|already exists)")
+
+
+def base_red_lot(test: str, *, name: str, carrier: int, base_sha: str,
+                 target: str, driver: str = "",
+                 sender: str | None = None, log=print) -> int:
+    """#8262 : ouvre, ou relance par une note, le lot de déblocage d'un test.
+
+    Une clé durable par test (`paquet-rouge-base:<test>`) : un second rouge
+    du même test retrouve le même lot, quel que soit son état, et y ajoute
+    la base et le paquet où il a été revu. Rend le numéro du lot, 0 si le
+    geste n'a pas abouti (consigné, sans arrêter la composition). Le projet
+    est celui du composeur (`work add` sans `--app`), jamais écrit en dur.
+    """
+    body = (
+        "Rouge de la base relevé par le composeur du paquet %s (porteur #%d) : "
+        "`%s` est rouge sur la tête composée et sur la base exacte `%s` `%s`, "
+        "même classe d'échec, même pilote (`%s`). Canon §3 : un test dépendant "
+        "de l'environnement est un défaut du test ; le paquet n'est pas retenu, "
+        "aucune unité n'est retirée pour ce rouge. Attendu : corriger le test "
+        "(ou la cible) à la source, puis livrer."
+        % (name, carrier, test, target, base_sha, driver or "?"))
+    actor = ["--actor", sender] if sender else []
+    try:
+        proc = run_command(
+            ["ameesh", "work", "add", "--title",
+             "Rouge de la base : %s" % ".".join(test.split(".")[-2:]),
+             "--type", "bug", "--priority", "1",
+             "--source", "paquet-auto (#8262), rouge de la base",
+             "--unique-ref", BASE_RED_REF + test,
+             "--see-also", str(carrier), "--body", "-"] + actor,
+            input_text=body, timeout=GIT_TIMEOUT)
+    except PaquetAutoError as exc:
+        log("lot de déblocage de %s non ouvert : %s" % (test, exc))
+        return 0
+    found = BASE_RED_LOT_RE.search(_output(proc))
+    if proc.returncode != 0 or not found:
+        log("lot de déblocage de %s non ouvert : %s" % (test, _tail(_output(proc))))
+        return 0
+    lot = int(found.group(1))
+    if found.group(2) == "already exists":
+        # relance : le lot garde son état ; la note date le nouveau constat
+        note = ("relance #8262 : %s encore rouge sur la base `%s` (paquet %s, "
+                "porteur #%d)" % (test, base_sha[:12], name, carrier))
+        try:
+            run_command(["ameesh", "work", "note", str(lot), "-"] + actor,
+                        input_text=note, timeout=GIT_TIMEOUT)
+        except PaquetAutoError as exc:
+            log("relance du lot #%d non notée : %s" % (lot, exc))
+    log("lot de déblocage de %s : #%d (%s)"
+        % (test, lot, "relancé" if found.group(2) == "already exists" else "ouvert"))
+    return lot
+
+
+def notify_base_red(name: str, carrier: int, tests: list[str], *,
+                    base_sha: str, target: str, driver: str = "",
+                    pilot: str = "mesh-design",
+                    sender: str | None = None, log=print,
+                    open_lot=None) -> str:
+    """#8262 : un rouge de la base ne retient pas le paquet ; lot et pilote.
+
+    Chaque test (cinq au plus) reçoit son lot de déblocage (`base_red_lot`,
+    injectable par `open_lot`) ; le pilote est prévenu. Rien n'arrête la
+    composition : un courrier ou un lot manqué est consigné. Rend le motif
+    d'échec du courrier.
+    """
+    opener = open_lot or base_red_lot
+    lots = []
+    for test in tests[:5]:
+        lot = opener(test, name=name, carrier=carrier, base_sha=base_sha,
+                     target=target, driver=driver, sender=sender, log=log)
+        lots.append("%s → %s" % (test, ("#%d" % lot) if lot else "lot non ouvert"))
+    body = (
+        "#%d paquet %s : test(s) rouge(s) sur la tête et sur la base `%s` "
+        "(même classe d'échec) : rouge(s) de la base, défaut(s) du test (canon "
+        "§3). Aucun retrait pour eux, le paquet continue. Déblocage : %s."
+        % (carrier, name, base_sha[:12], " ; ".join(lots) or "aucun"))
+    try:
+        send_mail(pilot, carrier, body, sender)
+    except PaquetAutoError as exc:
+        log("courrier de rouge de la base au pilote non envoyé : %s" % exc)
+        return str(exc)
+    log("courrier de rouge de la base au pilote envoyé (%s)" % pilot)
+    return ""
+
+
 def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
             composition: Composition, candidates: list[Candidate],
             tests: list[TestRun] | None, inclusion_rc: int,
@@ -7100,6 +7332,16 @@ def compose_packet(args: argparse.Namespace) -> int:
                 notify_flaky(args.name, args.carrier, flaky,
                              pilot=getattr(args, "pilot", "mesh-design"),
                              sender=getattr(args, "sender", None))
+            base_red = sorted({name for run in runs
+                               for name in getattr(run, "base_red", [])})
+            if base_red and not getattr(args, "local", False):
+                # #8262 : rouge de la base consigné, le paquet continue ; le
+                # lot de déblocage est ouvert ou relancé, le pilote prévenu.
+                notify_base_red(args.name, args.carrier, base_red,
+                                base_sha=base_sha, target=args.target,
+                                driver=test_driver(worktree),
+                                pilot=getattr(args, "pilot", "mesh-design"),
+                                sender=getattr(args, "sender", None))
             if contract_report is not None and not args.local:
                 # Classification may turn a flaky negative into an explicit
                 # inconclusive result; the projection must reflect that too.

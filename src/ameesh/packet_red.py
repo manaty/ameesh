@@ -22,6 +22,13 @@ Ce module construit ce lien **à partir de preuves**, pour chaque test en
    base ne désigne pas une migration) ;
 3. sinon **non attribuable** : rien n'est inventé.
 
+#8262 : avant tout cela, un test dont le lot de déblocage « rouge de la base »
+est ouvert (clé durable `paquet-rouge-base:<test>`, posée par le composeur
+quand le rejeu sur la base exacte du paquet a donné le même rouge, ou par le
+pilote) est classé **rouge de la base** : aucune unité n'est nommée, c'est un
+défaut du test (canon §3) qui ne retient pas le paquet. Le verdict de la CI
+reste rouge ; seule la lecture du rouge change.
+
 L'unité est nommée, jamais retirée : ce module ne modifie ni lot, ni branche,
 ni CI. Un candidat n'est pas une preuve de culpabilité.
 
@@ -70,6 +77,9 @@ WEIGHTS = {"test": 6, "support": 2, "list": 4, "migration": 4, "covered": 2}
 _KIND_ORDER = ("test", "support", "list", "migration", "covered")
 #: unités nommées au plus par test (le reste est compté, jamais caché)
 MAX_UNITS = 3
+#: #8262 : la clé durable (#6090) du lot de déblocage d'un rouge de la base,
+#: la même que `BASE_RED_REF` du composeur (scripts/paquet-auto.py)
+BASE_RED_REF = "paquet-rouge-base:"
 #: caractères d'un dépôt conservés dans un nom de fichier de cache
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -675,10 +685,40 @@ def _unit_label(unit: dict) -> str:
     return "#%s (%s)" % (unit.get("lot"), suffix) if suffix else "#%s" % unit.get("lot")
 
 
+def mark_base_red(db, entries) -> int:
+    """#8262 : classe « rouge de la base » les tests au lot de déblocage ouvert.
+
+    Le lot porte la clé `paquet-rouge-base:<test>` ; un lot livré, fusionné ou
+    clos ne classe plus rien (le défaut est réputé corrigé, un nouveau rouge
+    se relit comme avant). Une lecture impossible ne classe rien. Rend le
+    nombre d'entrées classées.
+    """
+    if db is None:
+        return 0
+    count = 0
+    for entry in entries or ():
+        test = _text(entry.get("test"))
+        if not test:
+            continue
+        try:
+            lot = work.existing_by_unique_ref(db, BASE_RED_REF + test)
+        except Exception:  # noqa: BLE001 - une base illisible ne classe rien
+            return count
+        if not lot or lot.get("state") not in work.OPEN_STATES:
+            continue
+        entry.update({"status": "base", "units": [], "more": 0,
+                      "base_lot": int(lot["id"])})
+        count += 1
+    return count
+
+
 def evidence_line(entry) -> str:
     """La ligne lisible d'une attribution de test, ou ""."""
     if not entry:
         return ""
+    if entry.get("status") == "base":
+        return ("aucune — rouge de la base (lot #%s) : défaut du test, ne "
+                "retient pas le paquet (canon §3)" % entry.get("base_lot"))
     if entry.get("status") != "probable" or not entry.get("units"):
         return "non attribuable"
     text = " ; ".join(_unit_label(unit) for unit in entry["units"])
@@ -727,6 +767,21 @@ def note_of(attribution) -> str:
     attribution = attribution or {}
     manifest = attribution.get("manifest") or {}
     card = attribution.get("card") or {}
+    base_red = [entry for entry in attribution.get("tests") or ()
+                if entry.get("status") == "base"]
+    note = _note_of(attribution, manifest, card)
+    if base_red:
+        # #8262 : dit avant tout que ces rouges ne sont pas ceux du paquet
+        lead = ("Rouge(s) de la base : %s — déjà rouge(s) sur la cible, lot(s) "
+                "de déblocage ouvert(s) ; défaut du test (canon §3), ne "
+                "retient pas le paquet."
+                % ", ".join("%s (#%s)" % (entry.get("test"), entry.get("base_lot"))
+                            for entry in base_red[:5]))
+        return lead + (" " + note if note else "")
+    return note
+
+
+def _note_of(attribution: dict, manifest: dict, card: dict) -> str:
     parts = []
     if manifest.get("units"):
         parts.append("manifeste %d unité(s)" % int(manifest["units"]))
@@ -847,7 +902,8 @@ def _attribute_run(db, item, run, failures, *, cfg=None, api=None, checkout: str
                       "ni détail de commit GitHub")
         out["tests"] = attribute_tests(failures, units, card_index(card),
                                        sources=lambda module: "")
-        out["unattributable"] = len(out["tests"])
+        out["base_red"] = mark_base_red(db, out["tests"])
+        out["unattributable"] = len(out["tests"]) - out["base_red"]
         return out
     if card is None and not card_known:
         card, card_prov = carte_for(cfg, slug, repo=path, fetch=fetch)
@@ -873,8 +929,9 @@ def _attribute_run(db, item, run, failures, *, cfg=None, api=None, checkout: str
         return texts[module]
 
     out["tests"] = attribute_tests(failures, units, index, sources=source)
+    out["base_red"] = mark_base_red(db, out["tests"])
     out["unattributable"] = sum(1 for entry in out["tests"]
-                                if entry["status"] != "probable")
+                                if entry["status"] not in ("probable", "base"))
     if card is None:
         out["status"] = "no-card"
         out["why"] = (out["card"] or {}).get("why") or "carte d'impact absente"

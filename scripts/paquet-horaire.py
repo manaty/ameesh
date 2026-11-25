@@ -1116,6 +1116,10 @@ def classify(run: dict) -> Verdict:
     échec de test propre au paquet, et si **chaque** échec propre est attribué
     (`probable`) à une **seule** meilleure unité. Un échec de job sans test, un
     test non attribuable ou partagé entre unités, un run annulé : non concluant.
+
+    #8262 : un échec classé « rouge de la base » par #3801 (lot de déblocage
+    ouvert) n'est pas un échec du paquet : il est écarté comme un hérité ; s'il
+    ne reste que de tels rouges, le verdict le dit, sans retrait.
     """
     status = str(run.get("status") or "")
     if status != "failure":
@@ -1130,6 +1134,14 @@ def classify(run: dict) -> Verdict:
         return Verdict(False, [], [], "attribution #3801 : %s"
                        % (attribution.get("status") or "absente"))
     by_test = {str(t.get("test") or ""): t for t in attribution.get("tests") or []}
+    base = [f for f in own
+            if (by_test.get(str(f.get("test"))) or {}).get("status") == "base"]
+    if base:
+        own = [f for f in own if f not in base]
+        if not own:
+            return Verdict(False, [], [], "rouge(s) de la base seulement (%s) : "
+                           "défaut du test, ne retient pas le paquet (canon §3)"
+                           % ", ".join(str(f.get("test")) for f in base[:3]))
     lots: list[int] = []
     tests: list[str] = []
     for failure in own:
