@@ -34,7 +34,36 @@ def _refs(cfg, db, project):
     return refs
 
 
-def _record(cfg, db, item, freeze, prefix, result):
+def _recorded_policy(db, lot, freeze) -> str:
+    """The policy ref of this freeze's current designation mark, or "".
+
+    The mark is written with the canon source read at designation time
+    (`policy_ref`), so it is the exact reference to compare with the policy
+    sources of the refresh pass. A carried mark or an old writer may not name
+    one: the caller treats that as a move and keeps the pre-#8265 behaviour.
+    """
+    try:
+        effective = act._effective_mark(
+            db, int(lot), int(freeze["id"]),
+            since_ts=float((freeze or {}).get("at_ts") or 0.0))
+    except Exception:  # noqa: BLE001 - an unreadable journal is not a proof
+        return ""
+    if effective is None:
+        return ""
+    return str((effective[2] or {}).get("policy_ref") or "")
+
+
+def _policy_moved(result, refs, recorded: str) -> bool:
+    """Did the audited canon change since the freeze's designation (#8265)?"""
+    current = {str(ref) for ref in refs or ()}
+    if recorded:
+        return recorded not in current
+    # No mark before the pass: the refresh may itself have written the first
+    # designation. Its policy ref says whether that read is the current one.
+    return str((result or {}).get("policy_ref") or "") not in current
+
+
+def _record(cfg, db, item, freeze, prefix, result, *, refs=(), recorded_policy=""):
     """A successful check per canon signature, an alert at most once per freeze.
 
     #7662 : a `stale` result means the designation moved under the read, not
@@ -46,6 +75,12 @@ def _record(cfg, db, item, freeze, prefix, result):
     un échec transitoire après la borne sont clés **par gel**, sans signature :
     le pilote reçoit un seul courrier par gel, quel que soit le nombre de
     signatures publiées ensuite.
+
+    #8265 : une attente n'alerte que si la politique du canon a réellement
+    changé depuis la désignation du gel. À politique inchangée, le gel a déjà
+    envoyé son avis « Designation at freeze incomplete » ; le contrôle ne le
+    double pas d'un « canon policy changed » qui serait faux. La désignation
+    reste rejouée à chaque passe : la capacité peut revenir.
     """
     lot = int(item["id"])
     state = str(result.get("state") or "")
@@ -54,6 +89,12 @@ def _record(cfg, db, item, freeze, prefix, result):
         # plancher : la désignation lue n'est plus la courante, ce n'est pas
         # un échec de la politique. Aucune note, aucun courrier au pilote et
         # pas de clé `checked:` — la passe suivante relit ce lot.
+        return
+    if state == act.rd.WAITING and not _policy_moved(result, refs, recorded_policy):
+        # #8265 : le gel a déjà son avis d'attente (capacité, provenance) ;
+        # à politique inchangée, un second courrier au pilote serait un faux
+        # « canon policy changed ». Rien n'est écrit : la désignation reste
+        # rejouée à la passe suivante, où la capacité peut être revenue.
         return
     freeze_prefix = "%s%d:%d:" % (PREFIX, lot, freeze["id"])
     checked = prefix + "checked:"
@@ -150,8 +191,10 @@ def after_sync(cfg, db, *, limit=act.RETRY_LIMIT):
                 prefix = "%s%d:%d:%s:" % (PREFIX, lot, freeze["id"], signature)
                 if storage.of(db).work.events_noted(prefix + "checked:", 0.0, ids=[lot]):
                     continue
+                recorded_policy = _recorded_policy(db, lot, freeze)
                 result = act.designate(cfg, db, lot, freeze=freeze, refresh_policy=True)
-                _record(cfg, db, item, freeze, prefix, result)
+                _record(cfg, db, item, freeze, prefix, result,
+                        refs=refs, recorded_policy=recorded_policy)
                 if str((result or {}).get("state") or "") != "stale":
                     out["refreshed"] += 1
             except Exception as exc:  # one lot never prevents the next one
