@@ -5280,6 +5280,8 @@
     "subject_attach",
     "subject_items",
     "follow_ups",
+    "subject_set_github",
+    "subjects_by_github",
     "lock",
     "lock_deep_analysis",
     "lock_workflow_activation",
