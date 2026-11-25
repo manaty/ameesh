@@ -1377,7 +1377,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           dependencies: Mapping[int, Iterable[Mapping[str, Any]]] | None = None,
           roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None,
           families: Iterable[str] = (),
-          decisions: Iterable[Mapping[str, Any]] = (),
+          decision_coverages: Mapping[str, Mapping[str, Any]] | None = None,
           external_executors: Mapping[str, Mapping[str, Any]] | None = None,
           human_routes: Iterable[str] = (),
           review_pilots: Mapping[str, str] | None = None,
@@ -1448,13 +1448,14 @@ def build(*, items: Iterable[Mapping[str, Any]],
     ligne ; un porteur terminé ou composé sur une autre tête la laisse
     revenir.
 
-    `decisions` (#8264) : les décisions closes lues par `read`
-    (`decisions.history`). Une pause de famille qu'une décision owner
-    **signée, non remplacée et non échue** couvre est listée dans
-    `decision_waits`, hors `slow_waits` et hors `--check` : aucun geste
-    n'existe avant l'échéance de la décision, citée avec sa date de fin. À
-    l'échéance, la ligne redevient une attente ordinaire. Sans cette lecture,
-    rien n'est couvert — le doute ne tait jamais un goulot."""
+    `decision_coverages` (#8264) : `{famille: couverture}` calculé par `read`
+    (`review_family_paused.verified_coverages`) sur des décisions closes dont
+    la preuve signée est **revérifiée** (B #46462). Une pause de famille
+    couverte est listée dans `decision_waits`, hors `slow_waits` et hors
+    `--check` : aucun geste n'existe avant l'échéance de la décision, citée
+    avec sa date de fin. À l'échéance, la ligne redevient une attente
+    ordinaire. Sans couverture vérifiée, rien n'est couvert — le doute ne tait
+    jamais un goulot."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -1537,14 +1538,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
             family = family_of(agent.get("harness"), known_families)
             if name and family:
                 agent_families[_norm(name)] = family
-    #: #8264 : les familles dont une décision owner signée et non échue couvre
-    #: la pause. Calculé une fois pour tous les lots ; sans familles du canon,
-    #: aucune pause n'est prouvée et rien n'est couvert.
-    decision_coverages: dict[str, dict] = {}
-    if known_families and decisions:
-        from . import review_family_paused
-        decision_coverages = review_family_paused.coverages(
-            decisions, families=known_families, now=now)
+    #: #8264 : les couvertures vérifiées, calculées une fois par `read`.
+    decision_coverages = dict(decision_coverages or {})
     milestones_by_lot = _rows_by_lot(milestones)
     # #5328 : les corrections dues viennent de `due_fixes` (une seule lecture,
     # la même que `work fixes-owed`) ; le repli sans base reste local.
@@ -3507,16 +3502,19 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
     # #5424 N6 : le vivier d'une famille en pause est celui de la désignation
     # (pilote du projet et hôtes fermés exclus) ; illisible : personne d'exclu.
     # #8264 : les décisions owner signées et non échues qui couvrent une pause
-    # de famille. Une lecture en échec ne couvre rien et se dit : le débit ne
-    # tait jamais un goulot sur une lecture absente.
+    # de famille, preuve revérifiée à la lecture (B #46462). Une preuve refusée
+    # ne couvre rien ; une lecture en échec ne couvre rien et se dit : le débit
+    # ne tait jamais un goulot sur une lecture absente.
     review_pilots, closed_hosts = None, ()
-    decisions_views: list[dict] = []
+    decision_coverages: dict[str, dict] = {}
     if families:
         from . import review_family_paused
         review_pilots, closed_hosts = review_family_paused.exclusions(
             cfg, db, [item.get("app") or "" for item in items], agents)
         try:
-            decisions_views = review_family_paused.decisions_history(db, now=now)
+            decision_views = review_family_paused.decisions_history(db, now=now)
+            decision_coverages = review_family_paused.verified_coverages(
+                db, decision_views, families=families, now=now)
         except Exception as exc:  # noqa: BLE001 - une lecture absente ne couvre rien
             unreadable.append("owner decisions unreadable: %s"
                               % " ".join(str(exc).split())[:160])
@@ -3540,7 +3538,7 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
                    ci_unreadable=ci_unreadable, fixes=fixes,
                    packets=packets, dependencies=dependencies,
                    roadmap_exhausted=roadmap_exhausted,
-                   families=families, decisions=decisions_views,
+                   families=families, decision_coverages=decision_coverages,
                    external_executors=external_executors,
                    human_routes=human_routes,
                    review_pilots=review_pilots,

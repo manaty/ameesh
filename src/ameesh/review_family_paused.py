@@ -95,7 +95,9 @@ def decision_until(view):
     non remplacée, et une échéance explicite dans le périmètre **retenu** (le
     libellé de l'option et le texte de la réponse). La question n'est pas lue
     pour l'échéance : elle décrit les options, dont celles qui n'ont pas été
-    choisies."""
+    choisies. La **validité** de la preuve n'est pas jugée ici : elle se
+    revérifie à part (`verified_coverages`, B #46462), sans quoi le canal
+    `signed` ne serait qu'une déclaration."""
     if not isinstance(view, dict):
         return None
     answer = view.get("answer") or {}
@@ -138,14 +140,21 @@ def decision_until(view):
     return until.timestamp()
 
 
-def coverages(decisions, *, families, now):
+def coverages(decisions, *, families, now, verify=None):
     """#8264 : les familles en pause qu'une décision owner signée couvre.
 
     Rend `{famille: {id, option, until, until_iso, by}}` pour les décisions
     `answered`, signées, non remplacées et non échues dont le périmètre retenu
     nomme la famille et une échéance. Deux décisions pour la même famille :
     la plus proche échéance tranche, pour ne jamais prolonger une couverture
-    par une décision plus tardive."""
+    par une décision plus tardive.
+
+    `verify` (#46462) : revérifie la preuve de la réponse
+    (`decisions.verify_proof`). Sans elle, le canal `signed` et la présence
+    d'une preuve ne sont qu'une déclaration : ni la clé owner, ni l'empreinte
+    de la réponse, ni l'approbation ne sont prouvées, et rien ne couvre. Un
+    refus ne couvre rien ; une exception remonte à l'appelant, qui la
+    consigne comme lecture impossible."""
     now = float(now)
     out = {}
     for view in decisions or ():
@@ -162,6 +171,8 @@ def coverages(decisions, *, families, now):
         try:
             ident = int(view.get("id"))
         except (TypeError, ValueError):
+            continue
+        if verify is None or not verify(view):
             continue
         for family in families or ():
             family = str(family or "").strip()
@@ -180,6 +191,18 @@ def decisions_history(db, *, now):
     """Les décisions closes relues par le débit (voir `DECISION_SCAN`)."""
     from . import decisions
     return decisions.history(db, now=now, limit=DECISION_SCAN)
+
+
+def verified_coverages(db, views, *, families, now):
+    """Les couvertures dont la preuve signée est revérifiée (B #46462).
+
+    `decisions.verify_proof` refuse une empreinte altérée, une approbation qui
+    n'est pas celle de cette décision, une clé owner absente, révoquée ou
+    remplacée, et une signature Ed25519 invalide. Une preuve refusée ne couvre
+    rien ; une lecture en échec remonte, l'appelant la consigne."""
+    from . import decisions
+    return coverages(views, families=families, now=now,
+                     verify=lambda view: bool(decisions.verify_proof(db, view)[0]))
 
 
 def blocked(designation, listing, *, project, families, now, pilot="", closed_hosts=(),

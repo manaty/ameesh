@@ -134,8 +134,10 @@ classification.
 non échue** couvre est listée à part (`decision_waits`, hors `slow_waits`) et
 `--check` ne sort pas 2 : aucun geste n'existe avant l'échéance de la
 décision, citée avec sa date de fin. La couverture se lit dans la réponse
-signée (canal `signed` avec sa preuve, option retenue nommant la famille et
-une échéance explicite), jamais dans une simple mention de décision ; à
+signée dont la preuve est **revérifiée** (`decisions.verify_proof` : empreinte
+de la réponse, approbation consommée par cette décision, clé owner vivante et
+non révoquée, signature Ed25519 ; B #46462), option retenue nommant la famille
+et une échéance explicite, jamais dans une simple mention de décision ; à
 l'échéance, la ligne redevient une attente ordinaire.
 
 #### Capacité au repos (#3256, owner 28/10/2026)
