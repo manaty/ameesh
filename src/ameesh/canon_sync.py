@@ -138,12 +138,14 @@ authentificateurs, verrou compris, y est UNE opération
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
 import re
 import shlex
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -2564,12 +2566,14 @@ class ProcessSync:
     skipped_retired: list[str] = field(default_factory=list)
     #: #6640 : envois en information (`info`, sans réveil) parmi `sent`
     informed: int = 0
+    #: #8267 : fiches retenues le temps que leurs révisions se stabilisent
+    held: int = 0
     #: diff git illisible : aucune poussée, les règles restent lues par le brief
     error: str = ""
 
     def to_dict(self) -> dict:
         out = {"changed": self.changed, "sent": self.sent,
-               "informed": self.informed,
+               "informed": self.informed, "held": self.held,
                "skipped_retired": self.skipped_retired}
         if self.error:
             out["error"] = self.error
@@ -2581,6 +2585,19 @@ class ProcessSync:
 #: de lot » pèse ~98 k o, et 41 agents en recevaient 4 M caractères par
 #: diffusion (09/11) ; seules les sections changées partent, bornées ici.
 PROCESS_PUSH_SECTIONS_MAX = 8000
+#: #8267 : fenêtre de regroupement des révisions d'une même fiche. Tant que la
+#: dernière révision de la fiche a moins que ce délai, le sync ne pousse rien
+#: et laisse `process_commit` en arrière : le message suivant porte le cumul
+#: des révisions. 50 min couvre l'écart de 47 min entre les révisions 2 et 3
+#: de « Processus de lot » du 24/11 (messages 233295 puis 233391), sans
+#: retarder de deux heures une règle ordinaire. Une fiche marquée `urgent:
+#: true` dans son frontmatter ignore la fenêtre.
+PROCESS_PUSH_GROUP_S = 50 * 60.0
+#: #8267 : borne dure du regroupement. Une fiche révisée sans interruption ne
+#: reste pas en attente au-delà : au bout de 4 h, le sync pousse le cumul et
+#: avance le repère. La fenêtre de 50 min est une attente de stabilité, pas
+#: une famine.
+PROCESS_PUSH_GROUP_MAX_S = 4 * 3600.0
 #: #6425 : marque de coupe d'un extrait trop long ; le lien de la fiche suit.
 PROCESS_PUSH_CUT = "… [cut at %d bytes — read the whole card at the link below]"
 #: #6640 : nom de la « section » du frontmatter (hors `updated:`, qui bouge à
@@ -2653,6 +2670,68 @@ def _process_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
+def _changed_words(old: str, new: str) -> str:
+    """#8267 : les mots ajoutés, modifiés ou retirés entre deux versions d'une
+    section — jamais le texte inchangé qui les entoure.
+
+    Sert à choisir qui réveiller : une section entière peut nommer trente
+    agents (la projection courte de « Processus de lot » les nomme tous), mais
+    seule la phrase qui a changé dit qui est concerné. Un mot est comparé tel
+    quel (ponctuation comprise) ; l'ordre et les espaces suffisent à retrouver
+    les insertions et retraits."""
+    before, after = (old or "").split(), (new or "").split()
+    if not before:
+        return " ".join(after)
+    if not after:
+        return " ".join(before)
+    if len(before) + len(after) > 20000:
+        # Très grosse section : au-delà, SequenceMatcher devient un O(n²)
+        # coûteux pour un simple choix de destinataires. On examine les deux
+        # textes entiers — réveil plus large, jamais manqué — sans bloquer le
+        # sync.
+        return " ".join(before) + " " + " ".join(after)
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    words: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            words.extend(before[i1:i2])
+            words.extend(after[j1:j2])
+    return " ".join(words)
+
+
+def _process_changed_at(source, process) -> float | None:
+    """#8267 : date de la dernière révision de cette fiche jusqu'au commit lu,
+    ou None si git ne sait pas la lire (l'appelant diffuse alors sans attendre)."""
+    try:
+        return canon_mod.git_last_change_ts(source.repo, source.commit,
+                                            process.fiche.path)
+    except canon_mod.GitError:
+        return None
+
+
+def _process_first_change_at(source, old: str, process) -> float | None:
+    """#8267 : date de la première révision non poussée de cette fiche, ou None."""
+    try:
+        return canon_mod.git_first_change_ts(source.repo, old, source.commit,
+                                             process.fiche.path)
+    except canon_mod.GitError:
+        return None
+
+
+def _process_urgent(process) -> bool:
+    """#8267 : la fiche demande-t-elle une diffusion immédiate ?
+
+    Marqueur de frontmatter `urgent: true` (ou `oui`/`yes`/`1`) : une règle
+    urgente ne passe pas par la fenêtre de regroupement. Toute autre valeur
+    (absente, `false`, texte libre) ne l'est pas — le doute ne rend jamais
+    une règle urgente."""
+    data = getattr(getattr(process, "fiche", None), "data", None) or {}
+    value = data.get("urgent") if isinstance(data, dict) else None
+    if isinstance(value, bool):
+        return value
+    return _fold(str(value or "")).strip() in ("1", "true", "yes", "oui")
+
+
 @dataclass
 class ProcessPush:
     """#6640 : ce qu'une fiche modifiée pousse — le texte du message, les
@@ -2697,14 +2776,16 @@ def _process_push(process, old: str, source) -> ProcessPush | None:
         if before.get(key) == texte:
             continue
         noms.append(key)
-        touche += [texte, before.get(key, "")]
+        # #8267 : seuls les mots qui ont changé désignent les destinataires ;
+        # le texte de la section, lui, part entier (borné) dans le message.
+        touche.append(_changed_words(before.get(key, ""), texte))
         etat = "modifiée" if key in before else "ajoutée"
         blocs.append("— section « %s » (%s) :\n%s"
                      % (key or "(avant le premier titre)", etat, texte))
     for key, texte in before.items():
         if key not in keys_after:
             noms.append(key)
-            touche.append(texte)
+            touche.append(_changed_words(texte, ""))
             blocs.append("— section « %s » (retirée)" % (key or "(avant le premier titre)"))
     if not noms:
         return None
@@ -2724,13 +2805,62 @@ def _fold(text: str) -> str:
                    if not unicodedata.combining(ch)).lower()
 
 
+#: #8267 : préfixes de flotte retirés pour reconnaître le nom court d'un agent
+#: dans une règle (« cx1 », « impl-11 » plutôt que le nom complet). Un nom
+#: court n'est retenu que s'il ne désigne qu'un agent du canon.
+_SHORT_PREFIXES = ("ameesh-", "mty-amh-", "mty-nxl-")
+
+
+def _declared_names(agent) -> list[str]:
+    """Les chaînes qui nomment un agent : son nom, le titre et les alias de sa fiche."""
+    return [agent.title] + list(agent.aliases or [])
+
+
+def _short_forms(canon: Canon, name: str) -> list[str]:
+    """#8267 : formes courtes non ambiguës du nom d'un agent.
+
+    « mty-amh-impl-11 » donne « impl-11 », « ameesh-cx1 » donne « cx1 » ; un
+    nom court porté par deux agents (par exemple « impl-01 » pour un agent
+    ameesh et un agent Nexlink) n'est rendu pour aucun des deux."""
+    agent = canon.agent(name)
+    if agent is None:
+        return []
+    shorts = set()
+    for value in _declared_names(agent):
+        folded = _fold(value).strip()
+        for prefix in _SHORT_PREFIXES:
+            if folded.startswith(prefix):
+                short = folded[len(prefix):]
+                if len(short) >= 3:
+                    shorts.add(short)
+    if not shorts:
+        return []
+    owners: dict[str, set[str]] = {short: set() for short in shorts}
+    for other in canon.agents:
+        for value in _declared_names(other):
+            folded = _fold(value).strip()
+            for prefix in _SHORT_PREFIXES:
+                if not folded.startswith(prefix):
+                    continue
+                short = folded[len(prefix):]
+                if short in owners:
+                    owners[short].add(other.title)
+    return sorted(short for short, names in owners.items() if len(names) == 1)
+
+
 def _recipient_tokens(canon: Canon, name: str) -> list[str]:
-    """#6640 : ce qui désigne un destinataire dans le texte d'une règle — son
-    nom, le titre et les alias de sa fiche, ses rôles déclarés (`roles:`)."""
+    """#6640, #8267 : ce qui désigne un destinataire dans le texte d'une règle.
+
+    Son nom, le titre et les alias de sa fiche, et les formes courtes non
+    ambiguës de ces noms. **Les rôles ne suffisent plus** (#8267) : le
+    paragraphe §11 du 24/11 nommait « relecture », rôle porté par 38 des 44
+    agents, et chacun a été réveillé pour une décision qui ne concernait que
+    trois d'entre eux ; un rôle partagé envoie désormais une information
+    (`info`), pas un réveil."""
     tokens = [name]
     agent = canon.agent(name)
     if agent is not None:
-        tokens += [agent.title] + list(agent.aliases or []) + list(agent.roles or [])
+        tokens += _declared_names(agent) + _short_forms(canon, name)
     return sorted({_fold(t).strip() for t in tokens if t and len(t.strip()) >= 3})
 
 
@@ -2754,6 +2884,16 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
     #6425 : le message porte un diff borné et le lien vers la fiche, jamais le
     corps entier (98 k o × 41 agents = 4 M caractères par diffusion). Un diff
     de fiche illisible ne retient pas la poussée : le lien est toujours envoyé.
+
+    #8267 : une fiche dont la dernière révision a moins de
+    `PROCESS_PUSH_GROUP_S` n'est pas poussée : `process_commit` reste sur la
+    base précédente, le sync suivant repart de cette base et le message porte
+    le cumul des révisions (une seule diffusion pour trois révisions du 24/11).
+    La borne `PROCESS_PUSH_GROUP_MAX_S` empêche une fiche révisée sans arrêt
+    d'attendre indéfiniment ; une fiche marquée `urgent: true` part tout de
+    suite. Le destinataire réveillé est celui que les **mots changés** nomment
+    (nom, titre, alias, nom court non ambigu), jamais un rôle partagé : les
+    autres reçoivent une information (`info`) sans réveil.
 
     #793 : les synchronisations concurrentes d'un hôte lisent le même ancien
     commit ; seule celle qui l'avance (`claim_commit`, dans la transaction
@@ -2816,18 +2956,62 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
                and (touched is None or process.fiche.path in touched)]
     if not changed:
         return done
+    # #6640 : base absente ou illisible — la fiche entière part tout de suite
+    # et le repère est ré-ancré ; aucune fenêtre de regroupement ne s'applique
+    # à un diff qu'on ne sait pas calculer.
+    base_unknown = touched is None
     from . import mail as mail_mod
     from . import work as work_mod
+    # #8267 : les lectures git (sections, dates de révision) se font AVANT la
+    # transaction de `claim_commit` — pas de sous-processus git sous le verrou
+    # de la ligne d'état (note de #6425), et le cumul porte sur toutes les
+    # révisions retenues depuis `old`.
+    pushes = []
+    for process in changed:
+        # #6425, #6640 : sections changées + lien, jamais le corps entier
+        # (sauf base illisible : la fiche entière, jamais un delta orphelin).
+        push = _process_push(process, old, source)
+        if push is not None:
+            pushes.append((process, push))
+    if not pushes:
+        # seul `updated:` a bougé : rien à pousser, le repère avance.
+        with db.transaction() as tx:
+            storage.of(tx).canon.claim_commit(host, old, source.commit,
+                                              state_key(db, canon, host))
+        return done
+    now = time.time()
+    window = float(PROCESS_PUSH_GROUP_S)
+    if window > 0 and not base_unknown \
+            and not any(_process_urgent(process) for process, _ in pushes):
+        due = True
+        for process, _push in pushes:
+            changed_at = _process_changed_at(source, process)
+            if changed_at is not None and changed_at > now:
+                changed_at = now      # horloge en avance : ne pas retarder indûment
+            if changed_at is None or now - changed_at >= window:
+                continue          # révision stable (ou illisible) : pousser
+            first_at = _process_first_change_at(source, old, process)
+            if first_at is not None:
+                first_at = min(first_at, now)
+            if first_at is not None and now - first_at >= float(PROCESS_PUSH_GROUP_MAX_S):
+                continue          # borne dure : une fiche révisée sans arrêt part
+            due = False
+            break
+        if not due:
+            # #8267 : épingler la base AVANT que `record_state` n'avance
+            # `last_good_commit` — sans cela, le sync retenu lirait au tour
+            # suivant un repère plus récent et perdrait la première révision.
+            with db.transaction() as tx:
+                pinned = storage.of(tx).canon.claim_commit(
+                    host, old, old, state_key(db, canon, host))
+            if pinned:
+                done.held = len(pushes)
+            return done
     with db.transaction() as tx:
         if not storage.of(tx).canon.claim_commit(host, old, source.commit,
                                                  state_key(db, canon, host)):
             return done
-        for process in changed:
-            # #6425, #6640 : sections changées + lien, jamais le corps entier
-            # (sauf base illisible : la fiche entière, jamais un delta orphelin).
-            push = _process_push(process, old, source)
-            if push is None:
-                continue
+        for process, push in pushes:
             for name in sorted(set(agents)):
                 if name in done.skipped_retired:
                     continue
@@ -2836,8 +3020,10 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
                            "ref": _fiche_ref(source, process),
                            "base": old, "sections": push.sections,
                            "full": push.full}
-                # #6640 : en information, sauf si une section changée nomme
-                # le destinataire (nom, titre, alias, rôle) : lui est réveillé.
+                # #6640, #8267 : en information, sauf si les mots changés
+                # nomment le destinataire (nom, titre, alias, nom court non
+                # ambigu) : lui seul est réveillé. Un rôle partagé n'est pas
+                # une désignation.
                 if not _touches(push.touched_text, _recipient_tokens(canon, name)):
                     payload["info"] = True
                 try:

@@ -3431,7 +3431,61 @@ def git_commit(repo: str, rev: str, *, timeout: float = GIT_TIMEOUT,
                     rev + "^{commit}", timeout=timeout, deadline=deadline)
 
 
+def git_last_change_ts(repo: str, commit: str, path: str, *,
+                       timeout: float = GIT_TIMEOUT,
+                       deadline: Deadline | None = None) -> float | None:
+    """Date (epoch, committer) du dernier commit qui a touché `path` jusqu'à
+    `commit`, ou None si git ne sait pas la lire.
+
+    #8267 : sert à attendre qu'une fiche du canon soit stable avant de la
+    diffuser (regroupement des révisions d'une même fiche). Un chemin vide ou
+    une révision inconnue rend None : l'appelant décide (ici : diffuser sans
+    attendre, jamais retenir une règle sur une lecture incertaine)."""
+    sha = git_commit(repo, commit, timeout=timeout, deadline=deadline)
+    if sha is None or not path:
+        return None
+    try:
+        out = _git_out(repo, "log", "-1", "--format=%ct", sha, "--", path,
+                       timeout=timeout, deadline=deadline)
+    except GitError:
+        return None
+    if out is None:
+        return None
+    try:
+        return float(out.strip())
+    except ValueError:
+        return None
+
+
 _SHA_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def git_first_change_ts(repo: str, base: str, tip: str, path: str, *,
+                        timeout: float = GIT_TIMEOUT,
+                        deadline: Deadline | None = None) -> float | None:
+    """Date (epoch, committer) du PREMIER commit qui a touché `path` entre
+    `base` et `tip`, ou None si aucun ou si git ne sait pas la lire.
+
+    #8267 : borne dure du regroupement — une fiche révisée sans arrêt ne doit
+    pas être retenue indéfiniment. Le calcul est fait sur l'historique, pas
+    sur un état local : les processus concurrents de l'hôte voient la même
+    réponse."""
+    base_sha = git_commit(repo, base, timeout=timeout, deadline=deadline)
+    tip_sha = git_commit(repo, tip, timeout=timeout, deadline=deadline)
+    if base_sha is None or tip_sha is None or not path:
+        return None
+    try:
+        out = _git_out(repo, "log", "--reverse", "--format=%ct",
+                       "%s..%s" % (base_sha, tip_sha), "--", path,
+                       timeout=timeout, deadline=deadline)
+    except GitError:
+        return None
+    if not out:
+        return None
+    try:
+        return float(out.splitlines()[0].strip())
+    except (IndexError, ValueError):
+        return None
 
 
 def git_contains(repo: str, ancestor: str, descendant: str) -> bool:
