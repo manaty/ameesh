@@ -121,7 +121,9 @@ class TableTest(unittest.TestCase):
         # work.review_floor (plancher d'avis d'un lot, sans contenu de
         # décision) ; contrat 1.15 : #8112 admet
         # mailbox.unread_priority (courrier du jour et actifs filtrés dans la
-        # requête du serveur, devant le stock FIFO).
+        # requête du serveur, devant le stock FIFO) ; contrat 1.16 : #8235
+        # ajoute served_at facultatif à lot_sessions.consume_wake (date réelle
+        # de remise du réveil, pour le suivi des agents de conversation).
         self.assertEqual(len(self.c.operations), 76)
         self.assertEqual(sum(o.write for o in ops), 44)
         self.assertEqual(sum(not o.write for o in ops), 32)
@@ -132,7 +134,7 @@ class TableTest(unittest.TestCase):
                           "mailbox.unread", "mailbox.unread_human",
                           "mailbox.unread_human_page", "mailbox.unread_priority",
                           "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.15.0")
+        self.assertEqual(self.c.version, "1.16.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 

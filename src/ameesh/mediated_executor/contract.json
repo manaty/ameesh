@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.15.0",
+ "version": "1.16.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -4677,6 +4677,18 @@
       "type": "number"
      },
      "required": true
+    },
+    {
+     "name": "served_at",
+     "kind": "positional",
+     "schema": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -4688,7 +4700,7 @@
     "natural": false
    },
    "rules": [
-    "Clears the claimed due date only when it is still the same wake_ts; a deadline re-armed in the meantime is preserved. The consumption writes the single 'wake: scheduled wake delivered' journal line in the same transaction."
+    "Clears the claimed due date only when it is still the same wake_ts; a deadline re-armed in the meantime is preserved. The consumption writes the single 'wake: scheduled wake delivered' journal line in the same transaction. served_at, when given, dates that line at the actual delivery (the chat veille passes the wall instant of the pty write); it is never derived from wake_claim_at, which precedes delivery and is renewed meanwhile. Without it the line is dated at consumption."
    ]
   }
  ],
