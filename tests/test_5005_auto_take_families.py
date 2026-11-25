@@ -50,6 +50,18 @@ class CompilationTest(unittest.TestCase):
             now = datetime(2026, 10, 30, hour, 59, tzinfo=ZoneInfo("UTC")).timestamp()
             self.assertEqual(policy.auto_take_excluded_families(now), expected)
 
+    def test_auto_take_until_ends_at_the_included_date(self):
+        # #8266 : la fin de couverture d'une pause est minuit après la date
+        # incluse, dans le fuseau du canon ; c'est la borne que lit le
+        # rapport d'information des pauses budget.
+        policy = document(expire="2026-10-30")
+        midnight = datetime(2026, 10, 31, tzinfo=ZoneInfo("Europe/Paris")).timestamp()
+        self.assertAlmostEqual(policy.auto_take_until(midnight - 3600), midnight,
+                               delta=1)
+        self.assertIsNone(policy.auto_take_until(midnight))
+        self.assertIsNone(mechanics.compile_document(MECHANICS).auto_take_until(
+            midnight - 3600))
+
 
 class BudgetHandoffTest(_Handoff):
     def hand_with_policy(self, policy, **kwargs):

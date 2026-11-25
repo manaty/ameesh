@@ -972,7 +972,12 @@ def _subject(alert: dict, vocabulary=None) -> str:
         parts.append("account %s" % _account(alert))
         if alert.get("gauge"):
             parts.append("window %s" % _clean(alert["gauge"], 32))
-    if alert.get("agent"):
+    agents = alert.get("agents") or ()
+    if len(agents) > 1:
+        # #8266 : le sujet nomme la cause (famille/compte ci-dessus) et le
+        # nombre d'agents ; le corps les liste, sans allonger le titre.
+        parts.append("%d agents" % len(agents))
+    elif alert.get("agent"):
         parts.append("agent %s" % _clean(alert["agent"], 64))
     if alert.get("decision") is not None:
         parts.append("decision #%s" % alert["decision"])
@@ -981,7 +986,7 @@ def _subject(alert: dict, vocabulary=None) -> str:
         if alert.get("title"):
             lot += ' "%s"' % _clean(alert["title"], 80)
         parts.append(lot)
-    if alert.get("host"):
+    if alert.get("host") and not alert.get("grouped"):
         parts.append("host %s" % _clean(alert["host"], 64))
     return " · ".join(parts) or "mesh"
 
@@ -1008,8 +1013,10 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     subject = _subject(alert, vocabulary)
     since = alert.get("since")
     start = float(since) if since is not None else (float(raised_ts) if raised_ts else None)
-    who = alert.get("agent") or alert.get("host") or _account(alert) or (
-        vocabulary.label(alert["lot"]) if alert.get("lot") is not None else "")
+    agents = alert.get("agents") or ()
+    who = (("%d agents" % len(agents)) if len(agents) > 1 else alert.get("agent")) \
+        or alert.get("host") or _account(alert) or (
+            vocabulary.label(alert["lot"]) if alert.get("lot") is not None else "")
     suffix = " (%s)" % _clean(who, 64) if who else ""
     if event == "resolved":
         title = "ameesh: resolved — %s%s" % (label, suffix)
@@ -3516,8 +3523,21 @@ class Notifier:
                 # (`pace`) se suit sans courrier quel que soit son recul
                 # (#7521, cas du 16/11).
                 entry.pop("absent_since", None)
+                if entry.get("covered") and not alert.get("covered_by_decision"):
+                    # #8266 : la couverture est tombée (fin de la décision
+                    # owner ou reprise annoncée dépassée) alors que la pause
+                    # dure : elle doit réveiller. L'entrée est retirée pour
+                    # que le brief reparte à tous, sans attendre la relance
+                    # de 6 h ni passer pour une relance de la pause couverte.
+                    del sent[key]
+                    (self.state.get("reset_rebriefed") or {}).pop(key, None)
+                    continue
                 announced = entry.get("resume_ts")
-                if entry.get("resume_kind") == "reset" and announced is not None \
+                # #8266 : une entrée en fenêtre de regroupement n'a pas encore
+                # envoyé de courrier ; la remise à zéro passée pendant la
+                # fenêtre ne la rouvre pas comme un épisode déjà briefé.
+                if entry.get("coalesce_until") is None \
+                        and entry.get("resume_kind") == "reset" and announced is not None \
                         and now >= float(announced) \
                         and entry.get("reset_rebriefed") != float(announced):
                     self.state.setdefault("reset_rebriefed", {})[key] = float(announced)
@@ -3527,6 +3547,7 @@ class Notifier:
                     entry["resume_ts"] = float(alert["resume_ts"])
                 if alert.get("resume_kind") is not None:
                     entry["resume_kind"] = alert["resume_kind"]
+                entry["covered"] = bool(alert.get("covered_by_decision"))
         open_lots = None
         for key in list(sent):
             if key not in alive:
@@ -3552,6 +3573,13 @@ class Notifier:
                     # #7307 : échéance passée, la pause se repose d'ordinaire
                     # 10 à 25 min après (même compte, même fenêtre) : un seul
                     # brief tant que l'absence continue reste sous le seuil.
+                    continue
+                if entry.get("coalesce_until") is not None:
+                    # #8266 : la fenêtre de regroupement n'a encore rien
+                    # envoyé ; la pause qui se lève avant son terme ne laisse
+                    # ni courrier ni entrée. Aucun `absent_since` à poser.
+                    del sent[key]
+                    (self.state.get("reset_rebriefed") or {}).pop(key, None)
                     continue
                 if entry.get("type") == "budget_pause_long":
                     # #7175 : la pause déjà dite ; le statut qui clignote ne
@@ -3628,6 +3656,11 @@ class Notifier:
             elif entry.get("pending"):
                 # #3036 : une remise a échoué ; la passe la retente.
                 due.append((key, alert, entry))
+            elif entry.get("coalesce_until") is not None:
+                # #8266 : la pause attend la fin de la fenêtre courte pour
+                # être regroupée avec les agents qui la rejoignent.
+                if now >= float(entry["coalesce_until"]):
+                    due.append((key, alert, entry))
             elif alert.get("type") != "review_family_paused" \
                     and not entry.get("reminded") and now - float(entry["sent_ts"]) \
                     >= alert_briefs.REMIND_AFTER_S:
@@ -3828,7 +3861,33 @@ class Notifier:
                 if entry is not None and kind != "slo_breach":
                     entry["dead"] = sorted(dead)
                     entry["pending"] = []
+                    if entry.get("coalesce_until") is not None:
+                        # #8266 : la fenêtre n'a plus de destinataire ; elle
+                        # ne doit pas rejouer à chaque passe.
+                        del sent[key]
                 continue        # personne à prévenir : on réessaie au passage suivant
+            if kind == "budget_pause_long" and entry is None \
+                    and alert.get("covered_by_decision") and not alert.get("urgent"):
+                # #8266 : une pause couverte attend la fin d'une fenêtre courte
+                # avant son premier courrier, pour qu'un agent qui franchit le
+                # seuil à la passe suivante soit dans le même rapport. La
+                # fenêtre part du franchissement (`since` + seuil), pas de la
+                # première observation : une alerte vue en retard part tout de
+                # suite. Aucun courrier, donc aucune entrée `to` avant l'envoi.
+                try:
+                    crossing = float(alert.get("since") or 0.0) \
+                        + float(alert.get("threshold") or 0.0)
+                except (TypeError, ValueError):
+                    crossing = 0.0
+                until = crossing + exploitation.BUDGET_PAUSE_COALESCE_S
+                if crossing > 0 and now < until:
+                    sent[key] = {"type": kind, "sent_ts": now,
+                                 "coalesce_until": until,
+                                 "covered": True,
+                                 "to": [], "dead": [], "pending": []}
+                    self.log("[%s] first mail held %ds to group the pause (%s)"
+                             % (kind, int(until - now), _subject(alert)))
+                    continue
             if kind != "slo_breach" and entry is not None:
                 # #1787 N1 : la relance repart aux destinataires de la levée,
                 # pas à ceux que l'état vivant désignerait maintenant (le brief
@@ -3859,6 +3918,10 @@ class Notifier:
                     # `fresh` ; ce qui reste a quitté les briefs ou a été
                     # remis depuis : oublié, la passe ne tourne pas à vide.
                     entry["pending"] = []
+                    if entry.get("coalesce_until") is not None:
+                        # #8266 : la fenêtre de regroupement n'a plus de
+                        # destinataire ; elle ne rejoue pas à chaque passe.
+                        del sent[key]
                     continue
             payload = {"alert": kind, "reminder": False}
             # #789 t2 (canon §9) : l'urgence portée par l'alerte elle-même
@@ -3892,15 +3955,21 @@ class Notifier:
             delivered = []
             suppressed: set = set()
             # #7625 : un compte rendu de pause budget ne se répète pas tant que
-            # l'état n'a pas changé. L'identité est celle de la pause (agent,
-            # hôte), et l'empreinte ignore la durée, l'échéance reculée et les
-            # relevés de jauge (le texte, lui, les porte) ; le passage de
-            # l'échéance annoncée, lui, est un changement d'état. Un rappel
+            # l'état n'a pas changé. L'identité est celle de la pause (famille
+            # et compte depuis #8266, agent et hôte sinon), et l'empreinte
+            # ignore la durée, l'échéance reculée et les relevés de jauge (le
+            # texte, lui, les porte) ; le passage de l'échéance annoncée et
+            # l'ensemble des agents, eux, sont un changement d'état. Un rappel
             # repart au plus toutes les `alert_briefs.REMIND_AFTER_S` (6 h).
             report_label = report_fp = None
             if kind == "budget_pause_long":
-                report_label = "budget_pause_long:%s:%s" % (
-                    alert.get("agent") or "", alert.get("host") or "")
+                if alert.get("grouped") or (
+                        alert.get("harness") and alert.get("account")):
+                    report_label = "budget_pause_long:%s:%s" % (
+                        alert.get("harness") or "", alert.get("account") or "")
+                else:
+                    report_label = "budget_pause_long:%s:%s" % (
+                        alert.get("agent") or "", alert.get("host") or "")
                 resume_ts = alert.get("resume_ts")
                 try:
                     passed = resume_ts is not None and float(resume_ts) <= now
@@ -3908,7 +3977,9 @@ class Notifier:
                     passed = False
                 report_fp = json.dumps(
                     [kind, alert.get("agent"), alert.get("host"), alert.get("harness"),
-                     bool(alert.get("waits_reset")), alert.get("resume_kind"), passed],
+                     alert.get("account"), sorted(alert.get("agents") or ()),
+                     bool(alert.get("waits_reset")), alert.get("resume_kind"), passed,
+                     bool(alert.get("covered_by_decision"))],
                     sort_keys=True, ensure_ascii=False)
             quiet = alert_briefs.quiet_modes(alert, briefs, by_name)
             for name, text in sorted(briefs.items()):
@@ -4026,10 +4097,17 @@ class Notifier:
                              "reminded": kind in ("mail_undeliverable", "review_family_paused",
                                                   "critical_budget_pause")
                              # #7175 : une attente de remise à zéro, sans relance
-                             or bool(alert.get("waits_reset")),
+                             # #8266 : une pause couverte par une décision
+                             # owner datée est un rapport d'information ; pas
+                             # de relance tant que la couverture court.
+                             or bool(alert.get("waits_reset"))
+                             or bool(alert.get("covered_by_decision")),
                              "resume_ts": alert.get("resume_ts"),
                              "resume_kind": alert.get("resume_kind"),
                              "reset_rebriefed": reset_rebriefed,
+                             # #8266 : l'état de couverture au moment du
+                             # courrier ; sa chute rouvre un brief qui réveille.
+                             "covered": bool(alert.get("covered_by_decision")),
                              "to": sorted(set(delivered)),
                              # #3036 : les écartés, pour réévaluer la passe
                              # suivante et remettre à qui est revenu, et les
@@ -4037,9 +4115,16 @@ class Notifier:
                              "dead": sorted(dead),
                              "pending": sorted(set(briefs) - set(delivered) - set(dead) - suppressed)}
             else:
+                # #8266 : la fenêtre de regroupement a produit son courrier.
+                entry.pop("coalesce_until", None)
+                entry["covered"] = bool(alert.get("covered_by_decision"))
                 entry["to"] = sorted(set(entry.get("to") or ()) | set(delivered))
                 entry["dead"] = sorted(dead)
                 entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead) - suppressed)
+                if alert.get("covered_by_decision") or alert.get("waits_reset"):
+                    # #8266/#7175 : rapport couvert ou attente de remise à
+                    # zéro — pas de relance de 6 h tant que l'état tient.
+                    entry["reminded"] = True
                 if remind_due:
                     entry["reminded"] = True
                     # #5461 : la garde contre l'oscillation se mesure depuis

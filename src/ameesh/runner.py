@@ -314,6 +314,8 @@ EXIT_RESTART = 75
 #: L159f : tant que la porte d'hôte n'est pas fixée (canon pas encore lu en
 #: entier), le sync du canon est réessayé à ce pas (secondes)
 GATE_SETTLE_RETRY_S = 30
+#: #8231 : au plus une reprise des désignations en attente par minute
+RESUME_WAITING_S = 60.0
 
 #: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
 BOOT_ORPHAN_PAGE = 500
@@ -13900,6 +13902,17 @@ class Runner:
             names &= set(flt)
         if not names:
             return []
+        # #8268 : un canon en sous-répertoire ne porte pas les mécaniques
+        # (`mechanics.configured` le refuse) ; la passe ne peut pas réussir.
+        # Une ligne à l'arrêt, une au retour, pas un échec par minute.
+        from . import mechanics
+        prefix = mechanics.canon_prefix(self.cfg)
+        if prefix != getattr(self, "_take_off_prefix", ""):
+            log_async("auto-take off: canon under a sub-directory (%s)" % prefix
+                      if prefix else "auto-take on: canon at the Git root")
+            self._take_off_prefix = prefix
+        if prefix:
+            return []
         alerts = []
         try:
             if self.host_pressure().get("blocked"):
@@ -16354,6 +16367,10 @@ class Runner:
             if message != getattr(self, "_deferred_error", None):
                 log_async(message)
             self._deferred_error = message
+        # #8231 : une famille revenue de pause complète les attentes
+        resume = getattr(self, "resume_waiting_designations", None)
+        if resume is not None and not self.dry_run:
+            resume(db)
         seen = getattr(self, "_carry_errors", set())
         errors = set()
         for entry in report:
@@ -16366,6 +16383,35 @@ class Runner:
                     continue
             log_async(line)
         self._carry_errors = errors
+
+    def resume_waiting_designations(self, db) -> None:
+        """#8231 : complète les désignations en attente dès qu'un relecteur
+        d'une famille manquante redevient disponible (fin de pause de rythme
+        ou de budget), sans attendre une synchronisation du canon ni un
+        `work reviewers --apply` à la main. Au plus une passe par
+        `RESUME_WAITING_S` ; ne lève jamais."""
+        now = time.monotonic()
+        if now - getattr(self, "_resume_waiting_at", -RESUME_WAITING_S) < RESUME_WAITING_S:
+            return
+        self._resume_waiting_at = now
+        from . import review_designation_activation as activation
+        try:
+            if not activation.enabled(self.cfg):
+                return
+            memo = getattr(self, "_resume_waiting_memo", None)
+            if memo is None:
+                memo = self._resume_waiting_memo = {}
+            report = activation.resume_waiting(fresh_radar(self.cfg), db, memo=memo)
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            report = {"results": [], "errors": ["%s: %s" % (type(exc).__name__, exc)]}
+        for entry in report.get("results") or ():
+            log_async("waiting designation resumed: lot #%s %s%s"
+                      % (entry.get("lot"), entry.get("result"),
+                         " — %s" % entry.get("detail") if entry.get("detail") else ""))
+        errors = set(report.get("errors") or ())
+        for line in sorted(errors - getattr(self, "_resume_waiting_errors", set())):
+            log_async("waiting designation resume: %s" % " ".join(line.split())[:200])
+        self._resume_waiting_errors = errors
 
     @migrations.writer_tick
     def packet_sweep_once(self, db) -> None:

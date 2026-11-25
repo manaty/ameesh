@@ -509,6 +509,29 @@ class Document:
         today = datetime.fromtimestamp(now, ZoneInfo(self.timezone)).date()
         return self.auto_take.excluded_families if today <= self.auto_take.expire else ()
 
+    def auto_take_until(self, now: float) -> float | None:
+        """#8266 : fin (epoch, exclue) de l'exclusion `auto_take`, ou None.
+
+        La date `expire` est incluse dans le fuseau du canon : la couverture
+        court jusqu'à minuit du lendemain, heure du canon. None quand le bloc
+        est absent ou déjà échu — aucun repli n'est inventé.
+
+        Le bloc `auto_take` est la trace mécanique d'une décision owner datée
+        au canon (le commentaire de `processus/mecanique.yaml` nomme la pause
+        de famille qu'il porte) : une pause budget d'une famille exclue est
+        attendue jusqu'à cette échéance. Le lecteur d'alertes s'en sert pour
+        classer le rapport en information, jamais pour supprimer l'alerte.
+        """
+        if self.auto_take is None:
+            return None
+        tz = ZoneInfo(self.timezone)
+        today = datetime.fromtimestamp(now, tz).date()
+        if today > self.auto_take.expire:
+            return None
+        end = datetime.combine(self.auto_take.expire + timedelta(days=1),
+                               datetime.min.time(), tzinfo=tz)
+        return end.timestamp()
+
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
             if item.name == project:
@@ -1523,6 +1546,23 @@ def configured(cfg) -> Document:
     if key not in _CONFIGURED:
         _CONFIGURED[key] = load_global(source.repo, source.commit)
     return _CONFIGURED[key]
+
+
+def canon_prefix(cfg) -> str:
+    """#8268 : le sous-répertoire du canon appliqué, vide à la racine.
+
+    Même source que `configured` (première source du canon par défaut, Git) :
+    un préfixe rendu ici est un canon que `configured` refusera toujours. Un
+    canon absent, illisible ou non Git rend une chaîne vide (`configured` dit
+    lui-même pourquoi il refuse)."""
+    try:
+        canons = canon.load_configured(cfg) if cfg is not None else []
+    except Exception:  # noqa: BLE001 — illisible : `configured` le dira
+        return ""
+    if not canons or not canons[0].sources:
+        return ""
+    source = canons[0].sources[0]
+    return (source.prefix or "") if source.mode == "git" else ""
 
 
 def session_max_tokens(cfg, harness: str, fallback: float) -> float:
