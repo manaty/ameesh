@@ -182,6 +182,15 @@ def _html_url(sub, row, fallback):
 def events_from(sub, kind, rows):
     for row in rows:
         body = row.get("body") or ""
+        if (kind == "issue" and row.get("state") == "closed"
+                and "pull_request" not in row
+                and _subject_github().BEGIN_PREFIX in body
+                and str(row.get("number") or "").isdigit()):
+            # #8195 : l'épique d'un sujet fermée côté GitHub clôt le sujet
+            # (`deliver`) ; ce n'est pas une demande à porter au veilleur.
+            yield dict(kind=SUBJECT_CLOSED, object_id=int(row["id"]),
+                       issue_ref="%s#%s" % (sub.repo, row["number"]))
+            continue
         if "<!-- ameesh:" in body:
             continue
         if kind == "issue" and "pull_request" in row:
@@ -206,6 +215,16 @@ def events_from(sub, kind, rows):
                    body=body[:MAX_BODY], title=content["title"][:MAX_TITLE],
                    truncated=(len(body) > MAX_BODY or
                               len(content["title"]) > MAX_TITLE))
+
+
+#: #8195 : événement interne, jamais remis au veilleur : une épique de sujet
+#: fermée côté GitHub.
+SUBJECT_CLOSED = "subject-closed"
+
+
+def _subject_github():
+    from . import subject_github
+    return subject_github
 
 
 def collect_batch(api, sub, since, now, scan):
@@ -659,6 +678,13 @@ def deliver(db, sub, events, until, feed, host, *, partial=False,
         agent = st.agents.get(sub.agent)
         if agent is None or agent.get("status") == "stopped":
             raise ValueError("GitHub watcher absent or stopped: %s" % sub.agent)
+        # #8195 : clôt les sujets des épiques fermées, dans la même transaction
+        # que le curseur (idempotent : un sujet clos garde sa date).
+        for event in events:
+            if event["kind"] == SUBJECT_CLOSED:
+                _subject_github().close_by_issue(tx, event["issue_ref"],
+                                                 actor="github:%s" % event["issue_ref"])
+        events = [event for event in events if event["kind"] != SUBJECT_CLOSED]
         for index, event in enumerate(events):
             if not st.github_watch.remember(sub.project, sub.repo, event["kind"],
                                             event["object_id"], event["digest"]):
@@ -794,7 +820,8 @@ class Watcher:
                     self.log("github-watch-stalled: %s/%s still scanning after %d "
                              "tick(s), cursor retained"
                              % (sub.project, sub.repo, next_scan["ticks"]))
-                count = len(events) if self.dry_run else deliver(
+                count = len([e for e in events if e["kind"] != SUBJECT_CLOSED]) \
+                    if self.dry_run else deliver(
                     db, sub, events, until, storage.of(db).work.issue_feed(plan_github.FEED_LIMIT),
                     self.cfg.host, partial=True, scan_before=scan, scan_after=next_scan,
                     now=now)

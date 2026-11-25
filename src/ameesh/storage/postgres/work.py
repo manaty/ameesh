@@ -3470,6 +3470,25 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
             return rows[0]
 
+    def subject_set_github(self, subject_id, ref) -> dict | None:
+        # Refus d'un ticket déjà adopté dans l'instruction même. Sans index
+        # unique (0608), deux adoptions strictement simultanées passeraient
+        # toutes deux : sans dommage, chaque sujet tient sa propre section
+        # (marqueurs par slug) et la clôture du ticket les clôt tous.
+        rows = self.db.query(
+            "UPDATE work_subjects s SET github_ref = %%s"
+            " WHERE s.id = %%s AND (s.github_ref IS NULL OR lower(s.github_ref) = lower(%%s))"
+            " AND NOT EXISTS (SELECT 1 FROM work_subjects o WHERE o.id <> s.id"
+            " AND lower(o.github_ref) = lower(%%s))"
+            " RETURNING %s" % self._SUBJECT_COLUMNS,
+            (ref, int(subject_id), ref, ref))
+        return rows[0] if rows else None
+
+    def subjects_by_github(self, ref) -> list[dict]:
+        return self.db.query(
+            "SELECT %s FROM work_subjects WHERE lower(github_ref) = lower(%%s)"
+            " ORDER BY id" % self._SUBJECT_COLUMNS, (ref,))
+
     def subject_items(self, *, subject_id=None, package_id=None) -> list[dict]:
         clauses, params = [], []
         if subject_id is not None:

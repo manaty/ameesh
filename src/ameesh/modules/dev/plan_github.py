@@ -3221,6 +3221,8 @@ class Projector:
         #: repli quand l'état de l'hôte manque ou ne s'écrit pas : le compteur
         #: vit alors le temps du processus, sans faire échouer la projection.
         self.failures: dict = {}
+        #: #8195 : {id du sujet: empreinte de la section écrite dans son épique}
+        self.subjects_written: dict = {}
 
     def _once(self, key, text: str) -> None:
         if key not in self.said:
@@ -3382,7 +3384,29 @@ class Projector:
                 self.backoff[name] = now + settings.interval
             self._journal(report)
             reports.append(report)
+        if not self.dry_run:
+            self._subjects(db)
         return reports
+
+    def _subjects(self, db) -> None:
+        """#8195 : la section des épiques de sujets, réécrite quand la liste
+        de leurs lots change (ajout, changement d'état). Jamais fatal."""
+        from ... import subject_github
+        try:
+            if self.gh is None:
+                self.gh = Gh()
+            report = subject_github.sync(self.cfg, db, self.gh, written=self.subjects_written,
+                                         cache=self.cache, log=self.log)
+        except Exception as exc:  # noqa: BLE001 - GitHub, gh, base : jamais fatal
+            self._once(("subjects", _one_line(exc)),
+                       "GitHub subject epics: failed: %s" % _one_line(exc))
+            return
+        if report["updated"]:
+            self.log("GitHub subject epics: %d updated" % report["updated"])
+        for row in report["errors"]:
+            self._once(("subject", row["ref"], row["detail"]),
+                       "GitHub subject epic %s (subject %s): %s"
+                       % (row["ref"], row["subject"], row["detail"]))
 
     def _journal(self, report: dict) -> None:
         where = "%s (%s)" % (report["repo"], report["project"])
