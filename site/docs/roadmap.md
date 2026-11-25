@@ -538,6 +538,7 @@ version.
 - **v1.71.0** (2026-11-23): +23 internal lots.
 - **v1.72.0** (2026-11-24): Migrations 0607; +17 internal lots.
 - **v1.73.0** (2026-11-24): Migrations 0606, 0608; +15 internal lots.
+- **v1.74.0** (2026-11-25): Commands wait; +20 internal lots.
 <!-- generated releases: end -->
 
 ## In progress
