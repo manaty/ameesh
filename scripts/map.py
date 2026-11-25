@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
+import contextlib
 import copy
 import datetime
 import glob
@@ -359,23 +360,32 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict], list[dic
             try:
                 donnees = CoverageData(basename=fichier)
                 donnees.read()
-                contextes = donnees.measured_contexts()
-                module_de = {c: context_module(c) for c in contextes}
-                sans_attribution = bool(contextes) and not any(module_de.values())
-                # #5604 : contexte unique → `lines()`, sans attribution par ligne
-                unique = module_de[next(iter(contextes))] if len(contextes) == 1 else None
-                for mesure in donnees.measured_files() if not sans_attribution else ():
-                    relatif = relative_path(mesure)
-                    if relatif is None:
-                        continue
-                    if unique is not None:
-                        contribution[relatif][unique].update(donnees.lines(mesure) or ())
-                        continue
-                    for ligne, ctx in donnees.contexts_by_lineno(mesure).items():
-                        for c in ctx:
-                            module = module_de[c] if c in module_de else context_module(c)
-                            if module:
-                                contribution[relatif][module].add(ligne)
+                # #8261 : coverage rouvre la base SQLite à chaque bloc `with`
+                # le plus externe, donc à chaque `lines()` ou
+                # `contexts_by_lineno()` : ~600 connexions par fichier, 72 s
+                # pour 300 des 4 234 fichiers de psycopg 1/12 (run 45316377857,
+                # fusion coupée à 60 min). Un bloc englobant garde une seule
+                # connexion par fichier ; sans `_connect` (autre version), rien
+                # ne change.
+                connexion = getattr(donnees, "_connect", None)
+                with connexion() if connexion is not None else contextlib.nullcontext():
+                    contextes = donnees.measured_contexts()
+                    module_de = {c: context_module(c) for c in contextes}
+                    sans_attribution = bool(contextes) and not any(module_de.values())
+                    # #5604 : contexte unique → `lines()`, sans attribution par ligne
+                    unique = module_de[next(iter(contextes))] if len(contextes) == 1 else None
+                    for mesure in donnees.measured_files() if not sans_attribution else ():
+                        relatif = relative_path(mesure)
+                        if relatif is None:
+                            continue
+                        if unique is not None:
+                            contribution[relatif][unique].update(donnees.lines(mesure) or ())
+                            continue
+                        for ligne, ctx in donnees.contexts_by_lineno(mesure).items():
+                            for c in ctx:
+                                module = module_de[c] if c in module_de else context_module(c)
+                                if module:
+                                    contribution[relatif][module].add(ligne)
             except (CoverageException, sqlite3.DatabaseError, OSError) as exc:
                 # #1257 x #1690 : la perte alimente les deux projections, sans
                 # double compteur ; le diagnostic d'en-tête nomme la panne.

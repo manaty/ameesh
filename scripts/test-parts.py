@@ -11,6 +11,7 @@
                                 [--parallel N]
     scripts/test-parts.py plan  --out plan.json --parts "mesure-psycopg-1 …"
                                 [--list-psql F] [--map carte.json.gz] [--summary F]
+                                [--plafond-min 60 --parts-max 32] [--github-output F]
     scripts/test-parts.py durations --driver psql F.json [F.json…]
                                 [--flows F.jsonl…] [--min-test-s 5]
 
@@ -114,6 +115,18 @@ une part chargée (psycopg 3/6 annulée à 40m46, aucune carte publiée).
 part mesurée : un test bloqué est nommé dans la carte comme erreur et la suite
 continue, au lieu de laisser la part consumer le plafond de 60 min (psycopg
 2/8, run 40177589953 : 3 087 s sans sortie après `test_503_agent_host`).
+
+#8261 — avec `--parts-max N` en plus de `--plafond-min`, les parts de
+`--parts` ne sont plus qu'un **plancher** : le plan ajoute des parts à un
+pilote tant que sa part la plus lourde, × `SURCOUT_CHARGE`, dépasse
+`MARGE_PLAFOND` du plafond (jusqu'à N parts, ou tant qu'une part de plus
+allège encore la plus lourde : un module insécable reste signalé). Le
+24/11, six mesures sur sept ont été annulées : la suite avait grossi, chaque
+part psycopg sur 12 pesait ~3 018 s (× 1,5 : 75 min pour un plafond de 60),
+le plan l'avertissait, et la matrice figée de carte.yml rejouait le même
+découpage à chaque run, sans jamais publier la carte qui l'aurait corrigé.
+`--github-output` écrit la matrice (`matrice`, JSON) et les parts attendues
+(`attendu`) du plan, que le workflow lit au lieu d'une liste figée.
 """
 from __future__ import annotations
 
@@ -158,6 +171,11 @@ EXCERPT_LINES = 40
 #: 3/6 estimée 1 588,7 s, 2 316 s de tests réels (×1,46) ; une part dont
 #: l'estimation × ce facteur dépasse le plafond du job est signalée par le plan
 SURCOUT_CHARGE = 1.5
+#: #8261 — part de plafond visée par l'ajustement du nombre de parts : psql
+#: 5/9 et 7/9, estimées ~2 372 s (× 1,5 = 59 min, juste sous le plafond), ont
+#: tenu 54 et 55 min de mur le 24/11 (run 45443586463) ; une estimation qui
+#: frôle le plafond n'est pas une marge.
+MARGE_PLAFOND = 0.9
 #: #3604 — borne par test sous mesure. Le run 40177589953 (main 7d3e776e) a
 #: perdu psycopg 2/8 après 3 087 s sans sortie : un test bloqué a consommé le
 #: plafond de 60 min et annulé la part, donc la carte. La borne nomme le test
@@ -448,6 +466,7 @@ def plan(args) -> int:
     mods = modules()
     table = map_durations(args.map) if args.map else None
     parts = parts_du_plan(args.parts.replace(",", " ").split())
+    planchers = dict(parts)
     sortie: dict = {"schema": PLAN_SCHEMA, "kind": "mesure", "parts": {}, "classes": {},
                     "poids": {}}
     for pilote, n in sorted(parts.items()):
@@ -456,6 +475,8 @@ def plan(args) -> int:
         if table_pilote is not None and not table_pilote.get(pilote):
             table_pilote = None  # la carte ne porte pas ce pilote : table statique
         poids, repli = weight(sel, pilote, table_pilote)
+        n = nombre_de_parts(poids, n, args.plafond_min, args.parts_max)
+        parts[pilote] = n
         sortie["parts"][pilote] = [
             {"part": i, "of": n, "modules": part, "label": f"{pilote} {i}/{n}",
              "estimate_s": round(sum(poids[m] for m in part), 1),
@@ -472,7 +493,9 @@ def plan(args) -> int:
         charges = [entree["estimate_s"] for entree in sortie["parts"][pilote]]
         lignes.append(f"* {pilote} : {infos['modules']} module(s) en {n} parts "
                       f"(poids {infos['source']}, {infos['repli']} en repli), "
-                      f"max ~{max(charges):.0f} s")
+                      f"max ~{max(charges):.0f} s"
+                      + (f" — relevé de {planchers[pilote]} parts pour tenir sous le "
+                         f"plafond (#8261)" if n != planchers[pilote] else ""))
         for entree in sortie["parts"][pilote] if args.plafond_min else ():
             if entree["estimate_s"] * SURCOUT_CHARGE > args.plafond_min * 60:
                 print(f"::warning::mesure {entree['label']} estimée "
@@ -486,7 +509,46 @@ def plan(args) -> int:
         with open(args.summary, "a", encoding="utf-8") as fh:
             fh.write(texte)
     print(texte, end="")
+    if args.github_output:
+        # #8261 : la matrice de `mesure` et les parts attendues par la fusion
+        # viennent du plan, plus d'une liste figée dans le workflow. Le pilote
+        # le plus chargé d'abord : `max-parallel` démarre ses parts en premier.
+        charge = {pilote: sum(e["estimate_s"] for e in sortie["parts"][pilote])
+                  for pilote in parts}
+        matrice = [{"pilote": pilote, "part": i, "parts": parts[pilote]}
+                   for pilote in sorted(parts, key=lambda p: (-charge[p], p))
+                   for i in range(1, parts[pilote] + 1)]
+        attendu = " ".join(f"mesure-{e['pilote']}-{e['part']}" for e in matrice)
+        with open(args.github_output, "a", encoding="utf-8") as fh:
+            fh.write(f"matrice={json.dumps(matrice, separators=(',', ':'))}\n"
+                     f"attendu={attendu}\n")
     return 0
+
+
+def nombre_de_parts(poids: dict[str, float], plancher: int, plafond_min: int | None,
+                    parts_max: int | None) -> int:
+    """#8261 — le nombre de parts d'un pilote : `plancher` (la liste du
+    workflow), relevé tant que la part la plus lourde, × `SURCOUT_CHARGE`,
+    dépasse `MARGE_PLAFOND` du plafond. Sans `plafond_min` ni `parts_max`,
+    le plancher est rendu tel quel (découpage figé d'avant #8261).
+
+    S'arrête à `parts_max`, ou dès qu'une part de plus n'allège plus la plus
+    lourde (un module seul au-delà de la cible) : le plan le signale alors
+    comme avant, au lieu de multiplier des parts inutiles."""
+    if not plafond_min or not parts_max:
+        return plancher
+    cible = plafond_min * 60 * MARGE_PLAFOND / SURCOUT_CHARGE
+
+    def plus_lourde(n: int) -> float:
+        return max((sum(poids[m] for m in part) for part in split(poids, n)), default=0.0)
+
+    n, charge = plancher, plus_lourde(plancher)
+    while charge > cible and n < parts_max:
+        suivante = plus_lourde(n + 1)
+        if suivante >= charge:
+            break
+        n, charge = n + 1, suivante
+    return n
 
 
 def _module_of(test) -> str:
@@ -1384,6 +1446,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--plafond-min", type=int,
                    help="timeout-minutes du job de mesure : signale une part trop "
                    "proche du plafond (#2224)")
+    p.add_argument("--parts-max", type=int,
+                   help="#8261 : avec --plafond-min, --parts devient un plancher et "
+                   "chaque pilote gagne des parts (au plus N) jusqu'à tenir sous le plafond")
+    p.add_argument("--github-output",
+                   help="#8261 : écrit `matrice` (JSON) et `attendu` du plan dans ce "
+                   "fichier ($GITHUB_OUTPUT)")
     args = ap.parse_args(argv)
     if args.commande == "run" and not args.parts and not args.plan:
         ap.error("run: --parts or --plan required")
