@@ -69,16 +69,24 @@ PLAN_K1 = {"parts": {"psycopg": [{"part": 1, "modules": ["a", "d"]},
 
 
 class MiroirDesPartsTest(unittest.TestCase):
-    """Le workflow et le garde-fou ne peuvent pas diverger en silence."""
+    """Le workflow et le garde-fou ne peuvent pas diverger en silence.
 
-    def test_le_miroir_couvre_la_matrice_de_mesure(self):
-        matrice = sorted(f"mesure-{p}-{n}" for p, n, _ in INCLUDE.findall(WORKFLOW))
-        self.assertEqual(len(matrice), 21, "matrice de mesure inattendue")
-        m = MIROIR.search(WORKFLOW)
-        self.assertIsNotNone(m, "PARTS_MESURE introuvable dans carte.yml")
-        miroir = sorted(m.group(2).split())
-        self.assertEqual(matrice, miroir,
-                         "PARTS_MESURE doit être le miroir exact de la matrice mesure")
+    #8261 : la matrice de `mesure` et les parts attendues par la fusion
+    viennent toutes deux du plan ; `PARTS_MESURE` n'en est que le plancher."""
+
+    def test_la_matrice_et_les_parts_attendues_viennent_du_plan(self):
+        self.assertEqual(INCLUDE.findall(WORKFLOW), [],
+                         "plus de matrice figée : elle vient du plan (#8261)")
+        self.assertIn("include: ${{ fromJSON(needs.plan-mesure.outputs.matrice) }}",
+                      _job("mesure"))
+        plan = _job("plan-mesure")
+        self.assertIn("matrice: ${{ steps.plan.outputs.matrice }}", plan)
+        self.assertIn("attendu: ${{ steps.plan.outputs.attendu }}", plan)
+        self.assertIn('--github-output "$GITHUB_OUTPUT"', plan)
+        fusion = _job("carte")
+        self.assertIn("needs: [plan-mesure, mesure]", fusion)
+        self.assertIn("PARTS_ATTENDUES: ${{ needs.plan-mesure.outputs.attendu }}", fusion)
+        self.assertIn('if [ -z "$PARTS_ATTENDUES" ]', fusion)
 
     def test_la_mesure_psql_est_decoupee(self):
         # B : une seule part de 45 modules pesait 38 min de mur pour 40 de
@@ -87,12 +95,13 @@ class MiroirDesPartsTest(unittest.TestCase):
         # parts psycopg (#3450 : 8 ; #3604 : 8 ne tenaient plus sous le
         # plafond de 60 min sur un pool saturé, run 40177589953 du 25/10).
         # #5604 : psql 4/6 et 1/6 coupées à 60 min (01/11, 02/11), parts
-        # estimées 2 548 s : 9 parts psql.
-        psql = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW) if p == "psql"]
-        self.assertEqual(psql, [("psql", str(n), "9") for n in range(1, 10)])
-        psycopg = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW)
-                   if p == "psycopg"]
-        self.assertEqual(psycopg, [("psycopg", str(n), "12") for n in range(1, 13)])
+        # estimées 2 548 s : 9 parts psql. #8261 : ce n'est plus qu'un
+        # plancher, que le plan relève.
+        m = MIROIR.search(WORKFLOW)
+        self.assertIsNotNone(m, "PARTS_MESURE introuvable dans carte.yml")
+        self.assertEqual(parts.parts_du_plan(m.group(2).split()),
+                         {"psql": 9, "psycopg": 12})
+        self.assertRegex(_job("plan-mesure"), r"--parts-max (\d+)")
 
     def test_le_plafond_des_mesures_est_celui_que_le_plan_verifie(self):
         # #2224 : psycopg 3/6 annulée à 40m46 (run 39015105210), aucune carte.
@@ -117,7 +126,7 @@ class MiroirDesPartsTest(unittest.TestCase):
         self.assertIn("RESULTAT_MESURE: ${{ needs.mesure.result }}", WORKFLOW)
 
     def test_la_fusion_declare_les_parts_attendues(self):
-        self.assertIn('--attendu "$PARTS_MESURE"', WORKFLOW)
+        self.assertIn('--attendu "$PARTS_ATTENDUES"', WORKFLOW)
 
     def test_rien_n_est_publie_si_la_fusion_echoue(self):
         # l'artefact `carte` et le cache ne s'écrivent qu'après une fusion
@@ -285,6 +294,39 @@ class PlanMesureTest(unittest.TestCase):
                    options=("--plafond-min", "100000"))
         self.assertNotIn("::warning::", self.sortie)
 
+    def test_le_plan_releve_les_parts_jusqu_au_plafond(self):
+        # #8261 : le 24/11, chaque part psycopg sur 12 pesait ~3 018 s (× 1,5 :
+        # 75 min pour 60 de plafond) ; le plan l'avertissait, la matrice figée
+        # rejouait le même découpage et aucune carte ne sortait. Avec
+        # --parts-max, le plancher est relevé jusqu'à tenir sous la marge.
+        with tempfile.TemporaryDirectory() as tmp:
+            sortie = pathlib.Path(tmp) / "github-output"
+            plancher = self._plan("mesure-psycopg-1", "mesure-psycopg-2")
+            plafond = max(e["estimate_s"] for e in plancher["parts"]["psycopg"]) / 60 / 2
+            plafond = max(1, int(plafond))
+            plan = self._plan("mesure-psycopg-1", "mesure-psycopg-2",
+                              options=("--plafond-min", str(plafond), "--parts-max", "32",
+                                       "--github-output", str(sortie)))
+            entrees = plan["parts"]["psycopg"]
+            n = len(entrees)
+            self.assertGreater(n, 2, "le plancher de 2 parts n'est pas relevé")
+            self.assertEqual([e["of"] for e in entrees], [n] * n)
+            vus = [m for e in entrees for m in e["modules"]]
+            self.assertEqual(sorted(vus), sorted(parts.modules()))
+            self.assertIn(f"relevé de 2 parts", self.sortie)
+            lignes = dict(l.split("=", 1) for l in sortie.read_text().splitlines())
+            matrice = json.loads(lignes["matrice"])
+            self.assertEqual(matrice, [{"pilote": "psycopg", "part": i, "parts": n}
+                                       for i in range(1, n + 1)])
+            self.assertEqual(lignes["attendu"].split(),
+                             [f"mesure-psycopg-{i}" for i in range(1, n + 1)])
+
+    def test_sans_parts_max_le_plancher_reste(self):
+        # le découpage figé d'avant #8261 : --plafond-min seul avertit sans relever
+        plan = self._plan("mesure-psycopg-1", "mesure-psycopg-2",
+                          options=("--plafond-min", "1"))
+        self.assertEqual(len(plan["parts"]["psycopg"]), 2)
+
     def test_le_plan_partitionne_les_modules(self):
         plan = self._plan("mesure-psycopg-1", "mesure-psycopg-2")
         entrees = plan["parts"]["psycopg"]
@@ -311,6 +353,54 @@ class PlanMesureTest(unittest.TestCase):
                 capture_output=True, text=True, cwd=REPO)
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("non contiguës", proc.stderr)
+
+
+class NombreDePartsTest(unittest.TestCase):
+    """#8261 — le cercle fermé : une carte périmée ne doit plus figer un
+    découpage qui dépasse le plafond, donc ne jamais publier de carte."""
+
+    # cible : 60 min × MARGE_PLAFOND / SURCOUT_CHARGE
+    CIBLE = 60 * 60 * parts.MARGE_PLAFOND / parts.SURCOUT_CHARGE
+
+    def test_le_cas_du_24_11(self):
+        # 12 parts de ~3 018 s : chacune × 1,5 dépasse 60 min ; le plan
+        # relève jusqu'à ce que la plus lourde tienne sous la cible.
+        poids = {f"m{i:04d}": 3018.0 * 12 / 1200 for i in range(1200)}
+        n = parts.nombre_de_parts(poids, 12, 60, 32)
+        self.assertGreater(n, 12)
+        lourde = max(sum(poids[m] for m in p) for p in parts.split(poids, n))
+        self.assertLessEqual(lourde, self.CIBLE)
+        avant = max(sum(poids[m] for m in p) for p in parts.split(poids, n - 1))
+        self.assertGreater(avant, self.CIBLE, "une part de trop")
+
+    def test_sous_le_plafond_le_plancher_reste(self):
+        poids = {f"m{i}": 10.0 for i in range(100)}
+        self.assertEqual(parts.nombre_de_parts(poids, 12, 60, 32), 12)
+
+    def test_borne_par_parts_max(self):
+        poids = {f"m{i}": 1000.0 for i in range(1000)}
+        self.assertEqual(parts.nombre_de_parts(poids, 12, 60, 20), 20)
+
+    def test_un_module_insecable_n_ajoute_pas_de_parts_inutiles(self):
+        # un module seul au-delà de la cible : une part de plus ne l'allège
+        # pas, le plan s'arrête (et l'avertissement #2224 le nomme)
+        poids = {"lourd": 10_000.0, **{f"m{i}": 10.0 for i in range(50)}}
+        self.assertEqual(parts.nombre_de_parts(poids, 2, 60, 32), 2)
+
+    def test_un_palier_du_decoupage_n_arrete_pas(self):
+        # relecture ameesh-cx2 (gel #46410) : 25 modules de 1 300 s, plus
+        # lourde à 2 600 s pour 13 comme pour 14 parts ; s'arrêter au palier
+        # rendait 13 (65 min sous charge), alors que 25 parts tiennent.
+        poids = {f"m{i:02d}": 1300.0 for i in range(25)}
+        n = parts.nombre_de_parts(poids, 12, 60, 32)
+        lourde = max(sum(poids[m] for m in p) for p in parts.split(poids, n))
+        self.assertLessEqual(lourde, self.CIBLE)
+        self.assertEqual(n, 25)
+
+    def test_sans_plafond_ni_parts_max(self):
+        poids = {f"m{i}": 1000.0 for i in range(1000)}
+        self.assertEqual(parts.nombre_de_parts(poids, 12, None, 32), 12)
+        self.assertEqual(parts.nombre_de_parts(poids, 12, 60, None), 12)
 
 
 class PartsIncompletesTest(unittest.TestCase):

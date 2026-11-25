@@ -616,6 +616,46 @@ class AttributionParContexteTest(_PetitDepot, unittest.TestCase):
                           "src/ameesh/autre.py": {1: {"test_a"}}})
 
 
+class UneConnexionParFichierTest(_PetitDepot, unittest.TestCase):
+    """#8261 : coverage rouvre la base à chaque `lines()` ou
+    `contexts_by_lineno()` hors d'un bloc englobant ; la fusion du 24/11
+    (run 45316377857, 4 234 fichiers pour psycopg 1/12) a été coupée à 60 min.
+    Le nombre de connexions ne suit plus le nombre de fichiers mesurés."""
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_connexions_bornees_par_fichier_de_couverture(self):
+        import sqlite3
+
+        from coverage import CoverageData
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        (dossier / "cov").mkdir()
+        sources = [str(carte.REPO / "src" / "ameesh" / f"m{i}.py") for i in range(30)]
+        for nom, contextes in (("multiple", ("tests.test_a.T.t", "tests.test_b.T.t")),
+                               ("unique", ("tests.test_c.T.t",))):
+            donnees = CoverageData(basename=str(dossier / "cov" / f".coverage.{nom}"))
+            for contexte in contextes:
+                donnees.set_context(contexte)
+                donnees.add_lines({s: {1, 2} for s in sources})
+            donnees.write()
+        connecter = sqlite3.connect
+        appels = []
+
+        def compte(*args, **kwargs):
+            appels.append(args[0] if args else kwargs.get("database"))
+            return connecter(*args, **kwargs)
+
+        with mock.patch.object(sqlite3, "connect", compte):
+            lignes, processus, _, ignorees, _ = carte._coverage([str(dossier)])
+        self.assertEqual((processus, ignorees), (2, []))
+        self.assertEqual(len(lignes), 30)
+        self.assertEqual(lignes["src/ameesh/m0.py"][1], {"test_a", "test_b", "test_c"})
+        # quelques connexions par fichier de couverture (lecture seule, read(),
+        # le bloc englobant : 4 avec coverage 7.17), jamais une par fichier
+        # mesuré (30 ici : plus de 60 avant #8261)
+        self.assertLessEqual(len(appels), 2 * 5, appels)
+
+
 class _FauxCoverageException(Exception):
     pass
 
