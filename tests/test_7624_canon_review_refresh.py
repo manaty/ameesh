@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from ameesh import review_canon_refresh as refresh
+from ameesh import review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import work
 from ameesh.work_reviewers import designated
@@ -87,6 +88,45 @@ class CanonReviewRefreshTest(base._ActivationFixture, PgTestCase):
         self.assertEqual(result["errors"], [], result)
         self.assertEqual(len(designated(work.get(self.db, self.lot))), 2)
         self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["pilot", other])
+
+    def test_paused_family_gets_no_second_notice_when_the_canon_did_not_move(self):
+        """#8265 : le gel qui attend une famille en pause a déjà reçu son avis
+        « Designation at freeze incomplete » ; le contrôle du canon qui suit,
+        à politique inchangée, n'en ajoute pas un second."""
+        self.raise_policy()
+        self.db.execute("UPDATE agent_registry SET status = 'stopped'"
+                        " WHERE name = %s", ("r2",))
+        _, initial = self.freeze()
+        self.assertEqual(initial["state"], rd.WAITING)
+        notices = [m for m in self.mailbox() if m["recipient"] == "pilot"]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("Designation at freeze incomplete", notices[0]["body"])
+        before = len(self.mailbox())
+        for _ in range(2):
+            result = refresh.after_sync(self.cfg, self.db)
+            self.assertEqual(result["errors"], [], result)
+        self.assertEqual(self.mailbox()[before:], [])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1"])
+
+    def test_waiting_freeze_alerts_once_more_when_the_canon_really_moves(self):
+        """#8265 : le second avis n'est pas supprimé en bloc ; une politique
+        réellement publiée (sha du canon différent) alerte une fois."""
+        self.raise_policy()
+        self.db.execute("UPDATE agent_registry SET status = 'stopped'"
+                        " WHERE name = %s", ("r2",))
+        self.freeze()
+        before = len(self.mailbox())
+        self.canon.update("index.md", "# canon move\n")
+        first = refresh.after_sync(self.cfg, self.db)
+        self.assertEqual(first["errors"], [], first)
+        pilot = [m for m in self.mailbox()[before:] if m["recipient"] == "pilot"]
+        self.assertEqual(len(pilot), 1, pilot)
+        self.assertIn("canon policy changed", pilot[0]["body"])
+        second = refresh.after_sync(self.cfg, self.db)
+        self.assertEqual(second["errors"], [], second)
+        self.assertEqual(
+            [m for m in self.mailbox()[before:] if m["recipient"] == "pilot"],
+            pilot)
 
     def test_stale_result_is_silent_and_retried_on_the_next_pass(self):
         """#7662 : un gel ou un siège déplacé pendant la complétion rend
@@ -234,6 +274,28 @@ class CanonRefreshCarryTest(_CarryFixture):
         self.assertEqual(self.review_mail(), [])
         self.assertEqual(self.designated(), ["rev1", "rev2"])
         self.assertEqual(act._effective_mark(self.db, self.lot, mark["id"])[1], "carried")
+
+
+class PolicyMoveTest(unittest.TestCase):
+    """#8265 : la politique a bougé si le commit du canon a bougé, pas si le
+    même canon est lu sous un autre chemin de poste."""
+
+    SHA = "a" * 40
+    OTHER = "b" * 40
+
+    def test_the_same_canon_commit_at_another_path_is_not_a_move(self):
+        recorded = "/poste-a/canon@%s:processus/mecanique.yaml" % self.SHA
+        refs = ["/poste-b/canon@%s:processus/mecanique.yaml" % self.SHA]
+        self.assertFalse(refresh._policy_moved({}, refs, recorded))
+
+    def test_a_new_canon_commit_is_a_move(self):
+        recorded = "/poste-a/canon@%s:processus/mecanique.yaml" % self.OTHER
+        refs = ["/poste-b/canon@%s:processus/mecanique.yaml" % self.SHA]
+        self.assertTrue(refresh._policy_moved({}, refs, recorded))
+
+    def test_a_first_designation_written_by_the_refresh_is_not_a_move(self):
+        ref = "/poste-b/canon@%s:processus/mecanique.yaml" % self.SHA
+        self.assertFalse(refresh._policy_moved({"policy_ref": ref}, [ref], ""))
 
 
 class RunnerRefreshTest(unittest.TestCase):
