@@ -1897,10 +1897,15 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
                 if probe and record:
                     fresh = gauge_probe.reread(profile, environ=environ, now=now)
                     if _covers(fresh, exc.missing):
+                        # les fenêtres lues localement restent, sauf celles que
+                        # la relecture publie (`merge`) : une courte saturée
+                        # absente d'une réponse hebdomadaire seule tient
                         return evaluate(book, profile, items, now, environ,
                                         record=True, critical=critical,
                                         reserve=reserve, model=model,
-                                        probe=False, _gauges=fresh)
+                                        probe=False,
+                                        _gauges=gauge_probe.merge(
+                                            exc.partial, fresh, now=now))
             return result
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)

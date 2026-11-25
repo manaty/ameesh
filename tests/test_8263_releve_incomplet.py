@@ -14,12 +14,15 @@ confirmation des passages suivants. Aucun test ne lance le vrai `codex`.
 from __future__ import annotations
 
 import os
+import unittest
 from unittest import mock
 
 from ameesh import accounts, budget, cost, exploitation, gauge_probe, registry
 from ameesh.codex_gauges import AmbiguousCodexGauges, IncompleteCodexGauges
 
 from .support import PgTestCase
+from . import test_2843_codex_window_aging as t2843
+from .test_cost import Sandbox
 
 WEEK = 7 * 86400.0
 SHORT = 5 * 3600.0
@@ -91,6 +94,20 @@ class EvaluateTest(PgTestCase):
         self.assertEqual(result.held[0], "codex-300min")
         self.assertEqual(result.until, NOW + SHORT)
 
+    def test_a_saturated_local_short_survives_a_weekly_only_reread(self):
+        # relecture de dev3 : seule l'hebdomadaire manque, la courte locale est
+        # à 100 % ; la réponse fournisseur ne publie que l'hebdomadaire
+        partial = cost.Gauges([cost.Gauge(
+            "codex", "codex-300min", 1.0, NOW + 3600, SHORT, read_at=NOW - 60,
+            produced_at=NOW - 60, source="t")], cost.Overage(False, False))
+        error = IncompleteCodexGauges(["weekly window"], partial)
+        result, sonde = self._evaluate(provider(None, 0.10), error=error)
+        sonde.assert_called_once()
+        self.assertFalse(result.ok)
+        self.assertFalse(result.doubt)
+        self.assertEqual(result.held[0], "codex-300min")
+        self.assertEqual(result.until, NOW + 3600)
+
     def test_the_reread_shares_the_probe_retry_delay(self):
         self._evaluate(None)
         result, sonde = self._evaluate(provider(0.0, 0.85))
@@ -151,3 +168,21 @@ class AlertTest(PgTestCase):
         raison = ("pause (account primaire, codex-10080min 95 % reset) until 08:31; "
                   "all codex accounts at threshold")
         self.assertEqual(len(self._alerts(raison, 20)), 1)
+
+
+
+class PartialReadingTest(Sandbox, unittest.TestCase):
+    """Le refus d'un relevé incomplet porte les fenêtres lues, datées et
+    sourcées comme un relevé complet (relecture de dev3)."""
+
+    def test_the_refusal_carries_the_windows_it_read(self):
+        sample = t2843.TruncatedSampleTest._sample_with_expired_short
+        sample(self)
+        with self.assertRaises(IncompleteCodexGauges) as caught:
+            self.book().codex_gauges()
+        self.assertEqual(caught.exception.missing, ("short window",))
+        partial = {g.key: g for g in caught.exception.partial}
+        self.assertIn("codex-10080min", partial)
+        week = partial["codex-10080min"]
+        self.assertTrue(week.source)
+        self.assertEqual(week.produced_at, week.read_at)
