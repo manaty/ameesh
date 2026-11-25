@@ -159,7 +159,7 @@ class FailureKindsTest(unittest.TestCase):
 
 
 class BaseRedLotTest(unittest.TestCase):
-    def call(self, outputs, sender=None):
+    def call(self, outputs, sender=None, kind="FAIL"):
         calls = []
 
         def fake(cmd, *, input_text=None, timeout=None, **_kw):
@@ -169,7 +169,7 @@ class BaseRedLotTest(unittest.TestCase):
         with mock.patch.object(auto, "run_command", side_effect=fake):
             lot = auto.base_red_lot(OWN, name="h-test", carrier=9,
                                     base_sha=BASE, target="main",
-                                    kind="FAIL", repo="manaty/ameesh",
+                                    kind=kind, repo="manaty/ameesh",
                                     driver="psycopg", sender=sender,
                                     log=lambda _l: None)
         return lot, calls
@@ -207,6 +207,15 @@ class BaseRedLotTest(unittest.TestCase):
                          {"test": OWN, "kind": "FAIL", "base": BASE,
                           "repo": "manaty/ameesh", "driver": "psycopg",
                           "packet": "h-test", "carrier": 9})
+
+    def test_relance_error_ecrit_la_classe_error(self) -> None:
+        # #8269 : le constat ERROR du rejeu doit atteindre la preuve écrite,
+        # sinon la lecture CI le comparerait à FAIL et ne neutraliserait rien.
+        _lot, calls = self.call([
+            "lot #77 already exists (unique-ref x, merged): Rouge", "noted"],
+            kind="ERROR")
+        proof = json.loads(calls[1][1][len(auto.BASE_RED_PROOF):])
+        self.assertEqual(proof["kind"], "ERROR")
 
     def test_preuve_meme_prefixe_que_la_lecture_ci(self) -> None:
         self.assertEqual(auto.BASE_RED_PROOF, packet_red.BASE_RED_PROOF)
@@ -277,8 +286,36 @@ class CiReadingTest(unittest.TestCase):
         self.assert_not_marked(failures=[{"test": OWN, "status": "erreur"}])
         self.assert_not_marked(proofs=[self.proof(kind="ERROR")])
 
+    def test_erreur_avec_preuve_error_classe_rouge_de_la_base(self) -> None:
+        # #8269 : même test, même base, même classe ERROR : c'est bien un
+        # rouge de la base, aucune unité ne lui est imputée.
+        entries = self.entries()
+        count = self.mark(entries, self.OPEN, [self.proof(kind="ERROR")],
+                          failures=[{"test": OWN, "status": "erreur"},
+                                    {"test": "tests.test_autre.T.test_y",
+                                     "status": "echec"}])
+        self.assertEqual(count, 1)
+        self.assertEqual(entries[0]["base_proof"],
+                         {"base": BASE, "kind": "ERROR", "carrier": 9})
+        self.assertEqual((entries[0]["status"], entries[0]["units"],
+                          entries[0]["base_lot"]), ("base", [], 77))
+        self.assertEqual(entries[1]["status"], "probable")
+
     def test_classe_absente_en_ci_ne_classe_rien(self) -> None:
         self.assert_not_marked(failures=[{"test": OWN}])
+
+    def test_classe_inconnue_en_ci_ne_classe_rien(self) -> None:
+        # #8269 : le témoin du 25/11 02:06Z portait aussi un statut inconnu ;
+        # une classe illisible ne doit jamais effacer l'attribution.
+        entries = self.entries()
+        count = self.mark(entries, self.OPEN,
+                          failures=[{"test": OWN, "status": "inconnu"},
+                                    {"test": "tests.test_autre.T.test_y",
+                                     "status": "echec"}])
+        self.assertEqual(count, 0)
+        self.assertEqual(entries[0]["status"], "probable")
+        self.assertEqual(entries[0]["units"],
+                         [{"lot": 1, "best": 6, "evidence": []}])
 
     def test_autre_depot_ou_base_inconnue_ne_classe_rien(self) -> None:
         self.assert_not_marked(proofs=[self.proof(repo="manaty/nexlink")])
