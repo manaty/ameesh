@@ -38,6 +38,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import time
 import types
 import unittest
 from unittest import mock
@@ -645,6 +646,11 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.bare, self.clone = publish(self.workspace, "acme", EXAMPLE)
         write(self.clone, RACINE, carte())
         commit_all(self.clone, "règles de travail")
+        # #8267 : ces tests portent sur le contenu poussé, pas sur la fenêtre
+        # de regroupement (les révisions y sont immédiates).
+        patcher = mock.patch.object(canon_sync, "PROCESS_PUSH_GROUP_S", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def sync(self, ref: str = "") -> canon_sync.SyncReport:
         return canon_sync.sync(self.db, canon.load(self.clone, ref=ref), "atelier")
@@ -652,8 +658,8 @@ class PushProcessTest(_TmpMixin, PgTestCase):
     def _sujets(self, name: str) -> list[dict]:
         return mail.unread(self.db, name)
 
-    def _change(self, body: str, message: str = "nouvelle règle") -> None:
-        write(self.clone, RACINE, carte(body=body))
+    def _change(self, body: str, message: str = "nouvelle règle", **fields) -> None:
+        write(self.clone, RACINE, carte(body=body, **fields))
         commit_all(self.clone, message)
 
     def test_premier_sync_ne_pousse_rien(self):
@@ -675,6 +681,83 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         # un sync sans modification ne repousse rien
         self.sync()
         self.assertEqual(len(self._sujets("orchestre")), 1)
+
+    def test_les_revisions_d_une_fiche_sont_regroupees(self):
+        # #8267 : deux révisions rapprochées ne font qu'une diffusion, sur la
+        # base précédente ; `process_commit` n'avance qu'au moment de pousser.
+        self.sync()
+        etat = canon_sync.state(self.db, "atelier")
+        before = etat["process_commit"] or etat["last_good_commit"]
+        jeune = time.time()
+        self._change("# Processus de lot\n\n- règle A\n")
+        with mock.patch.object(canon_sync, "PROCESS_PUSH_GROUP_S", 3000.0), \
+                mock.patch.object(canon_sync, "_process_changed_at",
+                                  return_value=jeune):
+            retenu = self.sync()
+        self.assertEqual((retenu.processes.sent, retenu.processes.held), (0, 1))
+        self.assertEqual(self._sujets("orchestre"), [])
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
+                         before)
+        self._change("# Processus de lot\n\n- règle A\n- règle B\n")
+        with mock.patch.object(canon_sync, "PROCESS_PUSH_GROUP_S", 3000.0), \
+                mock.patch.object(canon_sync, "_process_changed_at",
+                                  return_value=jeune):
+            encore = self.sync()
+        self.assertEqual((encore.processes.sent, encore.processes.held), (0, 1))
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
+                         before)
+        head = canon.load(self.clone).sources[0].commit
+        with mock.patch.object(canon_sync, "PROCESS_PUSH_GROUP_S", 3000.0), \
+                mock.patch.object(canon_sync, "_process_changed_at",
+                                  return_value=time.time() - 3001):
+            parti = self.sync()
+        self.assertEqual((parti.processes.sent, parti.processes.held), (2, 0))
+        recus = self._sujets("orchestre")
+        self.assertEqual(len(recus), 1, recus)
+        self.assertIn("règle A", recus[0]["body"])
+        self.assertIn("règle B", recus[0]["body"])
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
+                         head)
+
+    def test_une_regle_urgente_ignore_la_fenetre(self):
+        # #8267 : `urgent: true` dans le frontmatter part tout de suite.
+        self.sync()
+        self._change("# Processus de lot\n\n- règle urgente\n", urgent="true")
+        with mock.patch.object(canon_sync, "PROCESS_PUSH_GROUP_S", 3000.0), \
+                mock.patch.object(canon_sync, "_process_changed_at",
+                                  return_value=time.time()):
+            report = self.sync()
+        self.assertEqual((report.processes.sent, report.processes.held), (2, 0))
+        self.assertEqual(len(self._sujets("orchestre")), 1)
+
+    def test_une_fiche_revisee_sans_arret_part_a_la_borne(self):
+        # #8267 : la borne dure empêche une fiche révisée sans cesse d'attendre
+        # indéfiniment.
+        self.sync()
+        self._change("# Processus de lot\n\n- règle sans fin\n")
+        with mock.patch.object(canon_sync, "PROCESS_PUSH_GROUP_S", 3000.0), \
+                mock.patch.object(canon_sync, "_process_changed_at",
+                                  return_value=time.time()), \
+                mock.patch.object(canon_sync, "_process_first_change_at",
+                                  return_value=time.time() - 4 * 3600 - 1):
+            report = self.sync()
+        self.assertEqual((report.processes.sent, report.processes.held), (2, 0))
+
+    def test_un_updated_seul_avance_le_repere_meme_avec_fenetre(self):
+        # #8267 : aucune section changée (seul `updated:` a bougé) — rien à
+        # pousser, la fenêtre ne retarde pas le repère.
+        self.sync()
+        self._change("# Processus de lot\n\n- %s\n" % REGLE,
+                     updated="2026-11-25")
+        head = canon.load(self.clone).sources[0].commit
+        with mock.patch.object(canon_sync, "PROCESS_PUSH_GROUP_S", 3000.0), \
+                mock.patch.object(canon_sync, "_process_changed_at",
+                                  return_value=time.time()):
+            report = self.sync()
+        self.assertEqual((report.processes.sent, report.processes.held), (0, 0))
+        self.assertEqual(self._sujets("orchestre"), [])
+        self.assertEqual(canon_sync.state(self.db, "atelier")["process_commit"],
+                         head)
 
     def test_le_message_porte_les_sections_bornees_et_un_lien_pas_le_corps(self):
         # #6425, #6640 : la diffusion d'une fiche Process porte les sections
