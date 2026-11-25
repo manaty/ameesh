@@ -5350,6 +5350,178 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     return out
 
 
+#: #8231 : une passe de reprise des attentes lit au plus ce nombre de lots
+RESUME_SCAN = 200
+#: son curseur, sous le répertoire d'état de l'hôte (B P2 ameesh-cx1) : le
+#: dernier lot examiné. Une passe reprend après lui et se replie au bout,
+#: comme `RETRY_CURSOR` : une fenêtre de lots sans candidat ne cache plus
+#: indéfiniment les lots suivants.
+RESUME_CURSOR = "review-designation-resume.cursor"
+
+
+def _waiting_lots(db, after: int = 0, *, scan: Optional[int] = None) -> list:
+    """Les lots en `qa` qui portent une marque d'attente récente (#8231).
+
+    Une présélection seulement, après le lot `after` et bornée : la marque
+    effective du dernier gel est relue lot par lot (`_effective_mark`),
+    seule preuve de l'attente."""
+    return db.query(
+        "SELECT w.id, w.app FROM work_items w"
+        " WHERE w.state = %s AND w.id > %s"
+        "   AND EXISTS (SELECT 1 FROM work_item_events e"
+        "     WHERE e.work_item_id = w.id"
+        "       AND e.note LIKE %s AND e.note LIKE %s"
+        "       AND e.created_at >= now() - interval '30 days')"
+        " ORDER BY w.id LIMIT %s",
+        (lifecycle.QA, int(after), pg.MARK_PREFIX + "%", '%"state": "waiting"%',
+         int(RESUME_SCAN if scan is None else scan)))
+
+
+def _resumable(payload: Mapping, available: Mapping) -> list:
+    """Les relecteurs disponibles d'une famille qui manque à l'attente (#8231).
+
+    `available` : nom → famille des candidats disponibles du projet. Une
+    famille d'auteur (correcteurs compris) ou déjà pourvue par la marque ne
+    compte pas : son retour ne pourvoit aucun siège. Une liste vide dit que
+    rien n'a changé pour ce gel ; le rejeu ne vaut pas sa lecture git."""
+    _names, forbidden = rd.families_of(payload.get("authors") or ())
+    seated = {str((row or {}).get("family") or "").strip().lower()
+              for row in payload.get("reviewers") or ()}
+    return sorted(name for name, family in available.items()
+                  if family and family not in forbidden and family not in seated)
+
+
+def resume_waiting(cfg, db, *, memo: Optional[dict] = None,
+                   limit: int = RETRY_LIMIT) -> dict:
+    """Complète les attentes quand une famille manquante redevient disponible.
+
+    #8231 : une désignation `waiting` (famille en pause de rythme ou de
+    budget, #233013) n'était reprise que par la passe d'après synchronisation
+    du canon ; le retour de la famille laissait le lot en `qa` jusqu'à un
+    `work reviewers --apply` à la main. Cette passe de l'exécuteur relit le
+    registre : pour chaque gel en attente dont une famille ni auteur ni déjà
+    pourvue a de nouveau un candidat disponible, elle rejoue la désignation
+    du même gel sous le bail du lot (`designate_deferred`). Les sièges acquis
+    sont gardés, seuls les manquants sont pourvus ; un rejeu sans siège
+    nouveau n'écrit rien (`PgPort._write`).
+
+    `memo` (état de l'appelant, gardé d'une passe à l'autre) évite de
+    rejouer la même situation à chaque passe : un candidat écarté pour une
+    autre raison (correcteur, plancher) ne relance pas la lecture git tant
+    que ni la marque ni les disponibles ne bougent. La fenêtre avance par
+    `RESUME_CURSOR` et se replie au bout ; le registre entier est relu à
+    chaque passe, si bien qu'un départ puis un retour vus pendant que le lot
+    est hors fenêtre rejouent quand même son gel (B mty-amh-docs-01 #46318).
+    Bornée, ne lève jamais.
+    """
+    out = {"examined": 0, "attempted": 0, "designated": 0, "waiting": 0,
+           "errors": [], "results": []}
+    memo = {} if memo is None else memo
+    lots = memo.setdefault("lots", {})
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = RETRY_LIMIT
+    start = _read_cursor(cfg, RESUME_CURSOR)
+    try:
+        rows = _waiting_lots(db, start)
+        if not rows and start:
+            # bout de la file : le tour suivant reprend au plus ancien
+            start = 0
+            rows = _waiting_lots(db, 0)
+        if not rows:
+            memo.clear()
+            _write_cursor(cfg, RESUME_CURSOR, 0)
+            return out
+        families = mechanics.configured(cfg).families
+        listing = registry.overview(db)
+        closed = alert_briefs.claims_closed_hosts(db)
+    except Exception as exc:  # noqa: BLE001 - la passe suivante relit
+        out["errors"].append("%s: %s" % (type(exc).__name__, str(exc)[:160]))
+        return out
+    # Les retours se lisent sur tout le registre, pas sur la fenêtre : un
+    # nom absent à la passe précédente et disponible à celle-ci est daté du
+    # numéro de passe ; une signature posée avant ce retour ne vaut plus.
+    turn = int(memo.get("turn") or 0) + 1
+    memo["turn"] = turn
+    available = {str(row.get("name") or "").strip() for row in listing
+                 if rd.is_available(row, closed_hosts=closed)}
+    available.discard("")
+    returned = memo.setdefault("returned", {})
+    if "available" in memo:
+        for name in available - set(memo["available"]):
+            returned[name] = turn
+    memo["available"] = available
+    pools: dict = {}
+    seen: set = set()
+    last = start
+    for row in rows:
+        lot = int(row.get("id") or 0)
+        project = str(row.get("app") or "")
+        if out["attempted"] >= limit:
+            # budget dépensé : ce lot reste pour la passe suivante
+            break
+        seen.add(lot)
+        last = lot
+        out["examined"] += 1
+        try:
+            if project not in pools:
+                pools[project] = {
+                    candidate.name: candidate.family
+                    for candidate in _candidates(
+                        listing, loads={}, project=project, families=families,
+                        pilot=_notify(cfg, db, project, listing),
+                        closed_hosts=closed)
+                    if candidate.available}
+            freeze = _latest_freeze(db, lot)
+            if not freeze:
+                continue
+            effective = _effective_mark(db, lot, int(freeze["id"]),
+                                        since_ts=float(freeze.get("at_ts") or 0.0))
+            if (effective is None or effective[1] != "designation"
+                    or effective[2].get("state") != rd.WAITING):
+                lots.pop(lot, None)
+                continue
+            names = _resumable(effective[2], pools[project])
+            signature = (int(freeze["id"]), int(effective[0]), tuple(names))
+            if not names:
+                # B mty-amh-docs-01 : le candidat parti, son retour est une
+                # situation nouvelle, rejouée même à signature identique.
+                lots.pop(lot, None)
+                continue
+            known = lots.get(lot)
+            if (known is not None and known[0] == signature
+                    and not any(returned.get(name, 0) > known[1] for name in names)):
+                continue
+            out["attempted"] += 1
+            lots[lot] = (signature, turn)
+            result = designate_deferred(cfg, db, lot, freeze)
+        except Exception as exc:  # noqa: BLE001 - un lot n'arrête pas la passe
+            # un échec transitoire ne fige pas la situation : passe suivante
+            lots.pop(lot, None)
+            out["errors"].append("#%d: %s: %s" % (lot, type(exc).__name__,
+                                                  str(exc)[:160]))
+            continue
+        state = str((result or {}).get("state") or "")
+        if state == "busy":
+            # le bail est tenu ailleurs : la passe suivante réessaie
+            lots.pop(lot, None)
+        if state in (rd.DESIGNATED, rd.WAITING):
+            out[state] += 1
+        out["results"].append({"lot": lot, "result": state or "?",
+                               "detail": str((result or {}).get("why") or "")[:160]})
+    # seuls les lots de la fenêtre lue sont oubliés : un lot hors fenêtre
+    # garde sa signature jusqu'au tour du curseur qui le relit
+    for lot in [lot for lot in lots if start < lot <= last and lot not in seen]:
+        lots.pop(lot, None)
+    # un retour plus ancien que toute signature gardée ne sert plus
+    oldest = min((entry[1] for entry in lots.values()), default=turn)
+    for name in [name for name, at in returned.items() if at <= oldest]:
+        returned.pop(name, None)
+    _write_cursor(cfg, RESUME_CURSOR, last)
+    return out
+
+
 #: #3328 : journal prefix of a seat reattributed because its reviewer became
 #: unreachable (host closed, stopped/dead, absent). The examined names are in
 #: the prefix, so a later loss of the replacement is a new reassignment while a
