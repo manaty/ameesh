@@ -11,6 +11,7 @@ renvoie pas le même avis au pilote.
 from __future__ import annotations
 
 import hashlib
+import re
 
 from . import mail, registry, review_designation_activation as act
 from . import storage, work_lifecycle as lifecycle
@@ -53,14 +54,37 @@ def _recorded_policy(db, lot, freeze) -> str:
     return str((effective[2] or {}).get("policy_ref") or "")
 
 
+#: the exact canon commit inside a policy ref (`<checkout>@<commit>:<file>`)
+_REF_COMMIT = re.compile(r"@([0-9a-f]{40}|[0-9a-f]{64}):")
+
+
+def _ref_commit(ref) -> str:
+    found = _REF_COMMIT.search(str(ref or ""))
+    return found.group(1) if found else ""
+
+
 def _policy_moved(result, refs, recorded: str) -> bool:
-    """Did the audited canon change since the freeze's designation (#8265)?"""
+    """Did the audited canon change since the freeze's designation (#8265)?
+
+    The comparison is on the canon commit, never on the checkout path: two
+    hosts of the mesh may hold the same canon at different paths, and a path
+    difference alone is not a policy publication.
+    """
     current = {str(ref) for ref in refs or ()}
+    commits = {_ref_commit(ref) for ref in current}
+    commits.discard("")
+
+    def moved(ref) -> bool:
+        commit = _ref_commit(ref)
+        if commit and commits:
+            return commit not in commits
+        return str(ref or "") not in current
+
     if recorded:
-        return recorded not in current
+        return moved(recorded)
     # No mark before the pass: the refresh may itself have written the first
     # designation. Its policy ref says whether that read is the current one.
-    return str((result or {}).get("policy_ref") or "") not in current
+    return moved((result or {}).get("policy_ref"))
 
 
 def _record(cfg, db, item, freeze, prefix, result, *, refs=(), recorded_policy=""):

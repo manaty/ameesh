@@ -276,6 +276,28 @@ class CanonRefreshCarryTest(_CarryFixture):
         self.assertEqual(act._effective_mark(self.db, self.lot, mark["id"])[1], "carried")
 
 
+class PolicyMoveTest(unittest.TestCase):
+    """#8265 : la politique a bougé si le commit du canon a bougé, pas si le
+    même canon est lu sous un autre chemin de poste."""
+
+    SHA = "a" * 40
+    OTHER = "b" * 40
+
+    def test_the_same_canon_commit_at_another_path_is_not_a_move(self):
+        recorded = "/poste-a/canon@%s:processus/mecanique.yaml" % self.SHA
+        refs = ["/poste-b/canon@%s:processus/mecanique.yaml" % self.SHA]
+        self.assertFalse(refresh._policy_moved({}, refs, recorded))
+
+    def test_a_new_canon_commit_is_a_move(self):
+        recorded = "/poste-a/canon@%s:processus/mecanique.yaml" % self.OTHER
+        refs = ["/poste-b/canon@%s:processus/mecanique.yaml" % self.SHA]
+        self.assertTrue(refresh._policy_moved({}, refs, recorded))
+
+    def test_a_first_designation_written_by_the_refresh_is_not_a_move(self):
+        ref = "/poste-b/canon@%s:processus/mecanique.yaml" % self.SHA
+        self.assertFalse(refresh._policy_moved({"policy_ref": ref}, [ref], ""))
+
+
 class RunnerRefreshTest(unittest.TestCase):
     def test_sync_recovery_rechecks_policy_before_capacity_retries(self):
         from ameesh import runner
