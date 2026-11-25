@@ -24,6 +24,7 @@ import os
 import pathlib
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -98,6 +99,8 @@ class DetachTest(unittest.TestCase):
             self.assertNotIn(key, env)
         self.assertEqual(env["AGENT_MAIL_NAME"], "mty-amh-impl-01")
         self.assertEqual(env["AMEESH_DSN"], "postgresql://base")
+        # #8255 : un hôte de rôle n'apparaît que pour une commande de rôle
+        self.assertNotIn("AMEESH_ROLE_HOST", env)
         self.assertEqual(env["TMPDIR"], str(self.home / ".cache/ameesh/paquet-auto"))
         # aucune valeur sur la ligne de commande de l'unité
         self.assertNotIn("postgresql://base", " ".join(self.shell.calls[-1]))
@@ -116,6 +119,25 @@ class DetachTest(unittest.TestCase):
         self.assertNotIn("--as-role", self.shell.calls[-1])
         kept = json.loads(self.env_file().read_text(encoding="utf-8"))
         self.assertEqual(kept["AMEESH_LEASE_EPOCH"], "41")
+
+    def test_commande_de_role_sans_hote_pose_l_hote_de_l_unite(self):
+        # #8255 : sans AMEESH_ROLE_HOST, la garde ne peut pas présenter la
+        # lignée même-hôte (#4245) d'une réélection pendant les tests.
+        env = dict(SESSION_ENV, AMEESH_ROLE="mesh-design", AMEESH_LEASE_EPOCH="41")
+        env.pop("AGENT_MAIL_NAME")
+        env.pop("AMEESH_ROLE_HOST", None)
+        self.detach(env, elected=True)
+        kept = json.loads(self.env_file().read_text(encoding="utf-8"))
+        self.assertEqual(kept["AMEESH_ROLE_HOST"],
+                         socket.gethostname().split(".", 1)[0])
+
+    def test_commande_de_role_garde_son_hote(self):
+        env = dict(SESSION_ENV, AMEESH_ROLE="mesh-design", AMEESH_LEASE_EPOCH="41",
+                   AMEESH_ROLE_HOST="ameesh-agents-2")
+        env.pop("AGENT_MAIL_NAME")
+        self.detach(env, elected=True)
+        kept = json.loads(self.env_file().read_text(encoding="utf-8"))
+        self.assertEqual(kept["AMEESH_ROLE_HOST"], "ameesh-agents-2")
 
     def test_echec_de_systemd_run_dit_et_efface_le_fichier(self):
         self.shell.rc = 1
@@ -319,6 +341,13 @@ class CallerKilledTest(unittest.TestCase):
         caller.write_text(CALLER)
         env = dict(os.environ, **{k: v for k, v in SESSION_ENV.items()
                                   if k not in ("PATH", "TMPDIR", "AMEESH_DSN")})
+        # #3801 : ce tour est une SESSION, pas une commande de rôle. Sous un
+        # lanceur en unité de rôle (paquet composé), l'AMEESH_ROLE hérité
+        # faisait garder l'époque de SESSION_ENV dans l'unité, et le gel
+        # attendu sans époque échouait. Le test isole son environnement.
+        for key in ("AMEESH_ROLE", "AMEESH_ROLE_HOST", "AMEESH_ROLE_PASS",
+                    "AMEESH_LEASE_OWNER", "AMEESH_LEASE_LEFT"):
+            env.pop(key, None)
         env["PAQUET_7824_MARKS"] = str(marks)
         root = str(pathlib.Path(__file__).resolve().parent.parent)
         # un tour : sa propre session, tuée en groupe comme l'exécuteur le fait
