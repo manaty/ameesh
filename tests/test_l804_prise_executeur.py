@@ -307,6 +307,49 @@ class TakePassTest(_Lots):
         self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
                          [("claude1", un["id"])])
 
+    def test_canon_en_sous_repertoire_coupe_la_passe_sans_bruit(self):
+        # #8268 (manaty/ameesh#6474) : `mechanics.configured` refuse un canon
+        # en sous-répertoire ; la passe n'échoue plus chaque minute, elle se
+        # coupe avec une ligne et revient d'elle-même au canon à la racine.
+        self.agent("a1", team="nexlink", since_s=2 * HEURE)
+        lot = self.lot("un")
+        faux = _FauxRunner(self.db, self.cfg, self.settings(), {"a1": _Worker()})
+        prefixes = iter(["ameesh", "ameesh", "ameesh", ""])
+        with mock.patch("ameesh.mechanics.canon_prefix",
+                        side_effect=lambda cfg: next(prefixes)), \
+                mock.patch.object(runner, "log_async") as log, \
+                mock.patch.object(runner, "local_take", wraps=runner.local_take) as take:
+            for _ in range(3):
+                self.assertEqual(runner.Runner.take_pass(faux), [])
+            take.assert_not_called()
+            self.assertEqual([c.args[0] for c in log.call_args_list],
+                             ["auto-take off: canon under a sub-directory (ameesh)"])
+            self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+            out = runner.Runner.take_pass(faux)
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out], [("a1", lot["id"])])
+        self.assertEqual(log.call_args_list[1].args[0], "auto-take on: canon at the Git root")
+
+
+class CanonPrefixTest(unittest.TestCase):
+    def test_prefixe_de_la_premiere_source_git(self):
+        from types import SimpleNamespace as NS
+        from ameesh import mechanics
+
+        def canons(*sources):
+            return mock.patch("ameesh.canon.load_configured",
+                              return_value=[NS(sources=list(sources))])
+        with canons(NS(mode="git", prefix="ameesh")):
+            self.assertEqual(mechanics.canon_prefix(object()), "ameesh")
+        with canons(NS(mode="git", prefix="")):
+            self.assertEqual(mechanics.canon_prefix(object()), "")
+        with canons(NS(mode="path", prefix="x")):
+            self.assertEqual(mechanics.canon_prefix(object()), "")
+        with canons():
+            self.assertEqual(mechanics.canon_prefix(object()), "")
+        with mock.patch("ameesh.canon.load_configured", side_effect=OSError("x")):
+            self.assertEqual(mechanics.canon_prefix(object()), "")
+        self.assertEqual(mechanics.canon_prefix(None), "")
+
 
 class ReglagesTest(unittest.TestCase):
     def test_options_et_variables_des_reglages(self):

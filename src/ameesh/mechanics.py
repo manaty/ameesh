@@ -1525,6 +1525,23 @@ def configured(cfg) -> Document:
     return _CONFIGURED[key]
 
 
+def canon_prefix(cfg) -> str:
+    """#8268 : le sous-répertoire du canon appliqué, vide à la racine.
+
+    Même source que `configured` (première source du canon par défaut, Git) :
+    un préfixe rendu ici est un canon que `configured` refusera toujours. Un
+    canon absent, illisible ou non Git rend une chaîne vide (`configured` dit
+    lui-même pourquoi il refuse)."""
+    try:
+        canons = canon.load_configured(cfg) if cfg is not None else []
+    except Exception:  # noqa: BLE001 — illisible : `configured` le dira
+        return ""
+    if not canons or not canons[0].sources:
+        return ""
+    source = canons[0].sources[0]
+    return (source.prefix or "") if source.mode == "git" else ""
+
+
 def session_max_tokens(cfg, harness: str, fallback: float) -> float:
     """#4448 : le seuil de rotation du harnais, lu du canon appliqué.
 
