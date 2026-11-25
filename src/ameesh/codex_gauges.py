@@ -18,6 +18,24 @@ class AmbiguousCodexGauges(ValueError):
     """Live readings in one account directory contradict each other."""
 
 
+#: #8263 : the reason of an incomplete reading, read back by the alert pass
+INCOMPLETE_MARK = "incomplete Codex account reading"
+
+
+class IncompleteCodexGauges(AmbiguousCodexGauges):
+    """#8263 : the bounded sample lacks a window the plan must show.
+
+    A doubt, not a contradiction: the reading proves no cap. `missing` names
+    the absent windows (``short window``, ``weekly window``) so that a fresh
+    provider reading can be checked against them (`accounts.evaluate`).
+    """
+
+    def __init__(self, missing):
+        self.missing = tuple(missing)
+        super().__init__("%s: %s absent from bounded session sample"
+                         % (INCOMPLETE_MARK, ", ".join(self.missing)))
+
+
 def _timestamp(event, fallback):
     try:
         return datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
@@ -340,9 +358,7 @@ def reconcile(readings, now, *, truncated=False, plan=None, unread_before=None):
         if not any(g.window_s > 5 * 3600 for g, _limits in windows.values()):
             missing.append("weekly window")
         if missing:
-            raise AmbiguousCodexGauges(
-                "incomplete Codex account reading: %s absent from bounded session sample"
-                % ", ".join(missing))
+            raise IncompleteCodexGauges(missing)
     if not windows:
         return []
     gauges = [r[0] for r in windows.values()]

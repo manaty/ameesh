@@ -1264,6 +1264,9 @@ class Evaluation:
     #: #3647 : {clé de jauge: perte prévue au reset} des fenêtres dont le
     #: rythme est relevé (`underused_floor`)
     raises: dict = field(default_factory=dict)
+    #: #8263 : retenu sur un relevé incomplet (`IncompleteCodexGauges`) — un
+    #: doute, sans échéance : le compte peut se libérer au relevé suivant
+    doubt: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1871,7 +1874,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         result.hard = bool(getattr(profile, "refused", ""))
         result.hard_all = result.hard
         return result
-    from .codex_gauges import AmbiguousCodexGauges
+    from .codex_gauges import AmbiguousCodexGauges, IncompleteCodexGauges
     if _gauges is not None:
         result.gauges = _gauges
     else:
@@ -1882,6 +1885,22 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
             result.reason = str(exc)
             result.hard = True
             result.hard_all = True
+            if isinstance(exc, IncompleteCodexGauges):
+                # #8263 : une fenêtre absente de l'échantillon borné est un
+                # doute, pas un plafond (cx1, 24/11 22:10Z : pause « jusqu'au
+                # 27/11 » et alerte urgente, secondaire relu à 85 % dans la
+                # minute). Relire la jauge chez le fournisseur avant de tenir
+                # la pause ; la relecture complète est rejouée comme tout
+                # relevé, ses plafonds confirmés tiennent. Sans relecture
+                # complète, la prudence garde le refus, sans échéance.
+                result.doubt = True
+                if probe and record:
+                    fresh = gauge_probe.reread(profile, environ=environ, now=now)
+                    if _covers(fresh, exc.missing):
+                        return evaluate(book, profile, items, now, environ,
+                                        record=True, critical=critical,
+                                        reserve=reserve, model=model,
+                                        probe=False, _gauges=fresh)
             return result
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
@@ -2003,6 +2022,21 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
                              % (float(solde["total"]), solde["currency"], profile.min_balance))
             result.until = None  # éligible dès qu'un relevé montre le solde rechargé
     return result
+
+
+def _covers(fresh, missing) -> bool:
+    """#8263 : la relecture fournisseur montre-t-elle les fenêtres absentes du
+    relevé local (`IncompleteCodexGauges.missing`) ? Sinon elle ne lève pas
+    le doute : une fenêtre courte saturée pourrait rester cachée."""
+    from .codex_gauges import SHORT_WINDOW_S as CODEX_SHORT_S
+    windows = [float(g.window_s) for g in fresh or ()]
+    if not windows:
+        return False
+    if "short window" in missing and not any(w <= CODEX_SHORT_S for w in windows):
+        return False
+    if "weekly window" in missing and not any(w > CODEX_SHORT_S for w in windows):
+        return False
+    return True
 
 
 def latest_balance(db, profile: Profile) -> dict | None:
@@ -2181,7 +2215,10 @@ def pause_label(evaluations: dict) -> str:
     compte). Elle est lue par `pause_deadline_nature` et reprise par les
     alertes ; un texte d'avant ce marqueur n'en annonce pas la nature."""
     dated = [ev for ev in evaluations.values() if ev.until and ev.held]
-    if not dated:
+    # #8263 : un compte retenu sur un relevé incomplet peut se libérer au
+    # relevé suivant ; annoncer l'échéance d'un autre compte serait faux.
+    if not dated or any(getattr(ev, "doubt", False) and not ev.ok
+                        for ev in evaluations.values()):
         return ""
     first = min(dated, key=lambda ev: ev.until)
     from .cost import until_label
