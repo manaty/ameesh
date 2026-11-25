@@ -36,6 +36,17 @@ Si $human est en train d'écrire, ameesh retient la ligne : elle peut arriver
 après coup. La veille vit avec la session (`ameesh chat --no-veille` la
 coupe) ; elle ne tourne pas quand `ameesh chat` n'est pas ouvert.
 
+### Réveils programmés
+
+Une ligne `[veille ameesh] réveil programmé du lot #N « … »` n'est pas un
+message de $human : c'est un rendez-vous armé sur un de tes lots
+(`ameesh work wake`). Ouvre le lot ce tour-ci (`ameesh work show N`), fais le
+geste attendu (relancer, vérifier, répondre) et écris ce que tu as fait par
+une note. Si tu ne peux pas avancer, pose une nouvelle retenue avec son
+échéance : `ameesh work note N "hold: <raison>" --wake-at <ISO avec fuseau>`.
+Un réveil ne sert qu'une fois : sans note ni réarmement, l'alerte
+`follow_up_unfollowed` te revient dessus.
+
 ### Decisions written in prose (L233)
 
 `ameesh decisions` also lists, apart, two things that are **not** requests

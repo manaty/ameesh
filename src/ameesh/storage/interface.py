@@ -6528,13 +6528,18 @@ class LotSessions(Domain):
         son bail avec `claim_ttl_s=0` tant que le lancement se prépare (#2614)."""
 
     @abc.abstractmethod
-    def consume_wake(self, name: str, lot: int, wake_ts: float) -> bool:
+    def consume_wake(self, name: str, lot: int, wake_ts: float,
+                     served_at: float | None = None) -> bool:
         """#2466 : consomme le réveil programmé délivré : efface `wake_at` et
         `wake_claim_at` (une seule fois), **seulement** si l'échéance est
         encore celle qui a été réclamée (`wake_ts`) et sous claim — une
         nouvelle échéance posée entre-temps est conservée. Rend False sinon.
         #2614 : la consommation écrit au journal, dans la même transaction, la
-        ligne `wake: … delivered …` — un témoin par réveil réellement délivré."""
+        ligne `wake: … delivered …` — un témoin par réveil réellement délivré.
+        #8235 : `served_at` est l'instant mural de la remise (après l'écriture
+        dans le pty) ; la ligne de délivrance en est datée, jamais du bail
+        `wake_claim_at` qui la précède et peut être renouvelé entre-temps. Sans
+        `served_at` (exécuteur), elle est datée de la consommation."""
 
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:

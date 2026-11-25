@@ -5572,7 +5572,10 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     descendre d'un gel antérieur du lot, ne plus être ancêtre de la tête,
     avoir été écrit par un relecteur désigné de ce gel et avoir été publié.
     Son acteur reste exclu par son nom, sa famille redevient éligible (§2) ;
-    `cited` nomme le commit qui le cite. Une citation d'un commit encore dans
+    `cited` nomme le commit qui le cite. #8244 : quand la ligne du reçu exact
+    porte le **même** commit, la citation s'y ajoute (`cited`) au lieu de
+    rester sur une ligne distincte : la trace garde la preuve par SHA et nomme
+    la réécriture de l'auteur. Une citation d'un commit encore dans
     la tête, d'un ancêtre ou d'un commit étranger au lot ne prouve rien et
     n'exclut personne ; une forge muette est un doute tracé (`unattached`).
     Avec `fetch=False` (lecture de la transaction du gel, #3836), la forge
@@ -6069,12 +6072,30 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     check()
 
     def merge_cited(result: dict) -> dict:
-        """#7252 : une citation complète un doute, jamais une preuve exacte."""
+        """#7252 : une citation complète un doute, jamais une preuve exacte.
+
+        #8244 : quand la citation nomme le **même** commit que la ligne du
+        reçu exact, elle s'y ajoute (`cited`) : la trace du correcteur dit la
+        réécriture de l'auteur sans remplacer la preuve par SHA. Un lot
+        empilé (`stacked_lot`) ou un doute n'est jamais complété — la citation
+        ne doit ni blanchir une provenance incertaine, ni changer le
+        traitement d'une autre correction.
+        """
         for name, row in cited.items():
             existing = result.get(name)
             if existing is None or (existing.get("unresolved")
                                     and not existing.get("rewritten")):
                 result[name] = row
+                continue
+            if (existing.get("cited") or existing.get("unresolved")
+                    or existing.get("stacked_lot")
+                    or row.get("unresolved") or row.get("stacked_lot")):
+                continue
+            rewritten = str(existing.get("rewritten") or "").strip()
+            cited_sha = str(row.get("rewritten") or "").strip()
+            if (rewritten and cited_sha
+                    and plan_git.same_commit(rewritten, cited_sha)):
+                existing["cited"] = str(row.get("cited") or "").strip()
         return result
 
     if not wanted:
@@ -6341,7 +6362,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     simple squash/consolidation à contenu identique ne prouve pas la
     réécriture (#3518) ; la réémission verbatim par la référence (#4387) est
     dispensée en amont par `_carried_from_previous`. Un doute (`unresolved`,
-    `stacked_lot`) ne retire jamais l'auteur.
+    `stacked_lot`) ne retire jamais l'auteur. #8244 : la ligne du reçu exact
+    porte aussi `cited` quand la citation de l'auteur nomme le même SHA ; la
+    levée ne dépend donc pas de la seule trace de report.
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -6716,6 +6739,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # pas un correctif plus ancien F0, non cité, dont le contenu survit. Seule
     # la citation prouve un commit (#3518 : un reçu sorti de l'ascendance par
     # squash ne prouve rien). Un report sans commit nommé garde l'auteur.
+    # #8244 : la ligne du reçu exact porte `cited` quand la citation nomme le
+    # même SHA ; la preuve de #8230 reste par commit, la trace dit le citeur.
     unattached: list = []
     rewritten_proven: dict[str, set] = {}
     rewritten_rows = _rewritten_after_freeze(

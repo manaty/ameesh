@@ -695,6 +695,44 @@ class CitedRewrittenCorrectorTest(_Fixture, PgTestCase):
         self.assertIn("r2", names)
         self.assertNotIn("cx3", names)
 
+    def test_a_frozen_correction_with_an_exact_receipt_leaves_the_authors(self):
+        # #8244 : le correctif de cx3 a un reçu exact (#4457) **et** a été gelé
+        # comme tête (#8224). La ligne du reçu exact n'a pas `cited` ; la
+        # citation du même SHA par la réécriture de l'auteur prouve le geste et
+        # doit le sortir des auteurs, famille codex éligible (§2). Sans cela,
+        # #8224 réapparaît dès qu'un reçu existe.
+        fix, head_b = self._rewrite()
+        self._receipt("cx3", "codex", [fix])
+        self._freeze_fix(fix)
+        authors, correctors, out = self._select(head_b)
+        self.assertEqual([row["name"] for row in authors], ["author"])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["family"], "")
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head_b)
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        names = [row["name"] for row in out["reviewers"]]
+        self.assertIn("r2", names)
+        self.assertNotIn("cx3", names)
+
+    def test_an_exact_receipt_cited_rewrite_leaves_the_authors(self):
+        # #8244 : même preuve quand le correctif n'a pas été gelé comme tête :
+        # le reçu exact le nomme (#4457), la citation du même SHA par l'auteur
+        # (#7252) prouve la réécriture. La ligne du reçu n'a pas `cited` ;
+        # `reading()` exige cette preuve pour le retirer des auteurs.
+        fix, head_b = self._rewrite()
+        self._receipt("cx3", "codex", [fix])
+        authors, correctors, out = self._select(head_b)
+        self.assertEqual([row["name"] for row in authors], ["author"])
+        self.assertEqual([row["name"] for row in correctors], ["cx3"])
+        self.assertEqual(correctors[0]["family"], "")
+        self.assertEqual(correctors[0]["rewritten"], fix)
+        self.assertEqual(correctors[0]["cited"], head_b)
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        names = [row["name"] for row in out["reviewers"]]
+        self.assertIn("r2", names)
+        self.assertNotIn("cx3", names)
+
     def test_without_rewrite_proof_the_carried_author_is_kept(self):
         # Témoin négatif : le reçu exact du correctif donne sa famille, mais
         # sans citation ni verdict qui porte la preuve de réécriture, le report
