@@ -17,6 +17,7 @@ Témoins, sans base ni réseau :
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import subprocess
 import sys
@@ -168,14 +169,16 @@ class BaseRedLotTest(unittest.TestCase):
         with mock.patch.object(auto, "run_command", side_effect=fake):
             lot = auto.base_red_lot(OWN, name="h-test", carrier=9,
                                     base_sha=BASE, target="main",
+                                    kind="FAIL", repo="manaty/ameesh",
                                     driver="psycopg", sender=sender,
                                     log=lambda _l: None)
         return lot, calls
 
     def test_ouvre_le_lot_avec_la_cle_durable(self) -> None:
-        lot, calls = self.call(["lot #77 created in intake: Rouge de la base"])
+        lot, calls = self.call(["lot #77 created in intake: Rouge de la base",
+                                "noted"])
         self.assertEqual(lot, 77)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         cmd, body = calls[0]
         self.assertIn("paquet-rouge-base:" + OWN, cmd)
         self.assertNotIn("--app", cmd)
@@ -186,7 +189,7 @@ class BaseRedLotTest(unittest.TestCase):
     def test_estimation_presente_sous_un_agent(self) -> None:
         # B mty-amh-qa-01 : sous le tic, `--from mesh-design` est un agent
         # enregistré ; sans estimation, L157 refuse la création du lot.
-        _lot, calls = self.call(["lot #77 created in intake: Rouge"],
+        _lot, calls = self.call(["lot #77 created in intake: Rouge", "noted"],
                                 sender="mesh-design")
         cmd = calls[0][0]
         self.assertEqual(cmd[cmd.index("--actor") + 1], "mesh-design")
@@ -198,7 +201,23 @@ class BaseRedLotTest(unittest.TestCase):
             "lot #77 already exists (unique-ref x, merged): Rouge", "noted"])
         self.assertEqual(lot, 77)
         self.assertEqual(calls[1][0][:4], ["ameesh", "work", "note", "77"])
-        self.assertIn(BASE[:12], calls[1][1])
+        proof = calls[1][1]
+        self.assertTrue(proof.startswith(auto.BASE_RED_PROOF))
+        self.assertEqual(json.loads(proof[len(auto.BASE_RED_PROOF):]),
+                         {"test": OWN, "kind": "FAIL", "base": BASE,
+                          "repo": "manaty/ameesh", "driver": "psycopg",
+                          "packet": "h-test", "carrier": 9})
+
+    def test_preuve_meme_prefixe_que_la_lecture_ci(self) -> None:
+        self.assertEqual(auto.BASE_RED_PROOF, packet_red.BASE_RED_PROOF)
+        self.assertEqual(auto.BASE_RED_REF, packet_red.BASE_RED_REF)
+
+    def test_depot_lu_a_l_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            subprocess.run(["git", "-C", tmp, "remote", "add", "origin",
+                            "git@github.com:Manaty/ameesh.git"], check=True)
+            self.assertEqual(auto.repo_slug(pathlib.Path(tmp)), "manaty/ameesh")
 
     def test_courrier_au_pilote_nomme_les_lots(self) -> None:
         sent = []
@@ -218,16 +237,62 @@ class CiReadingTest(unittest.TestCase):
                 {"test": "tests.test_autre.T.test_y", "status": "probable",
                  "units": [{"lot": 2, "best": 6, "evidence": []}], "more": 0}]
 
-    def mark(self, entries, rows):
+    FAILURES = [{"test": OWN, "status": "echec"},
+                {"test": "tests.test_autre.T.test_y", "status": "echec"}]
+
+    def proof(self, **changes):
+        row = {"test": OWN, "kind": "FAIL", "base": BASE,
+               "repo": "manaty/ameesh", "carrier": 9}
+        row.update(changes)
+        return {"note": packet_red.BASE_RED_PROOF + json.dumps(row)}
+
+    def mark(self, entries, rows, proofs=None, *, failures=None, base=BASE,
+             repo="Manaty/ameesh"):
+        if proofs is None:
+            proofs = [self.proof()]
         with mock.patch.object(packet_red.work, "existing_by_unique_ref",
-                               side_effect=lambda _db, key: rows.get(key)):
-            return packet_red.mark_base_red(object(), entries)
+                               side_effect=lambda _db, key: rows.get(key)), \
+                mock.patch.object(packet_red.work, "events_noted",
+                                  return_value=proofs):
+            return packet_red.mark_base_red(
+                object(), entries,
+                self.FAILURES if failures is None else failures,
+                base=base, repo=repo)
+
+    OPEN = {"paquet-rouge-base:" + OWN: {"id": 77, "state": "intake"}}
+
+    def assert_not_marked(self, **kwargs) -> None:
+        entries = self.entries()
+        self.assertEqual(self.mark(entries, self.OPEN, **kwargs), 0)
+        self.assertEqual(entries[0]["status"], "probable")
+
+    def test_lot_ouvert_sans_preuve_ne_classe_rien(self) -> None:
+        # B mty-amh-impl-11 : l'existence du suivi n'est pas une preuve
+        self.assert_not_marked(proofs=[])
+
+    def test_preuve_d_une_autre_base_ne_classe_rien(self) -> None:
+        self.assert_not_marked(proofs=[self.proof(base="5" * 40)])
+
+    def test_autre_classe_d_echec_ne_classe_rien(self) -> None:
+        self.assert_not_marked(failures=[{"test": OWN, "status": "erreur"}])
+        self.assert_not_marked(proofs=[self.proof(kind="ERROR")])
+
+    def test_classe_absente_en_ci_ne_classe_rien(self) -> None:
+        self.assert_not_marked(failures=[{"test": OWN}])
+
+    def test_autre_depot_ou_base_inconnue_ne_classe_rien(self) -> None:
+        self.assert_not_marked(proofs=[self.proof(repo="manaty/nexlink")])
+        self.assert_not_marked(repo="")
+        self.assert_not_marked(base="")
+        self.assert_not_marked(base=BASE[:12])
 
     def test_lot_ouvert_classe_rouge_de_la_base(self) -> None:
         entries = self.entries()
-        count = self.mark(entries, {"paquet-rouge-base:" + OWN:
-                                    {"id": 77, "state": "intake"}})
+        count = self.mark(entries, self.OPEN,
+                          [self.proof(base="5" * 40), self.proof()])
         self.assertEqual(count, 1)
+        self.assertEqual(entries[0]["base_proof"],
+                         {"base": BASE, "kind": "FAIL", "carrier": 9})
         self.assertEqual((entries[0]["status"], entries[0]["units"],
                           entries[0]["base_lot"]), ("base", [], 77))
         self.assertEqual(entries[1]["status"], "probable")

@@ -898,6 +898,9 @@ class TestRun:
     #: non concluants, ils ne retirent aucune unité et ne retiennent pas le
     #: paquet. Un lot de déblocage les porte.
     base_red: list[str] = field(default_factory=list)
+    #: #8262 : la classe d'échec (`FAIL`/`ERROR`) de chaque rouge de la base,
+    #: reportée dans la preuve notée sur le lot de déblocage.
+    base_kinds: dict = field(default_factory=dict)
     #: #4887 : les modules directs de l'unité (ses propres tests et ses voisins
     #: sélectionnés), tels que la série devait les jouer ; vide pour les contrats.
     direct: list[str] = field(default_factory=list)
@@ -4620,7 +4623,8 @@ def budget_spent(label: str, modules: list[str], *,
 
 def _consign_flaky(red: list[tuple[TestRun, list[dict]]],
                    runs: list[TestRun], names: list[str], *,
-                   base: bool = False) -> list[tuple[TestRun, list[dict]]]:
+                   base: bool = False,
+                   kinds: dict | None = None) -> list[tuple[TestRun, list[dict]]]:
     """#4221/#7239 : consigne des tests verts au rejeu comme non concluants.
 
     Retire de `red` les échecs dont le nom est dans `names` : une série qui ne
@@ -4628,7 +4632,8 @@ def _consign_flaky(red: list[tuple[TestRun, list[dict]]],
     est scindée en un rouge réel et une série instable consignée à part. Rend
     `red` sans ces échecs ; `runs` porte les séries non concluantes.
 
-    #8262 : `base=True` consigne de même des rouges de la base (`base_red`).
+    #8262 : `base=True` consigne de même des rouges de la base (`base_red`),
+    avec leur classe d'échec (`kinds` → `base_kinds`).
     """
     flaky_names = set(names)
     field_name = "base_red" if base else "flaky_tests"
@@ -4658,24 +4663,29 @@ def _consign_flaky(red: list[tuple[TestRun, list[dict]]],
                         "tests rouges sur la tête mais verts sur tous les "
                         "préfixes : %s") % ", ".join(names_here),
                 seconds=0.0, log_path=run.log_path,
+                base_kinds={name: (kinds or {}).get(name, "")
+                            for name in names_here} if base else {},
                 **{field_name: names_here}))
         else:
             setattr(run, field_name, names_here)
+            if base:
+                run.base_kinds = {name: (kinds or {}).get(name, "")
+                                  for name in names_here}
     return kept
 
 
 def _owned_base_red(worktree: Path, red: list[tuple[TestRun, list[dict]]],
                     pending: list, contract: TestRun, *, base_sha: str,
                     skip: set[str], timeout: int, deadline: float | None,
-                    guard, log, on_base) -> list[str]:
+                    guard, log, on_base) -> dict[str, str]:
     """#8262 : les rouges propres/de contrat aussi rouges sur la base.
 
     Les rouges de voisins ont déjà leur rejeu de base (#4025) et sont exclus,
     comme les rouges consignés non attribués (`skip`) et les identités
     opaques d'un lanceur déclaré (`FlowTestRun`, sans rejeu `unittest`).
-    Rend les noms rouges sur la tête **et** sur la base avec la même classe
-    d'échec ; [] si le rejeu n'est pas concluant (canon §3 : rien n'est
-    classé, le geste antérieur s'applique).
+    Rend `{test: classe}` des rouges sur la tête **et** sur la base avec la
+    même classe d'échec ; {} si le rejeu n'est pas concluant (canon §3 : rien
+    n'est classé, le geste antérieur s'applique).
     """
     neighbors = {id(run): neighbor
                  for _unit, run, _found, _proper, _mine, neighbor in pending}
@@ -4692,7 +4702,7 @@ def _owned_base_red(worktree: Path, red: list[tuple[TestRun, list[dict]]],
             if name in kinds:
                 head_kinds.setdefault(name, kinds[name])
     if not head_kinds or not base_sha:
-        return []
+        return {}
     if guard is not None:
         guard()
     limit = series_timeout(timeout, deadline)
@@ -4711,9 +4721,9 @@ def _owned_base_red(worktree: Path, red: list[tuple[TestRun, list[dict]]],
         log("tests ciblés : rejeu sur la base %s des rouges propres/de "
             "contrat non concluant — attribution inchangée"
             % (base_sha[:12] or "?"))
-        return []
-    same = sorted(name for name, kind in head_kinds.items()
-                  if at_base.get(name) == kind)
+        return {}
+    same = {name: kind for name, kind in sorted(head_kinds.items())
+            if at_base.get(name) == kind}
     other = sorted(name for name, kind in head_kinds.items()
                    if name in at_base and at_base[name] != kind)
     if other:
@@ -5161,8 +5171,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         log("tests ciblés : %d rouge(s) propre(s)/de contrat aussi rouge(s) "
             "sur la base %s, même classe d'échec : rouge(s) de la base, "
             "consigné(s) non concluant(s) (canon §3), aucun retrait : %s"
-            % (len(base_red), base_sha[:12], ", ".join(base_red[:5])))
-        red = _consign_flaky(red, runs, base_red, base=True)
+            % (len(base_red), base_sha[:12], ", ".join(sorted(base_red)[:5])))
+        red = _consign_flaky(red, runs, sorted(base_red), base=True,
+                             kinds=base_red)
         gone = set(base_red)
         own = {lot: [failure for failure in found
                      if _failure_name(failure) not in gone]
@@ -6331,17 +6342,42 @@ BASE_RED_LOT_RE = re.compile(r"#(\d+) (created|already exists)")
 #: L157 : un agent (le composeur passe `--from mesh-design`) ne crée pas de
 #: lot sans estimation ; forfait d'un test dépendant de l'environnement.
 BASE_RED_ESTIMATE = "2h"
+#: #8262 (B mty-amh-impl-11) : la preuve structurée notée sur le lot ; seule
+#: elle neutralise un rouge en CI (`packet_red.mark_base_red`), pour le même
+#: test, la même classe, la base exacte et le même dépôt. Le lot n'est que
+#: le suivi. Même préfixe que `packet_red.BASE_RED_PROOF`.
+BASE_RED_PROOF = "ameesh-base-red/1 "
+_REMOTE_SLUG_RE = re.compile(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$")
+
+
+def repo_slug(worktree: Path) -> str:
+    """`owner/repo` (minuscules) du dépôt `origin` de l'arbre, "" si illisible."""
+    proc = git(worktree, "remote", "get-url", "origin", check=False)
+    if proc.returncode != 0:
+        return ""
+    found = _REMOTE_SLUG_RE.search(_decode(proc.stdout).strip())
+    return found.group(1).lower() if found else ""
+
+
+def base_red_proof(test: str, *, kind: str, base_sha: str, repo: str,
+                   driver: str, name: str, carrier: int) -> str:
+    """#8262 : la note de preuve d'un rouge de la base (une ligne, JSON)."""
+    return BASE_RED_PROOF + json.dumps(
+        {"test": test, "kind": kind, "base": base_sha.lower(), "repo": repo,
+         "driver": driver, "packet": name, "carrier": carrier},
+        ensure_ascii=False, sort_keys=True)
 BASE_RED_ESTIMATE_SOURCE = "forfait #8262 : correction d'un test rouge sur la base"
 
 
 def base_red_lot(test: str, *, name: str, carrier: int, base_sha: str,
-                 target: str, driver: str = "",
+                 target: str, kind: str = "", repo: str = "", driver: str = "",
                  sender: str | None = None, log=print) -> int:
     """#8262 : ouvre, ou relance par une note, le lot de déblocage d'un test.
 
     Une clé durable par test (`paquet-rouge-base:<test>`) : un second rouge
-    du même test retrouve le même lot, quel que soit son état, et y ajoute
-    la base et le paquet où il a été revu. Rend le numéro du lot, 0 si le
+    du même test retrouve le même lot, quel que soit son état. Chaque constat
+    y est noté comme preuve structurée (`base_red_proof` : test, classe, base
+    exacte, dépôt) ; sans cette note, la CI ne neutralise rien. Rend le numéro du lot, 0 si le
     geste n'a pas abouti (consigné, sans arrêter la composition). Le projet
     est celui du composeur (`work add` sans `--app`), jamais écrit en dur.
     """
@@ -6373,22 +6409,26 @@ def base_red_lot(test: str, *, name: str, carrier: int, base_sha: str,
         log("lot de déblocage de %s non ouvert : %s" % (test, _tail(_output(proc))))
         return 0
     lot = int(found.group(1))
-    if found.group(2) == "already exists":
-        # relance : le lot garde son état ; la note date le nouveau constat
-        note = ("relance #8262 : %s encore rouge sur la base `%s` (paquet %s, "
-                "porteur #%d)" % (test, base_sha[:12], name, carrier))
-        try:
-            run_command(["ameesh", "work", "note", str(lot), "-"] + actor,
-                        input_text=note, timeout=GIT_TIMEOUT)
-        except PaquetAutoError as exc:
-            log("relance du lot #%d non notée : %s" % (lot, exc))
+    # création ou relance : la preuve du constat est notée ; le lot garde son
+    # état. Une note manquée laisse le suivi sans preuve (rien n'est
+    # neutralisé en CI), jamais l'inverse.
+    note = base_red_proof(test, kind=kind, base_sha=base_sha, repo=repo,
+                          driver=driver, name=name, carrier=carrier)
+    try:
+        noted = run_command(["ameesh", "work", "note", str(lot), "-"] + actor,
+                            input_text=note, timeout=GIT_TIMEOUT)
+        if noted.returncode != 0:
+            log("preuve du lot #%d non notée : %s" % (lot, _tail(_output(noted))))
+    except PaquetAutoError as exc:
+        log("preuve du lot #%d non notée : %s" % (lot, exc))
     log("lot de déblocage de %s : #%d (%s)"
         % (test, lot, "relancé" if found.group(2) == "already exists" else "ouvert"))
     return lot
 
 
 def notify_base_red(name: str, carrier: int, tests: list[str], *,
-                    base_sha: str, target: str, driver: str = "",
+                    base_sha: str, target: str, kinds: dict | None = None,
+                    repo: str = "", driver: str = "",
                     pilot: str = "mesh-design",
                     sender: str | None = None, log=print,
                     open_lot=None) -> str:
@@ -6403,7 +6443,8 @@ def notify_base_red(name: str, carrier: int, tests: list[str], *,
     lots = []
     for test in tests[:5]:
         lot = opener(test, name=name, carrier=carrier, base_sha=base_sha,
-                     target=target, driver=driver, sender=sender, log=log)
+                     target=target, kind=(kinds or {}).get(test, ""),
+                     repo=repo, driver=driver, sender=sender, log=log)
         lots.append("%s → %s" % (test, ("#%d" % lot) if lot else "lot non ouvert"))
     body = (
         "#%d paquet %s : test(s) rouge(s) sur la tête et sur la base `%s` "
@@ -7343,8 +7384,11 @@ def compose_packet(args: argparse.Namespace) -> int:
             if base_red and not getattr(args, "local", False):
                 # #8262 : rouge de la base consigné, le paquet continue ; le
                 # lot de déblocage est ouvert ou relancé, le pilote prévenu.
+                kinds = {name: kind for run in runs
+                         for name, kind in getattr(run, "base_kinds", {}).items()}
                 notify_base_red(args.name, args.carrier, base_red,
                                 base_sha=base_sha, target=args.target,
+                                kinds=kinds, repo=repo_slug(worktree),
                                 driver=test_driver(worktree),
                                 pilot=getattr(args, "pilot", "mesh-design"),
                                 sender=getattr(args, "sender", None))
