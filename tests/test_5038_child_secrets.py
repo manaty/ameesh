@@ -17,6 +17,41 @@ from ameesh.platform import child_environment as E
 from ameesh.platform import process as P
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
+# Witness children import ameesh under the full CI load (parallel psycopg and
+# psql parts): a short fixed deadline turns slowness into a red. The ceiling
+# only catches a child that is truly stuck.
+READY_CEILING = 240
+
+
+def _cpu_ticks(pid):
+    try:
+        fields = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def wait_ready(test, child, marker, what, ceiling=None):
+    """Wait for a witness child's marker; it must not exit first.
+
+    On timeout, tell a slow child (still burning CPU) from a blocked one."""
+    start = time.monotonic()
+    deadline = start + (READY_CEILING if ceiling is None else ceiling)
+    ticks = _cpu_ticks(child.pid)
+    checked = start
+    while not marker.exists():
+        if child.poll() is not None:
+            test.fail("%s: child exited (%s) before its marker: %s"
+                      % (what, child.returncode, child.stderr.read() if child.stderr else ""))
+        now = time.monotonic()
+        if now > deadline:
+            last = _cpu_ticks(child.pid)
+            state = ("slow (CPU still advancing)" if None not in (ticks, last) and last > ticks
+                     else "blocked (no CPU progress in the last %.0f s)" % (now - checked))
+            test.fail("%s: no marker after %.0f s, child %s" % (what, now - start, state))
+        if now - checked > 5:
+            ticks, checked = _cpu_ticks(child.pid), now
+        time.sleep(0.02)
 
 
 class ChildCredentialsTest(unittest.TestCase):
@@ -287,13 +322,7 @@ time.sleep(30)
                                   env=env, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE, text=True) as child:
                 try:
-                    deadline = time.monotonic() + 10
-                    while not marker.exists():
-                        if child.poll() is not None:
-                            self.fail(child.stderr.read())
-                        if time.monotonic() > deadline:
-                            self.fail("spoof helper not ready")
-                        time.sleep(0.02)
+                    wait_ready(self, child, marker, "spoof helper not ready")
                     start = platform.start_time(child.pid)
                     table = [{"pid": child.pid, "start": start, "zombie": False}]
                     with mock.patch.object(P, "_psutil", return_value=None), \
@@ -333,13 +362,7 @@ time.sleep(30)
             with subprocess.Popen([sys.executable, "-c", code, str(marker)], env=env,
                                   stderr=subprocess.PIPE, text=True) as child:
                 try:
-                    deadline = time.monotonic() + 10
-                    while not marker.exists():
-                        if child.poll() is not None:
-                            self.fail(child.stderr.read())
-                        if time.monotonic() > deadline:
-                            self.fail("managed CLI did not launch its filtered child")
-                        time.sleep(0.02)
+                    wait_ready(self, child, marker, "managed CLI did not launch its filtered child")
                     with self.assertRaises(PermissionError):
                         Path("/proc/%d/environ" % child.pid).read_bytes()
                 finally:
@@ -368,11 +391,7 @@ with mock.patch.object(main, '_dispatch', side_effect=dispatch):
             script = script + "\nimport pathlib,time\npathlib.Path(%r).touch()\ntime.sleep(30)\n" % str(marker)
             with subprocess.Popen([sys.executable, "-c", script], env=env) as child:
                 try:
-                    deadline = time.monotonic() + 10
-                    while not marker.exists():
-                        if child.poll() is not None or time.monotonic() > deadline:
-                            self.fail("CLI witness did not finish dispatch")
-                        time.sleep(0.02)
+                    wait_ready(self, child, marker, "CLI witness did not finish dispatch")
                     self.assertTrue(Path("/proc/%d/environ" % child.pid).read_bytes())
                 finally:
                     child.kill()
@@ -402,15 +421,49 @@ time.sleep(30)
                                       env=env, stdout=subprocess.DEVNULL,
                                       stderr=subprocess.PIPE, text=True) as child:
                     try:
-                        deadline = time.monotonic() + 10
-                        while not marker.exists():
-                            if child.poll() is not None:
-                                self.fail(child.stderr.read())
-                            if time.monotonic() > deadline:
-                                self.fail("service entrypoint did not reach its configuration")
-                            time.sleep(0.02)
+                        wait_ready(self, child, marker, "service entrypoint did not reach its configuration")
                         with self.assertRaises(PermissionError):
                             Path("/proc/%d/environ" % child.pid).read_bytes()
                     finally:
                         child.kill()
                         child.wait()
+
+
+@unittest.skipUnless(platform.is_linux(), "reads /proc/<pid>/stat")
+class WaitReadyTest(unittest.TestCase):
+    def _child(self, root, code):
+        marker = Path(root, "ready")
+        return marker, subprocess.Popen([sys.executable, "-c", code, str(marker)],
+                                        stderr=subprocess.PIPE, text=True)
+
+    def test_a_child_slower_than_the_former_ten_seconds_still_passes(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker, child = self._child(root, "import pathlib,sys,time\ntime.sleep(10.5)\n"
+                                              "pathlib.Path(sys.argv[1]).touch()\ntime.sleep(30)\n")
+            with child:
+                try:
+                    wait_ready(self, child, marker, "slow witness")
+                    self.assertTrue(marker.exists())
+                finally:
+                    child.kill()
+                    child.wait()
+
+    def test_timeout_tells_a_blocked_child_from_a_slow_one(self):
+        with tempfile.TemporaryDirectory() as root:
+            for code, state in (("import time\ntime.sleep(30)\n", "blocked"),
+                                ("while True: pass\n", "slow")):
+                marker, child = self._child(root, code)
+                with self.subTest(state=state), child:
+                    try:
+                        with self.assertRaisesRegex(AssertionError, "witness: no marker after .* child " + state):
+                            wait_ready(self, child, marker, "witness", ceiling=6)
+                    finally:
+                        child.kill()
+                        child.wait()
+
+    def test_an_exit_before_the_marker_reports_stderr(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker, child = self._child(root, "import sys\nsys.exit('boom')\n")
+            with child:
+                with self.assertRaisesRegex(AssertionError, r"witness: child exited \(1\) before its marker: boom"):
+                    wait_ready(self, child, marker, "witness")
