@@ -13902,6 +13902,17 @@ class Runner:
             names &= set(flt)
         if not names:
             return []
+        # #8268 : un canon en sous-répertoire ne porte pas les mécaniques
+        # (`mechanics.configured` le refuse) ; la passe ne peut pas réussir.
+        # Une ligne à l'arrêt, une au retour, pas un échec par minute.
+        from . import mechanics
+        prefix = mechanics.canon_prefix(self.cfg)
+        if prefix != getattr(self, "_take_off_prefix", ""):
+            log_async("auto-take off: canon under a sub-directory (%s)" % prefix
+                      if prefix else "auto-take on: canon at the Git root")
+            self._take_off_prefix = prefix
+        if prefix:
+            return []
         alerts = []
         try:
             if self.host_pressure().get("blocked"):
