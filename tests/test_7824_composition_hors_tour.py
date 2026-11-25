@@ -341,6 +341,13 @@ class CallerKilledTest(unittest.TestCase):
         caller.write_text(CALLER)
         env = dict(os.environ, **{k: v for k, v in SESSION_ENV.items()
                                   if k not in ("PATH", "TMPDIR", "AMEESH_DSN")})
+        # #3801 : ce tour est une SESSION, pas une commande de rôle. Sous un
+        # lanceur en unité de rôle (paquet composé), l'AMEESH_ROLE hérité
+        # faisait garder l'époque de SESSION_ENV dans l'unité, et le gel
+        # attendu sans époque échouait. Le test isole son environnement.
+        for key in ("AMEESH_ROLE", "AMEESH_ROLE_HOST", "AMEESH_ROLE_PASS",
+                    "AMEESH_LEASE_OWNER", "AMEESH_LEASE_LEFT"):
+            env.pop(key, None)
         env["PAQUET_7824_MARKS"] = str(marks)
         root = str(pathlib.Path(__file__).resolve().parent.parent)
         # un tour : sa propre session, tuée en groupe comme l'exécuteur le fait
