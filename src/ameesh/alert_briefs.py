@@ -1164,17 +1164,49 @@ def _budget_pause_long(alert: dict) -> str:
     réellement dépassée sans reprise, elle, est un nouvel épisode (#7175) :
     le brief suivant passe par le texte « check the caps ». Une attente de
     remise à zéro n'a pas de relance ; une pause avec geste attendu garde
-    celle de 6 h (#1466)."""
+    celle de 6 h (#1466).
+
+    #8266 : une pause de famille et de compte est une seule alerte, qui liste
+    ses agents. Tant qu'une décision owner datée la couvre (canon
+    `auto_take`), c'est un rapport d'information : aucun réveil, aucune
+    relance ; l'alerte reste lisible dans `ameesh alerts`. Un agent critique
+    sans tour possible garde son propre `critical_budget_pause`, urgent."""
+    detail = alert.get("detail") or "?"
+    agents = list(alert.get("agents") or ())
+    grouped = bool(alert.get("grouped")) and len(agents) > 1
+    who = ("%d agents paused" % len(agents)) if grouped else "Agent paused"
+    critical = ", ".join(alert.get("critical_agents") or ())
+    critical_txt = (" The critical agent(s) %s keep their own urgent budget "
+                    "alert." % critical) if critical else ""
+    if alert.get("covered_by_decision"):
+        coverage = alert.get("coverage") or {}
+        until = coverage.get("until_ts")
+        try:
+            until_txt = (time.strftime("%d/%m %H:%MZ", time.gmtime(float(until)))
+                         if until is not None else "?")
+        except (TypeError, ValueError):
+            until_txt = "?"
+        return ("%s on budget for a long time: %s. Expected action: none — the "
+                "canon `%s` exclusion of family %s is the dated owner decision "
+                "that covers this pause (rule expires %s, %s; covered until %s). "
+                "This is an information report: no wake and no reminder while it "
+                "lasts; the pause stays live in `ameesh alerts`.%s"
+                % (who, detail, coverage.get("rule") or "auto_take",
+                   coverage.get("family") or "?", coverage.get("rule_expire") or "?",
+                   coverage.get("timezone") or "?", until_txt, critical_txt))
+    uncovered = ", ".join(alert.get("uncovered_agents") or ())
+    uncovered_txt = (" Uncovered by any unexpired owner decision: %s." % uncovered
+                     if uncovered else "")
     if alert.get("waits_reset"):
-        return ("Agent paused on budget until the announced time: %s. Expected action: "
-                "none — every account of its harness on the host is at its threshold "
-                "and the agent resumes on its own at the announced time; this is said "
-                "once for the pause, with no reminder while it lasts and no new alert "
-                "when a pace catch-up slides (read the live detail with `ameesh "
-                "alerts`). If the announced window reset passes and the agent has not "
-                "resumed, a new alert follows."
-                % (alert.get("detail") or "?"))
-    return ("Agent paused on budget for a long time: %s. Expected action: check the caps "
+        return ("%s on budget until the announced time: %s. Expected action: "
+                "none — every account of its harness on the host is at its "
+                "threshold and the agent resumes on its own at the announced "
+                "time; this is said once for the pause, with no reminder while it "
+                "lasts and no new alert when a pace catch-up slides (read the live "
+                "detail with `ameesh alerts`). If the announced window reset passes "
+                "and the agent has not resumed, a new alert follows.%s%s"
+                % (who, detail, uncovered_txt, critical_txt))
+    return ("%s on budget for a long time: %s. Expected action: check the caps "
             "(ameesh budget), the accounts (ameesh accounts list) and the configuration "
             "the runner reads (ameesh doctor; a profile can diverge from the host's "
             "config.json); free an account, fix the profile, or have the runner restart, "
@@ -1184,8 +1216,8 @@ def _budget_pause_long(alert: dict) -> str:
             "gauge reading is old, that reading may be stale and hold the pause after "
             "its window reset — check it with `ameesh accounts list`. This is not "
             "repeated at every reading; it stays live in `ameesh alerts` and is "
-            "reminded after six hours while it lasts."
-            % (alert.get("detail") or "?"))
+            "reminded after six hours while it lasts.%s%s"
+            % (who, detail, uncovered_txt, critical_txt))
 
 
 def automatic_sleep(alert: dict) -> bool:
@@ -1311,6 +1343,15 @@ def quiet_modes(alert: dict, names, by_name: dict) -> dict:
                 if account and _budget_paused_on(by_name.get(name), account)}
     if alert.get("urgent"):
         return {}
+    if kind == "budget_pause_long" and alert.get("covered_by_decision"):
+        # #8266 : la pause est couverte par une décision owner datée et non
+        # échue ; le rapport reste lisible au tour suivant, sans réveil. Un
+        # agent critique sans tour possible garde son `critical_budget_pause`
+        # à part, urgent : la couverture ne l'éteint pas.
+        return {name: {"payload": {"info": True},
+                       "reason": "budget pause covered by a dated owner decision: "
+                                 "no action due"}
+                for name in names}
     if kind in OPERATOR_GESTURE_TYPES and not alert.get("critical"):
         # #8117 : le geste revient à un opérateur ; le pilote le lit au tour
         # suivant, sans réveil ni interruption (l'urgence du type reste celle
@@ -1852,7 +1893,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             teams = _projects(by_name, alert.get("agent"))
         elif kind == "budget_pause_long":
             text = _budget_pause_long(alert)
-            teams = _projects(by_name, alert.get("agent"))
+            # #8266 : le groupe peut couvrir plusieurs projets ; ses agents
+            # sont tous nommés. Une alerte par agent garde son équipe.
+            members = alert.get("agents") or (alert.get("agent"),)
+            teams = {p for name in members for p in _projects(by_name, name)}
         elif kind == "rate_limited_chronic":
             text = _rate_limited_chronic(alert)
             teams = _projects(by_name, alert.get("agent"))
@@ -1935,6 +1979,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     if kind in ("critical_budget_pause", "budget_pause_long", "rate_limited_chronic",
                 "account_config_invalid", "operator_pause_long",
                 "account_wave_coordination"):
+        # #8266 : tous les agents du groupe sont en pause, aucun ne lirait.
+        for name in (alert.get("agents") or ()) if kind == "budget_pause_long" else ():
+            out.pop(name, None)
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     if kind == "operator_pause_host":
         for name in alert.get("agents") or ():
