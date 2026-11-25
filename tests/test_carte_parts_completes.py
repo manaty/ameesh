@@ -387,6 +387,16 @@ class NombreDePartsTest(unittest.TestCase):
         poids = {"lourd": 10_000.0, **{f"m{i}": 10.0 for i in range(50)}}
         self.assertEqual(parts.nombre_de_parts(poids, 2, 60, 32), 2)
 
+    def test_un_palier_du_decoupage_n_arrete_pas(self):
+        # relecture ameesh-cx2 (gel #46410) : 25 modules de 1 300 s, plus
+        # lourde à 2 600 s pour 13 comme pour 14 parts ; s'arrêter au palier
+        # rendait 13 (65 min sous charge), alors que 25 parts tiennent.
+        poids = {f"m{i:02d}": 1300.0 for i in range(25)}
+        n = parts.nombre_de_parts(poids, 12, 60, 32)
+        lourde = max(sum(poids[m] for m in p) for p in parts.split(poids, n))
+        self.assertLessEqual(lourde, self.CIBLE)
+        self.assertEqual(n, 25)
+
     def test_sans_plafond_ni_parts_max(self):
         poids = {f"m{i}": 1000.0 for i in range(1000)}
         self.assertEqual(parts.nombre_de_parts(poids, 12, None, 32), 12)

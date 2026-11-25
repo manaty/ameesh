@@ -532,9 +532,12 @@ def nombre_de_parts(poids: dict[str, float], plancher: int, plafond_min: int | N
     dépasse `MARGE_PLAFOND` du plafond. Sans `plafond_min` ni `parts_max`,
     le plancher est rendu tel quel (découpage figé d'avant #8261).
 
-    S'arrête à `parts_max`, ou dès qu'une part de plus n'allège plus la plus
-    lourde (un module seul au-delà de la cible) : le plan le signale alors
-    comme avant, au lieu de multiplier des parts inutiles."""
+    S'arrête à `parts_max`, ou quand la plus lourde n'est plus que le plus
+    gros module (insécable : aucune part de plus ne l'allège) ; le plan le
+    signale alors comme avant, au lieu de multiplier des parts inutiles. Un
+    palier du découpage entre n et n + 1 parts ne prouve rien (relecture
+    ameesh-cx2 : 25 modules de 1 300 s donnent 2 600 s à 13 et 14 parts,
+    1 300 s à 25)."""
     if not plafond_min or not parts_max:
         return plancher
     cible = plafond_min * 60 * MARGE_PLAFOND / SURCOUT_CHARGE
@@ -542,12 +545,11 @@ def nombre_de_parts(poids: dict[str, float], plancher: int, plafond_min: int | N
     def plus_lourde(n: int) -> float:
         return max((sum(poids[m] for m in part) for part in split(poids, n)), default=0.0)
 
+    insecable = max(poids.values(), default=0.0)
     n, charge = plancher, plus_lourde(plancher)
-    while charge > cible and n < parts_max:
-        suivante = plus_lourde(n + 1)
-        if suivante >= charge:
-            break
-        n, charge = n + 1, suivante
+    while charge > cible and charge > insecable and n < parts_max:
+        n += 1
+        charge = plus_lourde(n)
     return n
 
 
