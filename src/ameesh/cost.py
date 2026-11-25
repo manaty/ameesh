@@ -1176,6 +1176,16 @@ CACHE_WRITE_5M = 1.25
 CACHE_WRITE_1H = 2.0
 
 
+def _sourced(gauges, source: str) -> "Gauges":
+    """Un relevé Codex lu sur cet hôte : source et instant de production."""
+    return Gauges([replace(gauge, source=gauge.source or source,
+                           produced_at=(gauge.produced_at
+                                        if gauge.produced_at is not None
+                                        else gauge.read_at))
+                   for gauge in gauges or ()],
+                  getattr(gauges, "overage", None))
+
+
 class CostBook:
     """Les jauges et la comptabilité d'une machine.
 
@@ -1665,7 +1675,8 @@ class CostBook:
         None = lecture locale seule (compte non déclaré, affichage global).
         """
         racine = sessions if sessions is not None else self.codex_sessions
-        from .codex_gauges import recent_files, reconcile, session_reading
+        from .codex_gauges import (IncompleteCodexGauges, recent_files, reconcile,
+                                   session_reading)
 
         files, truncated, unread_before = recent_files(racine)
 
@@ -1689,8 +1700,15 @@ class CostBook:
             if sample.truncated:
                 truncated = True
                 unread(read_at)
-        gauges = reconcile(readings, now, truncated=truncated, plan=plan,
-                           unread_before=unread_before)
+        source = config_mod.hostname()
+        try:
+            gauges = reconcile(readings, now, truncated=truncated, plan=plan,
+                               unread_before=unread_before)
+        except IncompleteCodexGauges as exc:
+            # #8263 : les fenêtres lues portent la même source et la même
+            # date de production que dans un relevé complet (ci-dessous).
+            exc.partial = _sourced(exc.partial, source)
+            raise
         # #5466 : la source d'un relevé Codex est l'hôte qui l'a lu (Codex ne
         # nomme pas d'agent comme Claude) ; elle est publiée telle quelle dans
         # l'historique partagé, sans quoi deux hôtes homonymes sont
@@ -1699,13 +1717,7 @@ class CostBook:
         # sans lui, l'heure d'insertion ferait passer un relevé périmé pour
         # frais (#1132, #1672) et l'historique ne pourrait pas départager
         # deux lectures de la même fenêtre.
-        source = config_mod.hostname()
-        gauges = Gauges([replace(gauge, source=gauge.source or source,
-                                produced_at=(gauge.produced_at
-                                             if gauge.produced_at is not None
-                                             else gauge.read_at))
-                         for gauge in gauges],
-                        getattr(gauges, "overage", None))
+        gauges = _sourced(gauges, source)
         if account is not None:
             gauges = self._codex_with_history(account, gauges)
         return gauges

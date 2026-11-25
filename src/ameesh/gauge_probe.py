@@ -293,6 +293,20 @@ def refresh(profile, gauges, *, held: str | None = None, environ=None,
     stamp = _stamp(gauges, held)
     if stamp is None or now - stamp < PROBE_AFTER_S:
         return None
+    return reread(profile, environ=environ, now=now, clock=clock)
+
+
+def reread(profile, *, environ=None, now: float | None = None,
+           clock=time.monotonic) -> Gauges | None:
+    """#8263 : relit la jauge sans condition d'âge, sous le même délai entre
+    tentatives que `refresh` (`PROBE_RETRY_S`).
+
+    Pour un relevé local incomplet : il n'a pas d'âge qui fonde une pause,
+    seulement une fenêtre absente. None comme `refresh`.
+    """
+    if not supported(getattr(profile, "harness", "")) \
+            or getattr(profile, "kind", "") != "config_dir":
+        return None
     if not _claim(profile, clock):
         return None
     return probe(profile, environ=environ, now=now)
