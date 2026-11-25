@@ -19,6 +19,11 @@
 # psql 4/6 (01/11) puis psql 1/6 (02/11) coupées à 60 min ; le plan estimait
 # chaque part psql à 2 548 s (×1,5 sous charge : 64 min, au-delà du plafond).
 # Le psql passe à 9 parts (~1 700 s chacune).
+# #8261 : le 24/11, six mesures sur sept annulées (parts psycopg à ~3 018 s
+# estimées, coupées à 60 min) et aucune carte depuis le 22/11 : chaque
+# relèvement à la main venait après des jours sans carte. Ces nombres ne sont
+# plus qu'un plancher (`PARTS_MESURE`) : le plan relève le nombre de parts de
+# chaque pilote jusqu'à tenir sous le plafond et publie la matrice.
 # Le job « carte » fusionne les mesures en carte.json.gz (ameesh-carte/1) :
 #   - cache GitHub Actions `carte-<sha>` (une PR lit les caches de sa branche
 #     de base ; clé de repli `carte-`), sur main et à la main seulement ;
@@ -141,11 +146,11 @@ env:
   AMEESH_REQUIRE_DB: "1"
   AMEESH_BALANCE_INTERVAL: "0"
   PYTHONPATH: src
-  # #1341 D — miroir de jobs.mesure.strategy.matrix.include : toute part
-  # ajoutée, retirée ou renumérotée là-bas doit l'être ici, et
-  # tests/test_carte_parts_completes.py refuse la divergence. Le plan unique
-  # du run (job `plan-mesure`) et la fusion (job `carte`) lisent la même
-  # liste : une seule source pour les parts attendues.
+  # #1341 D — les parts de la mesure. #8261 : ce n'est plus qu'un plancher.
+  # Le plan unique du run (job `plan-mesure`, `--parts-max`) relève le nombre
+  # de parts de chaque pilote tant que la plus lourde ne tient pas sous le
+  # plafond, et publie la matrice de `mesure` (`matrice`) et les parts
+  # attendues par la fusion (`attendu`) : une seule source, le plan.
   PARTS_MESURE: >-
     mesure-psycopg-1 mesure-psycopg-2 mesure-psycopg-3 mesure-psycopg-4
     mesure-psycopg-5 mesure-psycopg-6 mesure-psycopg-7 mesure-psycopg-8
@@ -203,6 +208,10 @@ jobs:
     if: needs.fenetre.outputs.mesurer == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-'))
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
+    # #8261 : la matrice de `mesure` et les parts attendues par `carte`
+    outputs:
+      matrice: ${{ steps.plan.outputs.matrice }}
+      attendu: ${{ steps.plan.outputs.attendu }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -215,14 +224,20 @@ jobs:
           key: carte-${{ github.sha }}
           restore-keys: carte-
       - name: plan unique du run
+        id: plan
         run: |
           mkdir -p plan
           CARTE=carte/carte.json.gz
           [ -f "$CARTE" ] || CARTE=""
+          # #8261 : le 24/11, six mesures sur sept annulées — chaque part
+          # psycopg sur 12 pesait ~3 018 s (× 1,5 : 75 min), la matrice figée
+          # rejouait le même découpage et aucune carte ne sortait pour le
+          # corriger. Le plan relève le nombre de parts (au plus 32 par pilote)
+          # jusqu'à tenir sous le plafond, et publie la matrice.
           python3 scripts/test-parts.py plan --out plan/plan.json \
             --parts "$PARTS_MESURE" --list-psql tests/parts/pilote-psql.txt \
             ${CARTE:+--map "$CARTE"} --summary "$GITHUB_STEP_SUMMARY" \
-            --plafond-min 60
+            --plafond-min 60 --parts-max 32 --github-output "$GITHUB_OUTPUT"
           # la fusion réutilise la carte qui a servi au plan (historique des
           # échecs) : le plan et la carte publiée décrivent le même run.
           if [ -f "$CARTE" ]; then cp "$CARTE" plan/carte-source.json.gz; fi
@@ -255,35 +270,19 @@ jobs:
     # #5604 — runs 41298837130 (01/11) et 41438191646 (02/11) : psql 4/6 puis
     # 1/6 coupées à 60 min, parts psql estimées 2 548 s (avertissement du
     # plan) ; 9 parts psql.
+    # #8261 — runs du 24/11 (45398942124, 45443586463, 45476112784…) : 2 à
+    # 5 parts psycopg sur 12 coupées à 60 min par run, parts estimées
+    # 3 018 s. Le plan dimensionne désormais la matrice sur ce plafond.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       # #6157 : jamais plus de 8 runners du pool (12) — une ci-full de paquet
-      # mise en file pendant la mesure garde des runners libres.
+      # mise en file pendant la mesure garde des runners libres. #8261 : des
+      # parts plus nombreuses attendent leur tour, sans occuper plus du pool.
       max-parallel: 8
+      # #8261 : la matrice vient du plan (`--parts-max`), plus d'une liste figée.
       matrix:
-        include:
-          - { pilote: psycopg, part: 1, parts: 12 }
-          - { pilote: psycopg, part: 2, parts: 12 }
-          - { pilote: psycopg, part: 3, parts: 12 }
-          - { pilote: psycopg, part: 4, parts: 12 }
-          - { pilote: psycopg, part: 5, parts: 12 }
-          - { pilote: psycopg, part: 6, parts: 12 }
-          - { pilote: psycopg, part: 7, parts: 12 }
-          - { pilote: psycopg, part: 8, parts: 12 }
-          - { pilote: psycopg, part: 9, parts: 12 }
-          - { pilote: psycopg, part: 10, parts: 12 }
-          - { pilote: psycopg, part: 11, parts: 12 }
-          - { pilote: psycopg, part: 12, parts: 12 }
-          - { pilote: psql, part: 1, parts: 9 }
-          - { pilote: psql, part: 2, parts: 9 }
-          - { pilote: psql, part: 3, parts: 9 }
-          - { pilote: psql, part: 4, parts: 9 }
-          - { pilote: psql, part: 5, parts: 9 }
-          - { pilote: psql, part: 6, parts: 9 }
-          - { pilote: psql, part: 7, parts: 9 }
-          - { pilote: psql, part: 8, parts: 9 }
-          - { pilote: psql, part: 9, parts: 9 }
+        include: ${{ fromJSON(needs.plan-mesure.outputs.matrice) }}
     services:
       postgres:
         image: postgres:17
@@ -361,7 +360,7 @@ jobs:
 
   carte:
     name: carte
-    needs: mesure
+    needs: [plan-mesure, mesure]
     # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
     # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
     # #3838 : et jamais sur une PR de paquet — `always()` recréerait ce job
@@ -395,6 +394,8 @@ jobs:
       - name: fusion des mesures
         env:
           RESULTAT_MESURE: ${{ needs.mesure.result }}
+          # #8261 : les parts de la matrice, telles que le plan les a fixées
+          PARTS_ATTENDUES: ${{ needs.plan-mesure.outputs.attendu }}
         run: |
           # #1341 D : aucune carte n'est publiée à partir d'une mesure
           # incomplète. Le résultat de la matrice attrape la part annulée
@@ -405,6 +406,10 @@ jobs:
             echo "::error::mesure $RESULTAT_MESURE : carte non publiée (part en échec ou annulée)"
             exit 1
           fi
+          if [ -z "$PARTS_ATTENDUES" ]; then
+            echo "::error::plan sans parts attendues : carte non publiée (#8261)"
+            exit 1
+          fi
           mkdir -p carte
           if [ -f plan/carte-source.json.gz ]; then
             cp plan/carte-source.json.gz carte/precedente.json.gz
@@ -412,7 +417,7 @@ jobs:
           python scripts/map.py merge --output carte/carte.json.gz \
             --previous carte/precedente.json.gz --plan plan/plan.json \
             --summary "$GITHUB_STEP_SUMMARY" \
-            --attendu "$PARTS_MESURE" mesures/*
+            --attendu "$PARTS_ATTENDUES" mesures/*
           rm -f carte/precedente.json.gz
       # #2520 : quota d'artefacts partagé de l'organisation (#2376). Rien ne lit
       # la carte d'un run à l'autre — le passage se fait par le cache
