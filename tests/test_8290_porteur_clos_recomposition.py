@@ -30,7 +30,12 @@ from tests.test_3807_paquet_auto import paquet_auto as auto
 from tests.test_6538_porteur_clos_pendant_tic import FakeShell, hourly
 
 OPEN = {"state": "qa", "close_reason": "", "carried": {}}
-CLOSED = {"state": "closed", "close_reason": "abandoned", "carried": {}}
+CLOSED = {"state": "closed", "close_reason": "abandoned", "terminal": True,
+          "carried": {}}
+#: relecture mty-amh-impl-03 : un porteur livré (#8273, #8276 en base) est
+#: terminal comme un porteur clos, sans raison de clôture.
+DELIVERED = {"state": "delivered", "close_reason": "", "terminal": True,
+             "carried": {}}
 
 
 def proc(rc: int, out: str = "") -> subprocess.CompletedProcess:
@@ -44,6 +49,24 @@ class ReadCarrierTest(unittest.TestCase):
         with mock.patch.object(auto, "run_command", return_value=proc(0, out)):
             with self.assertRaisesRegex(auto.CarrierClosed, "abandoned"):
                 auto.check_carrier_open(pathlib.Path("."), 8286)
+
+    def test_porteur_livre_refuse_tout_geste(self):
+        for state in ("delivered", "merged", "promoted"):
+            out = json.dumps({"state": state, "close_reason": "",
+                              "terminal": True, "carried": {}})
+            with self.subTest(state=state), \
+                    mock.patch.object(auto, "run_command", return_value=proc(0, out)):
+                with self.assertRaisesRegex(auto.CarrierClosed, state):
+                    auto.check_carrier_open(pathlib.Path("."), 8276)
+
+    def test_lecture_calcule_l_etat_terminal(self):
+        # le code lu en base classe l'état par `work_lifecycle.COMPLETED`
+        with mock.patch.object(auto, "run_command",
+                               return_value=proc(1, "")) as run:
+            with self.assertRaises(auto.PaquetAutoError):
+                auto.read_carrier(pathlib.Path("."), 8276)
+        code = run.call_args.args[0][2]
+        self.assertIn('"terminal": state in work_lifecycle.COMPLETED', code)
 
     def test_porteur_ouvert_laisse_passer(self):
         out = json.dumps({"state": "qa", "close_reason": "", "carried": {}})
@@ -79,6 +102,18 @@ class ClosedDuringTestsTest(unittest.TestCase):
     """Témoin : porteur clos pendant les tests → aucune poussée ni PR."""
 
     def test_clos_apres_les_tests_rien_n_est_publie(self):
+        mocks = self.compose(lambda tested, pushed: CLOSED if tested else OPEN)
+        mocks["push_branch"].assert_not_called()
+
+    def test_livre_apres_les_tests_rien_n_est_publie(self):
+        mocks = self.compose(lambda tested, pushed: DELIVERED if tested else OPEN)
+        mocks["push_branch"].assert_not_called()
+
+    def test_clos_pendant_la_poussee_ni_pr_ni_gel(self):
+        mocks = self.compose(lambda tested, pushed: CLOSED if pushed else OPEN)
+        mocks["push_branch"].assert_called_once()
+
+    def compose(self, state):
         tmp = tempfile.TemporaryDirectory(prefix="paquet-8290-")
         self.addCleanup(tmp.cleanup)
         worktree = pathlib.Path(tmp.name) / "wt"
@@ -94,6 +129,7 @@ class ClosedDuringTestsTest(unittest.TestCase):
             pilot="mesh-design", sender="mesh-design", exclude=[8284],
             exclude_reason=[])
         tested: list[bool] = []
+        pushed: list[bool] = []
 
         def tests(*_args, **_kwargs):
             tested.append(True)
@@ -119,17 +155,19 @@ class ClosedDuringTestsTest(unittest.TestCase):
                 mock.patch.object(auto, "check_local_tests", side_effect=tests), \
                 mock.patch.object(auto, "read_carrier",
                                   side_effect=lambda *_a, **_k:
-                                  dict(CLOSED if tested else OPEN)):
+                                  dict(state(tested, pushed))):
             for key, value in patches.items():
                 mocks[key].return_value = value
             mocks["PackageLock"].return_value = mock.MagicMock()
             mocks["CompositionClaim"].return_value = mock.MagicMock()
+            mocks["push_branch"].side_effect = lambda *_a, **_k: pushed.append(True)
             with self.assertRaises(auto.CarrierClosed):
                 auto.compose_packet(args)
         self.assertTrue(tested)
-        for gesture in ("push_branch", "ensure_pull_request", "freeze_carrier",
+        for gesture in ("ensure_pull_request", "freeze_carrier",
                         "request_full_ci", "keep_tested"):
             mocks[gesture].assert_not_called()
+        return mocks
 
 
 class HoraireClosedCarrierTest(unittest.TestCase):
@@ -151,6 +189,27 @@ class HoraireClosedCarrierTest(unittest.TestCase):
         launched.assert_not_called()
         self.assertFalse([call for call in self.shell.calls
                           if call[:3] == ["ameesh", "work", "note"]])
+
+    def test_tentative_sur_porteur_livre_sans_marque_ni_lancement(self):
+        ctx = self.context({"id": 8276, "state": "delivered", "close_reason": None})
+        with mock.patch.object(hourly, "composition_in_progress", return_value=""), \
+                mock.patch.object(hourly, "carrier_composition", return_value=""), \
+                mock.patch.object(hourly, "paquet_auto") as launched:
+            got = hourly.attempt(ctx, 8276, "h-20261125-09", hourly.Attempt(
+                hourly.RECOMPOSITION, 2, "", run_id=hourly.PILOT_RUN))
+        self.assertIn("porteur clos (delivered)", got)
+        launched.assert_not_called()
+        self.assertFalse([call for call in self.shell.calls
+                          if call[:3] == ["ameesh", "work", "note"]])
+
+    def test_echec_sur_porteur_livre_arret_propre(self):
+        ctx = self.context({"id": 8276, "state": "delivered"})
+        got = hourly.after_compose(
+            ctx, 8276, "h-20261125-09", hourly.Result(1, "", "rc 1\n"),
+            hourly.Attempt(hourly.RECOMPOSITION, 1, ""))
+        self.assertIn("porteur clos (delivered)", got)
+        self.assertFalse([call for call in self.shell.calls
+                          if call[0] == "agent-mail"])
 
     def test_porteur_ouvert_lance_la_tentative(self):
         ctx = self.context({"id": 8286, "state": "qa"})

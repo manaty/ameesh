@@ -2044,16 +2044,19 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
 def closed_reason(ctx: Context, carrier: int) -> str:
     """#6538 : la raison de clôture du porteur s'il est clos, sinon "".
 
-    Une lecture impossible laisse le porteur pour ouvert : l'échec suit
-    alors son chemin ordinaire.
+    #8290 : un porteur livré (`MERGED_STATES`, miroir de
+    `work_lifecycle.DELIVERED`) est terminal comme un porteur clos ; sa
+    raison est alors son état. Une lecture impossible laisse le porteur pour
+    ouvert : l'échec suit alors son chemin ordinaire.
     """
     try:
         item = show(ctx, carrier)
     except HoraireError:
         return ""
-    if str(item.get("state") or "") != "closed":
+    state = str(item.get("state") or "")
+    if state != "closed" and state not in MERGED_STATES:
         return ""
-    return str(item.get("close_reason") or "clos")
+    return str(item.get("close_reason") or (state if state != "closed" else "clos"))
 
 
 def contract_result_at(ctx: Context, item: dict, sha: str):

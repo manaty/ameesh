@@ -2317,8 +2317,10 @@ try:
         if package and package != carrier and str(
                 member.get("package_state") or "") not in work_lifecycle.COMPLETED:
             carried.setdefault(str(int(member["work_item_id"])), package)
-    print(json.dumps({"state": str(rows[0].get("state") or ""),
+    state = str(rows[0].get("state") or "")
+    print(json.dumps({"state": state,
                       "close_reason": str(rows[0].get("close_reason") or ""),
+                      "terminal": state in work_lifecycle.COMPLETED,
                       "carried": carried}))
 finally:
     if conn is not None:
@@ -2341,7 +2343,9 @@ finally:
 
 
 def check_carrier_open(worktree: Path, carrier: int) -> None:
-    """#8290 : un porteur clos n'est jamais recomposé, poussé ni armé.
+    """#8290 : un porteur clos (abandonné, remplacé) ou livré (`delivered`,
+    `merged`, `promoted` : `work_lifecycle.COMPLETED`) n'est jamais recomposé,
+    poussé ni armé.
 
     h-20261126-01 : la recomposition du pilote partie sur #8286 ouvert a
     continué ses tests après sa clôture, puis a poussé, ouvert la PR #6524,
@@ -2349,10 +2353,11 @@ def check_carrier_open(worktree: Path, carrier: int) -> None:
     garde de chaque geste (enregistrement, poussée, PR, gel, ci-full).
     """
     data = read_carrier(worktree, carrier)
-    if data.get("state") == "closed":
+    if data.get("terminal") or data.get("state") == "closed":
         raise CarrierClosed("porteur #%d clos (%s) : rien n'est enregistré, "
                             "poussé ni armé"
-                            % (carrier, data.get("close_reason") or "clos"))
+                            % (carrier, data.get("close_reason")
+                               or data.get("state") or "clos"))
 
 
 def carried_elsewhere(worktree: Path, carrier: int,
@@ -7414,6 +7419,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                                      discarded=len(composition.discarded))
             print("composition : tête %s" % head, flush=True)
             if not args.no_packet_record:
+                # #8290 : relu juste avant l'enregistrement (après les contrôles)
+                check_carrier_open(repo, args.carrier)
                 print(record_packet(worktree, args.carrier, base_sha, head,
                                     branch, args.target,
                                     expect_pushed=lease or "", claim=claim,
@@ -7570,6 +7577,9 @@ def compose_packet(args: argparse.Namespace) -> int:
                     print("poussée : %s%s" % (branch, " (recomposition)"
                                               if lease else ""), flush=True)
                     lease = pushed = head
+                    # #8290 : clos pendant la poussée : ni PR, ni gel, ni ci-full
+                    if not args.no_packet_record:
+                        check_carrier_open(repo, args.carrier)
                     pr_number, pr_url = ensure_pull_request(
                         worktree, branch, args.target, title(), body(runs))
                     print("PR : %s" % (pr_url or pr_number or "?"), flush=True)
