@@ -14,6 +14,7 @@ already present are re-read and only missing comments are posted.
 """
 from __future__ import annotations
 
+from ameesh import canon as canon_mod
 from ameesh import work_lifecycle as lifecycle
 
 import datetime as dt
@@ -53,11 +54,64 @@ def _date(value):
         return None
 
 
+def _staging_topology(cfg):
+    """#8313: the staging sequence the canon declares, never a host count.
+
+    #2844 required exactly four attested hosts. The canon now declares five
+    (three agent VMs, a server and the workstation), and §14 lets the last two
+    be reported absent, so a fixed count rejects every real staging proof.
+    Only the default canon (L42) declares the sequence; a bare or unreadable
+    canon declares no host, and then no receipt is proven.
+    """
+    try:
+        canons = canon_mod.load_configured(cfg)
+        return canon_mod.staging_topology(canons[:1])
+    except Exception:  # noqa: BLE001 - an unreadable canon proves nothing
+        return canon_mod.StagingTopology()
+
+
+def _staging_proof(attestation, sha, topology):
+    """#8313: the attestation covers the canon's staging sequence at `sha`.
+
+    Every host of the sequence is either active at the commit or reported
+    absent; only the canon-declared reportable hosts (server, workstation) may
+    be reported, never an agent VM, and an active proof must name the commit.
+    An empty sequence proves nothing: a bare profile has no staging host.
+    This is the rule the release path applies to the same attestation (#7662).
+    """
+    if not topology.hosts:
+        return False
+    hosts = attestation.get("hotes")
+    reportes = attestation.get("reportes") or {}
+    if not isinstance(hosts, dict) or not isinstance(reportes, dict):
+        return False
+    if set(reportes) - topology.reportable:
+        return False
+    if set(hosts) != set(topology.required(reportes)):
+        return False
+    for proof in hosts.values():
+        if not isinstance(proof, dict):
+            return False
+        actif = str(proof.get("actif") or "").lower()
+        if not actif or not (sha.startswith(actif) or actif.startswith(sha)):
+            return False
+    for detail in reportes.values():
+        if not isinstance(detail, dict) or not str(detail.get("raison") or "").strip():
+            return False
+    return True
+
+
 def release_receipts(cfg, project):
-    """Use durable successful release+activation reports, never a tag alone."""
+    """Use durable successful release+activation reports, never a tag alone.
+
+    #8313: the report's staging attestation must cover the canon's sequence
+    (every required host active at the released commit, only the reportable
+    ones absent), not a fixed number of hosts that the real sequence outgrew.
+    """
     folder = getattr(cfg, "state_dir", None)
     if not folder:
         return {}
+    topology = _staging_topology(cfg)
     receipts = {}
     for path in sorted((Path(folder) / "release" / "reports").glob("*.json")):
         try:
@@ -79,8 +133,7 @@ def release_receipts(cfg, project):
         if (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha)
                 or attestation.get("schema") != "ameesh-staging-actif/1"
                 or attestation.get("sha") != sha
-                or not isinstance(attestation.get("hotes"), dict)
-                or len(attestation["hotes"]) != 4):
+                or not _staging_proof(attestation, sha, topology)):
             continue
         version = report.get("version")
         day = _date(report.get("completed_at"))
