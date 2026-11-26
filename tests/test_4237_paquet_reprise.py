@@ -270,7 +270,8 @@ class EpochLostTest(unittest.TestCase):
             ensure_pull_request=(7, "http://pr"), freeze_carrier="",
             request_full_ci="", note_carrier="", send_mail=None,
             remove_worktree=None, PackageLock=mock.DEFAULT,
-            CompositionClaim=mock.DEFAULT)
+            CompositionClaim=mock.DEFAULT,
+            read_carrier={"state": "qa", "close_reason": "", "carried": {}})
         with mock.patch.multiple(auto, **{k: mock.DEFAULT for k in patches}) as mocks, \
                 mock.patch.object(auto, "check_epoch", side_effect=guard), \
                 mock.patch.object(auto, "check_local_tests", side_effect=tests), \
@@ -324,7 +325,7 @@ class PublishTest(Chain):
             note_carrier=mock.DEFAULT, request_full_ci=mock.DEFAULT,
             send_mail=mock.DEFAULT, record_packet=mock.DEFAULT,
             push_branch=mock.DEFAULT, freeze_carrier=mock.DEFAULT,
-            CompositionClaim=mock.DEFAULT)
+            CompositionClaim=mock.DEFAULT, check_carrier_open=mock.DEFAULT)
 
     def push(self, args, branch_head=None):
         git(self.repo, "push", "-q", "origin", "%s:%s" % (self.head, args.publish))
