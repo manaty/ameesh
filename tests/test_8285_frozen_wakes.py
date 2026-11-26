@@ -24,60 +24,49 @@ _FORCE = "test: frozen wakes (#8285)"
 class HumanGateTest(unittest.TestCase):
     """La porte humaine lue sur les retenues et les décisions du lot."""
 
-    NOW = 1_800_000_000.0
-
     def _hold(self, note):
         return {"agent": {"note": note, "by": "agent"}}
 
-    def test_owner_and_bureau_holds_gate(self):
+    def test_owner_and_avatar_holds_gate(self):
         for who in ("owner", "avatar"):
             with self.subTest(who=who):
                 gate = planned_waits.human_gate(
-                    7, self._hold("hold: attente %s : login web" % who), (),
-                    now=self.NOW)
+                    7, self._hold("hold: attente %s : login web" % who), ())
                 self.assertEqual(gate["executor"], who)
                 self.assertEqual(gate["gesture"], "login web")
-                self.assertIsNone(gate["until"])
 
-    def test_the_armed_wake_is_not_the_deadline(self):
-        gate = planned_waits.human_gate(
-            7, self._hold("hold: attente owner : séance DH-6 "
-                          "[réveil programmé: 2020-01-01 10:00 UTC]"), (),
-            now=self.NOW)
-        self.assertIsNotNone(gate, "le réveil armé par la note est celui qu'on reporte")
+    def test_a_runtime_route_gates(self):
+        """B1 : `bureau` est l'avatar déclaré au canon, pas un nom du cœur."""
+        note = "hold: attente bureau : login web"
+        self.assertIsNone(planned_waits.human_gate(7, self._hold(note), ()))
+        gate = planned_waits.human_gate(7, self._hold(note), (),
+                                        executors={"bureau"})
+        self.assertEqual(gate["executor"], "avatar")
 
-    def test_a_past_explicit_due_releases(self):
+    def test_a_declared_due_does_not_release(self):
+        """B2 : #8078, notes « due 12:00 » et réveil à 12:00 : la demande
+        reste ouverte, le report tient jusqu'à la levée (filet à l'appelant)."""
         for note in ("hold: attente owner (due 2020-01-01 10:00 UTC) : login",
-                     "hold: attente owner : login (due 2020-01-01)"):
+                     "hold: attente owner : séance DH-6 "
+                     "[réveil programmé: 2020-01-01 10:00 UTC]"):
             with self.subTest(note=note):
-                self.assertIsNone(planned_waits.human_gate(
-                    7, self._hold(note), (), now=self.NOW))
+                self.assertIsNotNone(planned_waits.human_gate(
+                    7, self._hold(note), ()))
 
-    def test_a_future_due_bounds_the_gate(self):
-        gate = planned_waits.human_gate(
-            7, self._hold("hold: attente avatar : relais (due 2099-01-01 10:00 UTC)"),
-            (), now=self.NOW)
-        self.assertGreater(gate["until"], self.NOW)
-
-    def test_unreadable_due_or_other_waits_do_not_gate(self):
-        for note in ("hold: attente owner : login (due demain matin)",
-                     "hold: attente externe : revue Apple",
+    def test_other_waits_do_not_gate(self):
+        for note in ("hold: attente externe : revue Apple",
                      "hold: séance owner",
+                     "hold: fenêtre : observation du relais",
                      "hold: attendre le paquet 451"):
             with self.subTest(note=note):
-                self.assertIsNone(planned_waits.human_gate(
-                    7, self._hold(note), (), now=self.NOW))
+                self.assertIsNone(planned_waits.human_gate(7, self._hold(note), ()))
 
-    def test_open_decision_gates_until_its_deadline(self):
-        request = {"id": 233821, "lot": 7, "owner": "human:o",
-                   "due_ts": self.NOW + 3600}
-        gate = planned_waits.human_gate(7, {}, [request], now=self.NOW)
+    def test_open_decision_gates_even_past_its_deadline(self):
+        request = {"id": 233821, "lot": 7, "owner": "human:o", "due_ts": 1.0}
+        gate = planned_waits.human_gate(7, {}, [request])
         self.assertEqual(gate["what"], "decision")
         self.assertEqual(gate["gesture"], "decision #233821")
-        self.assertIsNone(planned_waits.human_gate(8, {}, [request], now=self.NOW))
-        self.assertIsNone(planned_waits.human_gate(
-            7, {}, [dict(request, due_ts=self.NOW - 1)], now=self.NOW),
-            "une décision échue : l'humain est en retard, le réveil part")
+        self.assertIsNone(planned_waits.human_gate(8, {}, [request]))
 
 
 class FrozenWakeTest(_Base):

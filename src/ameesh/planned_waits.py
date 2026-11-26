@@ -1048,52 +1048,43 @@ def decision_waits(requests, *, now) -> dict[int, dict]:
     return out
 
 
-def _external_until(note) -> tuple[bool, float | None]:
-    """#8285 : la fin déclarée d'une attente externe, `(lisible, instant)`.
-
-    Seule l'échéance explicite (`(due …)`, `[échéance : …]`) compte, jamais le
-    `[réveil programmé: …]` que la note arme : c'est justement ce réveil qu'on
-    reporte. Une date seule vaut jusqu'à la fin du jour (`hold_end`) ; une
-    échéance illisible rend `(False, None)`, et rien n'est reporté."""
-    found = _EXTERNAL_DUE.search(str(note or ""))
-    if not found:
-        return True, None
-    raw = found.group("date").strip()
-    from . import debit  # import tardif : debit lit les attentes planifiées
-    until = debit.parse_wake_due("(due %s)" % raw)
-    if until is None and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", raw):
-        until = hold_end(raw)
-    return until is not None, until
-
-
-def human_gate(lot: int, holds, requests, *, now: float) -> dict | None:
+def human_gate(lot: int, holds, requests, *, executors=()) -> dict | None:
     """#8285 : la demande owner ou avatar encore ouverte qui fige le lot.
 
     `holds` : les retenues actives du lot par auteur (`active_holds`) ;
-    `requests` : les demandes de décision en attente (`decisions.pending`).
-    Rend la première porte trouvée — une décision ouverte non échue
-    (`decision_waits`), ou une retenue `hold: attente owner|avatar : <geste>`
-    (#3498) dont l'échéance explicite n'est pas passée — ou None. Une
-    décision échue, une attente `externe`, une échéance illisible ne figent
-    rien : l'humain est en retard ou rien n'est déclaré, le réveil part."""
-    waits = decision_waits(
-        [r for r in requests or () if r.get("lot") == int(lot)], now=now)
-    if int(lot) in waits:
-        wait = waits[int(lot)]
-        return {"what": "decision", "executor": wait.get("owner") or "owner",
-                "gesture": "decision #%s" % wait["decision"],
-                "until": wait["due_ts"]}
+    `requests` : les demandes de décision en attente (`decisions.pending`) ;
+    `executors` : les routes humaines du runtime (`_runtime_human_routes`,
+    #7634 — `bureau` y figure quand le canon le déclare avatar). Rend la
+    première porte trouvée — une décision du lot encore en attente, ou une
+    retenue `hold: attente owner|avatar|<route> : <geste>` (#3498) — ou None.
+    L'échéance déclarée ne lève pas la porte : la demande reste ouverte
+    jusqu'à la réponse ou la levée (B2 de la relecture) ; c'est l'appelant qui
+    borne le report. Une attente `externe` ne fige rien."""
+    for request in requests or ():
+        if request.get("lot") == int(lot):
+            return {"what": "decision",
+                    "executor": request.get("owner") or "owner",
+                    "gesture": "decision #%s" % request.get("id")}
     for hold in (holds or {}).values():
-        declared = external_hold(hold.get("note"))
-        if not declared or declared["executor"] not in ("owner", "avatar"):
-            continue
-        readable, until = _external_until(hold.get("note"))
-        if not readable or (until is not None and now >= until):
-            continue
-        return {"what": "hold", "executor": declared["executor"],
-                "gesture": declared["gesture"], "by": hold.get("by"),
-                "until": until}
+        declared = external_hold(hold.get("note"), executors=executors)
+        if declared and declared["executor"] in ("owner", "avatar"):
+            return {"what": "hold", "executor": declared["executor"],
+                    "gesture": declared["gesture"], "by": hold.get("by")}
     return None
+
+
+def lot_human_gate(db, lot: int, requests, *, cfg=None) -> dict | None:
+    """#8285 : `human_gate` lu en base pour un lot — retenues actives
+    (`active_holds`) et routes humaines du runtime, une lecture du registre et
+    une fenêtre de canons pour les deux, comme `human_waits` (#8051)."""
+    from . import canon as canon_mod
+    events = storage.of(db).progress.lot_hold_events([int(lot)], HOLD_NOTE_PATTERNS)
+    with canon_mod.configured_cache():
+        agents = _human_agent_rows(db)
+        routes = _runtime_human_routes(db, cfg, agents=agents)
+        holds = active_holds(db, events, cfg=cfg, agents=agents)
+    return human_gate(int(lot), holds.get(int(lot)) or {}, requests,
+                      executors=routes)
 
 
 def packet_carriers(rows):

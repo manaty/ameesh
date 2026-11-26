@@ -7684,15 +7684,16 @@ class AgentWorker(threading.Thread):
         Constat du 25/11 : des réveils programmés sur des lots bloqués par un
         geste owner encore ouvert réécrivaient à froid une session de 200 000+
         jetons pour constater que rien n'avait bougé, puis réarmer. Tant que
-        la demande qui bloque le lot reste ouverte — décision non échue
+        la demande qui bloque le lot reste ouverte — décision en attente
         (`ameesh decide ask`), retenue `hold: attente owner|avatar : <geste>`
-        dont l'échéance explicite n'est pas passée (`planned_waits.human_gate`)
-        —, le réveil est **reporté**, pas consommé : l'échéance reste armée et
-        part dès la réponse (décision close, retenue levée) ou l'échéance de la
-        demande, au plus tard `FROZEN_WAKE_MAX_DEFER_S` après la sienne. Rend
-        le motif du report, ou "" (réveil délivré). Relu au plus toutes les
-        `FROZEN_WAKE_RECHECK_S` ; illisible ou exécuteur médié : délivré, comme
-        avant (#6134). Un réveil armé par une retenue levée suit #6134."""
+        (routes humaines du runtime comprises, `bureau` par exemple ;
+        `planned_waits.human_gate`) —, le réveil est **reporté**, pas
+        consommé : l'échéance reste armée et part dès la réponse (décision
+        close, retenue levée), au plus tard `FROZEN_WAKE_MAX_DEFER_S` après la
+        sienne. L'échéance déclarée de la demande ne la ferme pas. Rend le
+        motif du report, ou "" (réveil délivré). Relu au plus toutes les
+        `FROZEN_WAKE_RECHECK_S` ; illisible ou exécuteur médié : délivré,
+        comme avant. Un réveil armé par une retenue levée suit #6134."""
         if getattr(self.runner, "mediated", False):
             return ""
         if now - float(wake_ts) >= self.FROZEN_WAKE_MAX_DEFER_S:
@@ -7704,14 +7705,9 @@ class AgentWorker(threading.Thread):
             return cached[1]
         from . import decisions as decisions_mod, planned_waits
         try:
-            holds = planned_waits.active_holds(
-                self.db,
-                storage.of(self.db).progress.lot_hold_events(
-                    [int(lot)], planned_waits.HOLD_NOTE_PATTERNS),
+            gate = planned_waits.lot_human_gate(
+                self.db, int(lot), decisions_mod.pending(self.db, now),
                 cfg=self.cfg)
-            gate = planned_waits.human_gate(
-                int(lot), holds.get(int(lot)) or {},
-                decisions_mod.pending(self.db, now), now=now)
         except (db_mod.DbError, AttributeError) as exc:
             log_async("[%s] human gate unreadable for lot #%s (%s): wake delivered"
                       % (self.name, lot, exc))
@@ -7719,9 +7715,6 @@ class AgentWorker(threading.Thread):
         reason = ""
         if gate:
             reason = "waiting for %s: %s" % (gate["executor"], gate["gesture"])
-            if gate.get("until") is not None:
-                reason += " (until %s)" % time.strftime(
-                    "%Y-%m-%d %H:%M %Z", time.localtime(float(gate["until"])))
             if not cached or cached[1] != reason:
                 log_async("[%s] scheduled wake for lot #%s deferred, %s"
                           % (self.name, lot, reason))
