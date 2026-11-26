@@ -37,6 +37,12 @@ elles existent. Les tests d'une classe partagent déjà un schéma unique par
 classe dans `PgTestCase` : deux processus de la même base ne se voient pas.
 La mesure (`--measure`) reste série : ses couvertures ne se fusionnent pas.
 
+#8291 — `run --echeance T` (epoch) : une part parallèle encore en cours à `T`
+arrête ses processus et finit d'elle-même, non concluante (`fin` `interrompu`,
+`raison` `echeance`, ses `restants`), au lieu d'être annulée par le plafond du
+job : la nocturne psql finissait « cancelled » (7/16 le 25/11, 10/16 le
+26/11). L'exécution série ne la lit pas.
+
 #6803 — **une base par processus** : un schéma ne cloisonne ni les verrous
 consultatifs (`pg_try_advisory_xact_lock(hashtextextended('vm-adapter:burst',
 0))`, verrou de migration, verrou gabarit : leur clé vaut pour toute la base)
@@ -167,6 +173,11 @@ PLAN_SCHEMA = "ameesh-test-plan/1"
 PART_MESURE = re.compile(r"mesure-(psycopg|psql)-(\d+)$")
 #: lignes de trace gardées dans l'extrait d'un échec
 EXCERPT_LINES = 40
+#: #8291 : modules restants nommés dans l'erreur d'une part échue
+SUMMARY_RESTANTS = 25
+#: #8291 : grâce laissée aux processus d'une part échue après SIGTERM, avant
+#: SIGKILL ; tient dans les 3 min de marge que tests.yml garde au job
+GRACE_ECHEANCE_S = 20.0
 #: #2224 — surcoût de charge d'une part de mesure : run 39015105210, psycopg
 #: 3/6 estimée 1 588,7 s, 2 316 s de tests réels (×1,46) ; une part dont
 #: l'estimation × ce facteur dépasse le plafond du job est signalée par le plan
@@ -526,7 +537,7 @@ def plan(args) -> int:
 
 
 def nombre_de_parts(poids: dict[str, float], plancher: int, plafond_min: int | None,
-                    parts_max: int | None) -> int:
+                    parts_max: int | None, debit: float | None = None) -> int:
     """#8261 — le nombre de parts d'un pilote : `plancher` (la liste du
     workflow), relevé tant que la part la plus lourde, × `SURCOUT_CHARGE`,
     dépasse `MARGE_PLAFOND` du plafond. Sans `plafond_min` ni `parts_max`,
@@ -537,10 +548,15 @@ def nombre_de_parts(poids: dict[str, float], plancher: int, plafond_min: int | N
     signale alors comme avant, au lieu de multiplier des parts inutiles. Un
     palier du découpage entre n et n + 1 parts ne prouve rien (relecture
     ameesh-cx2 : 25 modules de 1 300 s donnent 2 600 s à 13 et 14 parts,
-    1 300 s à 25)."""
+    1 300 s à 25).
+
+    #8291 — `debit` : secondes d'estimation tenues par seconde de mur. Une
+    part de mesure en compte 1 / `SURCOUT_CHARGE` (défaut) ; le nocturne psql
+    pèse la somme des tests de son flux, ses parts tiennent plusieurs tests à
+    la fois (`scripts/test-plan.py`, `PSQL_FULL_DEBIT`)."""
     if not plafond_min or not parts_max:
         return plancher
-    cible = plafond_min * 60 * MARGE_PLAFOND / SURCOUT_CHARGE
+    cible = plafond_min * 60 * MARGE_PLAFOND * (debit or 1 / SURCOUT_CHARGE)
 
     def plus_lourde(n: int) -> float:
         return max((sum(poids[m] for m in part) for part in split(poids, n)), default=0.0)
@@ -1096,6 +1112,33 @@ def _suivre_flux(chemin: str, flow: Flow, evenements: list, verrou: threading.Lo
         time.sleep(0.2)
 
 
+def attendre(procs: list[subprocess.Popen], echeance: float | None,
+             pas_s: float = 5.0, grace_s: float | None = None) -> bool:
+    """#8291 : attend la fin des processus ; à l'`echeance` (epoch), les
+    arrête (SIGTERM) et rend True — la part est non concluante, pas rouge.
+
+    Relecture ameesh-cx2 (B/P2) : un enfant qui ignore SIGTERM (un test qui
+    pose son propre gestionnaire) gardait la part ouverte jusqu'au plafond du
+    job. Passé `grace_s` (`GRACE_ECHEANCE_S`), il est tué (SIGKILL) et récolté : au retour, plus
+    aucun processus ne vit."""
+    while any(proc.poll() is None for proc in procs):
+        if echeance is not None and time.time() >= echeance:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.terminate()
+            limite = time.monotonic() + (GRACE_ECHEANCE_S if grace_s is None else grace_s)
+            for proc in procs:
+                try:
+                    proc.wait(timeout=max(0.0, limite - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            return True
+        time.sleep(pas_s if echeance is None else
+                   max(0.05, min(pas_s, echeance - time.time())))
+    return False
+
+
 def run_parallel(args) -> int | None:
     """#3754 — exécute la part en N processus `run`, chacun sur son schéma.
 
@@ -1124,6 +1167,13 @@ def run_parallel(args) -> int | None:
     except Exception as exc:  # un module qui n'importe pas : découpage par module
         print(f"découpage parallèle par module ({exc})", file=sys.stderr, flush=True)
         unites = {m: [f"tests.{m}"] for m in part}
+    # #8291 : les identifiants attendus de chaque module, pour dire à la
+    # coupure lesquels restent (un module découpé par module n'a que
+    # `tests.<m>`, jamais terminé : il reste, au doute)
+    attendus: dict[str, set[str]] = {}
+    for ids in unites.values():
+        for test_id in ids:
+            attendus.setdefault(_module_of_test_id(test_id), set()).add(test_id)
     pesees = _pesees_unites(unites, args.driver, part)
     unites, pesees = _affiner_unites(unites, pesees, _poids_par_test(args.driver))
     charge = sum(pesees.values())
@@ -1152,11 +1202,36 @@ def run_parallel(args) -> int | None:
     debut = time.monotonic()
     charge_systeme_debut = _charge_systeme()
 
+    ferme = threading.Event()  # la `fin` de la part est écrite
+
+    def non_concluante(raison: str) -> list[str]:
+        """#8291 : la `fin` d'une part arrêtée avant son terme, avec les
+        modules restants ; rend ces modules.
+
+        Relecture mty-amh-impl-11 et ameesh-dev3 (B/P2) : un module ayant un
+        seul résultat sortait des restants alors que ses autres tests
+        n'avaient pas tourné. Un module reste tant qu'un de ses identifiants
+        attendus n'a pas de résultat terminal."""
+        with verrou:
+            recus = list(evenements)
+        termines = {e.get("test") for e in recus}
+        restants = [m for m in part if attendus.get(m, set()) - termines]
+        if flow and not ferme.is_set():
+            ferme.set()
+            flow.write("fin", statut="interrompu", raison=raison, restants=restants,
+                       comptes=dict(collections.Counter(e.get("statut") for e in recus)),
+                       duree_s=round(time.monotonic() - debut, 1))
+            flow.close()
+        return restants
+
     def arreter(signum, _frame):
         for proc in procs:
             if proc.poll() is None:
                 proc.terminate()
         fini.set()
+        # #8291 : la part annulée par le job (SIGTERM) laisse aussi sa fin,
+        # non concluante (le flux de psql 10/16 du 26/11 n'en avait aucune).
+        non_concluante(f"signal {signum}")
         raise SystemExit(128 + signum)
 
     anciens = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
@@ -1200,13 +1275,25 @@ def run_parallel(args) -> int | None:
                                        daemon=True)
                 fil.start()
                 fils.append(fil)
+        echue = attendre(procs, getattr(args, "echeance", None))
         codes = [proc.wait() for proc in procs]
         fini.set()
         for fil in fils:
             fil.join(timeout=10)
         with verrou:
             recus = list(evenements)
-        if flow:
+        if echue:
+            # #8291 : la part s'arrête avant le plafond du job au lieu d'être
+            # annulée par lui (la nocturne finissait « cancelled ») : elle dit
+            # les modules restants, sa preuve est incomplète, pas négative.
+            restants = non_concluante("echeance")
+            rouges = sum(e.get("statut") in ("echec", "erreur") for e in recus)
+            print(f"::error title=Part non concluante (#8291)::{etiquette} arrêtée à son "
+                  f"échéance, avant le plafond du job : {len(restants)} module(s) non "
+                  f"terminé(s) sur {len(part)}, {rouges} test(s) en échec — "
+                  f"{', '.join(restants[:SUMMARY_RESTANTS]) or 'aucun'}"
+                  + (" …" if len(restants) > SUMMARY_RESTANTS else ""), flush=True)
+        elif flow:
             comptes = collections.Counter(e.get("statut") for e in recus)
             impactes = [m for m in part if classes.get(m, ("P3", ""))[0] in ("P0", "P1")]
             rouges = sorted({e.get("module") for e in recus
@@ -1216,6 +1303,7 @@ def run_parallel(args) -> int | None:
                        modules=impactes, rouges=rouges)
             echec = any(code != 0 for code in codes) \
                 or bool(comptes.get("echec") or comptes.get("erreur"))
+            ferme.set()
             flow.write("fin", statut="echec" if echec else "succes",
                        comptes=dict(comptes), duree_s=round(time.monotonic() - debut, 1))
             flow.close()
@@ -1235,7 +1323,7 @@ def run_parallel(args) -> int | None:
               f"charge ~{charge:.0f} s, {len(recus)} test(s), "
               f"{time.monotonic() - debut:.0f} s, hôte {host_cpus()} vCPU, "
               f"charge système {charge_systeme_debut} → {_charge_systeme()}", flush=True)
-        return 0 if all(code == 0 for code in codes) else 1
+        return 0 if all(code == 0 for code in codes) and not echue else 1
     finally:
         fini.set()
         for proc in procs:
@@ -1417,6 +1505,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--test-timeout", type=float, default=TEST_TIMEOUT,
                            help="borne chaque test sous mesure (secondes, défaut %(default)s) ; "
                            "0 la désactive (#3604)")
+            p.add_argument("--echeance", type=float, default=None,
+                           help="#8291 : instant (epoch) où la part parallèle s'arrête "
+                           "d'elle-même, non concluante, avant le plafond du job")
             p.add_argument("--parallel", type=int, default=1,
                            help="#3754 : N processus de test au moins dans la part, "
                            "chacun son schéma (1 = série, défaut) ; la charge mesurée "

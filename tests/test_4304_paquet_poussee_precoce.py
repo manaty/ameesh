@@ -134,6 +134,8 @@ class Flux:
 
         patches = [
             mock.patch.object(paquet_auto, "check_epoch"),
+            mock.patch.object(paquet_auto, "read_carrier", return_value={
+                "state": "qa", "close_reason": "", "carried": {}}),
             # #6891 : base de composition, puis relecture avant les tests.
             mock.patch.object(paquet_auto, "fresh_base",
                               side_effect=lambda *_a, **_k: (

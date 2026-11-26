@@ -70,6 +70,8 @@ what is proper to a driver) plus the whole contract list
 whole suite. The whole suite under psql runs at night
 (`.github/workflows/psql-nocturne.yml`, `--psql-full true`): psql only, every
 module, no psycopg part — psycopg already ran it on every push to `main`.
+#8291: the night run sizes its psql parts under the job timeout (16 at
+least, more while the heaviest part, weighed by `psql_full`, does not fit).
 
 **Documentation-only** (L161a): a pull request whose whole diff is
 documentation, and a push to `main` whose whole pushed range (`--base`,
@@ -247,6 +249,24 @@ RECENT_FAILURE_DAYS = 7
 #: 26,5 min (p80 31,3 → 27,2, max 38,5 → 29,0). psql reste à 16 : sa part
 #: nocturne complète garde son découpage (#6437, #1692).
 PARTS = {"psycopg": (4, 12), "psql": (3, 16)}
+#: #8291 : le nocturne psql dimensionne ses parts sur le plafond, comme la
+#: carte depuis #8261. Les 25 et 26/11, une part coupée à 60 min par nuit
+#: (7/16 puis 10/16, run 45738064364) : la table `psql_full` du 08/11
+#: annonçait 16 parts égales (~12 050 s) que le run a mesurées de 2 799 à
+#: 12 113 s. 16 n'est plus qu'un plancher : le plan ajoute des parts (au plus
+#: `PSQL_FULL_PARTS_MAX`) tant que la plus lourde ne tient pas sous 90 % du
+#: plafond du job psql (`PSQL_FULL_PLAFOND_MIN`, son timeout-minutes).
+#: `PSQL_FULL_DEBIT` : secondes de tests du flux tenues par seconde de mur
+#: d'une part (`--parallel 2`) ; mesuré 3,3 à 3,5 sur les parts de 15 à
+#: 60 min du 26/11 (11/16 : 12 113 s en 59 min), 3 garde la mise en route
+#: du job dans la marge.
+#: `PSQL_FULL_PARTS_MAX` : la fenêtre d'admission (01:47Z → 06Z,
+#: `ameesh psql-nocturne guard`) tient cinq vagues de quatre parts
+#: (`max-parallel: 4`) de 50 min au plus, soit 20 parts (relecture
+#: ameesh-dev3, #8292).
+PSQL_FULL_PLAFOND_MIN = 60
+PSQL_FULL_PARTS_MAX = 20
+PSQL_FULL_DEBIT = 3.0
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg
 #: comme dans celui de 60 min de psql (#1251).
@@ -1698,6 +1718,19 @@ def psql_full_weights(modules: list[str], card: dict | None) -> dict[str, float]
     return weighed
 
 
+def psql_full_count(weighed: dict[str, float]) -> int:
+    """#8291 : le nombre de parts du nocturne psql — 16 au moins, relevé
+    tant que la plus lourde dépasse la cible sous le plafond du job."""
+    return parts.nombre_de_parts(weighed, PARTS["psql"][1], PSQL_FULL_PLAFOND_MIN,
+                                 PSQL_FULL_PARTS_MAX, debit=PSQL_FULL_DEBIT)
+
+
+def psql_full_target_s() -> float:
+    """#8291 : l'estimation (secondes de tests) qu'une part du nocturne tient
+    sous le plafond, avec la marge de `nombre_de_parts`."""
+    return PSQL_FULL_PLAFOND_MIN * 60 * parts.MARGE_PLAFOND * PSQL_FULL_DEBIT
+
+
 def split(modules: list[str], driver: str, n: int, card: dict | None,
           classes: dict[str, tuple[str, str]],
           weighed: dict[str, float] | None = None) -> list[dict]:
@@ -2190,6 +2223,8 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         n = n_pr if lot and chosen_set is not None else n_other
         if chosen_set is not None:
             n = min(n, lot_part_count(driver, selected, card))
+        if driver == "psql" and psql_full and chosen_set is None:
+            n = psql_full_count({m: pleine[m] for m in selected})
         #: #7590 : hors sélection d'un lot, la suite est complète. Le
         #: découpage psycopg lit alors les durées sans couverture (la
         #: stabilité prime sur la fraîcheur de la carte, qui reste
@@ -2264,7 +2299,7 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
         try:
             weighed = psql_full_weights(modules, None)
             psql_split = [(part, sum(weighed[m] for m in part), False)
-                          for part in parts.split(weighed, PARTS["psql"][1])]
+                          for part in parts.split(weighed, psql_full_count(weighed))]
         except (Exception, SystemExit) as exc:  # the fallback must not fail
             plan["unsure"].append(f"psql_full table unreadable ({exc}); "
                                   "whole suite under psql")
@@ -2289,6 +2324,7 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
             plan["parts"][driver] = []
             continue
         if driver == "psql" and psql_split is not None:
+            n = len(psql_split)  # #8291 : le nocturne relève ses parts
             plan["parts"][driver] = [
                 {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": part,
                  "pilot_list": pilot, "estimate_s": round(estimate, 1)}
@@ -2332,6 +2368,16 @@ def annotations(plan: dict) -> list[str]:
             f"(> {MAX_AGE_H} h, générée le {str(m.get('generated') or '')[:10]}) : "
             "les lots gardent les impactés de cette carte sur leur propre diff ; "
             "relancer carte.yml")
+    # #8291 : une part du nocturne au-delà de la cible (module insécable, ou
+    # `PSQL_FULL_PARTS_MAX` atteint) risque la coupure à 60 min : signalée.
+    if plan.get("psql_full"):
+        for p in plan.get("parts", {}).get("psql", []):
+            if p["estimate_s"] > psql_full_target_s():
+                lines.append(
+                    f"::warning title=Part nocturne au plafond::{p['label']} estimée "
+                    f"{p['estimate_s']:.0f} s de tests (cible ~{psql_full_target_s():.0f} s, "
+                    f"{PSQL_FULL_DEBIT:g} s par seconde de mur) : risque de coupure à "
+                    f"{PSQL_FULL_PLAFOND_MIN} min (#8291)")
     sha = (m.get("commit") or "")[:12]
     lines.extend(
         f"::notice file={u['file']},line={u['lines'][0]},endLine={u['lines'][1]},"
@@ -2397,6 +2443,15 @@ def summary(plan: dict) -> str:
         if plan.get("psql_full"):
             lines.append("* psql night run (#3749): the whole suite under psql, "
                          "no psycopg part")
+            nuit = plan["parts"].get("psql", [])
+            if nuit:
+                # #8291 : le nombre de parts suit le plafond, plus un 16 figé
+                lourde = max(p["estimate_s"] for p in nuit)
+                lines.append(
+                    f"* psql night parts (#8291): {nuit[0]['of']} (floor {PARTS['psql'][1]}), "
+                    f"heaviest ~{lourde:.0f} s of tests for a target of "
+                    f"~{psql_full_target_s():.0f} s under the {PSQL_FULL_PLAFOND_MIN} min "
+                    "job timeout")
         elif sel.get("mode") == "full":
             lines.append(f"* psql (#3749): pilot list + contract, {psql_n} module(s); "
                          "the whole suite under psql runs at night (psql-nocturne.yml)")
