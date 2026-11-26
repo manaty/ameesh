@@ -260,8 +260,12 @@ PARTS = {"psycopg": (4, 12), "psql": (3, 16)}
 #: d'une part (`--parallel 2`) ; mesuré 3,3 à 3,5 sur les parts de 15 à
 #: 60 min du 26/11 (11/16 : 12 113 s en 59 min), 3 garde la mise en route
 #: du job dans la marge.
+#: `PSQL_FULL_PARTS_MAX` : la fenêtre d'admission (01:47Z → 06Z,
+#: `ameesh psql-nocturne guard`) tient cinq vagues de quatre parts
+#: (`max-parallel: 4`) de 50 min au plus, soit 20 parts (relecture
+#: ameesh-dev3, #8292).
 PSQL_FULL_PLAFOND_MIN = 60
-PSQL_FULL_PARTS_MAX = 32
+PSQL_FULL_PARTS_MAX = 20
 PSQL_FULL_DEBIT = 3.0
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg

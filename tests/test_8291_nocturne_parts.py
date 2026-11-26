@@ -10,11 +10,20 @@ quand un module seul la dépasse. Témoins sans base : le plan et tests.yml.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
 import datetime
 import importlib.util
+import io
 import json
+import os
 import pathlib
+import signal
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -32,6 +41,8 @@ def _load(name: str, filename: str):
 
 
 plan = _load("test_plan_8291", "test-plan.py")
+parts = _load("test_parts_8291", "test-parts.py")
+POPEN = subprocess.Popen  # le vrai, avant que le témoin ne le remplace
 
 
 class NocturnePartsTest(unittest.TestCase):
@@ -73,7 +84,7 @@ class NocturnePartsTest(unittest.TestCase):
 
     def test_les_parts_sont_relevees_sous_la_cible(self):
         # le 26/11 : 16 parts de ~12 050 s, au-delà de la cible
-        total = 16 * 12_050.0
+        total = 16 * 11_000.0
         self._table({m: total / len(self.mods) for m in self.mods})
         p = self._plan()
         n, lourde = self._coherent(p)
@@ -84,7 +95,7 @@ class NocturnePartsTest(unittest.TestCase):
         self.assertFalse([a for a in plan.annotations(p) if "#8291" in a])
 
     def test_le_repli_releve_les_memes_parts(self):
-        total = 16 * 12_050.0
+        total = 16 * 11_000.0
         self._table({m: total / len(self.mods) for m in self.mods})
         nominal, _ = self._coherent(self._plan())
         repli = plan.fallback_plan("workflow_dispatch", "boom", psql_full=True)
@@ -121,6 +132,93 @@ class NocturnePartsTest(unittest.TestCase):
         job = doc["jobs"]["psql"]
         self.assertEqual(job["timeout-minutes"], plan.PSQL_FULL_PLAFOND_MIN)
         self.assertEqual(job["env"]["AMEESH_PLAFOND_MIN"], str(plan.PSQL_FULL_PLAFOND_MIN))
+
+
+
+class EcheanceTest(unittest.TestCase):
+    """La part parallèle s'arrête à son échéance, non concluante, avant que
+    le plafond du job ne l'annule."""
+
+    MODULES = ["test_940_agregat_bash", "test_8291_nocturne_parts"]
+
+    def _bloquant(self, *_a, **kw):
+        return POPEN([sys.executable, "-c", "import time; time.sleep(60)"],
+                                cwd=kw.get("cwd"))
+
+    def test_attendre_sans_echeance_attend_la_fin(self):
+        procs = [subprocess.Popen([sys.executable, "-c", "pass"])]
+        self.assertFalse(parts.attendre(procs, None, pas_s=0.05))
+        self.assertEqual(procs[0].returncode, 0)
+
+    def test_attendre_arrete_a_l_echeance(self):
+        procs = [self._bloquant()]
+        debut = time.monotonic()
+        self.assertTrue(parts.attendre(procs, time.time() + 0.3, pas_s=0.05))
+        procs[0].wait(timeout=10)
+        self.assertLess(time.monotonic() - debut, 10)
+
+    def _couper(self, echeance=None, signal_apres=None):
+        """Joue `run_parallel` sur deux processus qui ne finissent jamais :
+        coupés à l'`echeance`, ou par un SIGTERM (le plafond du job)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        chemin = pathlib.Path(tmp.name) / "plan.json"
+        chemin.write_text(json.dumps({"parts": {"psql": [
+            {"part": 1, "of": 1, "label": "psql 1/1", "modules": self.MODULES}]},
+            "classes": {}}), encoding="utf-8")
+        flux = pathlib.Path(tmp.name) / "flux.jsonl"
+        args = argparse.Namespace(
+            plan=str(chemin), measure=None, driver="psql", part=1, parts=1,
+            label=None, parallel=2, flow=str(flux), output_durations=None,
+            echeance=echeance)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("AMEESH_TEST_DSN", "AGENT_MESH_TEST_DSN", parts.PARALLEL_ENV)}
+        sortie = io.StringIO()
+        self.addCleanup(os.chdir, os.getcwd())
+        minuterie = (threading.Timer(signal_apres, os.kill, (os.getpid(), signal.SIGTERM))
+                     if signal_apres else None)
+        debut = time.monotonic()
+        code = None
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(parts.subprocess, "Popen", side_effect=self._bloquant), \
+                contextlib.redirect_stdout(sortie):
+            if minuterie:
+                minuterie.start()
+            try:
+                code = parts.run_parallel(args)
+            except SystemExit as exc:
+                code = exc.code
+            finally:
+                if minuterie:
+                    minuterie.cancel()
+        self.assertLess(time.monotonic() - debut, 30)
+        evenements = [json.loads(l) for l in flux.read_text(encoding="utf-8").splitlines()]
+        fin = [e for e in evenements if e["type"] == "fin"]
+        self.assertEqual(len(fin), 1, evenements)
+        self.assertEqual(fin[0]["statut"], "interrompu")
+        self.assertEqual(fin[0]["restants"], self.MODULES)
+        return code, fin[0], sortie.getvalue()
+
+    def test_la_part_echue_est_non_concluante_avec_ses_restants(self):
+        code, fin, sortie = self._couper(echeance=time.time() + 1.0)
+        self.assertEqual(code, 1)
+        self.assertEqual(fin["raison"], "echeance")
+        self.assertIn("Part non concluante (#8291)", sortie)
+        self.assertIn("2 module(s) non joué(s) sur 2, 0 test(s) en échec", sortie)
+
+    def test_la_part_annulee_par_le_job_laisse_sa_fin(self):
+        """Le flux de psql 10/16 du 26/11 n'avait aucune `fin` (SIGTERM)."""
+        code, fin, _ = self._couper(signal_apres=1.0)
+        self.assertEqual(code, 128 + signal.SIGTERM)
+        self.assertEqual(fin["raison"], f"signal {int(signal.SIGTERM)}")
+
+    def test_la_part_psql_porte_son_echeance(self):
+        doc = canon.load_yaml((REPO / ".github" / "workflows" / "tests.yml")
+                              .read_text(encoding="utf-8"))
+        etape = next(s for s in doc["jobs"]["psql"]["steps"]
+                     if str(s.get("name", "")).startswith("part "))
+        self.assertIn('--echeance "$(( AMEESH_JOB_DEBUT + (AMEESH_PLAFOND_MIN - 3) * 60 ))"',
+                      etape["run"])
 
 
 if __name__ == "__main__":

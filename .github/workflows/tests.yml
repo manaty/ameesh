@@ -1051,11 +1051,14 @@ jobs:
       - *plan
       - *plan_empreinte
       - *publier
+      # #8291 : la part s'arrête d'elle-même 3 min avant le plafond du job
+      # (les étapes qui suivent tiennent ~20 s, run 45738064364), non
+      # concluante avec ses modules restants, au lieu d'être annulée.
       - name: part ${{ matrix.part }}
         run: >-
           python3 scripts/ci-test-space.py -- python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
           --part ${{ matrix.part }} --driver psql --flow "$RUNNER_TEMP/flux.jsonl"
-          --parallel 2
+          --parallel 2 --echeance "$(( AMEESH_JOB_DEBUT + (AMEESH_PLAFOND_MIN - 3) * 60 ))"
       - *fermer
       - *resume
       - name: flux en artefact
