@@ -1076,8 +1076,13 @@ def human_gate(lot: int, holds, requests, *, executors=()) -> dict | None:
 def lot_human_gate(db, lot: int, requests, *, cfg=None) -> dict | None:
     """#8285 : `human_gate` lu en base pour un lot — retenues actives
     (`active_holds`) et routes humaines du runtime, une lecture du registre et
-    une fenêtre de canons pour les deux, comme `human_waits` (#8051)."""
+    une fenêtre de canons pour les deux, comme `human_waits` (#8051).
+
+    `cfg` par défaut : celui de `db` (#8287) — omis, les routes humaines et
+    l'autorité des holds se liraient sans configuration, et un nom de route
+    déclaré au canon (`bureau`) ne figerait plus le lot."""
     from . import canon as canon_mod
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
     events = storage.of(db).progress.lot_hold_events([int(lot)], HOLD_NOTE_PATTERNS)
     with canon_mod.configured_cache():
         agents = _human_agent_rows(db)
