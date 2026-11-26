@@ -32,7 +32,6 @@ from dataclasses import dataclass
 WINDOW_S = 1800
 #: au-delà, la liste des gestes est coupée (le reste : `ameesh decisions`)
 MAX_LINES = 8
-EXCERPT = 240
 
 ACCORD_CUES = re.compile(
     r"accord\s+(?:conversationnel|utilisateur|oral|verbal)"
@@ -130,16 +129,17 @@ def _decision_line(view: dict) -> str:
     return "- décision #%d%s%s : %s" % (int(view["id"]), lot, flags, question)
 
 
-def body(where: Station, *, source: str, lot: int | None, text: str,
+def body(where: Station, *, source: str, lot: int | None, accord: bool,
          gestures: dict, accord_ids: list[int], now: float) -> str:
+    """Le réveil, sans le texte de l'humain : bureau et pilote ne sont pas
+    les destinataires de sa note ou de son courrier (§1, vie privée). Seuls
+    passent la source (`note`, `courrier`), le lot, l'accord relevé et les
+    décisions ouvertes qu'il cite."""
     moment = time.strftime("%d/%m %H:%MZ", time.gmtime(now))
     origin = "%s%s" % (source, " sur #%d" % lot if lot else "")
-    excerpt = " ".join((text or "").split())
-    if len(excerpt) > EXCERPT:
-        excerpt = excerpt[:EXCERPT - 1] + "…"
-    lines = ["Présence de %s sur son poste (%s) : %s à %s — « %s »."
-             % (where.human, where.account, origin, moment, excerpt)]
-    if accord_ids or is_accord(text):
+    lines = ["Présence de %s sur son poste (%s) : %s à %s."
+             % (where.human, where.account, origin, moment)]
+    if accord:
         cited = ", ".join("#%d" % i for i in accord_ids) or "la décision citée"
         lines.append("Accord conversationnel relevé (%s) : demander MAINTENANT la "
                      "signature native, tant que %s est présent : ameesh decide <id> "
@@ -204,6 +204,9 @@ def relay(cfg, db, where: Station | None, *, source: str, text: str,
           lot: int | str | None = None, now: float | None = None) -> list[str]:
     """Réveille bureau et pilote ; rend les destinataires effectivement saisis.
 
+    `text` n'est lu que pour l'accord et les décisions citées : il n'est
+    jamais recopié dans le réveil (`body`).
+
     Jamais d'exception : une note ou un courrier déjà écrit n'est pas défait
     par un relais impossible."""
     if where is None or db is None:
@@ -219,7 +222,7 @@ def relay(cfg, db, where: Station | None, *, source: str, text: str,
         accord = is_accord(text)
         accord_ids = ([int(n) for n in _CITED.findall(text or "") if int(n) in pending_ids]
                       if accord else [])
-        message = body(where, source=source, lot=lot, text=text, gestures=gestures,
+        message = body(where, source=source, lot=lot, accord=accord, gestures=gestures,
                        accord_ids=accord_ids, now=now)
         key = _key(where, text, accord, now)
         payload = {"urgent": True, "owner_presence": {

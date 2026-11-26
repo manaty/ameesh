@@ -3,6 +3,7 @@
 poste déclaré d'un humain du canon réveille le bureau et le pilote avec ses
 gestes en attente ; un accord conversationnel demande la signature native ;
 l'acteur « inconnu » du poste est marqué comme tel."""
+import json
 import types
 import unittest
 from unittest import mock
@@ -106,13 +107,34 @@ class RelayTest(PgTestCase):
 
     def test_mail_linked_to_a_lot_passes_it_as_a_string(self):
         # B1 de la relecture : `agent-mail send` rend le lot en chaîne
-        sent = owner_presence.relay(self.cfg, self.db, HERE, source="courrier à bureau",
+        sent = owner_presence.relay(self.cfg, self.db, HERE, source="courrier",
                                     text="je suis là", lot=str(self.lot["id"]),
                                     now=1_800_000_000.0)
         self.assertEqual(sent, ["bureau", "pilote"])
         [row] = self.mails("bureau")
-        self.assertIn("courrier à bureau sur #%d" % self.lot["id"], row["body"])
+        self.assertIn("courrier sur #%d" % self.lot["id"], row["body"])
         self.assertEqual(row["payload"]["owner_presence"]["lot"], self.lot["id"])
+
+    def test_private_text_and_recipient_never_reach_bureau_nor_pilot(self):
+        # §1 vie privée : le réveil ne recopie ni le texte ni le destinataire
+        secret = "rendez-vous médical jeudi, ne pas diffuser"
+        self.assertEqual(owner_presence.relay(
+            self.cfg, self.db, HERE, source="courrier", text=secret,
+            lot=self.lot["id"], now=1_800_000_000.0), ["bureau", "pilote"])
+        accord = ("%s ; accord utilisateur reçu : choix A à #233821, "
+                  "signature native attendue" % secret)
+        owner_presence.relay(self.cfg, self.db, HERE, source="courrier", text=accord,
+                             lot=self.lot["id"], now=1_800_000_060.0)
+        rows = self.mails("bureau") + self.mails("pilote")
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            dump = json.dumps(row["payload"], ensure_ascii=False) + row["body"]
+            self.assertNotIn("médical", dump)
+            self.assertNotIn("choix A", dump)
+            self.assertNotIn("mty-amh-impl-15", dump)
+        last = self.mails("bureau")[-1]
+        self.assertIn("Accord conversationnel relevé (#233821)", last["body"])
+        self.assertIn("ameesh decide", last["body"])
 
     def test_no_station_relays_nothing(self):
         self.assertEqual(owner_presence.relay(self.cfg, self.db, None, source="note",

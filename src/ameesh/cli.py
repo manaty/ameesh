@@ -916,7 +916,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         from . import owner_presence
         where = owner_presence.station(cfg, bk.db)
         if where is not None and where.human == sender:
-            owner_presence.relay(cfg, bk.db, where, source="courrier à %s" % dest,
+            owner_presence.relay(cfg, bk.db, where, source="courrier",
                                  text=text, lot=lot)
     return 0
 
