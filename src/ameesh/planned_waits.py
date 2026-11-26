@@ -1048,6 +1048,45 @@ def decision_waits(requests, *, now) -> dict[int, dict]:
     return out
 
 
+def human_gate(lot: int, holds, requests, *, executors=()) -> dict | None:
+    """#8285 : la demande owner ou avatar encore ouverte qui fige le lot.
+
+    `holds` : les retenues actives du lot par auteur (`active_holds`) ;
+    `requests` : les demandes de décision en attente (`decisions.pending`) ;
+    `executors` : les routes humaines du runtime (`_runtime_human_routes`,
+    #7634 — `bureau` y figure quand le canon le déclare avatar). Rend la
+    première porte trouvée — une décision du lot encore en attente, ou une
+    retenue `hold: attente owner|avatar|<route> : <geste>` (#3498) — ou None.
+    L'échéance déclarée ne lève pas la porte : la demande reste ouverte
+    jusqu'à la réponse ou la levée (B2 de la relecture) ; c'est l'appelant qui
+    borne le report. Une attente `externe` ne fige rien."""
+    for request in requests or ():
+        if request.get("lot") == int(lot):
+            return {"what": "decision",
+                    "executor": request.get("owner") or "owner",
+                    "gesture": "decision #%s" % request.get("id")}
+    for hold in (holds or {}).values():
+        declared = external_hold(hold.get("note"), executors=executors)
+        if declared and declared["executor"] in ("owner", "avatar"):
+            return {"what": "hold", "executor": declared["executor"],
+                    "gesture": declared["gesture"], "by": hold.get("by")}
+    return None
+
+
+def lot_human_gate(db, lot: int, requests, *, cfg=None) -> dict | None:
+    """#8285 : `human_gate` lu en base pour un lot — retenues actives
+    (`active_holds`) et routes humaines du runtime, une lecture du registre et
+    une fenêtre de canons pour les deux, comme `human_waits` (#8051)."""
+    from . import canon as canon_mod
+    events = storage.of(db).progress.lot_hold_events([int(lot)], HOLD_NOTE_PATTERNS)
+    with canon_mod.configured_cache():
+        agents = _human_agent_rows(db)
+        routes = _runtime_human_routes(db, cfg, agents=agents)
+        holds = active_holds(db, events, cfg=cfg, agents=agents)
+    return human_gate(int(lot), holds.get(int(lot)) or {}, requests,
+                      executors=routes)
+
+
 def packet_carriers(rows):
     """#2335 : les porteurs de paquet ouverts, indexés par lot.
 
