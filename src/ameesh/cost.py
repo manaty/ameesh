@@ -159,6 +159,45 @@ PRICE_PERIODS = {
                         "off_peak": [0.66, 0.022, 1.98]},
 }
 
+#: #8296 : paliers de service OpenAI et leur multiplicateur de prix. Fast mode
+#: (ancien « priority », renommé le 2026-07-30) coûte exactement **deux fois**
+#: le tarif Standard, sur chaque composante et en contexte court comme long.
+#: Relevé le 2026-11-26 sur
+#: https://developers.openai.com/api/docs/pricing?latest-pricing=fast :
+#: gpt-6.1-sol Fast 4.00/0.20/20.00 contre Standard 2.00/0.10/10.00, Flex
+#: 1.00/0.05/5.00 (0,5×), Ultrafast 12.00/0.60/60.00 (6×) ; pour GPT-6.2
+#: Astra/Sol, Ultrafast vaut **3× jusqu'au 2027-02-28 inclus**, puis 6× à
+#: partir du 2027-03-01 (heure du Pacifique). Ce couple modèle/période a sa
+#: propre facteur ci-dessous ; 6× reste le tarif des autres modèles et le
+#: repli des paliers inconnus. Confirmé par
+#: https://developers.openai.com/api/docs/guides/fast-mode.md (« Fast mode
+#: costs twice the corresponding Standard rate »). `priority` est l'alias que
+#: l'API sert encore pour GPT-5.6 et antérieurs ; `auto` prend le Scale Tier
+#: s'il est disponible, sinon le tarif Standard. Le multiplicateur s'applique
+#: au barème local de `DEFAULT_PRICES` (un tour Standard garde son prix
+#: actuel). Tout autre palier n'a pas de tarif déclaré ici : repli prudent (le
+#: multiplicateur le plus cher connu), marqué `price_fallback` — jamais un
+#: tarif Standard silencieux.
+SERVICE_TIER_MULTIPLIERS = {
+    "default": 1.0,
+    "auto": 1.0,
+    "flex": 0.5,
+    "fast": 2.0,
+    "priority": 2.0,
+    "ultrafast": 6.0,
+}
+#: #46602 : promotion Ultrafast des GPT-6.2 Astra/Sol — 3× le tarif Standard
+#: jusqu'au 2027-02-28 inclus, 6× à partir du 2027-03-01 (heure du Pacifique,
+#: donc 2027-03-01T08:00:00Z : le 1er mars 2027 est encore en PST, UTC−8).
+#: Relevé le 2026-11-26 sur
+#: https://developers.openai.com/api/docs/pricing?latest-pricing=fast
+ULTRAFAST_PROMO_FACTOR = 3.0
+ULTRAFAST_PROMO_END_TS = _dt.datetime(
+    2027, 3, 1, 8, 0, tzinfo=_dt.timezone.utc).timestamp()
+
+#: multiplicateur du repli prudent d'un palier inconnu (le plus cher connu)
+SERVICE_TIER_FALLBACK = max(SERVICE_TIER_MULTIPLIERS.values())
+
 #: Fenêtres nommées par les jauges, en secondes.
 KNOWN_WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 
@@ -655,6 +694,10 @@ class TurnUsage:
     #: (clos avant `turn.completed`) a été mesuré au journal de session. Il
     #: donne au tour suivant le repère que le flux n'a pas fourni.
     cum_usage: list[int] | None = None
+    #: #8296 : palier de service effectif du tour (`fast`, `default`, …), None
+    #: quand aucun palier n'est connu (harnais sans palier, tour d'avant le
+    #: marqueur). La ligne `turn_costs` le porte ; le tarif en dépend.
+    service_tier: str | None = None
 
     def row(self) -> dict:
         return {
@@ -667,6 +710,7 @@ class TurnUsage:
             "input_tokens": int(self.input_tokens),
             "cached_input_tokens": int(self.cached_input_tokens),
             "output_tokens": int(self.output_tokens),
+            "service_tier": self.service_tier,
         }
 
     @property
@@ -1146,22 +1190,41 @@ def worst_price_of(prices: dict) -> list | None:
     return [max(triplet[i] for triplet in candidats) for i in range(3)]
 
 
-def price_for(prices: dict, harness: str, model: str | None) -> tuple[list | None, dict]:
+def price_for(prices: dict, harness: str, model: str | None,
+              service_tier: str | None = None,
+              moment: float | None = None) -> tuple[list | None, dict]:
     """L225 : (triplet, marque) du tarif d'un tour compté au barème.
 
     Tarif du modèle, sinon majorant de sa famille (0019 §3) : marque vide.
     Famille sans tarif (ou harnais sans famille) : repli prudent sur tout le
     barème, marqué `price_fallback` — le tour reste dans la dépense et les
     plafonds. Aucun barème du tout : (None, `void_reason`), la ligne est écartée.
-    Les deux marques lèvent l'alerte `turn_unpriced`."""
+    Les deux marques lèvent l'alerte `turn_unpriced`.
+
+    #8296 : `service_tier` multiplie le tarif du modèle sur un harnais dont le
+    descripteur passe un palier (Codex). Un palier inconnu prend le
+    multiplicateur le plus cher connu **et** la marque `price_fallback` ; un
+    autre harnais garde son tarif, même si un palier traîne dans son état.
+    `moment` (epoch du tour) tranche les paliers datés : Ultrafast des GPT-6.2
+    Astra/Sol vaut 3× jusqu'au 2027-02-28, 6× ensuite.
+    """
+    factor, tier_mark = (1.0, {})
+    if harness == "codex":
+        factor, tier_mark = service_tier_factor(service_tier, model=model,
+                                                moment=moment)
     triplet = known_price(prices, model) or max_price_of(prices, harness)
     if triplet:
-        return triplet, {}
+        return [value * factor for value in triplet], dict(tier_mark)
     what = "modèle %s (harnais %s)" % (model or "inconnu", harness or "?")
     worst = worst_price_of(prices)
     if worst:
-        return worst, {"price_fallback": "%s : %s sans tarif au barème ni dans sa famille, "
-                       "facturé au maximum du barème" % (FALLBACK_REASON, what)}
+        if factor != 1.0:
+            worst = [value * factor for value in worst]
+        mark = {"price_fallback": "%s : %s sans tarif au barème ni dans sa famille, "
+                "facturé au maximum du barème" % (FALLBACK_REASON, what)}
+        if tier_mark:
+            mark["price_fallback"] += "; " + tier_mark["price_fallback"]
+        return worst, mark
     return None, {"void_reason": "%s : %s, aucun barème" % (UNPRICED_REASON, what)}
 
 
@@ -1169,6 +1232,50 @@ def price_for(prices: dict, harness: str, model: str | None) -> tuple[list | Non
 #: `price_fallback` d'un tour facturé au repli prudent (alerte `turn_unpriced`)
 UNPRICED_REASON = "prix inconnu"
 FALLBACK_REASON = "repli prudent"
+
+
+def service_tier_name(tier: str | None) -> str | None:
+    """#8296 : le nom normalisé d'un palier de service, None si vide."""
+    value = str(tier or "").strip().lower()
+    return value or None
+
+
+def _ultrafast_promo(model: str | None, moment: float | None) -> bool:
+    """#46602 : le couple est-il dans la promo Ultrafast à 3× ?
+
+    Seuls GPT-6.2 Astra/Sol (nom exact, ou instantané daté) sont en promotion,
+    jusqu'au 2027-02-28 inclus en heure du Pacifique. `moment` absent : l'heure
+    de l'appel, pour ne jamais figer une promotion passée.
+    """
+    name = str(model or "").strip().lower()
+    if not re.fullmatch(r"gpt-6\.2-(?:astra|sol)(?:-\d{4}-\d{2}-\d{2})?", name):
+        return False
+    at = time.time() if moment is None else float(moment)
+    return at < ULTRAFAST_PROMO_END_TS
+
+
+def service_tier_factor(tier: str | None, *, model: str | None = None,
+                        moment: float | None = None) -> tuple[float, dict]:
+    """#8296 : (multiplicateur, marque) du palier de service d'un tour.
+
+    Les paliers déclarés dans `SERVICE_TIER_MULTIPLIERS` (Standard, `auto`,
+    `flex`, Fast et son alias `priority`, Ultrafast) ont leur multiplicateur
+    dans cette table. `ultrafast` est le seul palier daté : les GPT-6.2
+    Astra/Sol paient 3× jusqu'au 2027-02-28 puis 6× (#46602), les autres 6×.
+    Un palier non déclaré est facturé au plus cher connu, marqué
+    `price_fallback` : jamais un tarif Standard silencieux.
+    """
+    name = service_tier_name(tier)
+    if name is None:
+        return 1.0, {}
+    if name == "ultrafast" and _ultrafast_promo(model, moment):
+        return ULTRAFAST_PROMO_FACTOR, {}
+    factor = SERVICE_TIER_MULTIPLIERS.get(name)
+    if factor is None:
+        return SERVICE_TIER_FALLBACK, {
+            "price_fallback": "%s : palier %s inconnu, facturé au plus cher connu (×%g)"
+            % (FALLBACK_REASON, name, SERVICE_TIER_FALLBACK)}
+    return factor, {}
 
 #: L225 : écritures de cache Claude, en multiple du prix d'entrée de base
 #: (barème officiel : 5 min ×1,25, 1 h ×2 ; durée inconnue : ×1,25)
@@ -2420,6 +2527,126 @@ class CostBook:
                 return model
         return ""
 
+    def codex_thread_service_tier(self, thread: str | None, *,
+                                  started: float | None = None,
+                                  ended: float | None = None) -> str:
+        """#8296 : le palier de service du tour mesuré, lu dans son journal.
+
+        Le journal d'un fil porte un `task_started` puis un `turn_context` par
+        tour ; lire le **dernier** contexte d'un fil qui a avancé prêterait à ce
+        tour le palier d'un suivant. Le tour mesuré est le premier dont le
+        `task_started` commence **au début du tour ou après** (le marqueur est
+        écrit avant le lancement) ; `started_at` est arrondi à la seconde, donc
+        un début **arrondi** dans la même seconde que le marqueur, juste avant
+        lui, reste accepté — mais seulement s'il est seul dans cette seconde.
+        Un horodatage ISO exact, lui, prouve un début réellement antérieur :
+        c'est le tour précédent, jamais un candidat (B #46592). Un tour
+        commencé après la fin du tour (`ended + 1 s`) est refusé. Sans fenêtre
+        (`started` inconnu), on ne lit que le journal d'un fil à **un seul**
+        tour ; sinon '' (aucune preuve, plutôt qu'un palier emprunté).
+        `codex exec --json` ne publie pas le palier : le lancement le connaît
+        (marqueur de tour) et ce journal n'est qu'un défaut pour un tour
+        d'avant #8296, ou quand le flux ne dit rien. Lecture seule, jamais une
+        valeur devinée.
+        """
+        path = self.codex_rollout(thread)
+        if not path:
+            return ""
+        turns: list[dict] = []
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    if ("task_started" not in line and "turn_context" not in line
+                            and "service_tier" not in line
+                            and "serviceTier" not in line):
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    payload = event.get("payload") if isinstance(event, dict) else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("type") == "task_started":
+                        stamp = _codex_task_started(event)
+                        if stamp is not None:
+                            turns.append({"start": stamp[0],
+                                          "precise": stamp[1], "tier": ""})
+                        continue
+                    if not turns:
+                        continue
+                    found = _codex_event_service_tier(event)
+                    if found:
+                        turns[-1]["tier"] = found
+        except (OSError, ValueError, TypeError):
+            return ""
+        if started is None:
+            # Aucune fenêtre : un fil à un seul tour est sans ambiguïté.
+            return turns[0]["tier"] if len(turns) == 1 else ""
+        began = float(started)
+        for turn in turns:
+            if turn["start"] < began:
+                continue
+            if ended is not None and turn["start"] > float(ended) + 1.0:
+                # Le tour mesuré n'a pas écrit son début ; les suivants du
+                # journal sont plus tardifs encore. Le repli de même seconde
+                # reste à tenter (le vrai début peut être entier, avant la
+                # fraction du marqueur), sans jamais emprunter ce tour-ci.
+                break
+            return turn["tier"]
+        # `started_at` est tronqué à la seconde : un début **arrondi** dans la
+        # seconde du marqueur mais avant sa fraction peut être le vrai tour.
+        # Un horodatage ISO exact, lui, prouve un début réellement antérieur :
+        # c'est le tour précédent, jamais un candidat. S'il y a plusieurs
+        # arrondis, le tour est ambigu : ne pas emprunter le premier venu.
+        same_second = [t for t in turns
+                       if not t["precise"]
+                       and math.floor(began) <= t["start"] < began]
+        if len(same_second) == 1:
+            if ended is None or same_second[0]["start"] <= float(ended) + 1.0:
+                return same_second[0]["tier"]
+        return ""
+
+    def service_tier_of_turn(self, agent: str, start: int, events,
+                             harness: str, session: str | None,
+                             service_tier: str | None = None,
+                             started: float | None = None,
+                             ended: float | None = None) -> str | None:
+        """#8296 : le palier de service effectif d'un tour Codex, ou None.
+
+        Le palier est un réglage de **lancement** (L26) que le flux ne répète
+        pas toujours. Preuve du flux d'abord (le palier réellement servi, qui
+        peut être `default` après un repli de Fast mode), puis le marqueur de
+        tour écrit avant le lancement (durable, y compris quand un autre
+        worker répare le tour : un marqueur qui dit `default` vaut Standard,
+        même si l'état de l'agent a changé depuis ; un marqueur **vide** dit
+        seulement qu'aucun `--tier` n'a été passé, donc il ne bloque pas la
+        lecture du journal), puis le palier transmis par l'appelant, puis le
+        `turn_context` du tour mesuré (`started`/`ended`). Aucun autre harnais
+        n'a de palier de service : None, même si un réglage traîne dans son
+        état.
+        """
+        if harness != "codex":
+            return None
+        found = ""
+        for event in reversed(events or ()):
+            found = _codex_event_service_tier(event)
+            if found:
+                break
+        decided = bool(found)
+        if not decided:
+            marker = self.turn_marker(agent, start)
+            if marker is not None and "service_tier" in marker:
+                found = str(marker.get("service_tier") or "").strip()
+                decided = bool(found)
+        if not decided:
+            found = str(service_tier or "").strip()
+            decided = bool(found)
+        if not decided:
+            found = self.codex_thread_service_tier(session, started=started,
+                                                   ended=ended)
+        return service_tier_name(found) or None
+
     def session_of(self, agent: str) -> str | None:
         """La session (ou le fil) courante d'un agent, lue sur **tout** son flux.
 
@@ -2453,7 +2680,8 @@ class CostBook:
     def turn_usage(self, agent: str, start: int = 0, session: str | None = None,
                    model: str | None = None, ended: float | None = None,
                    started: float | None = None,
-                   turn_id: str | None = None) -> TurnUsage:
+                   turn_id: str | None = None,
+                   service_tier: str | None = None) -> TurnUsage:
         """Ce que le tour qui vient de finir a coûté, sans rien écrire.
 
         Le repère de cumul (dernier `total_cost_usd` Claude, dernier usage Codex)
@@ -2469,6 +2697,10 @@ class CostBook:
         `codex exec --json` n'a pas publié son `turn.completed` — tour clos par
         le plafond de durée, arrêt ou erreur. Absent, il se lit sur le marqueur
         du tour.
+
+        #8296 : `service_tier` (facultatif) est le palier de lancement ; à
+        défaut, il se lit sur le flux, le marqueur du tour ou le journal Codex
+        (`service_tier_of_turn`). Le tarif du tour en dépend.
         """
         harness = self.tool_of(agent)
         # Le modèle **effectif du lancement** est passé par l'exécuteur ; le
@@ -2485,14 +2717,27 @@ class CostBook:
             # L95 : Codex n'annonce pas son modèle dans `exec --json` ; il se
             # lit dans le journal de session du fil, ou sa configuration.
             model = self.codex_thread_model(session)
+        # #8296 : fenêtre du tour Codex — le journal de session ne prête son
+        # `turn_context` qu'au tour commencé dans cette fenêtre, jamais au
+        # dernier tour d'un fil qui a avancé.
+        fenetre = fin = None
+        if harness == "codex":
+            fenetre = started if started is not None else self.turn_started(agent, start)
+            fin = ended if ended is not None else self.turn_ended_ts(turn_id)
+        service_tier = self.service_tier_of_turn(
+            agent, start, events, harness, session, service_tier=service_tier,
+            started=fenetre, ended=fin)
         prices = load_prices(self.prices_path)
         modele = model if known_price(prices, model) else (model or "inconnu")
         # L225 : la marque (`price_fallback` ou `void_reason`) ne vaut que pour
         # un tour effectivement compté au barème, avec des jetons.
-        triplet, marque = price_for(prices, harness or "deepseek", model)
+        # #46602 : le palier Ultrafast des GPT-6.2 dépend de la date du tour.
+        moment = time.time() if ended is None else ended
+        triplet, marque = price_for(prices, harness or "deepseek", model,
+                                    service_tier=service_tier, moment=moment)
         if triplet and not marque:
             triplet = period_price(prices, model, self.turn_started(agent, start),
-                                   time.time() if ended is None else ended) or triplet
+                                   moment) or triplet
         pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
         tier = prompt_tier(prices, model) if not marque else None
         # L80a : un tour résident Codex/ACP porte sa mesure dans un événement
@@ -2517,7 +2762,8 @@ class CostBook:
             return _resident_turn_usage(agent, harness, modele, resident,
                                         pin, pcache, pout, marque,
                                         cum=cum, session=session,
-                                        unknown_resume=unknown_resume)
+                                        unknown_resume=unknown_resume,
+                                        service_tier=service_tier)
 
         if harness == "claude":
             # L221 : seuls les `result` du fil principal (pas d'un sous-agent,
@@ -2587,20 +2833,21 @@ class CostBook:
                 # (`total_token_usage`) : borné à la fenêtre du tour, son delta
                 # est l'usage du tour et son total le repère du tour suivant.
                 # Sans journal ou hors fenêtre : zéro, comme avant (fail-closed,
-                # jamais l'usage d'un autre tour).
-                fenetre = started if started is not None else self.turn_started(agent, start)
-                fin = ended if ended is not None else self.turn_ended_ts(turn_id)
+                # jamais l'usage d'un autre tour). La fenêtre (`fenetre`, `fin`)
+                # est celle déjà calculée pour le palier de service (#8296).
                 mesure = None
                 if session and fenetre is not None:
                     mesure = self.codex_turn_last_call_usage(session, fenetre, fin)
                 delta, total_fil = _codex_journal_delta(mesure)
                 if delta is None:
-                    return TurnUsage(agent, harness, modele, 0.0)
+                    return TurnUsage(agent, harness, modele, 0.0,
+                                     service_tier=service_tier)
                 uncached = max(delta[0] - delta[1], 0)
                 usd = (uncached * pin + delta[1] * pcache + delta[2] * pout) / 1e6
                 return TurnUsage(agent, harness, modele, usd,
                                  input_tokens=delta[0], cached_input_tokens=delta[1],
                                  output_tokens=delta[2], cum_usage=total_fil,
+                                 service_tier=service_tier,
                                  **(marque if any(delta) else {}))
             last = completed[-1]
             current = [int(last.get("input_tokens", 0)), int(last.get("cached_input_tokens", 0)),
@@ -2625,7 +2872,7 @@ class CostBook:
             usd = (uncached * pin + delta[1] * pcache + delta[2] * pout) / 1e6
             return TurnUsage(agent, harness, modele, usd,
                              input_tokens=delta[0], cached_input_tokens=delta[1],
-                             output_tokens=delta[2],
+                             output_tokens=delta[2], service_tier=service_tier,
                              **(marque if any(delta) else {}))
 
         # #7519: each broker request already has its own durable priced row.
@@ -2653,23 +2900,33 @@ class CostBook:
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout,
                          **(marque if tin or tcache or tout else {}))
 
-    def _insert_turn_cost(self, *, inputs=None, attribution=None, **kwargs) -> None:
-        """Écrit la ligne du tour ; messages et attribution sont facultatifs.
+    def _insert_turn_cost(self, *, inputs=None, attribution=None,
+                          service_tier=None, **kwargs) -> None:
+        """Écrit la ligne du tour ; messages, attribution et palier facultatifs.
 
         L80b : un exécuteur médié peut parler à un serveur **1.6**, dont la
         table ne connaît pas `inputs` ; #6005 : un serveur **1.11** ne connaît
-        pas `attribution`. Le refus (`bad_args`) ne doit jamais suspendre la
+        pas `attribution` ; #8296 : un serveur **1.16** ne connaît pas
+        `service_tier`. Le refus (`bad_args`) ne doit jamais suspendre la
         comptabilité : on réessaie sans le paramètre inconnu — le coût du tour
-        reste compté, l'attribution est perdue et journalisée. Sans ces
-        paramètres, ils ne sont pas transmis du tout (compatible ancien)."""
+        reste compté, la donnée est perdue et journalisée. Sans ces paramètres,
+        ils ne sont pas transmis du tout (compatible ancien)."""
         insert = dict(kwargs)
         if attribution is not None:
             insert["attribution"] = attribution
         if inputs is not None:
             insert["inputs"] = inputs
-        for optional in ("attribution", "inputs"):
-            if optional not in insert:
-                continue
+        if service_tier is not None:
+            insert["service_tier"] = service_tier
+        labels = {"attribution": "attribution d'appelant",
+                  "inputs": "attribution de messages",
+                  "service_tier": "palier de service"}
+        # Le refus nomme le paramètre inconnu : retirer celui-là, jamais un
+        # autre (un serveur 1.16 refuse `service_tier` mais accepte
+        # `attribution` et `inputs` ; les perdre serait une régression).
+        removable = [name for name in ("attribution", "inputs", "service_tier")
+                     if name in insert]
+        for _ in range(len(removable) + 1):
             try:
                 storage.of(self.db).turn_costs.insert(**insert)
                 return
@@ -2679,12 +2936,14 @@ class CostBook:
                 if not isinstance(exc, db_mod.DbError) \
                         or ("bad_args" not in texte and "paramètre inconnu" not in texte):
                     raise
+                if not removable:
+                    raise
+                rejected = next((name for name in removable if name in texte),
+                                removable[0])
                 log("serveur médié sans `%s` (%s) : tour compté sans %s"
-                    % (optional, texte[:160],
-                       "attribution d'appelant" if optional == "attribution"
-                       else "attribution de messages"))
-                insert.pop(optional)
-        storage.of(self.db).turn_costs.insert(**insert)
+                    % (rejected, texte[:160], labels[rejected]))
+                insert.pop(rejected)
+                removable.remove(rejected)
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
@@ -2692,7 +2951,8 @@ class CostBook:
                work_item_id: int | None = None,
                started_at: float | None = None,
                turn_id: str | None = None,
-               attribution: dict | None = None) -> TurnUsage:
+               attribution: dict | None = None,
+               service_tier: str | None = None) -> TurnUsage:
         """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
 
         La ligne porte le cumul brut du harnais, qui sert de repère au tour
@@ -2714,7 +2974,9 @@ class CostBook:
         l'identifiant du tour (`turn_resources.turn_id`), même provenance, pour
         relier la ligne à ses ressources. `attribution` (#6005) : l'attribution
         d'appelant d'un tour hors lot, même provenance (le marqueur) — donnée
-        seule, jamais admission, budget ou autorisation.
+        seule, jamais admission, budget ou autorisation. `service_tier` (#8296) :
+        le palier de lancement, facultatif ; le flux ou le marqueur du tour le
+        fournissent quand l'appelant ne le passe pas.
         """
         if self.db is None:
             raise CostError("record without a database: the cumulative baseline lives in turn_costs")
@@ -2723,7 +2985,8 @@ class CostBook:
         # l'insertion : la ligne et le repère doivent porter la même session.
         session_id = session or self.session_of(agent)
         usage = self.turn_usage(agent, start, session=session_id, model=model,
-                                ended=ended, started=started_at, turn_id=turn_id)
+                                ended=ended, started=started_at, turn_id=turn_id,
+                                service_tier=service_tier)
         # L30 : le compte du tour est celui du dernier marqueur AVANT le tour.
         account = self.account_at(agent, start, usage.harness)
         cum_usd = cum_input = cum_cached = cum_out = None
@@ -2793,7 +3056,9 @@ class CostBook:
             turn_id=turn_id,
             # #6005 (0551) : l'attribution d'appelant d'un tour hors lot, à
             # côté du lot ; donnée seule, jamais une autorité
-            attribution=attribution)
+            attribution=attribution,
+            # #8296 (0609) : le palier de service effectif, pour les vues budget
+            service_tier=usage.service_tier)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:
@@ -3385,6 +3650,71 @@ def _codex_event_model(event) -> str:
     return ""
 
 
+def _codex_task_started(event) -> tuple[float, bool] | None:
+    """#8296 : l'instant de début d'un `task_started`, et sa précision.
+
+    Rend ``(epoch, precise)`` ou None. L'horodatage ISO de l'événement fait
+    foi (milliseconde) et vaut ``precise=True`` ; à défaut, le payload porte
+    `started_at` en secondes epoch, **arrondi** à la seconde, donc
+    ``precise=False``. Cette provenance est indispensable : un début exact
+    antérieur au marqueur est un tour précédent, tandis qu'un début arrondi
+    dans la même seconde peut être le tour mesuré (B #46592). Une valeur d'un
+    autre type ne dit rien.
+    """
+    payload = event.get("payload") if isinstance(event, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    value = event.get("timestamp")
+    if isinstance(value, str):
+        try:
+            return (_dt.datetime.fromisoformat(
+                value.replace("Z", "+00:00")).timestamp(), True)
+        except ValueError:
+            pass
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (float(value), True)
+    value = payload.get("started_at")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (float(value), False)
+    return None
+
+
+def _codex_task_started_ts(event) -> float | None:
+    """L'instant seul d'un `task_started` (compatibilité, #8296)."""
+    started = _codex_task_started(event)
+    return started[0] if started is not None else None
+
+
+def _codex_event_service_tier(event) -> str:
+    """#8296 : le palier de service porté par un événement Codex, ou ''.
+
+    Le flux `exec --json` le publierait à la racine d'un événement ; le
+    journal de session le porte dans le `payload` de `turn_context` (et, sur
+    un réglage appliqué, dans `thread_settings`). Lecture défensive : une
+    valeur vide ou d'un autre type ne dit rien.
+    """
+    if not isinstance(event, dict):
+        return ""
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        kinds = (event.get("type"), payload.get("type"))
+        if any(kind in ("turn_context", "session_meta", "thread_settings_applied")
+               for kind in kinds):
+            for source in (payload, payload.get("thread_settings"), event):
+                if not isinstance(source, dict):
+                    continue
+                for key in ("service_tier", "serviceTier"):
+                    value = source.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+        # Un flux plat peut nommer le palier à la racine de l'événement.
+    for key in ("service_tier", "serviceTier"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 _TOML_MODEL = re.compile(r'^\s*model\s*=\s*"([^"]+)"\s*(?:#.*)?$')
 
 
@@ -3619,7 +3949,8 @@ def _codex_journal_delta(mesure: dict | None,
 def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,
                          pin: float, pcache: float, pout: float,
                          marque: dict, *, cum: dict, session: str | None,
-                         unknown_resume: bool) -> "TurnUsage":
+                         unknown_resume: bool,
+                         service_tier: str | None = None) -> "TurnUsage":
     """La ligne d'un tour résident, lue sur son `resident.turn` (L80a).
 
     Codex publie `usage.last` : l'entrée du `TurnResult` est hors cache, le
@@ -3644,6 +3975,7 @@ def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,
                          input_tokens=uncached + cached,
                          cached_input_tokens=cached,
                          output_tokens=output,
+                         service_tier=service_tier,
                          **(marque if (uncached or cached or output) else {}))
     input_tokens = _num(usage, "input_tokens")
     cached = _num(usage, "cache_read_input_tokens")
@@ -3676,6 +4008,7 @@ def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,
                      input_tokens=input_tokens,
                      cached_input_tokens=cached,
                      output_tokens=output,
+                     service_tier=service_tier,
                      **mark)
 
 

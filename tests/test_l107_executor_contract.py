@@ -123,7 +123,9 @@ class TableTest(unittest.TestCase):
         # mailbox.unread_priority (courrier du jour et actifs filtrés dans la
         # requête du serveur, devant le stock FIFO) ; contrat 1.16 : #8235
         # ajoute served_at facultatif à lot_sessions.consume_wake (date réelle
-        # de remise du réveil, pour le suivi des agents de conversation).
+        # de remise du réveil, pour le suivi des agents de conversation) ;
+        # contrat 1.17 : #8296 ajoute service_tier facultatif à
+        # turn_costs.insert (palier de service effectif, pour les vues budget).
         self.assertEqual(len(self.c.operations), 76)
         self.assertEqual(sum(o.write for o in ops), 44)
         self.assertEqual(sum(not o.write for o in ops), 32)
@@ -134,7 +136,7 @@ class TableTest(unittest.TestCase):
                           "mailbox.unread", "mailbox.unread_human",
                           "mailbox.unread_human_page", "mailbox.unread_priority",
                           "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.16.0")
+        self.assertEqual(self.c.version, "1.17.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 
@@ -187,6 +189,21 @@ class TableTest(unittest.TestCase):
             self.c.bind("turn_costs.insert", kwargs=dict(req))["attribution"])
         with self.assertRaises(ValueError):
             self.c.bind("turn_costs.insert", kwargs=dict(req, attribution="ima"))
+
+    def test_turn_costs_insert_accepts_the_optional_service_tier(self):
+        """Contrat 1.17 (#8296) : palier de service facultatif, chaîne ou nulle."""
+        req = {"agent": "a", "harness": "dsh", "turn": None, "model": None,
+               "session": None, "usd": 0.1, "input_tokens": 1,
+               "cached_input_tokens": 0, "output_tokens": 1, "cum_usd": None,
+               "cum_input_tokens": None, "cum_cached_input_tokens": None,
+               "cum_output_tokens": None}
+        bound = self.c.bind("turn_costs.insert",
+                            kwargs=dict(req, service_tier="fast"))
+        self.assertEqual(bound["service_tier"], "fast")
+        self.assertIsNone(
+            self.c.bind("turn_costs.insert", kwargs=dict(req))["service_tier"])
+        with self.assertRaises(ValueError):
+            self.c.bind("turn_costs.insert", kwargs=dict(req, service_tier=2))
 
     def test_pending_spend_put_accepts_the_optional_attribution(self):
         """Contrat 1.12 (#6005) : le marqueur porte aussi l'attribution."""

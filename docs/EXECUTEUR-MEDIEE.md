@@ -24,7 +24,8 @@ puis par le plancher d'avis d'un lot (#8101, version `1.14.0`), puis par le
 courrier du jour et les actifs servis avant le stock (#8112, version
 `1.15.0`, compatible : voir « Contrat 1.15 »), puis par la date réelle de
 remise du réveil programmé (#8235, version `1.16.0`, compatible : voir
-« Contrat 1.16 »).
+« Contrat 1.16 »), puis par le palier de service du tour dans le grand livre
+(#8296, version `1.17.0`, compatible : voir « Contrat 1.17 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -1113,3 +1114,20 @@ Déploiement : serveur d'abord. Un ancien client omet `served_at` et garde le
 comportement d'avant ; un ancien serveur refuse l'argument facultatif s'il
 est envoyé, mais seule la veille locale du serveur le renseigne — les
 exécuteurs distants ne l'utilisent pas et n'ont rien à déployer.
+
+### Contrat 1.17 : palier de service du tour dans le grand livre (#8296)
+
+Le grand livre prixait un tour par modèle seulement ; le mode rapide Codex
+(`service_tier=fast`) est facturé deux fois le tarif Standard, et la prime
+n'atteignait ni `turn_costs.usd`, ni le plafond, ni les vues par agent.
+
+Le contrat 1.17 ajoute à `turn_costs.insert` le paramètre facultatif
+`service_tier` (chaîne ou `null`) : le palier effectif du tour (`fast`,
+`default`, …), `null` quand il est inconnu. Le coût du tour reste calculé par
+l'exécuteur ; le serveur se contente d'inscrire le palier à côté, pour les
+lectures budget et l'audit. Aucun autre changement d'opération.
+
+Déploiement : sans ordre imposé. Un ancien client omet `service_tier` et le
+serveur écrit `null` ; un ancien serveur refuse le paramètre inconnu
+(`bad_args`) et le client réessaie sans lui — le coût du tour reste compté,
+seul le palier est perdu et journalisé.

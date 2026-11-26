@@ -2513,6 +2513,19 @@ def _roadmap_verdicts(notes: Iterable[Mapping[str, Any]],
     aucune note ne vaut.
     """
     from . import file_decoupage
+    out: dict[str, dict] = {}
+    for project, (ident, lot_notes) in _split_notes(notes, open_lots).items():
+        if file_decoupage.exhausted(lot_notes, project):
+            out[project] = {"lot": ident,
+                            "at_ts": file_decoupage.exhausted_since(lot_notes, project)}
+    return out
+
+
+def _split_notes(notes: Iterable[Mapping[str, Any]],
+                 open_lots: Iterable[Mapping[str, Any]] = ()
+                 ) -> dict[str, tuple[int, list[dict]]]:
+    """`{projet: (lot de découpage ouvert, ses notes)}`, la sélection commune
+    au verdict (`_roadmap_verdicts`) et aux intervalles (#8283)."""
     from .work import OPEN_STATES
     splits: dict[str, int] = {}
     for lot in open_lots or ():
@@ -2534,13 +2547,53 @@ def _roadmap_verdicts(notes: Iterable[Mapping[str, Any]],
         except (TypeError, ValueError):
             continue
         by_lot.setdefault(ident, []).append(dict(note))
-    out: dict[str, dict] = {}
-    for project, ident in splits.items():
-        lot_notes = by_lot.get(ident, [])
-        if file_decoupage.exhausted(lot_notes, project):
-            out[project] = {"lot": ident,
-                            "at_ts": file_decoupage.exhausted_since(lot_notes, project)}
+    return {project: (ident, by_lot.get(ident, []))
+            for project, ident in splits.items()}
+
+
+def _exhausted_periods(notes: Iterable[Mapping[str, Any]],
+                       open_lots: Iterable[Mapping[str, Any]],
+                       start: float, end: float) -> dict[str, list[list[float]]]:
+    """#8283 : `{projet: [[t1, t2], …]}`, les plages de `[start, end]` où la
+    route du projet était notée épuisée, lues par
+    `file_decoupage.roadmap_transitions` sur les notes de son lot de découpage
+    ouvert. Une réouverture ponctuelle ne coupe que sa plage : avant #8283, le
+    seul verdict de l'instant valait pour toute la fenêtre. Une plage encore
+    ouverte court jusqu'à `end`.
+
+    Avant la première transition lue, la route est réputée épuisée : c'est la
+    projection de #7249/#7849 pour une note d'épuisement seule (toute la
+    fenêtre exclue, la note pouvant redire un épuisement plus ancien), et une
+    première réouverture dit d'elle-même que la route était épuisée."""
+    from . import file_decoupage
+    out: dict[str, list[list[float]]] = {}
+    for project, (_ident, lot_notes) in _split_notes(notes, open_lots).items():
+        periods: list[list[float]] = []
+        for state, at in file_decoupage.roadmap_transitions(lot_notes, project):
+            at = min(max(float(at), start), end)
+            if state == file_decoupage.EXHAUSTED_STATE:
+                periods.append([at if periods else start, end])
+            else:
+                if not periods:
+                    periods.append([start, end])
+                periods[-1][1] = at
+        periods = [period for period in periods if period[1] > period[0]]
+        if periods:
+            out[project] = periods
     return out
+
+
+def _outside(start: float, end: float,
+             periods: Iterable[Iterable[float]]) -> list[tuple[float, float]]:
+    """#8283 : `[start, end]` privé des `periods` (triées, disjointes)."""
+    out, cursor = [], start
+    for begin, finish in sorted(tuple(period) for period in periods):
+        if begin > cursor:
+            out.append((cursor, min(begin, end)))
+        cursor = max(cursor, finish)
+    if cursor < end:
+        out.append((cursor, end))
+    return [(a, b) for a, b in out if b > a]
 
 
 #: #5149, #6010 : un motif d'exemption du sommeil qui tient un siège de
@@ -2694,12 +2747,18 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       budget tient le tour, ou qu'une famille exclut n'est pas une capacité
       disponible : ses trous ne comptent pas, pour que la perte affichée soit
       celle des agents qu'on peut réellement réveiller.
-      L'état réveillable est celui de l'instant ; un agent d'un projet à la
-      feuille de route épuisée ne compte d'heures ni dans son projet ni au mesh
-      tant qu'aucun lot démarrable daté ne borne la reprise (#7249). La ligne
-      du projet porte alors `idle_agent_hours_excluded` avec la raison, et le
-      mesh `idle_agents_excluded` : une mesure absente n'est jamais rendue
-      comme un 0,0 mesuré (le texte affiche « exclu »). Sur une telle route,
+      L'état réveillable est celui de l'instant ; l'exclusion d'une feuille
+      de route épuisée (#7249) se mesure par plages (#8283) : un agent ne
+      compte d'heures, ni dans son projet ni au mesh, que hors des plages où
+      la route de son projet était notée épuisée (transitions lues sur le lot
+      de découpage, `_exhausted_periods`) ; la dernière plage suit le verdict
+      de l'instant et s'arrête au plus ancien lot démarrable daté. Une route
+      épuisée sans transition lisible l'est sur toute la fenêtre. La ligne du
+      projet porte la durée exclue (`roadmap_exhausted_s`) ; si toute la
+      fenêtre l'est, elle porte `idle_agent_hours_excluded` avec la raison, et
+      le mesh `idle_agents_excluded` : une mesure absente n'est jamais rendue
+      comme un 0,0 mesuré (le texte affiche « exclu »), et une réouverture
+      ponctuelle n'annule pas toute la fenêtre. Sur une telle route,
       des lots retenus par la garde d'empreinte sont du travail qui attend :
       les heures de repos depuis la création du plus ancien (dans la
       fenêtre) se lisent à part, `idle_agent_hours_footprint`, par projet et
@@ -2864,6 +2923,33 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
             since = max(start, float(at))
             footprint_since[project] = min(footprint_since.get(project, now), since)
 
+    # #8283 : l'exclusion se calcule par plage. Les plages d'épuisement viennent
+    # des transitions notées sur le lot de découpage ; le verdict de l'instant
+    # reste l'autorité de la dernière plage, qu'un lot démarrable daté borne
+    # (`available_since`). Une route épuisée sans plage lisible (verdict passé
+    # sans notes, note non datée) l'est sur toute la fenêtre, comme avant.
+    periods = _exhausted_periods(roadmap_notes, open_lots, start, now)
+    for project in set(periods) - set(exhausted):
+        if periods[project][-1][1] >= now:
+            periods[project].pop()
+    for project in exhausted:
+        spans_of = periods.setdefault(project, [])
+        if not spans_of or spans_of[-1][1] < now:
+            spans_of.append([spans_of[-1][1] if spans_of else start, now])
+        if project in available_since:
+            spans_of[-1][1] = max(spans_of[-1][0], available_since[project])
+    allowed = {project: _outside(start, now, values)
+               for project, values in periods.items()}
+
+    def project_idle(name: str) -> float:
+        """Les secondes au repos imputables de l'agent : hors des plages où la
+        route de son projet était épuisée (#8283), chaque plage permise lue
+        comme sa propre fenêtre — un tour à cheval sur la borne y est coupé."""
+        windows = allowed.get(primary.get(name) or "", [(start, now)])
+        return sum(_idle_gaps(
+            [(a, min(b, high)) for a, b in spans.get(name, []) if a < high],
+            low, high, min_gap) for low, high in windows)
+
     def hours_exclusion(project: str | None) -> str | None:
         """Pourquoi les heures de ce projet ne sont pas imputées (#7849).
 
@@ -2874,7 +2960,9 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         """
         if not project or project not in exhausted:
             return None
-        if project in available_since:
+        if project in available_since or allowed.get(project):
+            # #8283 : une partie de la fenêtre est mesurée ; la part exclue se
+            # lit sur `roadmap_exhausted_s`.
             return None
         if project in undated_startable:
             return "date de création du lot démarrable inconnue"
@@ -2890,16 +2978,12 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     def summary(members: list[dict], project: str | None) -> dict:
         names = sorted(row["name"] for row in members)
         idle = sorted(name for name in names if name in rested)
-        # un agent d'un projet à la feuille de route épuisée ne compte
-        # d'heures au repos ni dans son projet, ni au mesh ; seuls les
+        # un agent ne compte d'heures au repos, ni dans son projet ni au
+        # mesh, que hors des plages d'épuisement de sa route (#8283) ; seuls les
         # agents au repos en comptent (ni lot actionnable, ni pause budget,
         # ni famille exclue) : les trous d'un agent occupé ne sont pas de la
         # capacité disponible (#5043)
-        seconds = sum(_idle_gaps(
-            spans.get(name, []),
-            available_since.get(primary.get(name), now)
-            if primary.get(name) in exhausted else start, now, min_gap)
-            for name in idle)
+        seconds = sum(project_idle(name) for name in idle)
         held_seconds = sum(_idle_gaps(
             spans.get(name, []), footprint_since[primary.get(name)], now, min_gap)
             for name in idle if primary.get(name) in footprint_since)
@@ -2909,6 +2993,9 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
                "idle_agent_hours": round(seconds / 3600.0, 2),
                "idle_agent_hours_footprint": round(held_seconds / 3600.0, 2),
                "roadmap_exhausted": exhausted.get(project) if project else None}
+        if project and project in periods:
+            row["roadmap_exhausted_s"] = round(sum(
+                b - a for a, b in periods[project]), 1)
         excluded = hours_exclusion(project)
         if excluded:
             # #7849 : le 0,0 n'est pas une mesure, c'est une exclusion voulue ;
@@ -3222,6 +3309,12 @@ _TURNS_SQL = """
 #: `file_decoupage.ROADMAP_NOTE_RE` — préfixe de retenue facultatif, casse et
 #: blancs libres — et les deux se modifient ensemble (revue B : le journal
 #: exact du store voyait moins que ce `~*`).
+#: #8283 : `file_decoupage.SENTINEL_WRAPPER` + `roadmap\s*:` en SQL (apostrophe
+#: doublée) — préfixe `hold:`/`unhold:` puis préfixe de fenêtre d'observation,
+#: tous deux facultatifs. Les deux textes se modifient ensemble (un test les
+#: compare) : `hold: fenêtre : roadmap: épuisée nexlink` était invisible ici.
+_SENTINEL_SQL_RE = ("^(?:(?:un)?hold:\\s*)?(?:(?:fen[êe]tre(?:\\s+d[''’]observation)?"
+                    "|observation\\s+window|observation|window)\\s*:\\s*)?roadmap\\s*:")
 _ROADMAP_SQL = """
     SELECT e.id, e.work_item_id, e.note, w.source,
            extract(epoch FROM e.created_at)::float8 AS at_ts
@@ -3229,7 +3322,7 @@ _ROADMAP_SQL = """
       JOIN work_items w ON w.id = e.work_item_id
      WHERE e.created_at > to_timestamp(%s)
        AND w.source LIKE 'file-decoupage:%%'
-       AND (ltrim(e.note) ~* '^(?:(?:un)?hold:\\s*)?roadmap\\s*:'
+       AND (ltrim(e.note) ~* '""" + _SENTINEL_SQL_RE + """'
             OR ltrim(e.note) LIKE 'sleep exempted:%%')
      ORDER BY e.created_at
 """
@@ -3261,7 +3354,7 @@ _SPLIT_MOVES_SQL = """
            extract(epoch FROM greatest(
                (SELECT max(e.created_at) FROM work_item_events e
                  WHERE e.work_item_id = s.id
-                   AND ltrim(e.note) ~* '^(?:(?:un)?hold:\\s*)?roadmap\\s*:'
+                   AND ltrim(e.note) ~* '""" + _SENTINEL_SQL_RE + """'
                    AND e.actor = s.assignee
                    AND e.actor <> 'ameesh' AND e.actor NOT LIKE 'ameesh:%%'),
                (SELECT max(w.created_at) FROM work_items w

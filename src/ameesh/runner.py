@@ -10466,11 +10466,19 @@ class AgentWorker(threading.Thread):
         # L71 : marqueur de tour AVANT l'index de début — la session reprise
         # (vide = neuve). Sans total connu de cette session, `CostBook.record`
         # ne compte pas son cumul entier comme le coût du tour.
+        # #8296 : le palier de service du LANCEMENT part avec le marqueur. Le
+        # grand livre le relit pour le tarif du tour, y compris quand un autre
+        # worker répare la ligne après un changement de réglage — le flux ne le
+        # répète pas toujours. Seul Codex en déclare un (descripteur L26) ; sans
+        # `--tier` (tier vide), aucune clé : la configuration native du compte
+        # peut encore choisir Fast, et le journal du tour fera foi.
+        marqueur_tour = {"type": cost_mod.TURN_MARKER, "resume": session or "",
+                        "ts": time.time(), "agent": self.name}
+        if harness == "codex" and tier:
+            marqueur_tour["service_tier"] = tier
         try:
             with open(events_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"type": cost_mod.TURN_MARKER, "resume": session or "",
-                                     "ts": time.time(), "agent": self.name},
-                                    ensure_ascii=False) + "\n")
+                fh.write(json.dumps(marqueur_tour, ensure_ascii=False) + "\n")
         except OSError as exc:
             log("[%s] turn marker not written (%s)" % (self.name, exc))
         # Index du flux avant le tour : `CostBook.record` ne compte que les
