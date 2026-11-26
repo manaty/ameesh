@@ -203,6 +203,71 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(result["result"], "ci", result)
         self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
 
+    def test_invalidated_plan_ignores_a_dependency_blocked_lot(self):
+        """#8304 B P1 (#234582) : un lot de file jamais composable (prérequis
+        ouvert) ne rend pas la composition « nouvelle » à chaque passe ; le
+        plan identique reste idle au lieu d'être recomposé et refusé sans fin."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 7200)
+        engine = self.engine([admitted(1), admitted(2), admitted(3)],
+                             schedule=schedule)
+        # #3 dépend d'un lot non fusionné absent de la file : `ordered` l'écarte.
+        self.ports.edges = [dict(work_item_id=3, blocker_id=99, blocking=True)]
+        self.ports.published = lambda plan: ""
+        self.ports.publish = mock.Mock(side_effect=train.PublicationRefused(
+            "full-suite source differs from audited CI contract"))
+        outcome = engine.step(stamp("2026-10-15T12:00:00"))
+        self.assertEqual(outcome["result"], "invalidated", outcome)
+        self.assertEqual([r["work_item_id"] for r in outcome["plan"]["members"]],
+                         [1, 2])
+        # Même ensemble composable : aucune recomposition, aucune publication.
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:01"))["result"], "idle")
+        self.assertEqual(self.ports.publish.call_count, 1)
+
+    def test_invalidated_plan_ignores_a_composition_deferred_lot(self):
+        """#8304 B P1 (#234582) : un lot reporté par la composition fait
+        partie des entrées du plan invalidé ; il ne relance pas la même
+        composition à chaque passe."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 7200)
+        engine = self.engine([admitted(1), admitted(2), admitted(3)],
+                             schedule=schedule)
+        compose = self.ports.compose
+
+        def defer_three(base, rows, nonce, sync=None):
+            culprit = next((r for r in rows if r["work_item_id"] == 3), None)
+            if culprit is not None:
+                raise train.MemberDeferred(culprit, "incompatible context")
+            return compose(base, rows, nonce, sync=sync)
+
+        self.ports.compose = defer_three
+        self.ports.published = lambda plan: ""
+        self.ports.publish = mock.Mock(side_effect=train.PublicationRefused(
+            "full-suite source differs from audited CI contract"))
+        outcome = engine.step(stamp("2026-10-15T12:00:00"))
+        self.assertEqual(outcome["result"], "invalidated", outcome)
+        self.assertEqual([r["work_item_id"] for r in outcome["plan"]["members"]],
+                         [1, 2])
+        self.assertEqual([r["work_item_id"] for r in self.ports.document["deferred"]],
+                         [3])
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:01"))["result"], "idle")
+        self.assertEqual(self.ports.publish.call_count, 1)
+
+    def test_chain_keeps_a_lot_ready_at_landing_across_a_late_restart(self):
+        """#8304 B P2 (#234583) : la fenêtre d'une heure borne les arrivées
+        nouvelles, pas un lot déjà prêt quand la fusion a été vue ; un
+        redémarrage à 13:06 ne le fait pas attendre le créneau de 14:00."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 7200)
+        engine = self.engine([admitted(1)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T12:00:00"))["plan"]
+        self.ports.ci_by_head[first["head"]] = "green"
+        self.ports.rows.append(admitted(2, "2026-10-15T12:04:00"))
+        self.assertEqual(engine.step(stamp("2026-10-15T12:05:00"))["result"],
+                         "landed")
+        resumed = train.Engine(self.ports, source=engine.source,
+                               target=engine.target, policy=engine.policy)
+        result = resumed.step(stamp("2026-10-15T13:06:00"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [2])
+
     def test_repeated_paris_hour_starts_distinct_packets_across_restart(self):
         # Explicit supplier epochs: this checks the consumer, not how #1757
         # computes the calendar. Both instants are 02:00 in Europe/Paris.
