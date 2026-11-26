@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from ameesh import github_stage_comments as comments, plan_github as pg
+from . import canon_staging
 from .fake_github import FakeGh
 
 REPO = "acme/app"
@@ -42,6 +43,128 @@ class StageCommentsTest(unittest.TestCase):
 
     def bodies(self):
         return self.gh.repo(REPO)["comments"].get("7", [])
+
+    def with_topology(self):
+        """Use the canon's real staging sequence (three VMs, server, poste)."""
+        return mock.patch.object(comments, "_staging_topology",
+                                 return_value=canon_staging.topology())
+
+    def release_report(self, *, version="1.75.0", completed_at=1795732226.0,
+                       lots=(), sha="a" * 40, hosts=None, reportes=None,
+                       include=None, project="app", result="reconciled"):
+        """A release report with a complete staging proof.
+
+        The default shape is the real 1.75.0 one (#8313): the three agent VMs
+        active at the commit, the server and the workstation reported absent.
+        `lots` are the attestation lots, `include` the cutoff's own list.
+        """
+        if hosts is None:
+            hosts = {host: {"actif": sha} for host in canon_staging.AGENTS}
+        if reportes is None:
+            reportes = {host: {"raison": "absent at release time"}
+                        for host in (canon_staging.SERVER, canon_staging.WORKSTATION)}
+        report = {
+            "schema": "ameesh-release-cutoff/1", "project": project,
+            "result": result, "tag": "v" + version, "version": version,
+            "release_sha": sha, "completed_at": completed_at,
+            "staging": {"exit": 0, "attestation": {
+                "schema": "ameesh-staging-actif/1", "sha": sha,
+                "hotes": hosts, "reportes": reportes,
+                "lots": [str(lot) for lot in lots]}},
+        }
+        if include is not None:
+            report["included"] = include
+        return report
+
+    def write_reports(self, *reports):
+        folder = Path(self.folder.name) / "release" / "reports"
+        folder.mkdir(parents=True, exist_ok=True)
+        for number, report in enumerate(reports):
+            (folder / ("%02d.json" % number)).write_text(json.dumps(report))
+
+    def receipts(self, *reports, project="app"):
+        self.write_reports(*reports)
+        with self.with_topology():
+            return comments.release_receipts(self.db.cfg, project)
+
+    def test_release_receipts_prove_the_canon_staging_sequence(self):
+        """#8313 witness: the real 1.75.0 shape proves the release.
+
+        Three agent VMs are active and the server and the workstation are
+        reported absent, as the canon allows (§14); the old fixed count of
+        four hosts refused exactly this report, so no requester got the
+        "Delivered in release 1.75.0" confirmation.
+        """
+        report = self.release_report(lots=(8264, 8296))
+        receipts = self.receipts(report)
+        self.assertEqual(sorted(receipts), [8264, 8296])
+        self.assertEqual(receipts[8296],
+                         [("1.75.0", "2026-11-26", 1795732226.0)])
+
+    def test_release_receipts_accept_a_full_sequence(self):
+        hosts = {host: {"actif": "a" * 40} for host in canon_staging.HOSTS}
+        report = self.release_report(hosts=hosts, reportes={}, lots=(12,))
+        self.assertEqual(sorted(self.receipts(report)), [12])
+
+    def test_release_receipts_refuse_an_incomplete_sequence(self):
+        report = self.release_report(lots=(12,))
+        del report["staging"]["attestation"]["reportes"]
+        self.assertEqual(self.receipts(report), {})
+
+    def test_release_receipts_refuse_a_reported_agent_vm(self):
+        # The union covers the sequence, but an agent VM is never reportable.
+        agents = canon_staging.AGENTS
+        report = self.release_report(
+            lots=(12,),
+            hosts={agents[1]: {"actif": "a" * 40},
+                   agents[2]: {"actif": "a" * 40},
+                   canon_staging.WORKSTATION: {"actif": "a" * 40}},
+            reportes={agents[0]: {"raison": "absent"},
+                      canon_staging.SERVER: {"raison": "absent"}})
+        self.assertEqual(self.receipts(report), {})
+
+    def test_release_receipts_refuse_a_commit_mismatch_or_missing_reason(self):
+        bad_sha = self.release_report(lots=(12,))
+        bad_sha["staging"]["attestation"]["hotes"][canon_staging.AGENTS[0]]["actif"] = "b" * 40
+        self.assertEqual(self.receipts(bad_sha), {})
+        no_reason = self.release_report(lots=(12,))
+        no_reason["staging"]["attestation"]["reportes"][canon_staging.SERVER] = {}
+        self.assertEqual(self.receipts(no_reason), {})
+
+    def test_release_receipts_need_a_canon_sequence(self):
+        # #7662: no readable canon declares no host, so nothing is proven.
+        self.write_reports(self.release_report(lots=(12,)))
+        self.assertEqual(comments.release_receipts(self.db.cfg, "app"), {})
+
+    def test_the_sequence_comes_from_the_default_canon_only(self):
+        other = canon_staging.fake_canon()
+        other.hosts = list(other.hosts) + [SimpleNamespace(
+            title="other-host",
+            staging=canon_staging.canon.HostStaging(order=60, kind="agents"))]
+        with mock.patch.object(comments.canon_mod, "load_configured",
+                               return_value=[canon_staging.fake_canon(), other]):
+            topology = comments._staging_topology(self.db.cfg)
+        self.assertEqual(topology.hosts, canon_staging.HOSTS)
+        self.assertEqual(topology.reportable,
+                         {canon_staging.SERVER, canon_staging.WORKSTATION})
+
+    def test_catch_up_keeps_one_delivery_bounded_by_since(self):
+        """#2874/#8313: one delivery per lot, at its first release after _since."""
+        first = self.release_report(version="1.70.0", completed_at=1795430054.0,
+                                    lots=(1, 2))
+        second = self.release_report(version="1.71.0", completed_at=1795433654.0,
+                                     lots=(2, 3))
+        receipts = self.receipts(first, second)
+        self.assertEqual(comments._current_receipts(receipts[1], 0),
+                         [("1.70.0", "2026-11-23")])
+        self.assertEqual(comments._current_receipts(receipts[2], 0),
+                         [("1.70.0", "2026-11-23")])
+        self.assertEqual(comments._current_receipts(receipts[3], 0),
+                         [("1.71.0", "2026-11-23")])
+        # A cutoff between the two releases drops the earlier one.
+        self.assertEqual(comments._current_receipts(receipts[1], 1795433000), [])
+        self.assertEqual(comments._current_receipts(receipts[2], 1795433000),
+                         [("1.71.0", "2026-11-23")])
 
     def test_replay_between_passes_order_and_idempotence(self):
         self.marks = [dict(id=4, kind="merged", at_ts=5), dict(id=3, kind="frozen", at_ts=3)]
@@ -135,11 +258,8 @@ class StageCommentsTest(unittest.TestCase):
         self.assertNotIn("Delivered in release", "\n".join(self.bodies()))
         folder = Path(self.folder.name) / "release" / "reports"
         folder.mkdir(parents=True)
-        report = {"schema": "ameesh-release-cutoff/1", "project": "app", "result": "released",
-                  "release_sha": "a" * 40, "tag": "v1.2.3", "version": "v1.2.3", "completed_at": 1792454400,
-                  "included": [12], "staging": {"exit": 0, "attestation": {
-                      "schema": "ameesh-staging-actif/1", "sha": "a" * 40,
-                      "hotes": {str(n): {} for n in range(4)}, "lots": ["12"]}}}
+        report = self.release_report(version="v1.2.3", completed_at=1792454400,
+                                     include=[12], lots=(12,))
         path = folder / "release.json"
         for bad in (dict(report, staging=None), dict(report, project="other"),
                     dict(report, staging={"exit": 0}),
@@ -156,12 +276,13 @@ class StageCommentsTest(unittest.TestCase):
         report.pop("included")
         report["result"] = "reconciled"
         path.write_text(json.dumps(report))
-        self.project()
-        self.assertIn("Delivered in release v1.2.3 on 2026-10-20", self.bodies()[-1])
-        self.gh.reset_calls()
-        self.project()
-        self.assertEqual(self.gh.writes(), [])
-        self.assertEqual(self.gh.calls(), [])
+        with self.with_topology():
+            self.project()
+            self.assertIn("Delivered in release v1.2.3 on 2026-10-20", self.bodies()[-1])
+            self.gh.reset_calls()
+            self.project()
+            self.assertEqual(self.gh.writes(), [])
+            self.assertEqual(self.gh.calls(), [])
 
     def test_preexisting_closed_ticket_does_not_backfill_or_read_thread(self):
         self.item["state"] = "closed"
