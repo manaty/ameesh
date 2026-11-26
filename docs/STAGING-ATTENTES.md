@@ -22,8 +22,12 @@ note, seules les références `#lot` ou
 `migration N` d'une phrase qui nomme une attente de déploiement comptent
 (« attendre #3111 », « #3111 non actif », « la release doit porter #2994 ») ;
 un numéro de PR, de ticket, de paquet, de gel, ou une référence citée dans un
-conflit ou une relecture, n'est pas une attente. Une description de lot, un
-ancien hold levé ou un jalon de fusion annulé ne créent pas d'attente. Les
+conflit ou une relecture, n'est pas une attente. `release-check` est une garde,
+pas une release, et une attente d'avis, de relecture ou de verdict est exclue
+avec toute sa phrase (#8308), sauf si cette phrase nomme aussi un staging ou
+un déploiement : l'attente de déploiement, elle, compte. Une
+description de lot, un ancien hold levé ou un jalon de fusion annulé ne
+créent pas d'attente. Les
 commits actifs viennent de la dernière attestation de chaque hôte
 (`mise-a-jour/actif-<commit>.json`), dont la date est rendue dans le relevé.
 Un poste reporté absent par la dernière attestation (`reportes`, #3848) n'est
