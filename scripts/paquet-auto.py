@@ -7079,6 +7079,8 @@ def publish_tested(args: argparse.Namespace) -> int:
             note += " ; " + body_failure
         print(note_carrier(worktree, args.carrier, note), flush=True)
         check_pause(worktree, getattr(args, "pause_project", "") or "", args.target)
+        # #8290 : clos pendant la publication : pas de ci-full
+        check_carrier_open(repo, args.carrier)
         print(request_full_ci(worktree, args.carrier, head), flush=True)
         pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
         if body_failure:
@@ -7590,7 +7592,13 @@ def compose_packet(args: argparse.Namespace) -> int:
                             "concluants nommés ; instantané %s"
                             % (args.name, len(composition.units),
                                len(composition.discarded), head))
+                    # #8290 : relu avant le gel et avant la ci-full (clos
+                    # pendant la PR ou le gel : rien n'est armé)
+                    if not args.no_packet_record:
+                        check_carrier_open(repo, args.carrier)
                     print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
+                    if not args.no_packet_record:
+                        check_carrier_open(repo, args.carrier)
                     print(request_full_ci(worktree, args.carrier, head), flush=True)
                 break
             if pushed:

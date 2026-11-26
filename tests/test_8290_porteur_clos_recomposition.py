@@ -113,6 +113,17 @@ class ClosedDuringTestsTest(unittest.TestCase):
         mocks = self.compose(lambda tested, pushed: CLOSED if pushed else OPEN)
         mocks["push_branch"].assert_called_once()
 
+    def test_clos_pendant_la_pr_ni_gel_ni_ci_full(self):
+        mocks = self.compose(lambda tested, pushed:
+                             CLOSED if "ensure_pull_request" in self.called else OPEN)
+        mocks["ensure_pull_request"].assert_called_once()
+        mocks["freeze_carrier"].assert_not_called()
+
+    def test_clos_pendant_le_gel_pas_de_ci_full(self):
+        mocks = self.compose(lambda tested, pushed:
+                             CLOSED if "freeze_carrier" in self.called else OPEN)
+        mocks["freeze_carrier"].assert_called_once()
+
     def compose(self, state):
         tmp = tempfile.TemporaryDirectory(prefix="paquet-8290-")
         self.addCleanup(tmp.cleanup)
@@ -161,12 +172,20 @@ class ClosedDuringTestsTest(unittest.TestCase):
             mocks["PackageLock"].return_value = mock.MagicMock()
             mocks["CompositionClaim"].return_value = mock.MagicMock()
             mocks["push_branch"].side_effect = lambda *_a, **_k: pushed.append(True)
+            self.called: list[str] = []
+            for gesture, value in (("ensure_pull_request", (7, "http://pr")),
+                                   ("freeze_carrier", "")):
+                mocks[gesture].side_effect = (
+                    lambda *_a, _g=gesture, _v=value, **_k:
+                    self.called.append(_g) or _v)
             with self.assertRaises(auto.CarrierClosed):
                 auto.compose_packet(args)
         self.assertTrue(tested)
         for gesture in ("ensure_pull_request", "freeze_carrier",
                         "request_full_ci", "keep_tested"):
-            mocks[gesture].assert_not_called()
+            # les gestes déjà faits avant la clôture sont vérifiés par le témoin
+            if gesture not in self.called:
+                mocks[gesture].assert_not_called()
         return mocks
 
 

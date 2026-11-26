@@ -368,6 +368,28 @@ class PublishTest(Chain):
             ["git", "-C", str(self.origin), "rev-parse", "--verify", "--quiet",
              auto.TESTED_REF_PREFIX + NAME], capture_output=True).returncode, 1)
 
+    def test_porteur_clos_pendant_la_pause_sans_ci_full(self):
+        """#8290 : clos pendant `check_pause`, la reprise ne demande pas la ci-full."""
+        self.push(self.args())
+        closed: list[bool] = []
+
+        def carrier_state(*_args):
+            if closed:
+                raise auto.CarrierClosed("porteur #4000 clos (abandoned)")
+
+        with self.finishing() as mocks, \
+                mock.patch.object(auto, "check_pause",
+                                  side_effect=lambda *_a: closed.append(True)):
+            mocks["compute_candidates"].return_value = (self.candidates(), {})
+            mocks["pull_request_state"].return_value = "OPEN"
+            mocks["ensure_pull_request"].return_value = (7, "http://pr")
+            mocks["note_carrier"].return_value = ""
+            mocks["check_carrier_open"].side_effect = carrier_state
+            with self.assertRaises(auto.CarrierClosed):
+                auto.publish_tested(self.args())
+        mocks["request_full_ci"].assert_not_called()
+        mocks["send_mail"].assert_not_called()
+
     def test_regel_entre_verification_et_publication_refuse(self):
         """#6579 : la première lecture passe, la seconde voit le nouveau gel."""
         self.push(self.args())
