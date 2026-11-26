@@ -104,6 +104,16 @@ class RelayTest(PgTestCase):
         self.assertIn("ameesh decide", row["body"])
         self.assertEqual(row["payload"]["owner_presence"]["accord"], [233821])
 
+    def test_mail_linked_to_a_lot_passes_it_as_a_string(self):
+        # B1 de la relecture : `agent-mail send` rend le lot en chaîne
+        sent = owner_presence.relay(self.cfg, self.db, HERE, source="courrier à bureau",
+                                    text="je suis là", lot=str(self.lot["id"]),
+                                    now=1_800_000_000.0)
+        self.assertEqual(sent, ["bureau", "pilote"])
+        [row] = self.mails("bureau")
+        self.assertIn("courrier à bureau sur #%d" % self.lot["id"], row["body"])
+        self.assertEqual(row["payload"]["owner_presence"]["lot"], self.lot["id"])
+
     def test_no_station_relays_nothing(self):
         self.assertEqual(owner_presence.relay(self.cfg, self.db, None, source="note",
                                               text="x", lot=self.lot["id"]), [])

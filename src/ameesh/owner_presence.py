@@ -201,7 +201,7 @@ def _key(where: Station, text: str, accord: bool, now: float) -> str:
 
 
 def relay(cfg, db, where: Station | None, *, source: str, text: str,
-          lot: int | None = None, now: float | None = None) -> list[str]:
+          lot: int | str | None = None, now: float | None = None) -> list[str]:
     """Réveille bureau et pilote ; rend les destinataires effectivement saisis.
 
     Jamais d'exception : une note ou un courrier déjà écrit n'est pas défait
@@ -211,7 +211,9 @@ def relay(cfg, db, where: Station | None, *, source: str, text: str,
     now = time.time() if now is None else float(now)
     try:
         from . import mail, work
-        item = work.get(db, int(lot)) if lot else None
+        # le courrier rattaché à un lot le passe en chaîne (`link_message`)
+        lot = int(lot) if str(lot or "").strip().isdigit() else None
+        item = work.get(db, lot) if lot else None
         gestures = pending_gestures(cfg, db, where.human, now=now)
         pending_ids = {int(v["id"]) for v in gestures["decisions"]}
         accord = is_accord(text)
