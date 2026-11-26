@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -33,6 +33,9 @@ REPO = Path(__file__).resolve().parents[1]
 AGENT = "agent:alice-impl"
 SPEND = {"max_per_month": 50, "max_per_day": 10,
          "providers": ["quota"], "purposes": ["quota-reset"]}
+#: #8289 : jour J0 des balayages simulés, au milieu d'un mois fixe — J0 + 5
+#: reste dans le mois, quel que soit le jour réel du run (rouge le 26/11).
+SWEEP_BASE = date(2026, 6, 15)
 
 
 def federation(*, horizon: int | None = 24, **rule_overrides) -> dict:
@@ -190,6 +193,16 @@ class SpendLedgerTest(ActionsBase):
             "confirmed_decision_id = NULL, updated_at = now() WHERE id = %s",
             (day, ALICE, ledger))
 
+    def anchor_ledger(self, day=SWEEP_BASE):
+        """#8289 : ramène les lignes lancées à l'heure réelle au jour `day`,
+        pour que les cumuls mensuels des jours simulés ne dépendent pas de la
+        date du run (fin de mois)."""
+        self.db.execute(
+            "UPDATE spend_ledger SET started_on = %s::date, "
+            "started_at = (%s::date::timestamp AT TIME ZONE 'UTC'), "
+            "updated_at = now()", (day, day))
+        return day
+
     def signed_decision(self, ledger: int, *, option: str | None = None,
                         needs_signature: bool = True, now=None) -> int:
         key = option or ("confirm-spend-%d" % ledger)
@@ -325,7 +338,9 @@ class SpendLedgerTest(ActionsBase):
         410 + 85 = 495. Le coût de demain (10, jusqu'à la revue confirmée
         aujourd'hui) porte le total à 505 > 495 : refus nommé.
         """
-        grant = self.register(month=400, day=400, max_amount=495, horizon=24)
+        # #8289 : mois = total, le 31 du mois (310 + 10 + 85) ne touche pas
+        # le plafond mensuel avant le total.
+        grant = self.register(month=495, day=400, max_amount=495, horizon=24)
         daily = self.spend_action(amount=10, recurrence="daily")
         self.bound(daily)
         self.launch(daily)
@@ -515,7 +530,7 @@ class SpendLedgerTest(ActionsBase):
         self.bound(action)
         self.launch(action)
         ledger = int(self.db.query("SELECT id FROM spend_ledger")[0]["id"])
-        base = spend.utc_today()
+        base = self.anchor_ledger()
         stopped_on = None
         for offset in range(0, 6):
             day = base + timedelta(days=offset)
@@ -544,7 +559,7 @@ class SpendLedgerTest(ActionsBase):
         self.bound(action)
         self.launch(action)
         ledger = int(self.db.query("SELECT id FROM spend_ledger")[0]["id"])
-        base = spend.utc_today()
+        base = self.anchor_ledger()
         stopped = None
         for offset in range(0, 5):
             day = base + timedelta(days=offset)
@@ -571,7 +586,7 @@ class SpendLedgerTest(ActionsBase):
         self.bound(action)
         self.launch(action)
         ledger = int(self.db.query("SELECT id FROM spend_ledger")[0]["id"])
-        base = spend.utc_today()
+        base = self.anchor_ledger()
         # jour 0 : la revue est demain, pas d'arrêt
         self.assertEqual(actions.spend_sweep(
             self.db, today=base, connector=self.noop)["stopped"], [])
@@ -612,7 +627,7 @@ class SpendLedgerTest(ActionsBase):
         ids = [int(row["id"]) for row in self.db.query(
             "SELECT id FROM spend_ledger ORDER BY id")]
         self.assertEqual(len(ids), 2)
-        base = spend.utc_today()
+        base = self.anchor_ledger()
         first = actions.spend_sweep(self.db, today=base, connector=self.noop)
         self.assertEqual((first["errors"], first["stopped"]), ([], []))
         day1 = base + timedelta(days=1)
