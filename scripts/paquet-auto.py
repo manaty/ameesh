@@ -7575,6 +7575,9 @@ def compose_packet(args: argparse.Namespace) -> int:
                                 args.target)
                     if contract_report is not None:
                         verify_contract_scope(worktree, contract_report)
+                    # #8290 : relu après les contrôles, juste avant la poussée
+                    if not args.no_packet_record:
+                        check_carrier_open(repo, args.carrier)
                     push_branch(worktree, branch, force_lease=lease)
                     print("poussée : %s%s" % (branch, " (recomposition)"
                                               if lease else ""), flush=True)

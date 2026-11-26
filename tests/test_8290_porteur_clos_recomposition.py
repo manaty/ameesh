@@ -124,6 +124,14 @@ class ClosedDuringTestsTest(unittest.TestCase):
                              CLOSED if "freeze_carrier" in self.called else OPEN)
         mocks["freeze_carrier"].assert_called_once()
 
+    def test_clos_pendant_la_pause_rien_n_est_pousse(self):
+        # relecture ameesh-cx1 : clos pendant `check_pause`, juste avant la poussée
+        closing: list[bool] = []
+        self.pause = lambda *_a, **_k: closing.append(True)
+        mocks = self.compose(lambda tested, pushed: CLOSED if closing else OPEN)
+        self.assertTrue(closing)
+        mocks["push_branch"].assert_not_called()
+
     def compose(self, state):
         tmp = tempfile.TemporaryDirectory(prefix="paquet-8290-")
         self.addCleanup(tmp.cleanup)
@@ -172,6 +180,7 @@ class ClosedDuringTestsTest(unittest.TestCase):
             mocks["PackageLock"].return_value = mock.MagicMock()
             mocks["CompositionClaim"].return_value = mock.MagicMock()
             mocks["push_branch"].side_effect = lambda *_a, **_k: pushed.append(True)
+            mocks["check_pause"].side_effect = getattr(self, "pause", None)
             self.called: list[str] = []
             for gesture, value in (("ensure_pull_request", (7, "http://pr")),
                                    ("freeze_carrier", "")):
