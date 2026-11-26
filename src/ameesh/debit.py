@@ -187,6 +187,10 @@ GESTURES = {
               "(`ameesh work reviewer {lot} <agent>`)",
     "no_reviewer": "désigner un relecteur d'une autre famille "
                    "(`ameesh work reviewer {lot} <agent>`)",
+    "review_family_paused_decided":
+        "pause de famille couverte par la décision owner {decisions} jusqu'au "
+        "{until} : aucun geste avant l'échéance ; à cette date, l'attente "
+        "redevient ordinaire (canon §9)",
     "qa_merge": "lot relu, en attente du paquet : rappeler au pilote de le ranger "
                 "dans le prochain paquet horaire (canon §11 bis)",
     "qa_designation": "désignation en attente : {cause} — traiter la cause puis "
@@ -1373,6 +1377,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
           dependencies: Mapping[int, Iterable[Mapping[str, Any]]] | None = None,
           roadmap_exhausted: Mapping[str, Mapping[str, Any]] | None = None,
           families: Iterable[str] = (),
+          decision_coverages: Mapping[str, Mapping[str, Any]] | None = None,
           external_executors: Mapping[str, Mapping[str, Any]] | None = None,
           human_routes: Iterable[str] = (),
           review_pilots: Mapping[str, str] | None = None,
@@ -1441,7 +1446,16 @@ def build(*, items: Iterable[Mapping[str, Any]],
     ouverte, hors `--check`) ; un porteur `blocked` la laisse en attente
     d'agent (pilote). Un état de porteur absent ne prouve rien et laisse la
     ligne ; un porteur terminé ou composé sur une autre tête la laisse
-    revenir."""
+    revenir.
+
+    `decision_coverages` (#8264) : `{famille: couverture}` calculé par `read`
+    (`review_family_paused.verified_coverages`) sur des décisions closes dont
+    la preuve signée est **revérifiée** (B #46462). Une pause de famille
+    couverte est listée dans `decision_waits`, hors `slow_waits` et hors
+    `--check` : aucun geste n'existe avant l'échéance de la décision, citée
+    avec sa date de fin. À l'échéance, la ligne redevient une attente
+    ordinaire. Sans couverture vérifiée, rien n'est couvert — le doute ne tait
+    jamais un goulot."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -1524,6 +1538,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
             family = family_of(agent.get("harness"), known_families)
             if name and family:
                 agent_families[_norm(name)] = family
+    #: #8264 : les couvertures vérifiées, calculées une fois par `read`.
+    decision_coverages = dict(decision_coverages or {})
     milestones_by_lot = _rows_by_lot(milestones)
     # #5328 : les corrections dues viennent de `due_fixes` (une seule lecture,
     # la même que `work fixes-owed`) ; le repli sans base reste local.
@@ -1700,7 +1716,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 designation, agents, project=item.get("app") or "",
                 families=known_families, now=now,
                 pilot=(review_pilots or {}).get(item.get("app") or "") or "",
-                closed_hosts=closed_hosts)
+                closed_hosts=closed_hosts, decisions=decision_coverages)
             age = _age(now, freeze.get("at_ts"))
             state = {
                 "lot": ident, "title": item.get("title") or "",
@@ -1932,10 +1948,28 @@ def build(*, items: Iterable[Mapping[str, Any]],
         reviewers = row["pending_reviewers"]
         if row.get("review_family_paused"):
             pauses = row["review_family_paused"]
-            add_wait("review_family_paused", row, row["frozen_ts"],
-                     ", ".join(p["family"] for p in pauses),
-                     "vérifier le compte de repli ou demander une décision de plafond",
-                     pauses=pauses)
+            covered = [pause for pause in pauses if pause.get("decision")]
+            if covered and len(covered) == len(pauses):
+                # #8264 : la décision owner signée couvre la pause jusqu'à son
+                # échéance. L'attente est listée à part et `--check` ne sort
+                # pas 2 : aucun geste n'existe avant cette date, où la ligne
+                # redevient une attente ordinaire.
+                until = min(float(pause["decision"]["until"]) for pause in pauses)
+                cited = ", ".join("#%d" % int(pause["decision"]["id"])
+                                  for pause in pauses)
+                add_wait(
+                    "review_family_paused", row, row["frozen_ts"],
+                    ", ".join(pause["family"] for pause in pauses),
+                    GESTURES["review_family_paused_decided"].format(
+                        decisions=cited, until=_iso(until)),
+                    level=0, human=False, decided=True, pauses=pauses,
+                    decisions=[pause["decision"] for pause in pauses],
+                    decision_until=until, decision_until_iso=_iso(until))
+            else:
+                add_wait("review_family_paused", row, row["frozen_ts"],
+                         ", ".join(pause["family"] for pause in pauses),
+                         "vérifier le compte de repli ou demander une décision de plafond",
+                         pauses=pauses)
         elif reviewers:
             paused = row.get("pending_paused") or {}
             if paused and len(paused) == len(reviewers):
@@ -2209,7 +2243,11 @@ def build(*, items: Iterable[Mapping[str, Any]],
                                 int(row["lot"] or 0)))
     #: le canon ne vise que les attentes qui ne dépendent pas d'un humain :
     #: celles de l'owner sont listées à part et ne font pas sortir `--check` 2.
-    slow_waits = [row for row in waits if not row["human"]]
+    #: #8264 : une attente couverte par une décision owner signée et non échue
+    #: est listée à part, hors `slow_waits`, jusqu'à l'échéance de la décision.
+    slow_waits = [row for row in waits if not row["human"] and not row.get("decided")]
+    decision_waits = [row for row in waits
+                      if row.get("decided") and not row["human"]]
     human_waits = [row for row in waits if row["human"]]
 
     # -- avis dus par relecteur ---------------------------------------------
@@ -2373,6 +2411,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "undeployed_holds": len(undeployed_holds),
         "idle_with_work": len(idle_with_work),
         "slow_waits": len(slow_waits),
+        "decision_waits": len(decision_waits),
         "human_waits": len(human_waits),
         "external_waits": len(external_waits),
         "external_reminders": len([row for row in external_waits
@@ -2395,6 +2434,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "qa_merge": qa_merge,
         "totals": totals,
         "slow_waits": slow_waits,
+        "decision_waits": decision_waits,
         "human_waits": human_waits,
         "external_waits": sorted(
             external_waits,
@@ -3461,11 +3501,23 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
 
     # #5424 N6 : le vivier d'une famille en pause est celui de la désignation
     # (pilote du projet et hôtes fermés exclus) ; illisible : personne d'exclu.
+    # #8264 : les décisions owner signées et non échues qui couvrent une pause
+    # de famille, preuve revérifiée à la lecture (B #46462). Une preuve refusée
+    # ne couvre rien ; une lecture en échec ne couvre rien et se dit : le débit
+    # ne tait jamais un goulot sur une lecture absente.
     review_pilots, closed_hosts = None, ()
+    decision_coverages: dict[str, dict] = {}
     if families:
         from . import review_family_paused
         review_pilots, closed_hosts = review_family_paused.exclusions(
             cfg, db, [item.get("app") or "" for item in items], agents)
+        try:
+            decision_views = review_family_paused.decisions_history(db, now=now)
+            decision_coverages = review_family_paused.verified_coverages(
+                db, decision_views, families=families, now=now)
+        except Exception as exc:  # noqa: BLE001 - une lecture absente ne couvre rien
+            unreadable.append("owner decisions unreadable: %s"
+                              % " ".join(str(exc).split())[:160])
     # #6105 : les déclarations `system:…` nomment le responsable humain d'une
     # réservation et disent qu'un système retiré ne portera plus son lot. Une
     # lecture en échec laisse le texte générique de #3447 ; elle ne fait pas
@@ -3486,7 +3538,7 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
                    ci_unreadable=ci_unreadable, fixes=fixes,
                    packets=packets, dependencies=dependencies,
                    roadmap_exhausted=roadmap_exhausted,
-                   families=families,
+                   families=families, decision_coverages=decision_coverages,
                    external_executors=external_executors,
                    human_routes=human_routes,
                    review_pilots=review_pilots,
@@ -3877,6 +3929,18 @@ def format_text(report: Mapping[str, Any]) -> str:
         lines.append("")
         lines.append("Attentes de plus de %s hors humain : aucune."
                      % _duration(report.get("wait_s")))
+    decided = report.get("decision_waits") or []
+    if decided:
+        lines.append("")
+        lines.append("Attentes couvertes par une décision owner, hors --check (%d) "
+                     "— aucun geste avant l'échéance :" % len(decided))
+        for row in decided[:20]:
+            lines.append("  #%-6d %-16s %8s  %-22s %s"
+                         % (int(row.get("lot") or 0), str(row.get("kind")),
+                            _duration(row.get("age_s")),
+                            str(row.get("who") or "?")[:22],
+                            str(row.get("title") or "")[:48]))
+            lines.append("         → %s" % row.get("gesture"))
     human = report.get("human_waits") or []
     if human:
         lines.append("")

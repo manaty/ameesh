@@ -154,6 +154,16 @@ A lot is stale when it is open and inactive beyond the configured threshold
   it (the debit says so in `unreadable`), and an unreadable deadline guesses
   nothing: the hold stays an agent wait.
 
+  #8264: a `review_family_paused` wait that a **signed, unexpired owner
+  decision** covers (the selected option names the family and carries an
+  explicit `expire` date, the answer proven `signed`, its proof re-verified:
+  digest, approval consumed by that decision, live non-revoked owner key and
+  Ed25519 signature) is listed in `decision_waits`, outside `slow_waits`, and
+  `--check` does not fire: no gesture exists before the decision's end date,
+  which the line cites. At the end date it becomes an ordinary agent wait
+  again. A plain mention of a decision, an unsigned answer, a refused proof or
+  an unreadable date covers nothing.
+
 Grouped views (`work list`, `progress --json`, the stale alert, the dependency
 labels) read the hold from a targeted storage stream
 (`Progress.lot_hold_events`: state transitions plus the `hold:`/lift notes,
