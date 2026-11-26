@@ -71,6 +71,16 @@ class PlanTest(unittest.TestCase):
     def _ran(p, driver):
         return sorted(m for ps in p["parts"][driver] for m in ps["modules"])
 
+    def _night_count(self) -> int:
+        """#8292 : le compte attendu du nocturne, calculé par le plan.
+
+        Le nombre de parts n'est plus figé à `PARTS['psql'][1]` : la table
+        `psql_full` peut relever le découpage (dans la fenêtre 06Z). Le test
+        suit le compte calculé, sinon un rafraîchissement de la table le
+        rendrait faux sans qu'aucun code ne change.
+        """
+        return plan.psql_full_count(plan.psql_full_weights(self.mods, None))
+
     def test_paquet_main_et_release_passent_psql_pilote_et_contrat(self):
         expected = sorted(set(self.pilot) | set(self.contract))
         self.assertLess(len(expected), len(self.mods))
@@ -97,8 +107,10 @@ class PlanTest(unittest.TestCase):
                 p = self._plan(event, psql_full=True)
                 self.assertEqual(p["parts"]["psycopg"], [])
                 self.assertEqual(self._ran(p, "psql"), self.mods)
-                self.assertEqual({ps["of"] for ps in p["parts"]["psql"]},
-                                 {plan.PARTS["psql"][1]})
+                attendu = self._night_count()
+                self.assertGreaterEqual(attendu, plan.PARTS["psql"][1])
+                self.assertEqual({ps["of"] for ps in p["parts"]["psql"]}, {attendu})
+                self.assertEqual(len(p["parts"]["psql"]), attendu)
                 out = plan.outputs(p)
                 self.assertEqual(out["psycopg"], "[]")
                 self.assertEqual(out["psycopg_parts"], "0")
@@ -188,7 +200,9 @@ class PlanTest(unittest.TestCase):
         night = plan.fallback_plan("schedule", "boom", psql_full=True)
         self.assertEqual(night["parts"]["psycopg"], [])
         self.assertEqual(self._consumer_modules(night, "psql"), self.mods)
-        self.assertEqual(len(night["parts"]["psql"]), plan.PARTS["psql"][1])
+        attendu = self._night_count()
+        self.assertEqual({ps["of"] for ps in night["parts"]["psql"]}, {attendu})
+        self.assertEqual(len(night["parts"]["psql"]), attendu)
         self.assertEqual(plan.outputs(night)["psycopg"], "[]")
 
     def test_repli_sur_listes_illisibles_rend_la_suite_psql_entiere(self):
