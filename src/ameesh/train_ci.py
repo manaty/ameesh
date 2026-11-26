@@ -660,6 +660,22 @@ def _deferral_reason(source, row):
             % (source, row.get("work_item_id"), frozen))
 
 
+def _attribution_sources(path, plan, workflows):
+    """#8305: the audited pins, read before resolving the head's due suites.
+
+    A dynamic contract's ``sources_for`` resolves the due parts of the head;
+    a head that changes the selector itself makes that resolution refuse
+    (the selector differs from its audited commit), so using it for
+    attribution would name nobody. The optional ``audited_sources`` method
+    exposes the same pins without touching the head's suites. Publication
+    keeps using ``sources_for`` unchanged.
+    """
+    pinned = getattr(workflows, "audited_sources", None)
+    if callable(pinned):
+        return pinned()
+    return _verify_sources(path, plan, workflows)
+
+
 def deferred_source_member(path, plan, workflows, rows):
     """#8305: the single lot a packet composition must defer, with its reason.
 
@@ -672,7 +688,7 @@ def deferred_source_member(path, plan, workflows, rows):
     publication gate untouched, so the attribution can never lower it.
     """
     try:
-        sources = _verify_sources(path, plan, workflows)
+        sources = _attribution_sources(path, plan, workflows)
         if not isinstance(sources, dict) or not sources:
             return None
         base, head = plan.get("base"), plan.get("head")

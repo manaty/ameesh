@@ -23,6 +23,7 @@ from .test_l160e2_land import _Land
 from .test_l160b_radar import _git, _write
 
 SOURCE = ".github/workflows/lot-status.yml"
+SELECTOR = "scripts/ci/lot-plan.mjs"
 
 
 def contract(blob):
@@ -42,11 +43,13 @@ class GitFixture(unittest.TestCase):
         os.makedirs(self.repo)
         _git(self.repo, "init", "-q", "-b", "main")
         _write(self.repo, SOURCE, "audited\n")
+        _write(self.repo, SELECTOR, "selector\n")
         _write(self.repo, "shared.py", "base\n")
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-qm", "base")
         self.base = _git(self.repo, "rev-parse", "HEAD")
         self.expected = _git(self.repo, "rev-parse", "HEAD:" + SOURCE)
+        self.selector_expected = _git(self.repo, "rev-parse", "HEAD:" + SELECTOR)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -79,6 +82,20 @@ class GitFixture(unittest.TestCase):
             contract(blob or self.expected), members)
 
 
+class DynamicContract:
+    """Un contrat dont la résolution de tête refuse, mais dont les pins sont lus."""
+    def __init__(self, source, blob):
+        self.source, self.blob = source, blob
+        self.sources_for_called = False
+
+    def audited_sources(self):
+        return {self.source: self.blob}
+
+    def sources_for(self, plan, *, repo, cache=None):
+        self.sources_for_called = True
+        raise train.PublicationRefused("selector differs from its audited commit")
+
+
 class AttributionTest(GitFixture):
     def test_only_the_lot_whose_delta_changes_the_source_is_named(self):
         bad = self.branch("lot/1-bad", {SOURCE: "changed\n", "a.txt": "a\n"})
@@ -97,6 +114,19 @@ class AttributionTest(GitFixture):
         head = self.compose([bad, good])
         members = [member(1, bad), member(2, good)]
         self.assertIsNone(self.check(head, members))
+
+    def test_a_dynamic_contract_attributes_before_resolving_the_head(self):
+        """#8305 : un commentaire dans le sélecteur ne doit pas tout bloquer."""
+        bad = self.branch("lot/1-selector", {
+            SELECTOR: "selector\n// reviewed comment\n"})
+        head = self.compose([bad])
+        dynamic = DynamicContract(SELECTOR, self.selector_expected)
+        found = train_ci.deferred_source_member(
+            self.repo, dict(base=self.base, head=head, members=[member(1, bad)]),
+            dynamic, [member(1, bad)])
+        self.assertEqual(found[0]["work_item_id"], 1)
+        self.assertFalse(dynamic.sources_for_called,
+                         "l'attribution ne doit pas résoudre les suites de tête")
 
     def test_a_deleted_source_names_the_lot_that_deleted_it(self):
         bad = self.branch("lot/1-delete", {SOURCE: None})
