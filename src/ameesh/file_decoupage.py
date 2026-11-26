@@ -104,22 +104,32 @@ FALLBACK_MARK = "repli " + AUDITOR_ROLES[0]
 #: `hold: roadmap: épuisée nexlink — …`. Le préfixe de retenue est donc
 #: facultatif devant les deux sentinelles, jamais exigé.
 HOLD_WRAPPER = r"(?:(?:un)?hold:\s*)?"
+#: #8283 : la raison du hold est souvent une fenêtre d'observation
+#: (`planned_waits`, #4235, #6888) : `hold: fenêtre : roadmap: épuisée
+#: nexlink …`. Le préfixe de fenêtre, s'il est **immédiatement** suivi de la
+#: sentinelle, est donc facultatif lui aussi ; une autre cause avant
+#: `roadmap:` (`hold: fenêtre : relecture, roadmap: …`) n'en est pas une.
+WINDOW_WRAPPER = (r"(?:(?:fen[êe]tre(?:\s+d['’]observation)?|observation\s+window"
+                  r"|observation|window)\s*:\s*)?")
+#: les deux conventions, dans cet ordre, pour tous les lecteurs (journal,
+#: sommeil, alertes ; le SQL du débit en porte la copie `debit._SENTINEL_SQL_RE`)
+SENTINEL_WRAPPER = HOLD_WRAPPER + WINDOW_WRAPPER
 #: la note du pilote (§1, « Feuille de route épuisée »)
 EXHAUSTED_PREFIX = "roadmap: épuisée"
-EXHAUSTED_RE = re.compile(r"^\s*" + HOLD_WRAPPER + r"roadmap\s*:\s*épuisée\s+(\S+)",
+EXHAUSTED_RE = re.compile(r"^\s*" + SENTINEL_WRAPPER + r"roadmap\s*:\s*épuisée\s+(\S+)",
                           re.IGNORECASE)
 #: #4623 : la note qui rouvre la feuille de route ; deux orthographes déclarées
 REOPENED_PREFIX = "roadmap: rouverte"
-REOPENED_RE = re.compile(r"^\s*" + HOLD_WRAPPER + r"roadmap\s*:\s*r(?:é)?ouverte\s+(\S+)",
+REOPENED_RE = re.compile(r"^\s*" + SENTINEL_WRAPPER + r"roadmap\s*:\s*r(?:é)?ouverte\s+(\S+)",
                          re.IGNORECASE)
 #: toutes les notes de feuille de route, lues par un seul filtre : les deux
 #: formes sont ensuite départagées par leur ordre dans le journal. Le filtre
 #: est celui des deux parseurs ci-dessus et de la requête du débit
-#: (`debit._ROADMAP_SQL` : `ltrim(note) ~* '^(?:(?:un)?hold:\s*)?roadmap\s*:'`) :
-#: préfixe de retenue facultatif, casse et blancs libres. Un `LIKE 'roadmap:%'`
+#: (`debit._ROADMAP_SQL` : `ltrim(note) ~* '^<SENTINEL_WRAPPER>roadmap\s*:'`) :
+#: préfixe de retenue et de fenêtre facultatifs, casse et blancs libres. Un `LIKE 'roadmap:%'`
 #: du store, exact et sensible à la casse, ferait diverger le journal (#8198,
 #: revue B).
-ROADMAP_NOTE_RE = re.compile(r"^\s*" + HOLD_WRAPPER + r"roadmap\s*:",
+ROADMAP_NOTE_RE = re.compile(r"^\s*" + SENTINEL_WRAPPER + r"roadmap\s*:",
                              re.IGNORECASE)
 #: raison de la pause opérateur posée par le sommeil, levée par elle seule
 SLEEP_REASON = "roadmap: épuisée %s (#3256 §2.3)"
@@ -440,6 +450,32 @@ def exhausted_since(notes: list, project: str) -> float:
     return since
 
 
+def roadmap_transitions(notes: list, project: str) -> list:
+    """#8283 : les changements d'état de la route de `project`, dans l'ordre
+    du journal : `[(état, instant)]`, `état` valant `exhausted` ou `reopened`.
+
+    Même lecture que `roadmap_state` (la dernière transition est son verdict)
+    et même date que `exhausted_since` ; une note répétée dans le même état
+    n'est pas une transition. Une note sans date rend l'instant 0.0 : le débit
+    la lit comme antérieure à sa fenêtre, sans inventer d'heure."""
+    out: list = []
+    for row in _roadmap_order(notes):
+        note = str((row or {}).get("note") or "")
+        state = None
+        match = EXHAUSTED_RE.match(note)
+        if match and match.group(1).strip(".,;:") == project:
+            state = EXHAUSTED_STATE
+        else:
+            match = REOPENED_RE.match(note)
+            if match and match.group(1).strip(".,;:") == project:
+                state = REOPENED_STATE
+        if state is None or (out and out[-1][0] == state):
+            continue
+        out.append((state, float((row or {}).get("created_ts")
+                                 or (row or {}).get("at_ts") or 0.0)))
+    return out
+
+
 def exhausted(notes: list, project: str) -> bool:
     """La dernière note de feuille de route nommant le projet est-elle
     `roadmap: épuisée <projet>` ? (#4623 : une réouverture postérieure rend
@@ -488,7 +524,8 @@ def body_of(project: str, item: Measure, since_ts: float, now: float,
         "Attendu du pilote : des lots démarrables, d'au plus une journée chacun et de "
         "classe conforme au §1 du canon, pour %d agent(s) ; ce lot se ferme quand la "
         "file en compte assez. Rien à découper : notez « %s %s » avec sa source "
-        "et laissez ce lot ouvert (les agents en trop passent en sommeil jusqu'au "
+        "(seule ou comme raison d'un hold, fenêtre comprise : « hold: fenêtre : "
+        "roadmap: épuisée <projet> … ») et laissez ce lot ouvert (les agents en trop passent en sommeil jusqu'au "
         "prochain lot démarrable, l'owner reçoit une alerte). Pour rouvrir : notez "
         "« %s %s » sur ce lot, le sommeil est levé à la passe suivante." % (
             len(item.idle), EXHAUSTED_PREFIX, project, REOPENED_PREFIX, project),
