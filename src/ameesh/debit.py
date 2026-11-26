@@ -2747,12 +2747,18 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       budget tient le tour, ou qu'une famille exclut n'est pas une capacité
       disponible : ses trous ne comptent pas, pour que la perte affichée soit
       celle des agents qu'on peut réellement réveiller.
-      L'état réveillable est celui de l'instant ; un agent d'un projet à la
-      feuille de route épuisée ne compte d'heures ni dans son projet ni au mesh
-      tant qu'aucun lot démarrable daté ne borne la reprise (#7249). La ligne
-      du projet porte alors `idle_agent_hours_excluded` avec la raison, et le
-      mesh `idle_agents_excluded` : une mesure absente n'est jamais rendue
-      comme un 0,0 mesuré (le texte affiche « exclu »). Sur une telle route,
+      L'état réveillable est celui de l'instant ; l'exclusion d'une feuille
+      de route épuisée (#7249) se mesure par plages (#8283) : un agent ne
+      compte d'heures, ni dans son projet ni au mesh, que hors des plages où
+      la route de son projet était notée épuisée (transitions lues sur le lot
+      de découpage, `_exhausted_periods`) ; la dernière plage suit le verdict
+      de l'instant et s'arrête au plus ancien lot démarrable daté. Une route
+      épuisée sans transition lisible l'est sur toute la fenêtre. La ligne du
+      projet porte la durée exclue (`roadmap_exhausted_s`) ; si toute la
+      fenêtre l'est, elle porte `idle_agent_hours_excluded` avec la raison, et
+      le mesh `idle_agents_excluded` : une mesure absente n'est jamais rendue
+      comme un 0,0 mesuré (le texte affiche « exclu »), et une réouverture
+      ponctuelle n'annule pas toute la fenêtre. Sur une telle route,
       des lots retenus par la garde d'empreinte sont du travail qui attend :
       les heures de repos depuis la création du plus ancien (dans la
       fenêtre) se lisent à part, `idle_agent_hours_footprint`, par projet et
@@ -2972,8 +2978,8 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     def summary(members: list[dict], project: str | None) -> dict:
         names = sorted(row["name"] for row in members)
         idle = sorted(name for name in names if name in rested)
-        # un agent d'un projet à la feuille de route épuisée ne compte
-        # d'heures au repos ni dans son projet, ni au mesh ; seuls les
+        # un agent ne compte d'heures au repos, ni dans son projet ni au
+        # mesh, que hors des plages d'épuisement de sa route (#8283) ; seuls les
         # agents au repos en comptent (ni lot actionnable, ni pause budget,
         # ni famille exclue) : les trous d'un agent occupé ne sont pas de la
         # capacité disponible (#5043)
