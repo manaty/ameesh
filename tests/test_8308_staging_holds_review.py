@@ -48,10 +48,25 @@ class ReviewWaitTest(unittest.TestCase):
                 ("attente de relecture pour #8264 ; le staging attend #8294",
                  {8294}),
                 ("attendre que le correctif #8296 soit dans la release",
-                 {8296})):
+                 {8296}),
+                # B of mty-amh-impl-12: a done review before a deployment
+                # wait in the same clause must not hide that wait.
+                ("avis rendu, #8294 en attente de staging", {8294}),
+                ("avis ok acquis, déploiement attendu pour #8294", {8294}),
+                ("avis ok, #8294 en attente du déploiement", {8294}),
+                ("attente d'avis codex, staging de #8294", {8294})):
             with self.subTest(note=note):
                 self.assertEqual(_deployment_refs(note),
                                  (expected, set()))
+
+    def test_review_wait_alone_still_names_no_deployment(self):
+        # The B exception is the deployment word, not the review word: the
+        # alert's clause names neither staging nor a deployment.
+        self.assertEqual(
+            _deployment_refs(
+                "Les lots ouverts du jour (#8264, #8290, #8296) restent en "
+                "attente d’avis Codex"),
+            (set(), set()))
 
     def test_review_word_elsewhere_does_not_hide_a_deployment_wait(self):
         # #7647: the wait is the owner go; "avis ok auditeur acquis" is a

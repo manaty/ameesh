@@ -37,6 +37,17 @@ _MIGRATION = re.compile(r"\bmigration\s+0*([1-9][0-9]*)\b", re.I)
 #: #3297: a hold note is free prose. Clauses end on sentence marks; the dots
 #: of a version (`1.20.0`) do not end one.
 _CLAUSE = re.compile(r"[;!?\n]+|(?<!\d)\.(?!\d)")
+#: #8308: the deployment half of `_WAIT`. A clause that also names one of
+#: these keeps its references when a review wait shares the clause: "avis
+#: rendu, #8294 en attente de staging" waits for the staging, not the review.
+_DEPLOY_WAIT = re.compile(
+    r"\bdéploiement\b|\bdéploy[ée]e?s?\b|\bdeploy(?:ed|ment|s|ing)?\b(?!-)|"
+    r"\bstaging\b|\brelease\b(?![-‑–—_ ]?checks?\b)|\bmise\s+à\s+jour\b|"
+    r"\b(?:pas|non)\s+(?:encore\s+)?(?:actif|active)\b|"
+    r"\bn'est\s+pas\s+(?:encore\s+)?(?:actif|active|dans)\b|"
+    r"\bdoit\s+porter\b|\bdans\s+le\s+tag\b|\bdans\s+la\s+release\b|"
+    r"\bdans\s+la\s+version\b",
+    re.I)
 #: A reference is a deployment wait only in a clause that says so. A bare
 #: `#3266` in "conflit avec #3266" is not a wait, and neither is a reference
 #: to a PR, a ticket, a package or a review. Explicit wait words count
@@ -45,19 +56,17 @@ _CLAUSE = re.compile(r"[;!?\n]+|(?<!\d)\.(?!\d)")
 #: name of a guard, not a release to deploy.
 _WAIT = re.compile(
     r"\battend(?:s|re|u)?\b|\battente\b|\bwait(?:ing)?\b|"
-    r"\bdéploiement\b|\bdéploy[ée]e?s?\b|\bdeploy(?:ed|ment|s|ing)?\b(?!-)|"
-    r"\bstaging\b|\brelease\b(?![-‑–—_ ]?checks?\b)|\bmise\s+à\s+jour\b|"
-    r"\b(?:pas|non)\s+(?:encore\s+)?(?:actif|active|déployé|déployée|"
-    r"appliqué|appliquée)\b|"
-    r"\bn'est\s+pas\s+(?:encore\s+)?(?:actif|active|déployé|déployée|dans)\b|"
-    r"\babsent\w*\b|\bmanque\w*\b|\bne\s+contient\b|\bdoit\s+porter\b|"
-    r"\bdans\s+le\s+tag\b|\bdans\s+la\s+release\b|\bdans\s+la\s+version\b",
+    r"\babsent\w*\b|\bmanque\w*\b|\bne\s+contient\b|"
+    r"\b(?:pas|non)\s+(?:encore\s+)?(?:appliqué|appliquée)\b|"
+    + _DEPLOY_WAIT.pattern,
     re.I)
 #: #8308: a wait for a review, an opinion or a verdict is not a deployment
 #: wait. The whole clause is excluded, not only the reference within 32
 #: characters: "les lots (#1, #2) restent en attente d'avis" must name no
 #: deployment. The link has to be grammatical ("attente d'avis", "verdict
-#: attendu"): a mere "avis" elsewhere in a deployment clause keeps counting.
+#: attendu"): a mere "avis" elsewhere in a deployment clause keeps counting,
+#: and `_deployment_refs` also keeps a clause that names a deployment wait
+#: (B of mty-amh-impl-12: "avis rendu, #8294 en attente de staging").
 _REVIEW_WAIT = re.compile(
     r"\battente\s+(?:d[’']\s*|de\s+|du\s+|des\s+)?"
     r"(?:l[’']|la\s+|le\s+|les\s+|un\s+|une\s+)?"
@@ -89,11 +98,17 @@ def _deployment_refs(note) -> tuple[set[int], set[int]]:
     package, a freeze or a review reference inflated the threshold. Only a
     reference inside a clause that ties it to a deployment wait counts.
     #8308: a clause that waits for a review, an opinion or a verdict is
-    excluded whole; `release-check` is not a release.
+    excluded whole, unless it also names a deployment wait; `release-check`
+    is not a release.
     """
     lots, migrations = set(), set()
     for clause in _CLAUSE.split(str(note or "")):
-        if _REVIEW_WAIT.search(clause) or not _WAIT.search(clause):
+        # #8308: a review wait excludes its whole clause; but when the same
+        # clause names a deployment wait, the deployment is what remains (B
+        # of mty-amh-impl-12: "avis rendu, #8294 en attente de staging").
+        if _REVIEW_WAIT.search(clause) and not _DEPLOY_WAIT.search(clause):
+            continue
+        if not _WAIT.search(clause):
             continue
         for match in _LOT.finditer(clause):
             before = clause[max(0, match.start() - 32):match.start()]

@@ -24,7 +24,8 @@ note, seules les références `#lot` ou
 un numéro de PR, de ticket, de paquet, de gel, ou une référence citée dans un
 conflit ou une relecture, n'est pas une attente. `release-check` est une garde,
 pas une release, et une attente d'avis, de relecture ou de verdict est exclue
-avec toute sa phrase (#8308) : elle ne nomme aucun contenu à déployer. Une
+avec toute sa phrase (#8308), sauf si cette phrase nomme aussi un staging ou
+un déploiement : l'attente de déploiement, elle, compte. Une
 description de lot, un ancien hold levé ou un jalon de fusion annulé ne
 créent pas d'attente. Les
 commits actifs viennent de la dernière attestation de chaque hôte
