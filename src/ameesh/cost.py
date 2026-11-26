@@ -2551,7 +2551,11 @@ class CostBook:
             if turn["start"] < began:
                 continue
             if ended is not None and turn["start"] > float(ended) + 1.0:
-                return ""       # le tour mesuré n'a pas écrit son début
+                # Le tour mesuré n'a pas écrit son début ; les suivants du
+                # journal sont plus tardifs encore. Le repli de même seconde
+                # reste à tenter (le vrai début peut être entier, avant la
+                # fraction du marqueur), sans jamais emprunter ce tour-ci.
+                break
             return turn["tier"]
         # `started_at` est tronqué à la seconde : un début dans la seconde du
         # marqueur mais avant sa fraction peut être le vrai tour. S'il y en a

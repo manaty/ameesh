@@ -252,6 +252,21 @@ class TurnServiceTierTest(Sandbox, unittest.TestCase):
         self.assertEqual(usage.service_tier, "fast")
         self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
 
+    def test_journal_meme_seconde_quand_un_debut_suit_la_fenetre(self):
+        # Cas de la revue du 26/11 14:01 : marqueur à 10:00:00,250Z, vrai
+        # `task_started` entier à 10:00:00Z (même seconde, avant le marqueur),
+        # puis un tour à +10 min hors de la fenêtre. Le début hors fenêtre ne
+        # doit pas faire perdre le repli de même seconde : le tour fast connu
+        # reste fast, et n'est pas facturé au tarif standard.
+        self.NOW = 1_800_000_000.25
+        self._tour("borne", None)
+        self._journal("t-borne", (1_800_000_000.0, "fast"),
+                      (self.NOW + 600.0, "default"))
+        usage = self.book().turn_usage("borne", start=1,
+                                       ended=self.NOW + 100.0)
+        self.assertEqual(usage.service_tier, "fast")
+        self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
+
     def test_horodatage_exact_du_rollout_prime_sur_la_seconde_arrondie(self):
         event = {"timestamp": "1970-01-01T00:00:01.500Z",
                  "payload": {"type": "task_started", "started_at": 1}}
