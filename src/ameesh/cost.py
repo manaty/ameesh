@@ -166,8 +166,10 @@ PRICE_PERIODS = {
 #: https://developers.openai.com/api/docs/pricing?latest-pricing=fast :
 #: gpt-6.1-sol Fast 4.00/0.20/20.00 contre Standard 2.00/0.10/10.00, Flex
 #: 1.00/0.05/5.00 (0,5×), Ultrafast 12.00/0.60/60.00 (6×) ; pour GPT-6.2
-#: Astra/Sol, Ultrafast vaut 3× jusqu'au 2027-02-28 puis 6× — 6× est donc le
-#: majorant connu. Confirmé par
+#: Astra/Sol, Ultrafast vaut **3× jusqu'au 2027-02-28 inclus**, puis 6× à
+#: partir du 2027-03-01 (heure du Pacifique). Ce couple modèle/période a sa
+#: propre facteur ci-dessous ; 6× reste le tarif des autres modèles et le
+#: repli des paliers inconnus. Confirmé par
 #: https://developers.openai.com/api/docs/guides/fast-mode.md (« Fast mode
 #: costs twice the corresponding Standard rate »). `priority` est l'alias que
 #: l'API sert encore pour GPT-5.6 et antérieurs ; `auto` prend le Scale Tier
@@ -184,6 +186,15 @@ SERVICE_TIER_MULTIPLIERS = {
     "priority": 2.0,
     "ultrafast": 6.0,
 }
+#: #46602 : promotion Ultrafast des GPT-6.2 Astra/Sol — 3× le tarif Standard
+#: jusqu'au 2027-02-28 inclus, 6× à partir du 2027-03-01 (heure du Pacifique,
+#: donc 2027-03-01T08:00:00Z : le 1er mars 2027 est encore en PST, UTC−8).
+#: Relevé le 2026-11-26 sur
+#: https://developers.openai.com/api/docs/pricing?latest-pricing=fast
+ULTRAFAST_PROMO_FACTOR = 3.0
+ULTRAFAST_PROMO_END_TS = _dt.datetime(
+    2027, 3, 1, 8, 0, tzinfo=_dt.timezone.utc).timestamp()
+
 #: multiplicateur du repli prudent d'un palier inconnu (le plus cher connu)
 SERVICE_TIER_FALLBACK = max(SERVICE_TIER_MULTIPLIERS.values())
 
@@ -1180,7 +1191,8 @@ def worst_price_of(prices: dict) -> list | None:
 
 
 def price_for(prices: dict, harness: str, model: str | None,
-              service_tier: str | None = None) -> tuple[list | None, dict]:
+              service_tier: str | None = None,
+              moment: float | None = None) -> tuple[list | None, dict]:
     """L225 : (triplet, marque) du tarif d'un tour compté au barème.
 
     Tarif du modèle, sinon majorant de sa famille (0019 §3) : marque vide.
@@ -1193,10 +1205,13 @@ def price_for(prices: dict, harness: str, model: str | None,
     descripteur passe un palier (Codex). Un palier inconnu prend le
     multiplicateur le plus cher connu **et** la marque `price_fallback` ; un
     autre harnais garde son tarif, même si un palier traîne dans son état.
+    `moment` (epoch du tour) tranche les paliers datés : Ultrafast des GPT-6.2
+    Astra/Sol vaut 3× jusqu'au 2027-02-28, 6× ensuite.
     """
     factor, tier_mark = (1.0, {})
     if harness == "codex":
-        factor, tier_mark = service_tier_factor(service_tier)
+        factor, tier_mark = service_tier_factor(service_tier, model=model,
+                                                moment=moment)
     triplet = known_price(prices, model) or max_price_of(prices, harness)
     if triplet:
         return [value * factor for value in triplet], dict(tier_mark)
@@ -1225,17 +1240,36 @@ def service_tier_name(tier: str | None) -> str | None:
     return value or None
 
 
-def service_tier_factor(tier: str | None) -> tuple[float, dict]:
+def _ultrafast_promo(model: str | None, moment: float | None) -> bool:
+    """#46602 : le couple est-il dans la promo Ultrafast à 3× ?
+
+    Seuls GPT-6.2 Astra/Sol (nom exact, ou instantané daté) sont en promotion,
+    jusqu'au 2027-02-28 inclus en heure du Pacifique. `moment` absent : l'heure
+    de l'appel, pour ne jamais figer une promotion passée.
+    """
+    name = str(model or "").strip().lower()
+    if not re.fullmatch(r"gpt-6\.2-(?:astra|sol)(?:-\d{4}-\d{2}-\d{2})?", name):
+        return False
+    at = time.time() if moment is None else float(moment)
+    return at < ULTRAFAST_PROMO_END_TS
+
+
+def service_tier_factor(tier: str | None, *, model: str | None = None,
+                        moment: float | None = None) -> tuple[float, dict]:
     """#8296 : (multiplicateur, marque) du palier de service d'un tour.
 
     Les paliers déclarés dans `SERVICE_TIER_MULTIPLIERS` (Standard, `auto`,
     `flex`, Fast et son alias `priority`, Ultrafast) ont leur multiplicateur
-    daté dans cette table. Un palier non déclaré est facturé au plus cher
-    connu, marqué `price_fallback` : jamais un tarif Standard silencieux.
+    dans cette table. `ultrafast` est le seul palier daté : les GPT-6.2
+    Astra/Sol paient 3× jusqu'au 2027-02-28 puis 6× (#46602), les autres 6×.
+    Un palier non déclaré est facturé au plus cher connu, marqué
+    `price_fallback` : jamais un tarif Standard silencieux.
     """
     name = service_tier_name(tier)
     if name is None:
         return 1.0, {}
+    if name == "ultrafast" and _ultrafast_promo(model, moment):
+        return ULTRAFAST_PROMO_FACTOR, {}
     factor = SERVICE_TIER_MULTIPLIERS.get(name)
     if factor is None:
         return SERVICE_TIER_FALLBACK, {
@@ -2697,11 +2731,13 @@ class CostBook:
         modele = model if known_price(prices, model) else (model or "inconnu")
         # L225 : la marque (`price_fallback` ou `void_reason`) ne vaut que pour
         # un tour effectivement compté au barème, avec des jetons.
+        # #46602 : le palier Ultrafast des GPT-6.2 dépend de la date du tour.
+        moment = time.time() if ended is None else ended
         triplet, marque = price_for(prices, harness or "deepseek", model,
-                                    service_tier=service_tier)
+                                    service_tier=service_tier, moment=moment)
         if triplet and not marque:
             triplet = period_price(prices, model, self.turn_started(agent, start),
-                                   time.time() if ended is None else ended) or triplet
+                                   moment) or triplet
         pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
         tier = prompt_tier(prices, model) if not marque else None
         # L80a : un tour résident Codex/ACP porte sa mesure dans un événement

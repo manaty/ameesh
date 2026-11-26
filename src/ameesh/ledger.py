@@ -133,15 +133,17 @@ def thread_created_ts(thread: str | None) -> float | None:
 # --------------------------------------------------------------------------
 
 def _price(prices: dict, harness: str, model: str,
-           service_tier: str | None = None) -> list | None:
+           service_tier: str | None = None,
+           moment: float | None = None) -> list | None:
     """Le tarif du modèle, sinon le majorant de sa famille, sinon le repli
     prudent (maximum du barème) ; None sans aucun barème (L225).
 
     #8296 : le palier de service de la ligne (`fast`, …) multiplie le tarif du
     modèle — une correction ne réécrit jamais un tour rapide au tarif
-    Standard."""
+    Standard. #46602 : `moment` (instant d'enregistrement de la ligne) tranche
+    la promotion Ultrafast des GPT-6.2 Astra/Sol."""
     return cost_mod.price_for(prices, harness, model,
-                              service_tier=service_tier)[0]
+                              service_tier=service_tier, moment=moment)[0]
 
 
 def _usd(harness: str, tokens: list, triplet: list) -> float:
@@ -246,7 +248,8 @@ def plan(rows: Iterable[dict], *, prices: dict,
             fix(row, "modele", "\"unknown\" model → %s (%s)" % (model, source), model=model)
             continue
         triplet = _price(prices, row["harness"], model,
-                         service_tier=row.get("service_tier"))
+                         service_tier=row.get("service_tier"),
+                         moment=row.get("recorded_ts"))
         if triplet is None:
             fix(row, "modele", "\"unknown\" model → %s (%s), no price list: cost "
                 "unchanged" % (model, source), model=model)
@@ -339,7 +342,8 @@ def _codex_cumulative(first: dict, prices: dict, fix, repriced: dict,
         if model in UNKNOWN_MODELS and codex_model:
             model = codex_model(first["session"]) or ""
         triplet = _price(prices, "codex", model,
-                         service_tier=first.get("service_tier"))
+                         service_tier=first.get("service_tier"),
+                         moment=first.get("recorded_ts"))
         if triplet is None:
             fix(first, "cumul", "cumulative usage of the resumed session counted for one "
                 "turn; model %s has no price list" % (model or "unknown"),

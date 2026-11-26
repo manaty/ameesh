@@ -108,6 +108,36 @@ class ServiceTierPriceTest(unittest.TestCase):
                 self.assertAlmostEqual(got[0], self.prices["gpt-6.1-sol"][0] * factor)
         self.assertEqual(cost.service_tier_factor(" FAST ")[0], 2.0)
 
+    def test_ultrafast_62_promo_trois_fois_puis_six(self):
+        # B #46602 : GPT-6.2 Astra/Sol Ultrafast vaut 3× jusqu'au 2027-02-28
+        # inclus (heure du Pacifique) puis 6×. Le 1er mars 2027 est encore en
+        # PST : la bascule est à 08:00Z, pas à minuit UTC.
+        prices = {"gpt-6.2-sol": [2.0, 0.1, 10.0]}
+        before = datetime.datetime(2026, 11, 26, 12, 0,
+                                   tzinfo=datetime.timezone.utc).timestamp()
+        last = datetime.datetime(2027, 3, 1, 7, 59, 59,
+                                 tzinfo=datetime.timezone.utc).timestamp()
+        after = datetime.datetime(2027, 3, 1, 8, 0,
+                                  tzinfo=datetime.timezone.utc).timestamp()
+        for moment, factor in ((before, 3.0), (last, 3.0), (after, 6.0)):
+            with self.subTest(moment=moment):
+                got, mark = cost.price_for(
+                    prices, "codex", "gpt-6.2-sol",
+                    service_tier="ultrafast", moment=moment)
+                self.assertEqual(mark, {})
+                for base, value in zip(prices["gpt-6.2-sol"], got):
+                    self.assertAlmostEqual(value, base * factor)
+        astra, _ = cost.price_for(
+            {"gpt-6.2-astra": [8.0, 0.4, 40.0]}, "codex", "gpt-6.2-astra",
+            service_tier="ultrafast", moment=before)
+        for value, expected in zip(astra, [24.0, 1.2, 120.0]):
+            self.assertAlmostEqual(value, expected)
+        # Un autre modèle garde 6× même pendant la promotion.
+        other, mark = cost.price_for(self.prices, "codex", "gpt-6.1-sol",
+                                     service_tier="ultrafast", moment=before)
+        self.assertEqual(mark, {})
+        self.assertAlmostEqual(other[0], self.prices["gpt-6.1-sol"][0] * 6)
+
     def test_palier_inconnu_repli_prudent_marque(self):
         got, mark = cost.price_for(self.prices, "codex", "gpt-6.1-sol",
                                    service_tier="warp")
@@ -191,6 +221,26 @@ class TurnServiceTierTest(Sandbox, unittest.TestCase):
                 payload["service_tier"] = tier
             events.append({"type": "turn_context", "payload": payload})
         self.rollout(thread, *events)
+
+    def test_tour_ultrafast_62_utilise_la_date_de_fin(self):
+        # B #46602 : après le 2027-02-28 (Pacifique), GPT-6.2 Sol Ultrafast
+        # vaut 6×. La date du tour doit être transmise au barème : sans elle,
+        # le prix par défaut (promo) sous-facturerait.
+        with open(self.prices_path, "w", encoding="utf-8") as fh:
+            json.dump({"gpt-6.2-sol": [2.0, 0.1, 10.0]}, fh)
+        self.NOW = datetime.datetime(2027, 3, 1, 9, 0,
+                                     tzinfo=datetime.timezone.utc).timestamp()
+        self.agent("promo", "codex", "gpt-6.2-sol")
+        self.events("promo",
+                    {"type": cost.TURN_MARKER, "resume": "", "agent": "promo",
+                     "ts": self.NOW, "service_tier": "ultrafast"},
+                    {"type": "thread.started", "thread_id": "t-promo"},
+                    {"type": "turn.completed", "usage": USAGE})
+        usage = self.book().turn_usage("promo", start=1, ended=self.NOW)
+        self.assertEqual(usage.service_tier, "ultrafast")
+        # 0,6 M entrées non cachées × 2 $ + 0,4 M relues × 0,1 $ + 0,1 M
+        # sorties × 10 $ = 2,24 $ Standard, ×6 après la promotion.
+        self.assertAlmostEqual(usage.usd, 2.24 * 6, places=9)
 
     def test_marqueur_fast_double_le_tour_meme_jetons(self):
         self._tour("rapide", "fast")
