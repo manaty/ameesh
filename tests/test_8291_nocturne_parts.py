@@ -218,21 +218,59 @@ class EcheanceTest(unittest.TestCase):
         fin = [e for e in evenements if e["type"] == "fin"]
         self.assertEqual(len(fin), 1, evenements)
         self.assertEqual(fin[0]["statut"], "interrompu")
-        self.assertEqual(fin[0]["restants"], self.MODULES)
         return code, fin[0], sortie.getvalue()
 
     def test_la_part_echue_est_non_concluante_avec_ses_restants(self):
         code, fin, sortie = self._couper(echeance=time.time() + 1.0)
         self.assertEqual(code, 1)
         self.assertEqual(fin["raison"], "echeance")
+        self.assertEqual(fin["restants"], self.MODULES)
         self.assertIn("Part non concluante (#8291)", sortie)
-        self.assertIn("2 module(s) non joué(s) sur 2, 0 test(s) en échec", sortie)
+        self.assertIn("2 module(s) non terminé(s) sur 2, 0 test(s) en échec", sortie)
+
+    #: l'enfant simulé : écrit un résultat terminal pour chaque test de son
+    #: sous-plan retenu par `garder`, puis ne finit jamais (coupé à l'échéance)
+    def _partiel(self, garder):
+        def lancer(commande, **kw):
+            script = (
+                "import json, sys, time\n"
+                "cmd, garder = sys.argv[1:-1], set(json.loads(sys.argv[-1]))\n"
+                "plan = json.load(open(cmd[cmd.index('--plan') + 1], encoding='utf-8'))\n"
+                "flux = cmd[cmd.index('--flow') + 1]\n"
+                "tests = [t for e in plan['parts']['psql'] for t in e.get('tests', [])]\n"
+                "with open(flux, 'a', encoding='utf-8') as fh:\n"
+                "    for t in tests:\n"
+                "        if t in garder:\n"
+                "            fh.write(json.dumps({'type': 'test', 'module': t.split('.')[1],\n"
+                "                                 'test': t, 'statut': 'succes'}) + '\\n')\n"
+                "time.sleep(60)\n")
+            return POPEN([sys.executable, "-c", script, *commande[2:], json.dumps(sorted(garder))],
+                         cwd=kw.get("cwd"))
+        return lancer
+
+    def test_un_module_partiel_reste_et_un_module_termine_sort(self):
+        """Relecture mty-amh-impl-11 et ameesh-dev3 (B/P2) : t1 terminé et t2
+        coupé dans le même module le laissaient hors des restants."""
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(REPO)
+        unites = parts._unites_de(self.MODULES)
+        ids = sorted(t for v in unites.values() for t in v)
+        complet = [t for t in ids if parts._module_of_test_id(t) == self.MODULES[0]]
+        partiel = [t for t in ids if parts._module_of_test_id(t) == self.MODULES[1]]
+        self.assertGreater(len(partiel), 1)
+        garder = set(complet) | {partiel[0]}
+        code, fin, sortie = self._couper(echeance=time.time() + 3.0,
+                                         popen=self._partiel(garder))
+        self.assertEqual(code, 1)
+        self.assertEqual(fin["restants"], [self.MODULES[1]])
+        self.assertIn("1 module(s) non terminé(s) sur 2", sortie)
 
     def test_la_part_annulee_par_le_job_laisse_sa_fin(self):
         """Le flux de psql 10/16 du 26/11 n'avait aucune `fin` (SIGTERM)."""
         code, fin, _ = self._couper(signal_apres=1.0)
         self.assertEqual(code, 128 + signal.SIGTERM)
         self.assertEqual(fin["raison"], f"signal {int(signal.SIGTERM)}")
+        self.assertEqual(fin["restants"], self.MODULES)
 
     def test_la_part_psql_porte_son_echeance(self):
         doc = canon.load_yaml((REPO / ".github" / "workflows" / "tests.yml")

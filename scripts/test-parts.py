@@ -1167,6 +1167,13 @@ def run_parallel(args) -> int | None:
     except Exception as exc:  # un module qui n'importe pas : découpage par module
         print(f"découpage parallèle par module ({exc})", file=sys.stderr, flush=True)
         unites = {m: [f"tests.{m}"] for m in part}
+    # #8291 : les identifiants attendus de chaque module, pour dire à la
+    # coupure lesquels restent (un module découpé par module n'a que
+    # `tests.<m>`, jamais terminé : il reste, au doute)
+    attendus: dict[str, set[str]] = {}
+    for ids in unites.values():
+        for test_id in ids:
+            attendus.setdefault(_module_of_test_id(test_id), set()).add(test_id)
     pesees = _pesees_unites(unites, args.driver, part)
     unites, pesees = _affiner_unites(unites, pesees, _poids_par_test(args.driver))
     charge = sum(pesees.values())
@@ -1199,11 +1206,16 @@ def run_parallel(args) -> int | None:
 
     def non_concluante(raison: str) -> list[str]:
         """#8291 : la `fin` d'une part arrêtée avant son terme, avec les
-        modules restants (aucun test commencé) ; rend ces modules."""
+        modules restants ; rend ces modules.
+
+        Relecture mty-amh-impl-11 et ameesh-dev3 (B/P2) : un module ayant un
+        seul résultat sortait des restants alors que ses autres tests
+        n'avaient pas tourné. Un module reste tant qu'un de ses identifiants
+        attendus n'a pas de résultat terminal."""
         with verrou:
             recus = list(evenements)
-        joues = {e.get("module") for e in recus}
-        restants = [m for m in part if m not in joues]
+        termines = {e.get("test") for e in recus}
+        restants = [m for m in part if attendus.get(m, set()) - termines]
         if flow and not ferme.is_set():
             ferme.set()
             flow.write("fin", statut="interrompu", raison=raison, restants=restants,
@@ -1278,7 +1290,7 @@ def run_parallel(args) -> int | None:
             rouges = sum(e.get("statut") in ("echec", "erreur") for e in recus)
             print(f"::error title=Part non concluante (#8291)::{etiquette} arrêtée à son "
                   f"échéance, avant le plafond du job : {len(restants)} module(s) non "
-                  f"joué(s) sur {len(part)}, {rouges} test(s) en échec — "
+                  f"terminé(s) sur {len(part)}, {rouges} test(s) en échec — "
                   f"{', '.join(restants[:SUMMARY_RESTANTS]) or 'aucun'}"
                   + (" …" if len(restants) > SUMMARY_RESTANTS else ""), flush=True)
         elif flow:
