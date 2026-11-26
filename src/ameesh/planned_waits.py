@@ -1048,6 +1048,54 @@ def decision_waits(requests, *, now) -> dict[int, dict]:
     return out
 
 
+def _external_until(note) -> tuple[bool, float | None]:
+    """#8285 : la fin déclarée d'une attente externe, `(lisible, instant)`.
+
+    Seule l'échéance explicite (`(due …)`, `[échéance : …]`) compte, jamais le
+    `[réveil programmé: …]` que la note arme : c'est justement ce réveil qu'on
+    reporte. Une date seule vaut jusqu'à la fin du jour (`hold_end`) ; une
+    échéance illisible rend `(False, None)`, et rien n'est reporté."""
+    found = _EXTERNAL_DUE.search(str(note or ""))
+    if not found:
+        return True, None
+    raw = found.group("date").strip()
+    from . import debit  # import tardif : debit lit les attentes planifiées
+    until = debit.parse_wake_due("(due %s)" % raw)
+    if until is None and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", raw):
+        until = hold_end(raw)
+    return until is not None, until
+
+
+def human_gate(lot: int, holds, requests, *, now: float) -> dict | None:
+    """#8285 : la demande owner ou avatar encore ouverte qui fige le lot.
+
+    `holds` : les retenues actives du lot par auteur (`active_holds`) ;
+    `requests` : les demandes de décision en attente (`decisions.pending`).
+    Rend la première porte trouvée — une décision ouverte non échue
+    (`decision_waits`), ou une retenue `hold: attente owner|avatar : <geste>`
+    (#3498) dont l'échéance explicite n'est pas passée — ou None. Une
+    décision échue, une attente `externe`, une échéance illisible ne figent
+    rien : l'humain est en retard ou rien n'est déclaré, le réveil part."""
+    waits = decision_waits(
+        [r for r in requests or () if r.get("lot") == int(lot)], now=now)
+    if int(lot) in waits:
+        wait = waits[int(lot)]
+        return {"what": "decision", "executor": wait.get("owner") or "owner",
+                "gesture": "decision #%s" % wait["decision"],
+                "until": wait["due_ts"]}
+    for hold in (holds or {}).values():
+        declared = external_hold(hold.get("note"))
+        if not declared or declared["executor"] not in ("owner", "avatar"):
+            continue
+        readable, until = _external_until(hold.get("note"))
+        if not readable or (until is not None and now >= until):
+            continue
+        return {"what": "hold", "executor": declared["executor"],
+                "gesture": declared["gesture"], "by": hold.get("by"),
+                "until": until}
+    return None
+
+
 def packet_carriers(rows):
     """#2335 : les porteurs de paquet ouverts, indexés par lot.
 

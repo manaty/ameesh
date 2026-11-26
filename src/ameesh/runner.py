@@ -7581,6 +7581,12 @@ class AgentWorker(threading.Thread):
     WAKE_CLAIM_TTL = 120.0
     #: #2614 : pas du renouvellement, un quart de bail
     WAKE_CLAIM_RENEW_S = WAKE_CLAIM_TTL / 4.0
+    #: #8285 : relecture d'un réveil reporté sur une demande humaine ouverte
+    #: (et non toutes les 10 s du choix de tour)
+    FROZEN_WAKE_RECHECK_S = 60.0
+    #: #8285 : un réveil reporté part au plus tard ce délai après son échéance,
+    #: même si la demande reste ouverte sans échéance (filet, un tour par jour)
+    FROZEN_WAKE_MAX_DEFER_S = 24 * 3600.0
 
     def _hold_wake_claim(self, taken: dict) -> None:
         """#2614 : tient le bail du réveil réclamé, jusqu'à son oubli.
@@ -7672,6 +7678,58 @@ class AgentWorker(threading.Thread):
         return ("the hold note that armed it (%s) was lifted before delivery"
                 % (arm.get("actor") or "unknown author"), arm.get("id"))
 
+    def _wake_frozen_on_human(self, lot: int, wake_ts: float, now: float) -> str:
+        """#8285 : le réveil échu porte-t-il sur une situation figée ?
+
+        Constat du 25/11 : des réveils programmés sur des lots bloqués par un
+        geste owner encore ouvert réécrivaient à froid une session de 200 000+
+        jetons pour constater que rien n'avait bougé, puis réarmer. Tant que
+        la demande qui bloque le lot reste ouverte — décision non échue
+        (`ameesh decide ask`), retenue `hold: attente owner|avatar : <geste>`
+        dont l'échéance explicite n'est pas passée (`planned_waits.human_gate`)
+        —, le réveil est **reporté**, pas consommé : l'échéance reste armée et
+        part dès la réponse (décision close, retenue levée) ou l'échéance de la
+        demande, au plus tard `FROZEN_WAKE_MAX_DEFER_S` après la sienne. Rend
+        le motif du report, ou "" (réveil délivré). Relu au plus toutes les
+        `FROZEN_WAKE_RECHECK_S` ; illisible ou exécuteur médié : délivré, comme
+        avant (#6134). Un réveil armé par une retenue levée suit #6134."""
+        if getattr(self.runner, "mediated", False):
+            return ""
+        if now - float(wake_ts) >= self.FROZEN_WAKE_MAX_DEFER_S:
+            return ""
+        frozen = self.__dict__.setdefault("_frozen_wakes", {})
+        key = (int(lot), round(float(wake_ts), 3))
+        cached = frozen.get(key)
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
+        from . import decisions as decisions_mod, planned_waits
+        try:
+            holds = planned_waits.active_holds(
+                self.db,
+                storage.of(self.db).progress.lot_hold_events(
+                    [int(lot)], planned_waits.HOLD_NOTE_PATTERNS),
+                cfg=self.cfg)
+            gate = planned_waits.human_gate(
+                int(lot), holds.get(int(lot)) or {},
+                decisions_mod.pending(self.db, now), now=now)
+        except (db_mod.DbError, AttributeError) as exc:
+            log_async("[%s] human gate unreadable for lot #%s (%s): wake delivered"
+                      % (self.name, lot, exc))
+            return ""
+        reason = ""
+        if gate:
+            reason = "waiting for %s: %s" % (gate["executor"], gate["gesture"])
+            if gate.get("until") is not None:
+                reason += " (until %s)" % time.strftime(
+                    "%Y-%m-%d %H:%M %Z", time.localtime(float(gate["until"])))
+            if not cached or cached[1] != reason:
+                log_async("[%s] scheduled wake for lot #%s deferred, %s"
+                          % (self.name, lot, reason))
+        if len(frozen) > 256:
+            frozen.clear()
+        frozen[key] = (time.monotonic() + self.FROZEN_WAKE_RECHECK_S, reason)
+        return reason
+
     def _scheduled_wake_spec(self) -> dict | None:
         """#2466 : réveil programmé échu d'un lot de l'agent.
 
@@ -7731,6 +7789,9 @@ class AgentWorker(threading.Thread):
                         log_async("[%s] scheduled wake for lot #%s cancelled: %s"
                                   % (self.name, row["id"], abandon))
                     continue
+                if self._wake_frozen_on_human(int(row["id"]),
+                                              float(row["wake_ts"]), now):
+                    continue  # #8285 : reporté, l'échéance reste armée
                 taken = st.claim_wake(self.name, int(row["id"]), now,
                                       self.WAKE_CLAIM_TTL)
                 if not taken:
