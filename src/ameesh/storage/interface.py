@@ -978,7 +978,8 @@ class TurnCosts(Domain):
                started_at: float | None = None,
                turn_id: str | None = None,
                inputs: Sequence[str] | None = None,
-               attribution: dict | None = None) -> bool:
+               attribution: dict | None = None,
+               service_tier: str | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`
@@ -1001,7 +1002,10 @@ class TurnCosts(Domain):
         `attribution` (#6005, migration 0551) : l'attribution d'appelant du
         tour hors lot — un objet JSON à clés allow-listées, borné — écrite à
         côté de `work_item_id` ; None = pas d'attribution. Donnée seule :
-        jamais une admission, un budget ou une autorisation."""
+        jamais une admission, un budget ou une autorisation.
+        `service_tier` (#8296, migration 0609) : le palier de service effectif
+        du tour (`fast`, `default`, …), pour les vues budget ; None = aucun
+        palier connu, colonne non écrite."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
@@ -1050,8 +1054,9 @@ class TurnCosts(Domain):
         model, session, account, usd, input_tokens, cached_input_tokens,
         output_tokens, cum_*, recorded_ts, `void_reason` (None si la
         migration 0043 n'est pas passée), `source` et `attribution` (#6005 :
-        None si la migration 0551 n'est pas passée ou si le tour n'en a pas).
-        Lecture seule."""
+        None si la migration 0551 n'est pas passée ou si le tour n'en a pas),
+        `service_tier` (#8296 : None avant la migration 0609 ou si le palier
+        n'est pas connu). Lecture seule."""
 
     @abc.abstractmethod
     def correct(self, *, run_id: str, actor: str, corrections: Sequence[dict]) -> int:
@@ -5448,7 +5453,9 @@ class Operations(Domain):
         `attribution` (#6005) est l'attribution d'appelant du tour hors lot
         (None sans attribution, ou avant la migration 0551). `turn_id`
         (#6045) relie la ligne à son événement `turn.context` (None avant la
-        migration 0423). `min_reread` (#6045) ne garde que les tours dont
+        migration 0423). `service_tier` (#8296) est le palier de service
+        effectif du tour (None avant la migration 0609, ou pour un harnais
+        sans palier). `min_reread` (#6045) ne garde que les tours dont
         l'entrée relue (entrée + cache lu ; Codex : le plus grand des deux)
         dépasse strictement ce nombre, avant la limite.
         `message` (L80b) restreint aux tours qui ont servi ce message

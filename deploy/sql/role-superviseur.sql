@@ -596,7 +596,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #1469 (0443) : compte de facturation qui porte la dépense
         'billing_account',
         -- #796 (0423) : lot servi, début du tour et lien aux ressources du tour
-        'work_item_id', 'started_at', 'turn_id'
+        'work_item_id', 'started_at', 'turn_id',
+        -- #8296 (0609) : palier de service facturé (fast, default, …), non secret
+        -- et nécessaire à la lecture du grand livre et des budgets
+        'service_tier'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
     -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu
