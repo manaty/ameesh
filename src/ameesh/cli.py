@@ -910,6 +910,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             time.strftime("%H:%M", time.localtime(signed["expires_us"] / 1_000_000))))
     else:
         print("delivered to " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
+    if human_proof and targets and bk.kind == "pg":
+        # #8284 : un courrier humain depuis le poste déclaré de son auteur
+        # réveille aussi le bureau et le pilote, avec ses gestes en attente.
+        from . import owner_presence
+        where = owner_presence.station(cfg, bk.db)
+        if where is not None and where.human == sender:
+            owner_presence.relay(cfg, bk.db, where, source="courrier à %s" % dest,
+                                 text=text, lot=lot)
     return 0
 
 
