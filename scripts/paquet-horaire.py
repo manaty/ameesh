@@ -152,6 +152,14 @@ puis retirée — n'est jamais lue comme « rien composé » : l'abandon du port
 exige la preuve que la branche porte encore sa tête de départ ; à défaut, il
 reste ouvert et un agent lit (#6561).
 
+**Porteur clos** (#8290, h-20261126-01) : un porteur clos (abandonné,
+remplacé, livré) n'est jamais recomposé, poussé ni armé. `attempt` relit son
+état avant d'écrire la marque (une recomposition reprise après `--wait`, le
+tic, une relance immédiate) ; `paquet-auto` le relit dans la garde de chaque
+geste et sort en `CARRIER_CLOSED_RC` (arrêt propre, sans courrier). Un lot
+déjà membre d'un autre paquet ouvert est écarté de la composition, motif au
+manifeste (§11 bis : une unité, un paquet).
+
 #3256 C : quand la médiane d'attente `qa_merge` de la veille dépasse
 `paquet.attente_mediane_s` (bloc du canon compilé, lu avec `ameesh debit
 --json --no-jobs`), le tic ouvre **deux** porteurs dans la même heure. Les
@@ -1574,6 +1582,12 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
         # #6563 : un autre composeur — l'agent désigné par l'alerte — tient le
         # bail partagé du porteur ; le tic ne relance rien.
         return "#%d : composition en cours (%s)" % (carrier, claim)
+    reason = closed_reason(ctx, carrier)
+    if reason:
+        # #8290 : une recomposition reprise (attente du pilote, tic, relance
+        # immédiate) relit le porteur avant toute écriture ; clos, il n'est
+        # ni recomposé, ni poussé, ni armé (h-20261126-01, PR #6524).
+        return "#%d : porteur clos (%s), %s non reprise" % (carrier, reason, this.step)
     mark = "%s%s n=%d base=%s par=%s:%d" % (MARK_ATTEMPT, this.step, this.n,
                                             this.base or "-", ctx.host, ctx.pid)
     if this.step == RECOMPOSITION:
@@ -1856,7 +1870,10 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                     auto._tail(result.text, 10)))
         return "#%d : %s non concluante (refus de garde d'époque)" % (carrier, step)
     if result.returncode not in (0, auto.PAUSED_RC, auto.IN_PROGRESS_RC):
-        reason = closed_reason(ctx, carrier)
+        # #8290 : paquet-auto a vu le porteur clos avant un geste (rc dédié) ;
+        # la relecture ne fait que nommer la raison.
+        reason = closed_reason(ctx, carrier) or (
+            "clos" if result.returncode == auto.CARRIER_CLOSED_RC else "")
         if reason:
             # #6538 : porteur clos par le pilote pendant la tentative (abandon,
             # remplacement) ; son échec n'est ni une panne du composeur ni un
@@ -2027,16 +2044,19 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
 def closed_reason(ctx: Context, carrier: int) -> str:
     """#6538 : la raison de clôture du porteur s'il est clos, sinon "".
 
-    Une lecture impossible laisse le porteur pour ouvert : l'échec suit
-    alors son chemin ordinaire.
+    #8290 : un porteur livré (`MERGED_STATES`, miroir de
+    `work_lifecycle.DELIVERED`) est terminal comme un porteur clos ; sa
+    raison est alors son état. Une lecture impossible laisse le porteur pour
+    ouvert : l'échec suit alors son chemin ordinaire.
     """
     try:
         item = show(ctx, carrier)
     except HoraireError:
         return ""
-    if str(item.get("state") or "") != "closed":
+    state = str(item.get("state") or "")
+    if state != "closed" and state not in MERGED_STATES:
         return ""
-    return str(item.get("close_reason") or "clos")
+    return str(item.get("close_reason") or (state if state != "closed" else "clos"))
 
 
 def contract_result_at(ctx: Context, item: dict, sha: str):

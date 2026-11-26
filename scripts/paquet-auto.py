@@ -321,6 +321,10 @@ COMPOSITION_RED_RC = 5
 #: `paquet-horaire.py` relance aussitôt la composition sur la nouvelle tête,
 #: sans attendre le tic suivant.
 TARGET_MOVED_RC = 6
+#: #8290 : le porteur est clos (abandonné, remplacé, livré) : relu avant
+#: chaque geste, il arrête la composition sans rien pousser, geler ni armer ;
+#: `paquet-horaire.py` s'arrête proprement, sans marque d'échec ni courrier.
+CARRIER_CLOSED_RC = 7
 #: #6563 : bail de composition d'un porteur, tenu par un enfant `ameesh work
 #: packet hold` pendant toute la composition réelle. Renouvelé par l'enfant
 #: (TTL/3) ; un processus mort le laisse expirer en cinq minutes.
@@ -389,6 +393,9 @@ PARALLEL_EXCLUDE_REASON = "paquet parallèle : autre groupe disjoint"
 #: écarté avec ce motif, jamais une erreur qui garde la cible réservée.
 PARALLEL_GROUP_NOT_READY = "paquet parallèle : lot du groupe non prêt"
 PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
+#: #8290 : un lot déjà membre d'un autre paquet ouvert n'entre pas dans
+#: celui-ci (§11 bis : une unité, un paquet ; une CI de paquet à la fois).
+CARRIED_ELSEWHERE_REASON = "déjà porté par un autre paquet ouvert"
 #: #4581 : motifs écrits par une recomposition qui garde la composition
 #: précédente. Les lots prêts depuis vont au paquet suivant, jamais dans
 #: celui-ci ; un membre regelé n'est pas réadmis sur une tête sans ci de paquet.
@@ -573,6 +580,10 @@ class EpochLost(PaquetAutoError):
 
 class PacketPaused(PaquetAutoError):
     """#5084 : une pause de la cible posée pendant la tentative, relue avant de pousser."""
+
+
+class CarrierClosed(PaquetAutoError):
+    """#8290 : le porteur a été clos pendant la composition (h-20261126-01)."""
 
 
 class CarrierSettled(PaquetAutoError):
@@ -2277,6 +2288,91 @@ finally:
     if proc.returncode:
         raise PacketPaused("pause illisible avant de pousser : rien n'est poussé : %s"
                            % _tail(_output(proc), 5))
+
+
+def read_carrier(worktree: Path, carrier: int, lots=()) -> dict:
+    """#8290 : l'état du porteur relu en base, et les lots de `lots` déjà
+    membres d'un **autre** paquet ouvert (`{lot: porteur}`).
+
+    Une lecture impossible n'autorise aucun geste : on n'écrit pas sur un
+    état inconnu.
+    """
+    code = """
+import json, sys
+from ameesh import config, db, packet_link, work_lifecycle
+conn = None
+try:
+    conn = db.connect(config.load())
+    if conn is None:
+        raise RuntimeError("base absente pour relire le porteur")
+    carrier = int(sys.argv[1])
+    lots = [int(value) for value in sys.argv[2:]]
+    rows = conn.query("SELECT state, close_reason FROM work_items WHERE id = %s",
+                      (carrier,))
+    if not rows:
+        raise RuntimeError("porteur #%d introuvable" % carrier)
+    carried = {}
+    for member in packet_link.memberships(conn, item_ids=lots) if lots else ():
+        package = int(member.get("package_id") or 0)
+        if package and package != carrier and str(
+                member.get("package_state") or "") not in work_lifecycle.COMPLETED:
+            carried.setdefault(str(int(member["work_item_id"])), package)
+    state = str(rows[0].get("state") or "")
+    print(json.dumps({"state": state,
+                      "close_reason": str(rows[0].get("close_reason") or ""),
+                      "terminal": state in work_lifecycle.COMPLETED,
+                      "carried": carried}))
+finally:
+    if conn is not None:
+        conn.close()
+"""
+    proc = run_command([project_python(worktree), "-c", code, str(int(carrier)),
+                        *[str(int(lot)) for lot in lots]],
+                       cwd=worktree, env=python_env(worktree), timeout=EPOCH_CHECK_TIMEOUT)
+    text = _decode(proc.stdout).strip().splitlines()
+    try:
+        data = json.loads(text[-1]) if proc.returncode == 0 and text else None
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise PaquetAutoError("porteur #%d illisible : rien n'est écrit : %s"
+                              % (carrier, _tail(_output(proc), 5)))
+    data["carried"] = {int(lot): int(package) for lot, package
+                       in (data.get("carried") or {}).items()}
+    return data
+
+
+def check_carrier_open(worktree: Path, carrier: int) -> None:
+    """#8290 : un porteur clos (abandonné, remplacé) ou livré (`delivered`,
+    `merged`, `promoted` : `work_lifecycle.COMPLETED`) n'est jamais recomposé,
+    poussé ni armé.
+
+    h-20261126-01 : la recomposition du pilote partie sur #8286 ouvert a
+    continué ses tests après sa clôture, puis a poussé, ouvert la PR #6524,
+    gelé et demandé la ci-full, en parallèle du paquet suivant. Relu dans la
+    garde de chaque geste (enregistrement, poussée, PR, gel, ci-full).
+    """
+    data = read_carrier(worktree, carrier)
+    if data.get("terminal") or data.get("state") == "closed":
+        raise CarrierClosed("porteur #%d clos (%s) : rien n'est enregistré, "
+                            "poussé ni armé"
+                            % (carrier, data.get("close_reason")
+                               or data.get("state") or "clos"))
+
+
+def carried_elsewhere(worktree: Path, carrier: int,
+                      candidates: list[Candidate]) -> tuple[list[Candidate],
+                                                            list[Discarded]]:
+    """#8290 : écarte les lots déjà membres d'un autre paquet ouvert."""
+    if not candidates:
+        return candidates, []
+    carried = read_carrier(worktree, carrier,
+                           [candidate.lot for candidate in candidates])["carried"]
+    kept = [candidate for candidate in candidates if candidate.lot not in carried]
+    gone = [Discarded(candidate.lot, CARRIED_ELSEWHERE_REASON,
+                      "membre du paquet ouvert #%d (§11 bis)" % carried[candidate.lot])
+            for candidate in candidates if candidate.lot in carried]
+    return kept, gone
 
 
 def discarded_sources(payload: dict, candidates: list[Candidate],
@@ -6867,6 +6963,7 @@ def publish_tested(args: argparse.Namespace) -> int:
         def guard() -> None:
             claim.require()
             check_epoch(args.carrier, repo)
+            check_carrier_open(repo, args.carrier)
 
         guard()
         fetched = git(repo, "fetch", "--no-tags", "origin", args.publish, check=False,
@@ -6982,6 +7079,8 @@ def publish_tested(args: argparse.Namespace) -> int:
             note += " ; " + body_failure
         print(note_carrier(worktree, args.carrier, note), flush=True)
         check_pause(worktree, getattr(args, "pause_project", "") or "", args.target)
+        # #8290 : clos pendant la publication : pas de ci-full
+        check_carrier_open(repo, args.carrier)
         print(request_full_ci(worktree, args.carrier, head), flush=True)
         pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
         if body_failure:
@@ -7039,6 +7138,9 @@ def compose_packet(args: argparse.Namespace) -> int:
             claim.require()
         if base_guard is not None:
             base_guard()
+        if not args.no_packet_record:
+            # #8290 : un porteur clos pendant la composition arrête tout geste
+            check_carrier_open(repo, args.carrier)
 
     if base_guard is not None:
         base_guard()
@@ -7160,6 +7262,11 @@ def compose_packet(args: argparse.Namespace) -> int:
                 candidates, specs, worktree=worktree,
                 already_discarded={item.lot for item in errors})
             errors = errors + kept_discards
+        if not args.no_packet_record:
+            # #8290 : une unité déjà portée par un autre paquet ouvert n'entre
+            # pas dans celui-ci (h-20261126-01/02 : #8285 dans deux paquets).
+            candidates, elsewhere = carried_elsewhere(repo, args.carrier, candidates)
+            errors = errors + elsewhere
         for item in errors:
             print("écarté #%d : %s — %s"
                   % (item.lot, item.reason, item.detail), flush=True)
@@ -7314,6 +7421,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                                      discarded=len(composition.discarded))
             print("composition : tête %s" % head, flush=True)
             if not args.no_packet_record:
+                # #8290 : relu juste avant l'enregistrement (après les contrôles)
+                check_carrier_open(repo, args.carrier)
                 print(record_packet(worktree, args.carrier, base_sha, head,
                                     branch, args.target,
                                     expect_pushed=lease or "", claim=claim,
@@ -7466,10 +7575,16 @@ def compose_packet(args: argparse.Namespace) -> int:
                                 args.target)
                     if contract_report is not None:
                         verify_contract_scope(worktree, contract_report)
+                    # #8290 : relu après les contrôles, juste avant la poussée
+                    if not args.no_packet_record:
+                        check_carrier_open(repo, args.carrier)
                     push_branch(worktree, branch, force_lease=lease)
                     print("poussée : %s%s" % (branch, " (recomposition)"
                                               if lease else ""), flush=True)
                     lease = pushed = head
+                    # #8290 : clos pendant la poussée : ni PR, ni gel, ni ci-full
+                    if not args.no_packet_record:
+                        check_carrier_open(repo, args.carrier)
                     pr_number, pr_url = ensure_pull_request(
                         worktree, branch, args.target, title(), body(runs))
                     print("PR : %s" % (pr_url or pr_number or "?"), flush=True)
@@ -7480,7 +7595,13 @@ def compose_packet(args: argparse.Namespace) -> int:
                             "concluants nommés ; instantané %s"
                             % (args.name, len(composition.units),
                                len(composition.discarded), head))
+                    # #8290 : relu avant le gel et avant la ci-full (clos
+                    # pendant la PR ou le gel : rien n'est armé)
+                    if not args.no_packet_record:
+                        check_carrier_open(repo, args.carrier)
                     print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
+                    if not args.no_packet_record:
+                        check_carrier_open(repo, args.carrier)
                     print(request_full_ci(worktree, args.carrier, head), flush=True)
                 break
             if pushed:
@@ -8006,6 +8127,10 @@ def main(argv: list[str] | None = None) -> int:
         # le rapporte au pilote sans ouvrir de lot d'empreinte §16.
         print("paquet-auto : %s" % error, file=sys.stderr)
         return COMPOSITION_RED_RC
+    except CarrierClosed as error:
+        # #8290 : porteur clos pendant la tentative ; rien n'est écrit.
+        print("paquet-auto : %s" % error, file=sys.stderr)
+        return CARRIER_CLOSED_RC
     except TargetMoved as error:
         # #6891 : la cible a avancé avant les tests locaux ; rien n'est poussé.
         # `paquet-horaire.py` relance aussitôt sur la nouvelle tête.

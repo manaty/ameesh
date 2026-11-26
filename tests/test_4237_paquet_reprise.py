@@ -270,7 +270,8 @@ class EpochLostTest(unittest.TestCase):
             ensure_pull_request=(7, "http://pr"), freeze_carrier="",
             request_full_ci="", note_carrier="", send_mail=None,
             remove_worktree=None, PackageLock=mock.DEFAULT,
-            CompositionClaim=mock.DEFAULT)
+            CompositionClaim=mock.DEFAULT,
+            read_carrier={"state": "qa", "close_reason": "", "carried": {}})
         with mock.patch.multiple(auto, **{k: mock.DEFAULT for k in patches}) as mocks, \
                 mock.patch.object(auto, "check_epoch", side_effect=guard), \
                 mock.patch.object(auto, "check_local_tests", side_effect=tests), \
@@ -324,7 +325,7 @@ class PublishTest(Chain):
             note_carrier=mock.DEFAULT, request_full_ci=mock.DEFAULT,
             send_mail=mock.DEFAULT, record_packet=mock.DEFAULT,
             push_branch=mock.DEFAULT, freeze_carrier=mock.DEFAULT,
-            CompositionClaim=mock.DEFAULT)
+            CompositionClaim=mock.DEFAULT, check_carrier_open=mock.DEFAULT)
 
     def push(self, args, branch_head=None):
         git(self.repo, "push", "-q", "origin", "%s:%s" % (self.head, args.publish))
@@ -366,6 +367,28 @@ class PublishTest(Chain):
         self.assertEqual(subprocess.run(
             ["git", "-C", str(self.origin), "rev-parse", "--verify", "--quiet",
              auto.TESTED_REF_PREFIX + NAME], capture_output=True).returncode, 1)
+
+    def test_porteur_clos_pendant_la_pause_sans_ci_full(self):
+        """#8290 : clos pendant `check_pause`, la reprise ne demande pas la ci-full."""
+        self.push(self.args())
+        closed: list[bool] = []
+
+        def carrier_state(*_args):
+            if closed:
+                raise auto.CarrierClosed("porteur #4000 clos (abandoned)")
+
+        with self.finishing() as mocks, \
+                mock.patch.object(auto, "check_pause",
+                                  side_effect=lambda *_a: closed.append(True)):
+            mocks["compute_candidates"].return_value = (self.candidates(), {})
+            mocks["pull_request_state"].return_value = "OPEN"
+            mocks["ensure_pull_request"].return_value = (7, "http://pr")
+            mocks["note_carrier"].return_value = ""
+            mocks["check_carrier_open"].side_effect = carrier_state
+            with self.assertRaises(auto.CarrierClosed):
+                auto.publish_tested(self.args())
+        mocks["request_full_ci"].assert_not_called()
+        mocks["send_mail"].assert_not_called()
 
     def test_regel_entre_verification_et_publication_refuse(self):
         """#6579 : la première lecture passe, la seconde voit le nouveau gel."""
