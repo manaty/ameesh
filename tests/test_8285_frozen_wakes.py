@@ -5,15 +5,18 @@ Constat (auditeur, nuit du 26/11) : le 25/11, 25 réveils programmés ont
 réécrit à froid des sessions de 213 000 à 284 000 jetons pour constater qu'un
 geste owner restait ouvert (décision, login, séance), puis réarmer. Tant que la
 demande owner ou avatar qui bloque le lot reste ouverte, l'exécuteur reporte le
-réveil sans le consommer ; il part à la réponse, à l'échéance de la demande, ou
-au plus tard `FROZEN_WAKE_MAX_DEFER_S` après la sienne.
+réveil sans le consommer ; il part à la réponse ou à la levée, et au plus tard
+`FROZEN_WAKE_MAX_DEFER_S` après la sienne. L'échéance déclarée de la demande ne
+lève pas la porte (B2) : seule la réponse ou la levée la ferme, le filet de 24 h
+borne le report.
 """
 from __future__ import annotations
 
+import dataclasses
 import time
 import unittest
 
-from ameesh import decisions, planned_waits, work
+from ameesh import decisions, planned_waits, registry, work
 from ameesh.runner import AgentWorker
 
 from .test_6134_single_turn import _Base
@@ -134,6 +137,31 @@ class FrozenWakeTest(_Base):
             worker._forget_wake_claim()
         finally:
             worker.watchdog_stop.set()
+
+
+class LotHumanGateTest(_Base):
+    """#8287 : la lecture en base prend le cfg de la connexion s'il est omis."""
+
+    def test_a_cfg_omitted_reads_the_db_one(self):
+        """Sans cfg, `lot_human_gate` lit `db.cfg` ; `bureau` y reste une route."""
+        lot = work.add(self.db, title="lot", force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: attente bureau : login web",
+                  actor="human:owner")
+        registry.upsert(self.db, "bureau", harness="claude", host=self.cfg.host)
+        self.db.execute(
+            "UPDATE agent_registry SET responsible = %s WHERE name = %s",
+            ("human:smichea", "bureau"))
+        release = dict(self.cfg.release or {})
+        release["projects"] = {**(release.get("projects") or {}),
+                               "ameesh": {"report": "bureau"}}
+        previous = self.db.cfg
+        self.db.cfg = dataclasses.replace(self.cfg, release=release)
+        self.addCleanup(setattr, self.db, "cfg", previous)
+        gate = planned_waits.lot_human_gate(self.db, lot, [])
+        self.assertEqual(gate and gate["executor"], "avatar")
+        # même lot, cfg explicite sans route : rien n'est deviné (#7634).
+        self.assertIsNone(planned_waits.lot_human_gate(
+            self.db, lot, [], cfg=dataclasses.replace(self.cfg, release={})))
 
 
 if __name__ == "__main__":
