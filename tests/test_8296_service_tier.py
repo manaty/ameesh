@@ -139,15 +139,34 @@ class ServiceTierPriceTest(unittest.TestCase):
 class TurnServiceTierTest(Sandbox, unittest.TestCase):
     """La résolution du palier d'un tour et son effet sur le coût."""
 
+    #: instant du marqueur de tour (epoch) ; les `task_started` du journal
+    #: tombent juste après.
+    NOW = 1_800_000_000.0
+
     def _tour(self, name: str, tier_marker: str | None, *extra):
         """Un tour Codex : marqueur (s'il est donné) puis flux du tour."""
-        marker = {"type": cost.TURN_MARKER, "resume": "", "agent": name}
+        marker = {"type": cost.TURN_MARKER, "resume": "", "agent": name,
+                  "ts": self.NOW}
         if tier_marker is not None:
             marker["service_tier"] = tier_marker
         self.agent(name, "codex", "gpt-6.1-sol")
         self.events(name, marker,
-                    {"type": "thread.started", "thread_id": "t1"},
+                    {"type": "thread.started", "thread_id": "t-" + name},
                     {"type": "turn.completed", "usage": USAGE}, *extra)
+
+    def _journal(self, thread: str, *turns) -> None:
+        """Un rollout : un `task_started` + son `turn_context` par tour."""
+        events = []
+        for index, (started, tier) in enumerate(turns):
+            turn_id = "c%d" % index
+            events.append({"type": "event_msg", "payload": {
+                "type": "task_started", "started_at": started,
+                "turn_id": turn_id}})
+            payload = {"model": "gpt-6.1-sol", "turn_id": turn_id}
+            if tier:
+                payload["service_tier"] = tier
+            events.append({"type": "turn_context", "payload": payload})
+        self.rollout(thread, *events)
 
     def test_marqueur_fast_double_le_tour_meme_jetons(self):
         self._tour("rapide", "fast")
@@ -185,37 +204,66 @@ class TurnServiceTierTest(Sandbox, unittest.TestCase):
         self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
 
     def test_marqueur_du_lancement_prime_sur_le_parametre_de_l_appelant(self):
-        # Un worker qui répare passe le réglage courant (`default`) : le
-        # marqueur du tour, écrit au lancement, reste la preuve du palier.
+        # Un worker qui répare passe le réglage courant (`fast`) : le marqueur
+        # du tour, écrit au lancement avec `default`, reste la preuve.
         self._tour("lance", "fast")
         usage = self.book().turn_usage("lance", start=1, service_tier="default")
         self.assertEqual(usage.service_tier, "fast")
         self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
-        self._tour("standard", "")
+        self._tour("standard", "default")
         usage = self.book().turn_usage("standard", start=1, service_tier="fast")
-        self.assertIsNone(usage.service_tier)
+        self.assertEqual(usage.service_tier, "default")
         self.assertAlmostEqual(usage.usd, standard_usd(), places=9)
 
-    def test_journal_codex_sert_de_defaut_sans_marqueur(self):
-        # Marqueur d'avant #8296 : pas de clé `service_tier` ; le journal du
-        # fil porte le `turn_context` du lancement.
+    def test_marqueur_sans_override_lit_le_journal(self):
+        # B de la revue : sans `--tier`, le runner n'écrit plus de clé ; un
+        # marqueur vide (ancien binaire #8296) ne dit rien non plus. La
+        # configuration native du compte peut avoir choisi Fast : le journal
+        # du tour fait foi, sans `price_fallback`.
+        for name, marker in (("sanscle", None), ("vide", "")):
+            with self.subTest(marker=marker):
+                self._tour(name, marker)
+                self._journal("t-" + name, (self.NOW + 1.0, "fast"))
+                usage = self.book().turn_usage(name, start=1)
+                self.assertEqual(usage.service_tier, "fast")
+                self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
+                self.assertIsNone(usage.price_fallback)
+
+    def test_journal_ne_prend_pas_le_contexte_du_tour_suivant(self):
+        # B de la revue : le journal a avancé (contexte `default` à +10 min) ;
+        # le palier du tour mesuré reste celui de SON `turn_context`.
         self._tour("ancien", None)
-        self.rollout("t1", {"type": "turn_context",
-                            "payload": {"model": "gpt-6.1-sol",
-                                        "service_tier": "fast"}})
-        usage = self.book().turn_usage("ancien", start=1)
+        self._journal("t-ancien", (self.NOW + 1.0, "fast"),
+                      (self.NOW + 600.0, "default"))
+        usage = self.book().turn_usage("ancien", start=1,
+                                       ended=self.NOW + 100.0)
         self.assertEqual(usage.service_tier, "fast")
         self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
 
-    def test_marqueur_vide_ne_relit_pas_le_journal(self):
+    def test_journal_avance_sans_fenetre_ne_devine_pas(self):
+        # Sans instant de début, deux tours dans le journal : aucun palier
+        # n'est prouvé. Facturer Standard serait silencieux, emprunter le
+        # dernier contexte serait faux : None, et la ligne porte le défaut.
+        self.agent("ambigu", "codex", "gpt-6.1-sol")
+        self.events("ambigu",
+                    {"type": cost.TURN_MARKER, "resume": "", "agent": "ambigu"},
+                    {"type": "thread.started", "thread_id": "t-ambigu"},
+                    {"type": "turn.completed", "usage": USAGE})
+        self._journal("t-ambigu", (self.NOW + 1.0, "fast"),
+                      (self.NOW + 600.0, "default"))
+        usage = self.book().turn_usage("ambigu", start=1)
+        self.assertIsNone(usage.service_tier)
+        self.assertAlmostEqual(usage.usd, standard_usd(), places=9)
+
+    def test_marqueur_default_prime_sur_le_journal(self):
         # Un marqueur #8296 qui dit `default` est une preuve : le journal du
         # fil (qui peut être plus ancien) ne le contredit pas.
         self._tour("neuf", "default")
-        self.rollout("t1", {"type": "turn_context",
-                            "payload": {"service_tier": "fast"}})
+        self._journal("t-neuf", (self.NOW + 1.0, "fast"))
         usage = self.book().turn_usage("neuf", start=1)
         self.assertEqual(usage.service_tier, "default")
         self.assertAlmostEqual(usage.usd, standard_usd(), places=9)
+
 
     def test_autre_harnais_ne_prend_pas_de_palier(self):
         self.agent("claude", "claude", "claude-sonnet-5-5")

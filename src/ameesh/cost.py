@@ -2493,36 +2493,71 @@ class CostBook:
                 return model
         return ""
 
-    def codex_thread_service_tier(self, thread: str | None) -> str:
-        """#8296 : le palier de service d'un fil Codex, lu dans son journal.
+    def codex_thread_service_tier(self, thread: str | None, *,
+                                  started: float | None = None,
+                                  ended: float | None = None) -> str:
+        """#8296 : le palier de service du tour mesuré, lu dans son journal.
 
-        Dernier `turn_context.service_tier` (ou `thread_settings`) du rollout,
-        '' s'il n'en porte pas. `codex exec --json` ne publie pas ce palier ;
-        le lancement le connaît (marqueur de tour) et ce journal n'est qu'un
-        défaut pour un tour d'avant #8296, ou quand le flux ne dit rien.
-        Lecture seule, jamais une valeur devinée.
+        Le journal d'un fil porte un `task_started` puis un `turn_context` par
+        tour ; lire le **dernier** contexte d'un fil qui a avancé prêterait à ce
+        tour le palier d'un suivant. Le tour est donc celui dont le
+        `task_started` tombe dans la fenêtre `[started - 3 s, ended + 1 s]` :
+        le premier après le début du tour, et jamais un tour commencé après sa
+        fin. Sans fenêtre (`started` inconnu), on ne lit que le journal d'un
+        fil à **un seul** tour ; sinon '' (aucune preuve, plutôt qu'un palier
+        emprunté). `codex exec --json` ne publie pas le palier : le lancement
+        le connaît (marqueur de tour) et ce journal n'est qu'un défaut pour un
+        tour d'avant #8296, ou quand le flux ne dit rien. Lecture seule,
+        jamais une valeur devinée.
         """
         path = self.codex_rollout(thread)
         if not path:
             return ""
+        target = started is not None
         found = ""
+        tasks = 0
+        inside = not target
         try:
             with open(path, encoding="utf-8") as fh:
                 for line in fh:
-                    if "service_tier" not in line and "serviceTier" not in line:
+                    if ("task_started" not in line and "turn_context" not in line
+                            and "service_tier" not in line
+                            and "serviceTier" not in line):
                         continue
                     try:
                         event = json.loads(line)
                     except ValueError:
                         continue
+                    payload = event.get("payload") if isinstance(event, dict) else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("type") == "task_started":
+                        tasks += 1
+                        if not target:
+                            if tasks > 1:
+                                return ""       # fil avancé : tour ambigu
+                            continue
+                        if inside:
+                            return found        # le tour mesuré est terminé
+                        stamp = _codex_task_started_ts(event)
+                        if stamp is None or stamp < float(started) - 3.0:
+                            continue
+                        if ended is not None and stamp > float(ended) + 1.0:
+                            continue
+                        inside = True
+                        continue
+                    if not inside:
+                        continue
                     found = _codex_event_service_tier(event) or found
-        except OSError:
-            pass
+        except (OSError, ValueError, TypeError):
+            return ""
         return found
 
     def service_tier_of_turn(self, agent: str, start: int, events,
                              harness: str, session: str | None,
-                             service_tier: str | None = None) -> str | None:
+                             service_tier: str | None = None,
+                             started: float | None = None,
+                             ended: float | None = None) -> str | None:
         """#8296 : le palier de service effectif d'un tour Codex, ou None.
 
         Le palier est un réglage de **lancement** (L26) que le flux ne répète
@@ -2530,10 +2565,12 @@ class CostBook:
         peut être `default` après un repli de Fast mode), puis le marqueur de
         tour écrit avant le lancement (durable, y compris quand un autre
         worker répare le tour : un marqueur qui dit `default` vaut Standard,
-        même si l'état de l'agent a changé depuis), puis le palier transmis
-        par l'appelant, puis le `turn_context` du journal Codex. Aucun autre
-        harnais n'a de palier de service : None, même si un réglage traîne
-        dans son état.
+        même si l'état de l'agent a changé depuis ; un marqueur **vide** dit
+        seulement qu'aucun `--tier` n'a été passé, donc il ne bloque pas la
+        lecture du journal), puis le palier transmis par l'appelant, puis le
+        `turn_context` du tour mesuré (`started`/`ended`). Aucun autre harnais
+        n'a de palier de service : None, même si un réglage traîne dans son
+        état.
         """
         if harness != "codex":
             return None
@@ -2547,12 +2584,13 @@ class CostBook:
             marker = self.turn_marker(agent, start)
             if marker is not None and "service_tier" in marker:
                 found = str(marker.get("service_tier") or "").strip()
-                decided = True
+                decided = bool(found)
         if not decided:
             found = str(service_tier or "").strip()
             decided = bool(found)
         if not decided:
-            found = self.codex_thread_service_tier(session)
+            found = self.codex_thread_service_tier(session, started=started,
+                                                   ended=ended)
         return service_tier_name(found) or None
 
     def session_of(self, agent: str) -> str | None:
@@ -2625,8 +2663,16 @@ class CostBook:
             # L95 : Codex n'annonce pas son modèle dans `exec --json` ; il se
             # lit dans le journal de session du fil, ou sa configuration.
             model = self.codex_thread_model(session)
+        # #8296 : fenêtre du tour Codex — le journal de session ne prête son
+        # `turn_context` qu'au tour commencé dans cette fenêtre, jamais au
+        # dernier tour d'un fil qui a avancé.
+        fenetre = fin = None
+        if harness == "codex":
+            fenetre = started if started is not None else self.turn_started(agent, start)
+            fin = ended if ended is not None else self.turn_ended_ts(turn_id)
         service_tier = self.service_tier_of_turn(
-            agent, start, events, harness, session, service_tier=service_tier)
+            agent, start, events, harness, session, service_tier=service_tier,
+            started=fenetre, ended=fin)
         prices = load_prices(self.prices_path)
         modele = model if known_price(prices, model) else (model or "inconnu")
         # L225 : la marque (`price_fallback` ou `void_reason`) ne vaut que pour
@@ -2731,9 +2777,8 @@ class CostBook:
                 # (`total_token_usage`) : borné à la fenêtre du tour, son delta
                 # est l'usage du tour et son total le repère du tour suivant.
                 # Sans journal ou hors fenêtre : zéro, comme avant (fail-closed,
-                # jamais l'usage d'un autre tour).
-                fenetre = started if started is not None else self.turn_started(agent, start)
-                fin = ended if ended is not None else self.turn_ended_ts(turn_id)
+                # jamais l'usage d'un autre tour). La fenêtre (`fenetre`, `fin`)
+                # est celle déjà calculée pour le palier de service (#8296).
                 mesure = None
                 if session and fenetre is not None:
                     mesure = self.codex_turn_last_call_usage(session, fenetre, fin)
@@ -3547,6 +3592,29 @@ def _codex_event_model(event) -> str:
         if isinstance(settings, dict) and isinstance(settings.get("model"), str):
             return settings["model"].strip()
     return ""
+
+
+def _codex_task_started_ts(event) -> float | None:
+    """#8296 : l'instant de début d'un `task_started` de rollout, ou None.
+
+    Le payload le porte en secondes epoch (`started_at`) ; à défaut, l'horodatage
+    ISO de l'événement fait foi. Une valeur d'un autre type ne dit rien.
+    """
+    payload = event.get("payload") if isinstance(event, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("started_at")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw)
+    for value in (raw, event.get("timestamp")):
+        if not isinstance(value, str):
+            continue
+        try:
+            return _dt.datetime.fromisoformat(
+                value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return None
 
 
 def _codex_event_service_tier(event) -> str:
