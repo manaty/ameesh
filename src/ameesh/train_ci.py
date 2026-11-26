@@ -14,7 +14,7 @@ import re
 from urllib.parse import quote
 
 from . import land, resolutions
-from .train import PublicationRefused, SuiteRefused, TrainError, digest
+from .train import PublicationRefused, SuiteRefused, TrainError, digest, identity
 
 
 def _slurp_unsupported(proc) -> bool:
@@ -522,6 +522,22 @@ def called_workflow(run, workflow, plan):
     raise TrainError("caller run does not name the audited reusable workflow at the exact head")
 
 
+def _verify_sources(path, plan, workflows):
+    """The audited sources the publication gate must find at the train head.
+
+    A dynamic contract (#2503) supplies the sources of the parts this plan
+    makes due; its undued suites are not executed, so their files are not
+    part of this packet's proof. A versioned static contract reads the base
+    commit's own pins (#3098), never the installed release snapshot.
+    """
+    sources_for = getattr(workflows, "sources_for", None)
+    if callable(sources_for):
+        return sources_for(plan, repo=path)
+    if any(getattr(workflow, "pins_at", "") for workflow in workflows):
+        return versioned_sources(path, plan.get("base", ""), workflows)
+    return audited_sources(workflows)
+
+
 def verify_local(path, plan, workflows):
     """Check commit objects before a publication can trigger push CI.
 
@@ -531,13 +547,7 @@ def verify_local(path, plan, workflows):
     makes due; its undued suites are not executed, so their files are not
     part of this packet's proof.
     """
-    sources_for = getattr(workflows, "sources_for", None)
-    if callable(sources_for):
-        sources = sources_for(plan, repo=path)
-    elif any(getattr(workflow, "pins_at", "") for workflow in workflows):
-        sources = versioned_sources(path, plan.get("base", ""), workflows)
-    else:
-        sources = audited_sources(workflows)
+    sources = _verify_sources(path, plan, workflows)
     for source, blob in sorted(sources.items()):
         proc = resolutions._run(path, "ls-tree", plan["head"], "--", source)
         fields = resolutions._text(proc).strip().split()
@@ -557,6 +567,162 @@ def verify_local(path, plan, workflows):
                     or fields[1] != "blob" or fields[3] != workflow.path:
                 raise PublicationRefused("due suite workflow missing at the train head: %s"
                                          % workflow.path)
+
+
+def _source_entry(path, commit, source):
+    """The exact tree value of one audited source at ``commit``.
+
+    Returns the blob id for a regular file, ``None`` when the path is absent,
+    and a tuple for any other object (symlink, tree, submodule) that can never
+    equal an audited blob. A Git read failure raises ``TrainError``; the
+    caller of :func:`deferred_source_member` treats it as no attribution,
+    never as a named culprit.
+    """
+    proc = resolutions._run(path, "ls-tree", commit, "--", source)
+    fields = resolutions._text(proc).strip().split()
+    if proc.returncode:
+        raise TrainError("cannot read audited CI source %s at %s" % (source, commit[:12]))
+    if not fields:
+        return None
+    if len(fields) != 4 or fields[3] != source:
+        raise TrainError("malformed audited CI source entry: %s" % source)
+    if fields[0] not in ("100644", "100755") or fields[1] != "blob":
+        return (fields[0], fields[1], fields[2], fields[3])
+    return fields[2]
+
+
+def _merge_base(path, base, tip):
+    """The reviewed common ancestor of a member's freeze and the packet base."""
+    proc = resolutions._run(path, "merge-base", base, tip)
+    value = resolutions._text(proc)
+    if proc.returncode or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+        raise TrainError("cannot read the merge base of a train member")
+    return value
+
+
+def _source_member(path, base, source, final, rows, transports=()):
+    """The member whose own delta introduced ``final`` for ``source``.
+
+    Only exact tree values are compared: the member's merge base against its
+    frozen head, and a qualified transport's base against its head. A member
+    that changes the source and a later one that restores the audited blob
+    never reaches this function (the final tree already complies). Several
+    members carrying the same change are all culprits; the first in lot order
+    is named, and the next composition names the remaining one if it stays.
+    """
+    found = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        frozen = row.get("frozen_sha")
+        if not isinstance(frozen, str):
+            return None
+        try:
+            fork = _merge_base(path, base, frozen)
+            before = _source_entry(path, fork, source)
+            after = _source_entry(path, frozen, source)
+        except TrainError:
+            return None
+        if after != before and after == final:
+            found.append(row)
+    for receipt in transports or ():
+        if not isinstance(receipt, dict):
+            continue
+        head, transport_base = receipt.get("head"), receipt.get("base")
+        admission = receipt.get("admission")
+        if not isinstance(head, str) or not isinstance(transport_base, str) \
+                or not isinstance(admission, (list, tuple)):
+            continue
+        row = next((candidate for candidate in rows
+                    if isinstance(candidate, dict)
+                    and digest(identity(candidate)) == digest(list(admission))), None)
+        if row is None:
+            continue
+        try:
+            before = _source_entry(path, transport_base, source)
+            after = _source_entry(path, head, source)
+        except TrainError:
+            return None
+        if after != before and after == final:
+            found.append(row)
+    if not found:
+        return None
+    return min(found, key=lambda row: (int(row["work_item_id"]),
+                                       str(row.get("frozen_sha") or "")))
+
+
+def _deferral_reason(source, row):
+    frozen = str(row.get("frozen_sha") or "")[:12]
+    return ("source CI auditée %s différente du contrat audité à la tête composée "
+            "(lot #%s, gel %s) : un changement de workflow/sélecteur exige la voie "
+            "de déblocage CI et un contrat audité à jour (canon §11 bis) ; lot "
+            "différé seul, le train continue avec les autres lots"
+            % (source, row.get("work_item_id"), frozen))
+
+
+def _attribution_sources(path, plan, workflows):
+    """#8305: the audited pins, read before resolving the head's due suites.
+
+    A dynamic contract's ``sources_for`` resolves the due parts of the head;
+    a head that changes the selector itself makes that resolution refuse
+    (the selector differs from its audited commit), so using it for
+    attribution would name nobody. The optional ``audited_sources`` method
+    exposes the same pins without touching the head's suites. Publication
+    keeps using ``sources_for`` unchanged.
+    """
+    pinned = getattr(workflows, "audited_sources", None)
+    if callable(pinned):
+        return pinned(repo=path, base=plan.get("base", ""))
+    return _verify_sources(path, plan, workflows)
+
+
+def deferred_source_member(path, plan, workflows, rows):
+    """#8305: the single lot a packet composition must defer, with its reason.
+
+    The final composed tree is checked first, with the exact publication
+    sources: a compliant tree is accepted even when an intermediate member
+    changed a source and a later one restored it. On a mismatch, only a
+    member whose own delta (or qualified transport) introduced the final
+    value is named; an inherited base mismatch, a mechanical main sync and
+    any unreadable Git value name no culprit. ``None`` leaves the existing
+    publication gate untouched, so the attribution can never lower it.
+    """
+    try:
+        sources = _attribution_sources(path, plan, workflows)
+        if not isinstance(sources, dict) or not sources:
+            return None
+        base, head = plan.get("base"), plan.get("head")
+        if not isinstance(base, str) or not isinstance(head, str):
+            return None
+        sync = plan.get("sync")
+        sync_head = sync.get("head") if isinstance(sync, dict) else None
+        mismatched = []
+        for source, expected in sorted(sources.items()):
+            if not isinstance(source, str) or not isinstance(expected, str):
+                return None
+            value = _source_entry(path, head, source)
+            if value == expected:
+                continue
+            # An inherited mismatch is not a member's doing: the base is
+            # already outside the audited contract, so deferring one member
+            # would not make this packet publishable.
+            if _source_entry(path, base, source) != expected:
+                continue
+            # The mechanical main sync is not a member either.
+            if isinstance(sync_head, str) \
+                    and _source_entry(path, sync_head, source) != expected:
+                continue
+            mismatched.append((source, value))
+        for source, value in mismatched:
+            row = _source_member(path, base, source, value, rows,
+                                 plan.get("transports") or ())
+            if row is not None:
+                return row, _deferral_reason(source, row)
+    except Exception:  # noqa: BLE001 - an unreadable Git value names no culprit
+        # The publication gate re-reads the same exact objects before any
+        # remote effect; this preflight only attributes a deferral.
+        return None
+    return None
 
 
 class GitHub:

@@ -400,6 +400,20 @@ class Admissions:
             proof["targeted_ci"] = ci
         return proof
 
+    def note_deferred(self, row, reason):
+        """#8305: journal a train deferral on the lot, once, best effort.
+
+        The deferral itself is a composition fact and must stand even when
+        the journal is unavailable; the caller reports the returned problem
+        without turning it into a publication refusal.
+        """
+        try:
+            work.note(self.db, int(row["work_item_id"]), "train: " + reason,
+                      actor="ameesh train", once=True)
+        except Exception as exc:  # noqa: BLE001 - the deferral is the fact
+            return str(exc)
+        return ""
+
     def quarantine(self, rows, reason, *, lease):
         current = {row["work_item_id"]: row for row in self.entries()}
         # Validate the entire request before any mutation. The storage CAS

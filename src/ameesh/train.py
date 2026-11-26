@@ -240,7 +240,8 @@ class Engine:
         if self.ports.acquire(self.epoch) != self.epoch:
             raise TrainError("target reservation lost")
 
-    def _plan(self, state, members, now, *, diagnostic=False, suspects=None):
+    def _plan(self, state, members, now, *, diagnostic=False, suspects=None,
+              preflight=True):
         proof = self.ports.qualify(members, state["base"], self.policy.ci_mode)
         if not isinstance(proof, dict) or not proof:
             raise TrainError("missing structured admission evidence")
@@ -296,6 +297,17 @@ class Engine:
                     raise TrainError("composition migration mapping needs reserved and "
                                      "landed numbers")
             plan["migrations"] = copy.deepcopy(entries)
+        if preflight and not diagnostic:
+            # #8305 : une source CI auditée n'est pas un conflit de fusion.
+            # Le port nomme le SEUL lot dont le delta propre a introduit la
+            # différence à la tête composée ; l'Engine le retire comme un
+            # MemberDeferred et recompose les autres. Un arbre final conforme
+            # est accepté avant cette attribution ; un héritage de base ou une
+            # lecture Git impossible ne nomme personne (la porte de
+            # publication, inchangée, tranche).
+            hook = getattr(self.ports, "preflight", None)
+            if callable(hook):
+                hook(plan)
         state["plan"] = plan
         state["phase"] = "publishing"
         state["attempts"].append(dict(id=token, head=plan["head"], tree=plan["tree"],
@@ -986,5 +998,8 @@ class Engine:
         state["members"] = members
         # Even if this set equals a green diagnostic half, compose a new plan
         # and run complete CI on its own head before the actual promotion.
-        state = self._plan(state, members, now)
+        # #8305: this plan comes from members of an already preflighted
+        # composition; a MemberDeferred here has no composing loop to catch it,
+        # so the unchanged publication gate keeps the last word.
+        state = self._plan(state, members, now, preflight=False)
         return {"result": "recomposed", "plan": state["plan"]}
