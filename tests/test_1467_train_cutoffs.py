@@ -33,6 +33,20 @@ def paris_cutoff(now: float) -> float:
 PARIS = types.SimpleNamespace(last_packet=paris_cutoff)
 
 
+def paris_even_cutoff(now: float) -> float:
+    """Fixture calendar: the latest even hour Europe/Paris (#8029).
+
+    The compiled canon declares 00:00, 02:00, …, 22:00; the #8304 witness runs
+    on 26/11/2026 in the afternoon, outside a DST transition."""
+    local = datetime.fromtimestamp(now, ZoneInfo("Europe/Paris"))
+    slot = local.replace(hour=local.hour - local.hour % 2, minute=0, second=0,
+                         microsecond=0)
+    return slot.timestamp()
+
+
+PARIS_EVEN = types.SimpleNamespace(last_packet=paris_even_cutoff)
+
+
 def admitted(lot, when="2026-10-15T10:00:00"):
     return dict(row(lot), queued_ts=stamp(when))
 
@@ -54,7 +68,7 @@ class CutoffTest(unittest.TestCase):
             with self.subTest(at=at), self.assertRaises(train.TrainError):
                 train.Policy(schedule=types.SimpleNamespace(last_packet=lambda _: at)).cutoff(now)
 
-    def test_long_ci_resumes_latest_hour_without_a_catchup_burst(self):
+    def test_long_ci_resumes_latest_slot_and_chains_the_ready_lot(self):
         schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
         engine = self.engine([admitted(1)], schedule=schedule)
         first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
@@ -66,9 +80,17 @@ class CutoffTest(unittest.TestCase):
         second = engine.step(stamp("2026-10-15T14:00:02"))["plan"]
         self.ports.ci_by_head[second["head"]] = "green"
         self.assertEqual(engine.step(stamp("2026-10-15T14:00:03"))["result"], "landed")
+        # #8304 : le lot 3 est prêt à la fusion du précédent. Le paquet
+        # suivant part tout de suite (enchaînement §11 bis), une seule CI à
+        # la fois : ce n'est pas une rafale de rattrapage des créneaux
+        # manqués, c'est le seul paquet dû, puis son propre cycle CI.
         self.ports.rows = [admitted(3, "2026-10-15T13:00:00")]
-        self.assertEqual(engine.step(stamp("2026-10-15T14:00:04"))["result"], "idle")
-        self.assertEqual(engine.step(stamp("2026-10-15T15:00:00"))["result"], "ci")
+        third = engine.step(stamp("2026-10-15T14:00:04"))
+        self.assertEqual(third["result"], "ci", third)
+        self.assertEqual([r["work_item_id"] for r in third["plan"]["members"]], [3])
+        self.ports.ci_by_head[third["plan"]["head"]] = "green"
+        self.assertEqual(engine.step(stamp("2026-10-15T14:00:05"))["result"], "landed")
+        self.assertEqual(engine.step(stamp("2026-10-15T14:00:06"))["result"], "idle")
         self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 3)
 
     def test_landed_packet_frees_a_cutoff_it_overran_in_the_same_event(self):
@@ -95,6 +117,92 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(result["result"], "ci", result)
         self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [2])
 
+    def test_chain_composes_the_ready_lot_as_soon_as_the_previous_packet_lands(self):
+        """#8304, gel 46615 : un lot prêt pendant la CI du paquet précédent
+        part dès la fusion vue, sans attendre le créneau pair suivant.
+
+        Le plan précédent a démarré à 18:33, après le créneau de 18:00 : son
+        `started_ts` est postérieur au dernier créneau. Le filtre `admitted`
+        au créneau exclurait aussi #8294, admis à 18:51:35. Les deux
+        conditions du défaut sont donc exercées sur le même scénario.
+        """
+        day = "2026-11-26T"
+        engine = self.engine([admitted(1, day + "17:00:00")], schedule=PARIS_EVEN)
+        first = engine.step(stamp(day + "18:00:00"))["plan"]
+        self.ports.rows.append(admitted(2, day + "17:30:00"))
+        self.ports.ci_by_head[first["head"]] = "green"
+        self.assertEqual(engine.step(stamp(day + "18:32:00"))["result"], "landed")
+        self.ports.rows = [admitted(2, day + "17:30:00")]
+        # Le plan #8234 démarre à 18:33, après le créneau de 18:00.
+        second = engine.step(stamp(day + "18:33:00"))
+        self.assertEqual(second["result"], "ci", second)
+        self.assertEqual([r["work_item_id"] for r in second["plan"]["members"]], [2])
+        # #8294 (gel 46615) entre en file à 18:51:35, pendant cette CI ;
+        # le membre du plan reste en file jusqu'à sa fusion.
+        self.ports.rows = [admitted(2, day + "17:30:00"),
+                           admitted(3, day + "18:51:35")]
+        self.ports.ci_by_head[second["plan"]["head"]] = "green"
+        self.assertEqual(engine.step(stamp(day + "18:51:46"))["result"], "landed")
+        # La passe immédiate après la fusion compose #8294 ; sans
+        # l'enchaînement elle resterait idle jusqu'au créneau de 20:00.
+        third = engine.step(stamp(day + "18:51:47"))
+        self.assertEqual(third["result"], "ci", third)
+        self.assertEqual([r["work_item_id"] for r in third["plan"]["members"]], [3])
+        self.assertNotEqual(third["plan"]["id"], second["plan"]["id"])
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 3)
+
+    def test_chain_never_recomposes_the_members_of_the_landed_plan(self):
+        """#8304 : la file peut encore rendre les lignes du paquet livré.
+
+        Le premier passage après la fusion les exclut par `identity` ; sinon
+        le train recomposerait un lot déjà livré, ou pire, refuserait le
+        nouveau paquet sur une admission disparue.
+        """
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 7200)
+        engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T12:00:00"))
+        self.ports.ci_by_head[first["plan"]["head"]] = "green"
+        self.assertEqual(engine.step(stamp("2026-10-15T12:05:00"))["result"], "landed")
+        # Mêmes lignes de file : aucun candidat neuf, donc aucun paquet.
+        self.assertEqual(engine.step(stamp("2026-10-15T12:05:01"))["result"], "idle")
+        # Un lot neuf, lui, part tout de suite dans la fenêtre de l'heure.
+        self.ports.rows.append(admitted(3, "2026-10-15T12:05:02"))
+        result = engine.step(stamp("2026-10-15T12:05:03"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [3])
+
+    def test_due_chain_needs_a_ready_lot_and_ignores_only_the_consumed_slot(self):
+        """#8304 : les deux conditions du défaut, isolées dans `due`."""
+        now = stamp("2026-11-26T18:51:47")
+        policy = train.Policy(enabled=True, schedule=PARIS_EVEN)
+        ready = [admitted(3, "2026-11-26T18:51:35")]
+        started = stamp("2026-11-26T18:33:00")
+        self.assertFalse(train.due(ready, now, policy, last_started=started))
+        self.assertTrue(train.due(ready, now, policy, last_started=started, chain=True))
+        self.assertFalse(train.due([], now, policy, chain=True))
+
+    def test_invalidated_packet_chains_only_when_its_composition_changed(self):
+        """#8304 : un paquet invalidé libère la cible ; le remplacement est dû
+        tout de suite seulement si la composition a changé, jamais pour le
+        plan identique qui serait refusé à l'identique."""
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 7200)
+        engine = self.engine([admitted(1), admitted(2)], schedule=schedule)
+        self.ports.published = lambda plan: ""
+        self.ports.publish = mock.Mock(side_effect=train.PublicationRefused(
+            "full-suite source differs from audited CI contract"))
+        outcome = engine.step(stamp("2026-10-15T12:00:00"))
+        self.assertEqual(outcome["result"], "invalidated", outcome)
+        # Même composition : le plan serait refusé à l'identique, pas de boucle.
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:01"))["result"], "idle")
+        # Un membre part (le fautif est retiré) : les lots restants sont dus
+        # tout de suite, sans attendre le créneau pair de 14:00.
+        self.ports.rows = [admitted(1)]
+        self.ports.publish = lambda plan, epoch: self.ports.effects.append(
+            ("publish", plan["head"]))
+        result = engine.step(stamp("2026-10-15T12:00:02"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [1])
+
     def test_repeated_paris_hour_starts_distinct_packets_across_restart(self):
         # Explicit supplier epochs: this checks the consumer, not how #1757
         # computes the calendar. Both instants are 02:00 in Europe/Paris.
@@ -106,7 +214,9 @@ class CutoffTest(unittest.TestCase):
         earlier = engine.step(first + 5)["plan"]
         self.ports.ci_by_head[earlier["head"]] = "green"
         self.assertEqual(engine.step(first + 10)["result"], "landed")
-        self.ports.rows = [dict(row(2), queued_ts=first + 15)]
+        # Le lot 2 est admis juste après la seconde occurrence de 02:00 :
+        # le pas d'avant reste idle sans candidat, celui d'après le compose.
+        self.ports.rows = [dict(row(2), queued_ts=second + 1)]
         resumed = train.Engine(self.ports, source=engine.source, target=engine.target,
                                policy=engine.policy)
         self.assertEqual(resumed.step(second - 1)["result"], "idle")
@@ -118,8 +228,10 @@ class CutoffTest(unittest.TestCase):
         self.assertNotEqual(earlier["id"], later["id"])
         self.ports.ci_by_head[later["head"]] = "green"
         self.assertEqual(resumed.step(second + 10)["result"], "landed")
+        # #8304 : la fenêtre d'enchaînement est l'heure du Policy ; au-delà,
+        # le calendrier compilé reprend et ce fixture n'a plus de créneau.
         self.ports.rows = [dict(row(3), queued_ts=second + 15)]
-        self.assertEqual(resumed.step(second + 1800)["result"], "idle")
+        self.assertEqual(resumed.step(second + 3700)["result"], "idle")
         self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
 
     def test_pending_packet_survives_spring_gap_without_another_dispatch(self):
