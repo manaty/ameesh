@@ -2500,23 +2500,23 @@ class CostBook:
 
         Le journal d'un fil porte un `task_started` puis un `turn_context` par
         tour ; lire le **dernier** contexte d'un fil qui a avancé prêterait à ce
-        tour le palier d'un suivant. Le tour est donc celui dont le
-        `task_started` tombe dans la fenêtre `[started - 3 s, ended + 1 s]` :
-        le premier après le début du tour, et jamais un tour commencé après sa
-        fin. Sans fenêtre (`started` inconnu), on ne lit que le journal d'un
-        fil à **un seul** tour ; sinon '' (aucune preuve, plutôt qu'un palier
-        emprunté). `codex exec --json` ne publie pas le palier : le lancement
-        le connaît (marqueur de tour) et ce journal n'est qu'un défaut pour un
-        tour d'avant #8296, ou quand le flux ne dit rien. Lecture seule,
-        jamais une valeur devinée.
+        tour le palier d'un suivant. Le tour mesuré est le premier dont le
+        `task_started` commence **au début du tour ou après** (le marqueur est
+        écrit avant le lancement) ; `started_at` est arrondi à la seconde, donc
+        un début dans la même seconde que le marqueur, juste avant lui, reste
+        accepté — mais seulement s'il est seul dans cette seconde. Un tour
+        commencé après la fin du tour (`ended + 1 s`) est refusé. Sans fenêtre
+        (`started` inconnu), on ne lit que le journal d'un fil à **un seul**
+        tour ; sinon '' (aucune preuve, plutôt qu'un palier emprunté).
+        `codex exec --json` ne publie pas le palier : le lancement le connaît
+        (marqueur de tour) et ce journal n'est qu'un défaut pour un tour
+        d'avant #8296, ou quand le flux ne dit rien. Lecture seule, jamais une
+        valeur devinée.
         """
         path = self.codex_rollout(thread)
         if not path:
             return ""
-        target = started is not None
-        found = ""
-        tasks = 0
-        inside = not target
+        turns: list[dict] = []
         try:
             with open(path, encoding="utf-8") as fh:
                 for line in fh:
@@ -2532,26 +2532,36 @@ class CostBook:
                     if not isinstance(payload, dict):
                         continue
                     if payload.get("type") == "task_started":
-                        tasks += 1
-                        if not target:
-                            if tasks > 1:
-                                return ""       # fil avancé : tour ambigu
-                            continue
-                        if inside:
-                            return found        # le tour mesuré est terminé
                         stamp = _codex_task_started_ts(event)
-                        if stamp is None or stamp < float(started) - 3.0:
-                            continue
-                        if ended is not None and stamp > float(ended) + 1.0:
-                            continue
-                        inside = True
+                        if stamp is not None:
+                            turns.append({"start": stamp, "tier": ""})
                         continue
-                    if not inside:
+                    if not turns:
                         continue
-                    found = _codex_event_service_tier(event) or found
+                    found = _codex_event_service_tier(event)
+                    if found:
+                        turns[-1]["tier"] = found
         except (OSError, ValueError, TypeError):
             return ""
-        return found
+        if started is None:
+            # Aucune fenêtre : un fil à un seul tour est sans ambiguïté.
+            return turns[0]["tier"] if len(turns) == 1 else ""
+        began = float(started)
+        for turn in turns:
+            if turn["start"] < began:
+                continue
+            if ended is not None and turn["start"] > float(ended) + 1.0:
+                return ""       # le tour mesuré n'a pas écrit son début
+            return turn["tier"]
+        # `started_at` est tronqué à la seconde : un début dans la seconde du
+        # marqueur mais avant sa fraction peut être le vrai tour. S'il y en a
+        # plusieurs, le tour est ambigu : ne pas emprunter le premier venu.
+        same_second = [t for t in turns
+                       if math.floor(began) <= t["start"] < began]
+        if len(same_second) == 1:
+            if ended is None or same_second[0]["start"] <= float(ended) + 1.0:
+                return same_second[0]["tier"]
+        return ""
 
     def service_tier_of_turn(self, agent: str, start: int, events,
                              harness: str, session: str | None,
@@ -3597,23 +3607,22 @@ def _codex_event_model(event) -> str:
 def _codex_task_started_ts(event) -> float | None:
     """#8296 : l'instant de début d'un `task_started` de rollout, ou None.
 
-    Le payload le porte en secondes epoch (`started_at`) ; à défaut, l'horodatage
-    ISO de l'événement fait foi. Une valeur d'un autre type ne dit rien.
+    L'horodatage ISO de l'événement fait foi (milliseconde, écrit après le
+    marqueur de tour) ; à défaut, le payload porte `started_at` en secondes
+    epoch, arrondi à la seconde. Une valeur d'un autre type ne dit rien.
     """
     payload = event.get("payload") if isinstance(event, dict) else None
     if not isinstance(payload, dict):
         return None
-    raw = payload.get("started_at")
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-        return float(raw)
-    for value in (raw, event.get("timestamp")):
-        if not isinstance(value, str):
-            continue
-        try:
-            return _dt.datetime.fromisoformat(
-                value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            continue
+    for value in (event.get("timestamp"), payload.get("started_at")):
+        if isinstance(value, str):
+            try:
+                return _dt.datetime.fromisoformat(
+                    value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
     return None
 
 

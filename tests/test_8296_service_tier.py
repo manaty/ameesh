@@ -240,6 +240,35 @@ class TurnServiceTierTest(Sandbox, unittest.TestCase):
         self.assertEqual(usage.service_tier, "fast")
         self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
 
+    def test_journal_ne_prend_pas_le_tour_precedent_dans_la_tolerance(self):
+        # Cas de la revue : un `task_started` à −2 s (default) précède le vrai
+        # début à +1 s (fast). Le tour mesuré commence après le marqueur ;
+        # l'ancien à −2 s ne doit pas gagner parce qu'il est le premier.
+        self._tour("precedent", None)
+        self._journal("t-precedent", (self.NOW - 2.0, "default"),
+                      (self.NOW + 1.0, "fast"))
+        usage = self.book().turn_usage("precedent", start=1,
+                                       ended=self.NOW + 100.0)
+        self.assertEqual(usage.service_tier, "fast")
+        self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
+
+    def test_horodatage_exact_du_rollout_prime_sur_la_seconde_arrondie(self):
+        event = {"timestamp": "1970-01-01T00:00:01.500Z",
+                 "payload": {"type": "task_started", "started_at": 1}}
+        self.assertAlmostEqual(cost._codex_task_started_ts(event), 1.5)
+
+    def test_journal_meme_seconde_ambigu_ne_devine_pas(self):
+        # `started_at` est tronqué à la seconde : deux débuts dans la seconde
+        # du marqueur, aucun après lui. Le tour ne peut pas être prouvé.
+        self.NOW = 1_800_000_000.5
+        self._tour("ambigu2", None)
+        self._journal("t-ambigu2", (1_800_000_000.0, "default"),
+                      (1_800_000_000.0, "fast"))
+        usage = self.book().turn_usage("ambigu2", start=1,
+                                       ended=self.NOW + 100.0)
+        self.assertIsNone(usage.service_tier)
+        self.assertAlmostEqual(usage.usd, standard_usd(), places=9)
+
     def test_journal_avance_sans_fenetre_ne_devine_pas(self):
         # Sans instant de début, deux tours dans le journal : aucun palier
         # n'est prouvé. Facturer Standard serait silencieux, emprunter le
