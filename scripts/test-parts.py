@@ -526,7 +526,7 @@ def plan(args) -> int:
 
 
 def nombre_de_parts(poids: dict[str, float], plancher: int, plafond_min: int | None,
-                    parts_max: int | None) -> int:
+                    parts_max: int | None, debit: float | None = None) -> int:
     """#8261 — le nombre de parts d'un pilote : `plancher` (la liste du
     workflow), relevé tant que la part la plus lourde, × `SURCOUT_CHARGE`,
     dépasse `MARGE_PLAFOND` du plafond. Sans `plafond_min` ni `parts_max`,
@@ -537,10 +537,15 @@ def nombre_de_parts(poids: dict[str, float], plancher: int, plafond_min: int | N
     signale alors comme avant, au lieu de multiplier des parts inutiles. Un
     palier du découpage entre n et n + 1 parts ne prouve rien (relecture
     ameesh-cx2 : 25 modules de 1 300 s donnent 2 600 s à 13 et 14 parts,
-    1 300 s à 25)."""
+    1 300 s à 25).
+
+    #8291 — `debit` : secondes d'estimation tenues par seconde de mur. Une
+    part de mesure en compte 1 / `SURCOUT_CHARGE` (défaut) ; le nocturne psql
+    pèse la somme des tests de son flux, ses parts tiennent plusieurs tests à
+    la fois (`scripts/test-plan.py`, `PSQL_FULL_DEBIT`)."""
     if not plafond_min or not parts_max:
         return plancher
-    cible = plafond_min * 60 * MARGE_PLAFOND / SURCOUT_CHARGE
+    cible = plafond_min * 60 * MARGE_PLAFOND * (debit or 1 / SURCOUT_CHARGE)
 
     def plus_lourde(n: int) -> float:
         return max((sum(poids[m] for m in part) for part in split(poids, n)), default=0.0)
