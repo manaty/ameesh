@@ -5,7 +5,9 @@ Only active holds count (#3297). An explicit dependency is satisfied by the
 merge and says nothing about staging, so it is not a deployment wait. A hold
 is prose: a `#N` or `migration N` is read only in a clause that names a
 deployment wait — a conflict, a PR, a package, a freeze or a review is not
-one. #7893: a delivered but not closed lot carries no active hold; its
+one, and `release-check` is not a `release` (#8308). A wait for a review, an
+opinion or a verdict is not a deployment wait either: it is excluded with its
+whole clause. #7893: a delivered but not closed lot carries no active hold; its
 delivery note — the notes written in the delivery stage of the journal — is
 read with the same clause rules, so a verification that waits for a merged
 fix still counts before staging. Evidence is dated: the last attestation of
@@ -39,16 +41,34 @@ _CLAUSE = re.compile(r"[;!?\n]+|(?<!\d)\.(?!\d)")
 #: `#3266` in "conflit avec #3266" is not a wait, and neither is a reference
 #: to a PR, a ticket, a package or a review. Explicit wait words count
 #: ("attendre #3111"); "bloqué par #X" does not — it states an execution
-#: dependency, which is satisfied at merge.
+#: dependency, which is satisfied at merge. #8308: `release-check` is the
+#: name of a guard, not a release to deploy.
 _WAIT = re.compile(
     r"\battend(?:s|re|u)?\b|\battente\b|\bwait(?:ing)?\b|"
     r"\bdéploiement\b|\bdéploy[ée]e?s?\b|\bdeploy(?:ed|ment|s|ing)?\b(?!-)|"
-    r"\bstaging\b|\brelease\b|\bmise\s+à\s+jour\b|"
+    r"\bstaging\b|\brelease\b(?![-‑–—_ ]?checks?\b)|\bmise\s+à\s+jour\b|"
     r"\b(?:pas|non)\s+(?:encore\s+)?(?:actif|active|déployé|déployée|"
     r"appliqué|appliquée)\b|"
     r"\bn'est\s+pas\s+(?:encore\s+)?(?:actif|active|déployé|déployée|dans)\b|"
     r"\babsent\w*\b|\bmanque\w*\b|\bne\s+contient\b|\bdoit\s+porter\b|"
     r"\bdans\s+le\s+tag\b|\bdans\s+la\s+release\b|\bdans\s+la\s+version\b",
+    re.I)
+#: #8308: a wait for a review, an opinion or a verdict is not a deployment
+#: wait. The whole clause is excluded, not only the reference within 32
+#: characters: "les lots (#1, #2) restent en attente d'avis" must name no
+#: deployment. The link has to be grammatical ("attente d'avis", "verdict
+#: attendu"): a mere "avis" elsewhere in a deployment clause keeps counting.
+_REVIEW_WAIT = re.compile(
+    r"\battente\s+(?:d[’']\s*|de\s+|du\s+|des\s+)?"
+    r"(?:l[’']|la\s+|le\s+|les\s+|un\s+|une\s+)?"
+    r"(?:avis|relectures?|revues?|verdicts?|reviews?)\b|"
+    r"\battend\w*\s+(?:l[’']|la\s+|le\s+|les\s+|un\s+|une\s+)?"
+    r"(?:avis|relectures?|revues?|verdicts?|reviews?)\b|"
+    r"\b(?:avis|relectures?|revues?|verdicts?|reviews?)\b[^;!?\n]*?"
+    r"(?:\battend(?:u|ue|us|ues)\b|\ben\s+attente\b)|"
+    r"\bwait(?:ing)?\s+for\s+(?:(?:a|an|the)\s+)?(?:review|verdict)\b|"
+    r"\bawait(?:ing|s|ed)?\s+(?:(?:a|an|the)\s+)?(?:review|verdict)\b|"
+    r"\b(?:review|verdict)\s+(?:pending|awaited)\b",
     re.I)
 #: What makes a `#N` something else than a lot to deploy. Read in a short
 #: window before the reference (the form "ticket IMA #796" is also caught
@@ -68,10 +88,12 @@ def _deployment_refs(note) -> tuple[set[int], set[int]]:
     Every `#N` of a hold note used to count, so a conflict (#3266), a PR, a
     package, a freeze or a review reference inflated the threshold. Only a
     reference inside a clause that ties it to a deployment wait counts.
+    #8308: a clause that waits for a review, an opinion or a verdict is
+    excluded whole; `release-check` is not a release.
     """
     lots, migrations = set(), set()
     for clause in _CLAUSE.split(str(note or "")):
-        if not _WAIT.search(clause):
+        if _REVIEW_WAIT.search(clause) or not _WAIT.search(clause):
             continue
         for match in _LOT.finditer(clause):
             before = clause[max(0, match.start() - 32):match.start()]
