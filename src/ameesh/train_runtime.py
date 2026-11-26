@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import time
 
-from . import land, merge_queue, radar, train_diagnosis, work_lifecycle
-from .train import SCHEMA, TrainError, digest, evidence, identity, ordered
+from . import land, merge_queue, radar, train_ci, train_diagnosis, work_lifecycle
+from .train import (MemberDeferred, SCHEMA, TrainError, digest, evidence, identity,
+                    ordered)
 
 
 class Runtime:
@@ -160,6 +161,29 @@ class Runtime:
 
     def compose(self, base, rows, nonce, sync=None):
         return self.repository.compose(self.target_branch, base, rows, nonce, sync=sync)
+
+    def preflight(self, plan):
+        """#8305: defer the only lot whose composed delta breaks the CI sources.
+
+        The attribution is read from exact Git tree values and the audited
+        contract; it never names a member on an inherited base mismatch, a
+        mechanical main sync or an unreadable read. The lot keeps its journal
+        trace even while the rest of the packet is published.
+        """
+        self._belongs(plan)
+        found = train_ci.deferred_source_member(
+            self.repository.clone.path, plan, self.ci_adapter.workflows,
+            plan.get("members") or ())
+        if found is None:
+            return
+        row, reason = found
+        note = getattr(self.admissions, "note_deferred", None)
+        if callable(note):
+            problem = note(row, reason)
+            if problem:
+                self.notify("deferred lot #%s note not written: %s"
+                            % (row.get("work_item_id"), problem), row)
+        raise MemberDeferred(row, reason)
 
     def validate_transports(self, plan):
         self._belongs(plan)

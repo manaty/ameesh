@@ -210,6 +210,26 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
         self.hold(2, "hold: la version 1.21.0 doit porter #3111")
         self.assertEqual(self.scan()["lots"], [1, 2])
 
+    def test_release_check_and_review_wait_do_not_raise_the_threshold(self):
+        # #8308: the two exact clauses of the 26/11 20:26Z alert. Their #N
+        # were merged but named by a release-check or a review wait, not by a
+        # deployment wait.
+        for ident in (8264, 8290, 8291, 8296, 8294):
+            self.rows.append({"id": ident, "app": "ameesh", "state": "merged"})
+            self.milestones[ident] = [
+                {"id": 20 + ident, "kind": "merged", "sha": self.head,
+                 "at_ts": 5, "at": "2026-10-24T04:00:00Z"}]
+        self.hold(8026, "hold: fenêtre : R1 v3 (#6002), non lancé. Ce soir, "
+                        "non : release-check AG3 = 1 (#8290 et #8291 en "
+                        "relecture, #8234 et #8078 retenus par "
+                        "l'orchestrateur, #8110).")
+        self.hold(8035, "hold: fenêtre : point du 26/11 16:00Z. Les lots "
+                        "ouverts du jour (#8264, #8290, #8296) sont des "
+                        "correctifs, en attente d’avis codex.")
+        self.assertEqual(self.scan()["lots"], [])
+        self.hold(8040, "hold: attendre #8294 en staging")
+        self.assertEqual(self.scan()["lots"], [8040])
+
     def test_missing_merged_commit_goes_to_unknown_without_hiding_others(self):
         # #3297 N2: one merged head absent from the release clone used to make
         # the whole report unreadable at every tick.
