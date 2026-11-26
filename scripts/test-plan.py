@@ -72,6 +72,9 @@ whole suite. The whole suite under psql runs at night
 module, no psycopg part — psycopg already ran it on every push to `main`.
 #8291: the night run sizes its psql parts under the job timeout (16 at
 least, more while the heaviest part, weighed by `psql_full`, does not fit).
+#8292: that count is bounded by the 06Z admission window, not by the job
+timeout alone: four parallel admissions and five 60-minute waves from the
+01:47Z dispatch to the 06:00Z gate give 20 parts at most, not 32.
 
 **Documentation-only** (L161a): a pull request whose whole diff is
 documentation, and a push to `main` whose whole pushed range (`--base`,
@@ -260,13 +263,23 @@ PARTS = {"psycopg": (4, 12), "psql": (3, 16)}
 #: d'une part (`--parallel 2`) ; mesuré 3,3 à 3,5 sur les parts de 15 à
 #: 60 min du 26/11 (11/16 : 12 113 s en 59 min), 3 garde la mise en route
 #: du job dans la marge.
-#: `PSQL_FULL_PARTS_MAX` : la fenêtre d'admission (01:47Z → 06Z,
-#: `ameesh psql-nocturne guard`) tient cinq vagues de quatre parts
-#: (`max-parallel: 4`) de 50 min au plus, soit 20 parts (relecture
-#: ameesh-dev3, #8292).
+#: #8292 : la fenêtre d'admission du nocturne borne le nombre de parts, pas
+#: seulement la durée d'une part. La minuterie de rôle dispatche à 01:47Z
+#: (`role_timers.NOCTURNE_CALENDAR`) ; `ameesh psql-nocturne gate` ferme
+#: l'admission à `psql_nocturne.END_HOUR` = 06:00Z et `tests.yml` ne laisse
+#: courir que quatre parts psql de front au nocturne (`max-parallel`). Une
+#: vague dure au plus `PSQL_FULL_PLAFOND_MIN` : quatre vagues pleines finissent
+#: à 05:47Z, une cinquième est encore admise avant 06:00Z, la sixième (06:47Z)
+#: serait refusée. 20 parts au plus — 32 planifierait des parts que la porte
+#: rejetterait. Le test #8292 accorde ces constantes aux trois sources.
 PSQL_FULL_PLAFOND_MIN = 60
-PSQL_FULL_PARTS_MAX = 20
 PSQL_FULL_DEBIT = 3.0
+PSQL_FULL_WINDOW_START_MIN = 1 * 60 + 47
+PSQL_FULL_WINDOW_END_MIN = 6 * 60
+PSQL_FULL_ADMISSIONS = 4
+PSQL_FULL_WAVES = ((PSQL_FULL_WINDOW_END_MIN - PSQL_FULL_WINDOW_START_MIN - 1)
+                   // PSQL_FULL_PLAFOND_MIN + 1)
+PSQL_FULL_PARTS_MAX = PSQL_FULL_ADMISSIONS * PSQL_FULL_WAVES
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg
 #: comme dans celui de 60 min de psql (#1251).
@@ -1720,7 +1733,9 @@ def psql_full_weights(modules: list[str], card: dict | None) -> dict[str, float]
 
 def psql_full_count(weighed: dict[str, float]) -> int:
     """#8291 : le nombre de parts du nocturne psql — 16 au moins, relevé
-    tant que la plus lourde dépasse la cible sous le plafond du job."""
+    tant que la plus lourde dépasse la cible sous le plafond du job.
+    #8292 : borné par la fenêtre d'admission 06Z (`PSQL_FULL_PARTS_MAX`),
+    pas par le seul plafond d'une part."""
     return parts.nombre_de_parts(weighed, PARTS["psql"][1], PSQL_FULL_PLAFOND_MIN,
                                  PSQL_FULL_PARTS_MAX, debit=PSQL_FULL_DEBIT)
 
@@ -2370,14 +2385,25 @@ def annotations(plan: dict) -> list[str]:
             "relancer carte.yml")
     # #8291 : une part du nocturne au-delà de la cible (module insécable, ou
     # `PSQL_FULL_PARTS_MAX` atteint) risque la coupure à 60 min : signalée.
+    # #8292 : quand le plafond vient de la fenêtre 06Z et que la cible n'est
+    # toujours pas tenue, la fenêtre elle-même est signalée.
     if plan.get("psql_full"):
-        for p in plan.get("parts", {}).get("psql", []):
-            if p["estimate_s"] > psql_full_target_s():
+        nuit = plan.get("parts", {}).get("psql", [])
+        cible = psql_full_target_s()
+        for p in nuit:
+            if p["estimate_s"] > cible:
                 lines.append(
                     f"::warning title=Part nocturne au plafond::{p['label']} estimée "
-                    f"{p['estimate_s']:.0f} s de tests (cible ~{psql_full_target_s():.0f} s, "
+                    f"{p['estimate_s']:.0f} s de tests (cible ~{cible:.0f} s, "
                     f"{PSQL_FULL_DEBIT:g} s par seconde de mur) : risque de coupure à "
                     f"{PSQL_FULL_PLAFOND_MIN} min (#8291)")
+        if (len(nuit) >= PSQL_FULL_PARTS_MAX
+                and max((p["estimate_s"] for p in nuit), default=0.0) > cible):
+            lines.append(
+                f"::warning title=Fenêtre nocturne saturée::{PSQL_FULL_PARTS_MAX} parts "
+                f"(plafond de la fenêtre 06Z : {PSQL_FULL_ADMISSIONS} admissions × "
+                f"{PSQL_FULL_WAVES} vagues de {PSQL_FULL_PLAFOND_MIN} min) ; une part de "
+                "plus serait refusée à l'admission (#8292)")
     sha = (m.get("commit") or "")[:12]
     lines.extend(
         f"::notice file={u['file']},line={u['lines'][0]},endLine={u['lines'][1]},"
@@ -2451,7 +2477,8 @@ def summary(plan: dict) -> str:
                     f"* psql night parts (#8291): {nuit[0]['of']} (floor {PARTS['psql'][1]}), "
                     f"heaviest ~{lourde:.0f} s of tests for a target of "
                     f"~{psql_full_target_s():.0f} s under the {PSQL_FULL_PLAFOND_MIN} min "
-                    "job timeout")
+                    f"job timeout; the 06Z window admits at most {PSQL_FULL_PARTS_MAX} "
+                    f"parts ({PSQL_FULL_ADMISSIONS} × {PSQL_FULL_WAVES} waves, #8292)")
         elif sel.get("mode") == "full":
             lines.append(f"* psql (#3749): pilot list + contract, {psql_n} module(s); "
                          "the whole suite under psql runs at night (psql-nocturne.yml)")

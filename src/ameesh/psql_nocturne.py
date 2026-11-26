@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#7483: dispatch daily psql under the elected role, recheck each admission.
 
-Four waves of 60-minute jobs fit from 01:47Z to 06Z. Last admission at
-06Z leaves admitted jobs finished before 07Z. A delayed part fails visibly
-as incomplete; it never silently replaces a red result or cancels a sibling.
+Four full waves of 60-minute jobs fit from 01:47Z to 06Z; a fifth wave is
+still admitted at 05:47Z. Last admission at 06Z leaves admitted jobs
+finished before 07Z. #8292: the plan bounds the psql parts to what these
+five waves admit (20), not to the 60-minute job timeout alone. A delayed
+part fails visibly as incomplete; it never silently replaces a red result
+or cancels a sibling.
 """
 from __future__ import annotations
 
