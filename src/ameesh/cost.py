@@ -2503,8 +2503,10 @@ class CostBook:
         tour le palier d'un suivant. Le tour mesuré est le premier dont le
         `task_started` commence **au début du tour ou après** (le marqueur est
         écrit avant le lancement) ; `started_at` est arrondi à la seconde, donc
-        un début dans la même seconde que le marqueur, juste avant lui, reste
-        accepté — mais seulement s'il est seul dans cette seconde. Un tour
+        un début **arrondi** dans la même seconde que le marqueur, juste avant
+        lui, reste accepté — mais seulement s'il est seul dans cette seconde.
+        Un horodatage ISO exact, lui, prouve un début réellement antérieur :
+        c'est le tour précédent, jamais un candidat (B #46592). Un tour
         commencé après la fin du tour (`ended + 1 s`) est refusé. Sans fenêtre
         (`started` inconnu), on ne lit que le journal d'un fil à **un seul**
         tour ; sinon '' (aucune preuve, plutôt qu'un palier emprunté).
@@ -2532,9 +2534,10 @@ class CostBook:
                     if not isinstance(payload, dict):
                         continue
                     if payload.get("type") == "task_started":
-                        stamp = _codex_task_started_ts(event)
+                        stamp = _codex_task_started(event)
                         if stamp is not None:
-                            turns.append({"start": stamp, "tier": ""})
+                            turns.append({"start": stamp[0],
+                                          "precise": stamp[1], "tier": ""})
                         continue
                     if not turns:
                         continue
@@ -2557,11 +2560,14 @@ class CostBook:
                 # fraction du marqueur), sans jamais emprunter ce tour-ci.
                 break
             return turn["tier"]
-        # `started_at` est tronqué à la seconde : un début dans la seconde du
-        # marqueur mais avant sa fraction peut être le vrai tour. S'il y en a
-        # plusieurs, le tour est ambigu : ne pas emprunter le premier venu.
+        # `started_at` est tronqué à la seconde : un début **arrondi** dans la
+        # seconde du marqueur mais avant sa fraction peut être le vrai tour.
+        # Un horodatage ISO exact, lui, prouve un début réellement antérieur :
+        # c'est le tour précédent, jamais un candidat. S'il y a plusieurs
+        # arrondis, le tour est ambigu : ne pas emprunter le premier venu.
         same_second = [t for t in turns
-                       if math.floor(began) <= t["start"] < began]
+                       if not t["precise"]
+                       and math.floor(began) <= t["start"] < began]
         if len(same_second) == 1:
             if ended is None or same_second[0]["start"] <= float(ended) + 1.0:
                 return same_second[0]["tier"]
@@ -3608,26 +3614,39 @@ def _codex_event_model(event) -> str:
     return ""
 
 
-def _codex_task_started_ts(event) -> float | None:
-    """#8296 : l'instant de début d'un `task_started` de rollout, ou None.
+def _codex_task_started(event) -> tuple[float, bool] | None:
+    """#8296 : l'instant de début d'un `task_started`, et sa précision.
 
-    L'horodatage ISO de l'événement fait foi (milliseconde, écrit après le
-    marqueur de tour) ; à défaut, le payload porte `started_at` en secondes
-    epoch, arrondi à la seconde. Une valeur d'un autre type ne dit rien.
+    Rend ``(epoch, precise)`` ou None. L'horodatage ISO de l'événement fait
+    foi (milliseconde) et vaut ``precise=True`` ; à défaut, le payload porte
+    `started_at` en secondes epoch, **arrondi** à la seconde, donc
+    ``precise=False``. Cette provenance est indispensable : un début exact
+    antérieur au marqueur est un tour précédent, tandis qu'un début arrondi
+    dans la même seconde peut être le tour mesuré (B #46592). Une valeur d'un
+    autre type ne dit rien.
     """
     payload = event.get("payload") if isinstance(event, dict) else None
     if not isinstance(payload, dict):
         return None
-    for value in (event.get("timestamp"), payload.get("started_at")):
-        if isinstance(value, str):
-            try:
-                return _dt.datetime.fromisoformat(
-                    value.replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                continue
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
+    value = event.get("timestamp")
+    if isinstance(value, str):
+        try:
+            return (_dt.datetime.fromisoformat(
+                value.replace("Z", "+00:00")).timestamp(), True)
+        except ValueError:
+            pass
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (float(value), True)
+    value = payload.get("started_at")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (float(value), False)
     return None
+
+
+def _codex_task_started_ts(event) -> float | None:
+    """L'instant seul d'un `task_started` (compatibilité, #8296)."""
+    started = _codex_task_started(event)
+    return started[0] if started is not None else None
 
 
 def _codex_event_service_tier(event) -> str:

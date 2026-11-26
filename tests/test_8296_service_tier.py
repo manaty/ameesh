@@ -14,6 +14,7 @@ Ultrafast 6×, un palier inconnu prend le plus cher connu et porte
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
@@ -168,6 +169,29 @@ class TurnServiceTierTest(Sandbox, unittest.TestCase):
             events.append({"type": "turn_context", "payload": payload})
         self.rollout(thread, *events)
 
+    def _journal_exact(self, thread: str, *turns) -> None:
+        """Un rollout dont les `task_started` portent aussi l'ISO exact.
+
+        Le payload garde `started_at` arrondi, comme le vrai journal : c'est
+        la provenance exacte (timestamp ISO) qui doit primer, et ne jamais
+        passer pour un début tronqué.
+        """
+        events = []
+        for index, (started, tier) in enumerate(turns):
+            turn_id = "c%d" % index
+            stamp = datetime.datetime.fromtimestamp(
+                started, datetime.timezone.utc).isoformat().replace(
+                    "+00:00", "Z")
+            events.append({"timestamp": stamp, "type": "event_msg",
+                           "payload": {"type": "task_started",
+                                       "started_at": int(started),
+                                       "turn_id": turn_id}})
+            payload = {"model": "gpt-6.1-sol", "turn_id": turn_id}
+            if tier:
+                payload["service_tier"] = tier
+            events.append({"type": "turn_context", "payload": payload})
+        self.rollout(thread, *events)
+
     def test_marqueur_fast_double_le_tour_meme_jetons(self):
         self._tour("rapide", "fast")
         self._tour("standard", "default")
@@ -267,10 +291,36 @@ class TurnServiceTierTest(Sandbox, unittest.TestCase):
         self.assertEqual(usage.service_tier, "fast")
         self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
 
+    def test_journal_horodatage_exact_avant_le_marqueur_ne_prend_pas_le_repli(self):
+        # B #46592 : un timestamp ISO exact à 10:00:00,100Z avant le marqueur
+        # à 10:00:00,750Z prouve un début réellement antérieur, donc le tour
+        # précédent. Le repli de même seconde ne vaut que pour `started_at`
+        # tronqué : ne pas facturer ce tour fast au tour mesuré.
+        self.NOW = 1_800_000_000.75
+        self._tour("exactavant", None)
+        self._journal_exact("t-exactavant", (1_800_000_000.1, "fast"),
+                            (self.NOW + 600.0, "default"))
+        usage = self.book().turn_usage("exactavant", start=1,
+                                       ended=self.NOW + 100.0)
+        self.assertIsNone(usage.service_tier)
+        self.assertAlmostEqual(usage.usd, standard_usd(), places=9)
+
+    def test_journal_horodatage_exact_apres_le_marqueur_reste_preuve(self):
+        # Le timestamp ISO exact reste la preuve du tour mesuré quand il
+        # commence après le marqueur.
+        self.NOW = 1_800_000_000.75
+        self._tour("exactapres", None)
+        self._journal_exact("t-exactapres", (self.NOW + 0.1, "fast"))
+        usage = self.book().turn_usage("exactapres", start=1,
+                                       ended=self.NOW + 100.0)
+        self.assertEqual(usage.service_tier, "fast")
+        self.assertAlmostEqual(usage.usd, standard_usd() * 2, places=9)
+
     def test_horodatage_exact_du_rollout_prime_sur_la_seconde_arrondie(self):
         event = {"timestamp": "1970-01-01T00:00:01.500Z",
                  "payload": {"type": "task_started", "started_at": 1}}
         self.assertAlmostEqual(cost._codex_task_started_ts(event), 1.5)
+        self.assertEqual(cost._codex_task_started(event), (1.5, True))
 
     def test_journal_meme_seconde_ambigu_ne_devine_pas(self):
         # `started_at` est tronqué à la seconde : deux débuts dans la seconde
