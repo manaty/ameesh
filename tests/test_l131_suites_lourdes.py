@@ -105,16 +105,21 @@ class RunChildTest(unittest.TestCase):
         self.addCleanup(env.stop)
 
     def _wrapper(self, child: str = "import os, time; print(os.getpid(), flush=True); "
-                                    "time.sleep(60)", *, grace: float = 10.0, pids: int = 1):
-        """The wrapper process and the pid(s) its command prints, once started."""
+                                    "time.sleep(60)", *, grace: float = 10.0, pids: int = 1,
+                 stderr=None):
+        """The wrapper process and the pid(s) its command prints, once started.
+        SIGUSR1 dumps the wrapper's threads on its stderr (#8302)."""
         env = dict(os.environ, PYTHONPATH=SRC, AMEESH_MAX_HEAVY_SUITES="1")
-        code = ("import sys, types; from ameesh import heavy; "
+        code = ("import faulthandler, signal, sys, types; from ameesh import heavy; "
+                "faulthandler.register(signal.SIGUSR1, all_threads=True); "
                 "heavy.GROUP_GRACE_S = float(sys.argv[3]); "
                 "cfg = types.SimpleNamespace(state_dir=sys.argv[1], max_heavy_suites=1); "
                 "raise SystemExit(heavy.run(cfg, [sys.executable, '-c', sys.argv[2]], nice=0))")
         proc = subprocess.Popen([sys.executable, "-c", code, self.state, child, str(grace)],
-                                stdout=subprocess.PIPE, text=True, env=env)
+                                stdout=subprocess.PIPE, stderr=stderr, text=True, env=env)
         self.addCleanup(proc.stdout.close)
+        if proc.stderr is not None:
+            self.addCleanup(proc.stderr.close)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         found = [int(proc.stdout.readline()) for _ in range(pids)]
         for pid in found:
@@ -175,12 +180,27 @@ class RunChildTest(unittest.TestCase):
     def test_sigterm_and_sigint_are_relayed_to_the_command(self):
         for signum in (signal.SIGTERM, signal.SIGINT):
             with self.subTest(signal=signum):
-                proc, pid = self._wrapper()
+                # #8302: the wait outlasts the wrapper's SIGKILL escalation
+                # (the grace): a relay that did not stop the command ends
+                # with 137 and says so, instead of racing the grace; a
+                # wrapper still there dumps its threads into the failure
+                grace = 10.0
+                proc, pid = self._wrapper(grace=grace, stderr=subprocess.PIPE)
                 proc.send_signal(signum)
-                code = proc.wait(timeout=10)
+                try:
+                    code = proc.wait(timeout=grace + 30)
+                except subprocess.TimeoutExpired:
+                    proc.send_signal(signal.SIGUSR1)
+                    time.sleep(1)
+                    proc.kill()
+                    self._kill(pid)     # it shares the pipe: read to the end
+                    self.fail("wrapper alive %ds after %s:\n%s"
+                              % (grace + 30, signum.name, proc.stderr.read()))
                 self.assertTrue(self._gone(pid))
+                err = proc.stderr.read()
                 # SIGINT: Python's KeyboardInterrupt exits with 1
-                self.assertIn(code, (128 + signum, 1))
+                self.assertIn(code, (128 + signum, 1),
+                              "%s not relayed, wrapper stderr:\n%s" % (signum.name, err))
                 got = heavy.acquire(self.one, max_wait_s=0)
                 self.assertIsNotNone(got)
                 heavy.release(got[1])
