@@ -55,9 +55,11 @@ class NexlinkContractTest(unittest.TestCase):
         """#8305 : un lot qui change le sélecteur doit rester attribuable."""
         contract = train_contracts.nexlink()
         with mock.patch.object(contract, "resolve",
-                               side_effect=AssertionError("head resolved")):
-            self.assertEqual(contract.audited_sources(),
+                               side_effect=AssertionError("head resolved")), \
+                mock.patch.object(contract, "_audit_base") as audit:
+            self.assertEqual(contract.audited_sources(repo="/nonexistent", base="b" * 40),
                              dict(train_contracts._NEXLINK_SOURCES))
+        audit.assert_called_once_with("/nonexistent", "b" * 40)
 
     def test_contract_does_not_freeze_the_23_suites(self):
         self.assertFalse(hasattr(self.contract, "__iter__"))

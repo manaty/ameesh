@@ -204,19 +204,22 @@ class Nexlink:
         """#8175: ce plan a été accepté sur un diff doc seule prouvé."""
         return self._doc_only_key == (plan["head"], plan["base"])
 
-    def audited_sources(self):
-        """#8305: the audited pins, without resolving the head's due suites.
+    def audited_sources(self, *, repo, base):
+        """#8305: the audited pins after the base selector audit, before the head.
 
         Attribution must still name a lot that changes the selector itself:
         ``resolve`` would refuse the head declarations before returning the
-        sources. Publication keeps ``sources_for``, which resolves first.
+        sources. The base audit stays first, as in publication: an inherited
+        selector mismatch names nobody. Publication keeps ``sources_for``,
+        which resolves the head first, unchanged.
         """
+        self._audit_base(repo, base)
         return dict(_NEXLINK_SOURCES)
 
     def sources_for(self, plan, *, repo, cache=None):
         """The shared sources pinned by this contract, for one valid plan."""
         self.resolve(plan, repo=repo, cache=cache)
-        return self.audited_sources()
+        return dict(_NEXLINK_SOURCES)
 
 
 def nexlink() -> Nexlink:

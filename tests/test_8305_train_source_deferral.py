@@ -88,7 +88,8 @@ class DynamicContract:
         self.source, self.blob = source, blob
         self.sources_for_called = False
 
-    def audited_sources(self):
+    def audited_sources(self, *, repo, base):
+        assert isinstance(repo, str) and isinstance(base, str)
         return {self.source: self.blob}
 
     def sources_for(self, plan, *, repo, cache=None):

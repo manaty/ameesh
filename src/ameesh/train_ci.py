@@ -672,7 +672,7 @@ def _attribution_sources(path, plan, workflows):
     """
     pinned = getattr(workflows, "audited_sources", None)
     if callable(pinned):
-        return pinned()
+        return pinned(repo=path, base=plan.get("base", ""))
     return _verify_sources(path, plan, workflows)
 
 
