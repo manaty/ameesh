@@ -157,7 +157,28 @@ class EcheanceTest(unittest.TestCase):
         procs[0].wait(timeout=10)
         self.assertLess(time.monotonic() - debut, 10)
 
-    def _couper(self, echeance=None, signal_apres=None):
+    SOURD = ("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             "time.sleep(60)")
+
+    def _sourd(self, *_a, **kw):
+        return POPEN([sys.executable, "-c", self.SOURD], cwd=kw.get("cwd"))
+
+    def test_un_enfant_sourd_a_sigterm_est_tue_apres_la_grace(self):
+        """Relecture ameesh-cx2 (B/P2) : un enfant qui ignore SIGTERM ne
+        retient plus la part jusqu'au plafond du job."""
+        procs = [self._sourd()]
+        debut = time.monotonic()
+        self.assertTrue(parts.attendre(procs, time.time() + 1.0, pas_s=0.05, grace_s=0.5))
+        self.assertLess(time.monotonic() - debut, 10)
+        self.assertEqual(procs[0].returncode, -signal.SIGKILL)
+
+    def test_la_part_echue_avec_un_enfant_sourd_finit_non_concluante(self):
+        with mock.patch.object(parts, "GRACE_ECHEANCE_S", 0.5):
+            code, fin, _ = self._couper(echeance=time.time() + 1.5, popen=self._sourd)
+        self.assertEqual(code, 1)
+        self.assertEqual(fin["raison"], "echeance")
+
+    def _couper(self, echeance=None, signal_apres=None, popen=None):
         """Joue `run_parallel` sur deux processus qui ne finissent jamais :
         coupés à l'`echeance`, ou par un SIGTERM (le plafond du job)."""
         tmp = tempfile.TemporaryDirectory()
@@ -180,7 +201,8 @@ class EcheanceTest(unittest.TestCase):
         debut = time.monotonic()
         code = None
         with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.object(parts.subprocess, "Popen", side_effect=self._bloquant), \
+                mock.patch.object(parts.subprocess, "Popen",
+                                  side_effect=popen or self._bloquant), \
                 contextlib.redirect_stdout(sortie):
             if minuterie:
                 minuterie.start()

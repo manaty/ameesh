@@ -175,6 +175,9 @@ PART_MESURE = re.compile(r"mesure-(psycopg|psql)-(\d+)$")
 EXCERPT_LINES = 40
 #: #8291 : modules restants nommés dans l'erreur d'une part échue
 SUMMARY_RESTANTS = 25
+#: #8291 : grâce laissée aux processus d'une part échue après SIGTERM, avant
+#: SIGKILL ; tient dans les 3 min de marge que tests.yml garde au job
+GRACE_ECHEANCE_S = 20.0
 #: #2224 — surcoût de charge d'une part de mesure : run 39015105210, psycopg
 #: 3/6 estimée 1 588,7 s, 2 316 s de tests réels (×1,46) ; une part dont
 #: l'estimation × ce facteur dépasse le plafond du job est signalée par le plan
@@ -1110,14 +1113,26 @@ def _suivre_flux(chemin: str, flow: Flow, evenements: list, verrou: threading.Lo
 
 
 def attendre(procs: list[subprocess.Popen], echeance: float | None,
-             pas_s: float = 5.0) -> bool:
+             pas_s: float = 5.0, grace_s: float | None = None) -> bool:
     """#8291 : attend la fin des processus ; à l'`echeance` (epoch), les
-    arrête (SIGTERM) et rend True — la part est non concluante, pas rouge."""
+    arrête (SIGTERM) et rend True — la part est non concluante, pas rouge.
+
+    Relecture ameesh-cx2 (B/P2) : un enfant qui ignore SIGTERM (un test qui
+    pose son propre gestionnaire) gardait la part ouverte jusqu'au plafond du
+    job. Passé `grace_s` (`GRACE_ECHEANCE_S`), il est tué (SIGKILL) et récolté : au retour, plus
+    aucun processus ne vit."""
     while any(proc.poll() is None for proc in procs):
         if echeance is not None and time.time() >= echeance:
             for proc in procs:
                 if proc.poll() is None:
                     proc.terminate()
+            limite = time.monotonic() + (GRACE_ECHEANCE_S if grace_s is None else grace_s)
+            for proc in procs:
+                try:
+                    proc.wait(timeout=max(0.0, limite - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
             return True
         time.sleep(pas_s if echeance is None else
                    max(0.05, min(pas_s, echeance - time.time())))
