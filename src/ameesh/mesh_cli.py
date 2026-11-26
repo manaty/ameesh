@@ -3221,9 +3221,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 text, error = cli._stdin_body("note")
                 if error:
                     raise work.WorkError(error)
+            # #8284 : une note écrite depuis le poste d'un humain du canon
+            # (entrée non liée) est marquée si son acteur est « inconnu », et
+            # réveille le bureau et le pilote avec ses gestes en attente.
+            from . import owner_presence
+            where = owner_presence.station(cfg, db)
+            if args.actor == work.UNKNOWN_ACTOR:
+                text = owner_presence.mark(text, where)
             work.note(db, args.id, text, actor=args.actor,
                       wake_ts=_wake_deadline(args))
             print(('note added to %s #%d') % (v.noun, args.id))
+            for name in owner_presence.relay(cfg, db, where, source="note", text=text,
+                                             lot=args.id):
+                print("owner presence relayed to %s" % name, file=sys.stderr)
             # #5484 : la note est écrite ; si elle annonce en prose la levée
             # d'un hold encore actif, la CLI dit la forme exacte qui, elle,
             # lève la retenue.
