@@ -51,9 +51,13 @@ def station(cfg, db) -> Station | None:
 
     Seule une entrée non liée produit la preuve : l'exécuteur et les sessions
     liées du poste (agents du mesh) n'en ont pas. Un compte déclaré par deux
-    membres ne désigne personne."""
+    membres ne désigne personne. Un client médié (L109) est un exécuteur
+    sous bail, jamais l'entrée humaine du poste : rien n'est lu pour lui (ni
+    liaison, ni canon), son contrat d'opérations reste inchangé."""
     try:
-        from . import canon, decisions
+        from . import canon, decisions, storage
+        if db is None or storage.is_remote(db):
+            return None
         proof = decisions.human_account_proof(cfg, db)
         if not proof or proof.startswith("?@") or proof.endswith("@?"):
             return None

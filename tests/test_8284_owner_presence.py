@@ -28,7 +28,7 @@ class StationTest(unittest.TestCase):
     def station(self, proof, *members):
         with mock.patch("ameesh.decisions.human_account_proof", return_value=proof), \
                 mock.patch("ameesh.canon.load_configured", return_value=[_canon(*members)]):
-            return owner_presence.station(None, None)
+            return owner_presence.station(None, object())
 
     def test_declared_account_is_the_owner_station(self):
         self.assertEqual(self.station("owner@pc-owner", ("owner", ["owner@pc-owner"]),
