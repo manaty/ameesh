@@ -185,7 +185,11 @@ attente de plus de 2 h. Le geste dépend de l'état :
   jusqu'à son échéance (#8199).
 
 Une feuille de route notée épuisée (`roadmap: épuisée <projet>` sur le lot de
-découpage) retire le projet de l'alerte et de ses heures au repos. Une mesure
+découpage, seule ou comme raison d'un hold, fenêtre comprise : `hold: fenêtre :
+roadmap: épuisée <projet> …`, #8283) retire le projet de l'alerte et de ses
+heures au repos, plage par plage : une réouverture ne rend imputables que les
+heures où la route était ouverte (`roadmap_exhausted_s` donne la part exclue
+de la fenêtre). Une mesure
 exclue s'affiche `exclu (raison)` et porte `idle_agent_hours_excluded` : un
 0,0 ne représente jamais une mesure absente. Le mesh donne les heures
 imputées et, à part, les agents hors mesure (`idle_agents_excluded`) avec
