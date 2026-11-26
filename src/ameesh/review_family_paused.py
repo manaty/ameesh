@@ -6,7 +6,10 @@ latest freeze's designation are evidence; names and prose holds are not.
 """
 from __future__ import annotations
 
+import datetime
 import json
+import re
+import time
 
 from . import accounts, budget, review_designation as rd, work_lifecycle as lifecycle
 
@@ -14,6 +17,33 @@ from . import accounts, budget, review_designation as rd, work_lifecycle as life
 #: fusion relit. Le préfixe nomme la décision owner (#213032, option a).
 FALLBACK_PREFIX = "paused-family-review-fallback:#213032:"
 FALLBACK_SCHEMA = "ameesh-paused-family-fallback/1"
+
+#: #8264 : les décisions closes relues pour trouver une couverture de pause.
+#: La table ne porte que quelques centaines de décisions ; la borne évite une
+#: lecture sans fin sur une base ancienne. Une décision hors de cette fenêtre
+#: ne couvre rien : le doute laisse l'attente ordinaire, jamais l'inverse.
+DECISION_SCAN = 2000
+
+#: L'échéance que la décision signée donne à sa règle : « (expire 26/11
+#: 18:00Z) », « (expire: 2026-11-26 18:00Z) » ou une date seule, tenue
+#: jusqu'à la fin du jour. Sans ce marqueur explicite, rien ne couvre la
+#: pause : une date voisine (« jusqu'au 26/11 vers 16:00Z ») n'est pas une
+#: échéance de règle et ne doit pas écourter la couverture.
+_EXPIRES = re.compile(
+    r"\bexpir\w*[^0-9]{0,40}?"
+    r"(?:(?P<iso>\d{4}-\d{2}-\d{2})(?:[T ](?P<ih>\d{1,2}):(?P<im>\d{2}))?"
+    r"|(?P<day>\d{1,2})/(?P<month>\d{1,2})(?:/(?P<year>\d{4}))?"
+    r"(?:[ ]+(?:à[ ]+|vers[ ]+)?(?P<h>\d{1,2}):(?P<mi>\d{2}))?)"
+    r"[ ]*(?:Z|UTC)?",
+    re.IGNORECASE)
+
+#: Une décision ne couvre une pause que si elle en parle : la question ou la
+#: réponse retenue nomme la pause, le plafond ou l'indisponibilité. Une
+#: décision de compte sans rapport, qui cite la famille et une échéance, ne
+#: doit pas éteindre l'attente.
+_PAUSE_CUE = re.compile(
+    r"\bpause\b|\bpaused\b|\bindisponib\w*|\bplafond\b|\bquota\b|\bbudget\b"
+    r"|\boverage\b|\bcap\b", re.IGNORECASE)
 
 
 def _nature(row):
@@ -33,12 +63,159 @@ def _window(row):
     return nature[2] if nature[0] == "pause" else ""
 
 
-def blocked(designation, listing, *, project, families, now, pilot="", closed_hosts=()):
+def _iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+
+
+def _names(text, family):
+    """La famille est nommée comme un mot : « codex » ne vaut pas pour
+    « codex2 », et la casse du canon (« Codex ») est indifférente."""
+    return re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(str(family)),
+                     str(text or ""), re.IGNORECASE) is not None
+
+
+def _label_of(view):
+    """Le libellé de l'option retenue, ou son libellé d'origine s'il manque
+    (réponses antérieures à `option_label`)."""
+    answer = view.get("answer") or {}
+    label = str(answer.get("option_label") or "").strip()
+    if label:
+        return label
+    option = str(answer.get("option") or "")
+    for row in view.get("options") or ():
+        if str((row or {}).get("key") or "") == option:
+            return str((row or {}).get("label") or "")
+    return ""
+
+
+def decision_until(view):
+    """L'échéance d'une décision owner signée qui couvre une pause, ou None.
+
+    Preuve lue : réponse `answered`, canal `signed` avec sa preuve, décision
+    non remplacée, et une échéance explicite dans le périmètre **retenu** (le
+    libellé de l'option et le texte de la réponse). La question n'est pas lue
+    pour l'échéance : elle décrit les options, dont celles qui n'ont pas été
+    choisies. La **validité** de la preuve n'est pas jugée ici : elle se
+    revérifie à part (`verified_coverages`, B #46462), sans quoi le canal
+    `signed` ne serait qu'une déclaration."""
+    if not isinstance(view, dict):
+        return None
+    answer = view.get("answer") or {}
+    if str(view.get("state") or "") != "answered":
+        return None
+    if str(answer.get("channel") or "") != "signed" or not answer.get("proof"):
+        return None
+    if view.get("superseded_by"):
+        return None
+    scope = " ".join(part for part in (_label_of(view),
+                                       str(answer.get("text") or "")) if part)
+    match = _EXPIRES.search(scope)
+    if match is None:
+        return None
+    created = float(view.get("created_ts") or time.time())
+    try:
+        if match.group("iso"):
+            year, month, day = (int(part) for part in match.group("iso").split("-"))
+            hour = int(match.group("ih") or 23)
+            minute = int(match.group("im") or 59)
+            inferred = False
+        else:
+            day, month = int(match.group("day")), int(match.group("month"))
+            year = int(match.group("year") or 0) or datetime.datetime.fromtimestamp(
+                created, datetime.timezone.utc).year
+            hour = int(match.group("h") or 23)
+            minute = int(match.group("mi") or 59)
+            inferred = not match.group("year")
+        until = datetime.datetime(year, month, day, hour, minute,
+                                  tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    # Une date sans année qui tombe avant la décision est celle de l'année
+    # suivante (une règle de décembre court jusqu'en janvier).
+    if inferred and until.timestamp() < created - 86400:
+        try:
+            until = until.replace(year=until.year + 1)
+        except ValueError:
+            return None
+    return until.timestamp()
+
+
+def coverages(decisions, *, families, now, verify=None):
+    """#8264 : les familles en pause qu'une décision owner signée couvre.
+
+    Rend `{famille: {id, option, until, until_iso, by}}` pour les décisions
+    `answered`, signées, non remplacées et non échues dont le périmètre retenu
+    nomme la famille et une échéance. Deux décisions pour la même famille :
+    la plus proche échéance tranche, pour ne jamais prolonger une couverture
+    par une décision plus tardive.
+
+    `verify` (#46462) : revérifie la preuve de la réponse
+    (`decisions.verify_proof`). Sans elle, le canal `signed` et la présence
+    d'une preuve ne sont qu'une déclaration : ni la clé owner, ni l'empreinte
+    de la réponse, ni l'approbation ne sont prouvées, et rien ne couvre. Un
+    refus ne couvre rien ; une exception remonte à l'appelant, qui la
+    consigne comme lecture impossible."""
+    now = float(now)
+    out = {}
+    for view in decisions or ():
+        until = decision_until(view)
+        if until is None or until <= now:
+            continue
+        answer = view.get("answer") or {}
+        scope = " ".join(part for part in (_label_of(view),
+                                           str(answer.get("text") or "")) if part)
+        context = " ".join(part for part in (str(view.get("question") or ""),
+                                             scope) if part)
+        if not _PAUSE_CUE.search(context):
+            continue
+        try:
+            ident = int(view.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if verify is None or not verify(view):
+            continue
+        for family in families or ():
+            family = str(family or "").strip()
+            if not family or not _names(scope, family):
+                continue
+            current = out.get(family)
+            if current is not None and current["until"] <= until:
+                continue
+            out[family] = {"id": ident, "option": answer.get("option"),
+                           "until": until, "until_iso": _iso(until),
+                           "by": answer.get("by") or None}
+    return out
+
+
+def decisions_history(db, *, now):
+    """Les décisions closes relues par le débit (voir `DECISION_SCAN`)."""
+    from . import decisions
+    return decisions.history(db, now=now, limit=DECISION_SCAN)
+
+
+def verified_coverages(db, views, *, families, now):
+    """Les couvertures dont la preuve signée est revérifiée (B #46462).
+
+    `decisions.verify_proof` refuse une empreinte altérée, une approbation qui
+    n'est pas celle de cette décision, une clé owner absente, révoquée ou
+    remplacée, et une signature Ed25519 invalide. Une preuve refusée ne couvre
+    rien ; une lecture en échec remonte, l'appelant la consigne."""
+    from . import decisions
+    return coverages(views, families=families, now=now,
+                     verify=lambda view: bool(decisions.verify_proof(db, view)[0]))
+
+
+def blocked(designation, listing, *, project, families, now, pilot="", closed_hosts=(),
+            decisions=None):
     """Return indispensable paused families, never infer an unknown author.
 
     The pool is the designation's (`review_designation_activation._candidates`):
     the project's pilot and agents on closed hosts are never reviewers, so they
     cannot make a paused family look reachable (N6 of #5424).
+
+    `decisions` (#8264) : `{famille: couverture}` de `coverages`. Une pause
+    couverte garde son calcul et porte en plus `decision` (id, option,
+    échéance) ; sans cette lecture, aucune couverture n'est supposée.
     """
     required = designation.get("required")
     authors = set(designation.get("author_families") or ())
@@ -88,8 +265,12 @@ def blocked(designation, listing, *, project, families, now, pilot="", closed_ho
         else:
             if pauses:
                 deadlines = [p["resume_ts"] for p in pauses if p["resume_ts"] is not None]
-                out.append({"family": family, "pauses": pauses,
-                            "resume_ts": min(deadlines) if deadlines else None})
+                entry = {"family": family, "pauses": pauses,
+                         "resume_ts": min(deadlines) if deadlines else None}
+                coverage = (decisions or {}).get(family)
+                if coverage:
+                    entry["decision"] = dict(coverage)
+                out.append(entry)
     return out
 
 
