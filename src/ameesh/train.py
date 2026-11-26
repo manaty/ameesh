@@ -159,8 +159,16 @@ def ordered(rows: list[dict], dependencies: list[dict]) -> list[dict]:
     return result
 
 
+def _admitted(ports, rows: list[dict], cutoff: float) -> list[dict]:
+    """Rows admissible at `cutoff`, through the port or its queue fallback."""
+    admitted = getattr(ports, "admitted", None)
+    if callable(admitted):
+        return admitted(rows, cutoff)
+    return [r for r in rows if float(r["queued_ts"]) <= cutoff]
+
+
 def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0,
-        recompose: bool = False) -> bool:
+        recompose: bool = False, chain: bool = False) -> bool:
     if not rows:
         return False
     if policy.build_beta:
@@ -175,8 +183,14 @@ def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0
             # est un créneau consommé sans promotion. Le remplacement est dû
             # tout de suite, sans attendre le créneau suivant (§11 bis).
             return True
+        if chain:
+            # #8304 : le paquet suivant part dès que la fusion du précédent
+            # est vue, si un lot est prêt (décision owner #154026 a, §11 bis).
+            # Le créneau compilé reste le rythme quand aucun lot n'est prêt
+            # dans l'heure ; il n'est jamais une borne devant un lot déjà prêt.
+            return True
         return last_started < slot and bool(rows)
-    if recompose:
+    if recompose or chain:
         return True
     # First train: at most an hour from the oldest admitted lot. Subsequent
     # trains: at most an hour since the preceding train, never an idle burst.
@@ -437,6 +451,14 @@ class Engine:
                     state = self.ports.load()
                 rows = self.ports.entries()
                 recompose = self._recompose_pending(state)
+                # #8304 : un paquet livré (ou invalidé avec une composition
+                # devenue différente) rend le suivant dû sans attendre le
+                # créneau compilé. Le marqueur #8096 reste prioritaire : il
+                # prend les candidats courants sans filtre de créneau.
+                chain = (self.policy.build_beta and not recompose
+                         and self._chain_pending(state, now, rows))
+                if chain:
+                    rows = self._chain_candidates(state, rows)
                 if self.policy.build_beta and not recompose:
                     # A late admission belongs to the next packet, even if
                     # this cutoff was empty or the executor has restarted.
@@ -444,10 +466,11 @@ class Engine:
                     # read by the admission reader — not the queue insertion
                     # this train itself just wrote after the cutoff. A manual
                     # admission keeps its own queue instant and stays late.
+                    # #8304 : l'enchaînement est jugé sur les candidats
+                    # admissibles à l'instant de la passe, jamais sur le
+                    # créneau que le paquet précédent a déjà consommé.
                     slot = self.policy.cutoff(now)
-                    admitted = getattr(self.ports, "admitted", None)
-                    rows = (admitted(rows, slot) if callable(admitted)
-                            else [r for r in rows if float(r["queued_ts"]) <= slot])
+                    rows = _admitted(self.ports, rows, now if chain else slot)
                 # #8096 (B cx2 #45448) : quand un créneau a été consommé sans
                 # promotion, la recomposition due prend les candidats
                 # admissibles courants, y compris un nouveau gel qualifié
@@ -456,7 +479,7 @@ class Engine:
                 rows = ordered(rows, self.ports.dependencies(rows))
                 if not due(rows, now, self.policy,
                            last_started=float((state or {}).get("started_ts", 0)),
-                           recompose=recompose):
+                           recompose=recompose, chain=chain):
                     return {"result": "idle"}
                 from datetime import datetime, timezone
                 state = dict(schema=SCHEMA, source=self.source, target=self.target,
@@ -580,6 +603,12 @@ class Engine:
                 state = self._save(state)
                 self.ports.promote(state["plan"], fire, self.epoch)
                 state["phase"] = "landed"
+                # #8304 : l'instant de la fusion vue ouvre la fenêtre où le
+                # paquet suivant est dû dès qu'un lot est prêt (§11 bis), et
+                # la trace des candidats déjà prêts garde ce dû au-delà de
+                # l'heure après un redémarrage (B cx2 #234583).
+                state["landed_ts"] = now
+                state["landed_ready"] = self._landing_ready(now, state["plan"])
                 state = self._save(state)
                 return {"result": "landed", "plan": state["plan"]}
             if state["phase"] == "promoting":
@@ -590,6 +619,8 @@ class Engine:
                             or digest(receipt.get("plan")) != digest(state["plan"]):
                         raise TrainError("missing exact landed receipt after reconciliation")
                     state["phase"] = "landed"
+                    state["landed_ts"] = now
+                    state["landed_ready"] = self._landing_ready(now, state["plan"])
                     state = self._save(state)
                     return {"result": "landed", "plan": state["plan"]}
                 # An uncertain push/merge is inspected by the pilot. Do not
@@ -818,6 +849,120 @@ class Engine:
             return True
         abandoned = state.get("abandoned")
         return isinstance(abandoned, dict) and abandoned.get("previous_phase") == "paused"
+
+    def _chain_pending(self, state, now, rows):
+        """#8304 : le paquet suivant est-il dû hors du créneau compilé ?
+
+        Canon §11 bis (décision owner #154026 a) : dès la fusion du précédent,
+        le paquet suivant part si un lot est prêt, sans attendre le créneau ;
+        l'heure reste un rythme quand rien n'est prêt. La fenêtre est l'heure
+        du `Policy` : passé ce délai, la fusion n'ouvre plus le créneau et le
+        calendrier reprend — sauf pour un candidat déjà prêt quand la fusion a
+        été vue (B cx2 #234583 : un redémarrage tardif ne perd pas ce dû non
+        consommé). Un plan invalidé a consommé son créneau : le remplacement
+        n'est dû que si la composition courante diffère de celle qui vient
+        d'échouer (membre parti, lot neuf, report levé), jamais pour le plan
+        identique qui serait refusé à l'identique. La comparaison porte sur
+        l'ensemble composable (admission à `now`, puis ordre et dépendances),
+        pas sur la file brute : un lot bloqué ou non admissible ne fait pas à
+        lui seul une composition nouvelle (B impl-12 #234582).
+        """
+        if not isinstance(state, dict) or not rows:
+            return False
+        plan = state.get("plan")
+        members = plan.get("members") if isinstance(plan, dict) else None
+        try:
+            planned = ({identity(row) for row in members}
+                       if isinstance(members, list) else set())
+        except (KeyError, TypeError):
+            return False
+        phase = state.get("phase")
+        if phase == "landed":
+            at = state.get("landed_ts")
+            if isinstance(at, bool) or not isinstance(at, (int, float)) \
+                    or not math.isfinite(at) or at > now:
+                return False
+            if now - at <= self.policy.interval_s:
+                return True
+            return self._chain_ready_since_landing(state, rows)
+        if phase == "invalidated":
+            if not isinstance(members, list) or not members:
+                return False
+            # Un report de composition fait partie des entrées du plan
+            # invalidé : le même lot reporté ne rend pas la composition
+            # « nouvelle » à chaque passe.
+            try:
+                planned |= {identity(row) for row in state.get("deferred") or []
+                            if isinstance(row, dict)}
+            except (KeyError, TypeError):
+                return False
+            try:
+                current = {identity(row) for row in ordered(
+                    _admitted(self.ports, rows, now),
+                    self.ports.dependencies(rows))}
+            except (KeyError, TypeError, ValueError):
+                return False
+            return current != planned
+        return False
+
+    def _landing_ready(self, now, plan):
+        """#8304 B cx2 #234583 : les candidats déjà prêts à la fusion vue.
+
+        L'ensemble est figé au moment de la fusion (identités des lignes
+        composables, membres du paquet exclus) : un redémarrage tardif garde
+        le dû non consommé pour eux, sans rouvrir la fenêtre à une admission
+        qui n'existait pas encore. Une lecture impossible rend le calendrier.
+        """
+        members = plan.get("members") if isinstance(plan, dict) else None
+        if not isinstance(members, list):
+            return []
+        try:
+            delivered = {identity(row) for row in members}
+            fresh = [row for row in self.ports.entries()
+                     if identity(row) not in delivered]
+            ready = ordered(_admitted(self.ports, fresh, now),
+                            self.ports.dependencies(fresh))
+            return [list(identity(row)) for row in ready]
+        except (KeyError, TypeError, ValueError, TrainError):
+            return []
+
+    def _chain_ready_since_landing(self, state, rows):
+        """B cx2 #234583 : le dû tracé à la fusion est-il encore en file ?
+
+        Les identités figées à la fusion et encore présentes gardent le paquet
+        dû au-delà de l'heure ; une ligne arrivée ensuite ne compte pas.
+        """
+        stored = state.get("landed_ready")
+        if not isinstance(stored, list) or not stored:
+            return False
+        try:
+            current = {identity(row) for row in rows}
+            ready = {tuple(item) for item in stored
+                     if isinstance(item, (list, tuple))}
+        except (KeyError, TypeError):
+            return False
+        return bool(current & ready)
+
+    @staticmethod
+    def _chain_candidates(state, rows):
+        """#8304 : les membres du paquet livré ne sont plus candidats.
+
+        Le premier passage après la fusion peut précéder le retrait de ses
+        lignes de file. Les exclure par `identity` (jamais par numéro de lot)
+        évite de recomposer un lot déjà livré tout en laissant un nouveau gel
+        du même lot entrer comme une admission neuve.
+        """
+        if not isinstance(state, dict) or state.get("phase") != "landed":
+            return rows
+        plan = state.get("plan")
+        members = plan.get("members") if isinstance(plan, dict) else None
+        if not isinstance(members, list):
+            return []
+        try:
+            delivered = {identity(row) for row in members}
+            return [row for row in rows if identity(row) not in delivered]
+        except (KeyError, TypeError):
+            return []
 
     def _expired_step(self, state, deadline):
         """#7967 : termine un plan expiré seulement sur une issue établie.
