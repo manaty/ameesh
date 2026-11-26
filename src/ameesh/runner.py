@@ -10466,10 +10466,16 @@ class AgentWorker(threading.Thread):
         # L71 : marqueur de tour AVANT l'index de début — la session reprise
         # (vide = neuve). Sans total connu de cette session, `CostBook.record`
         # ne compte pas son cumul entier comme le coût du tour.
+        # #8296 : le palier de service du LANCEMENT part avec le marqueur. Le
+        # grand livre le relit pour le tarif du tour, y compris quand un autre
+        # worker répare la ligne après un changement de réglage — le flux ne le
+        # répète pas toujours. Seul Codex en déclare un (descripteur L26).
         try:
             with open(events_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"type": cost_mod.TURN_MARKER, "resume": session or "",
-                                     "ts": time.time(), "agent": self.name},
+                                     "ts": time.time(), "agent": self.name,
+                                     "service_tier": (tier or "")
+                                     if harness == "codex" else ""},
                                     ensure_ascii=False) + "\n")
         except OSError as exc:
             log("[%s] turn marker not written (%s)" % (self.name, exc))

@@ -132,10 +132,16 @@ def thread_created_ts(thread: str | None) -> float | None:
 # le plan de correction (pur : aucune écriture)
 # --------------------------------------------------------------------------
 
-def _price(prices: dict, harness: str, model: str) -> list | None:
+def _price(prices: dict, harness: str, model: str,
+           service_tier: str | None = None) -> list | None:
     """Le tarif du modèle, sinon le majorant de sa famille, sinon le repli
-    prudent (maximum du barème) ; None sans aucun barème (L225)."""
-    return cost_mod.price_for(prices, harness, model)[0]
+    prudent (maximum du barème) ; None sans aucun barème (L225).
+
+    #8296 : le palier de service de la ligne (`fast`, …) multiplie le tarif du
+    modèle — une correction ne réécrit jamais un tour rapide au tarif
+    Standard."""
+    return cost_mod.price_for(prices, harness, model,
+                              service_tier=service_tier)[0]
 
 
 def _usd(harness: str, tokens: list, triplet: list) -> float:
@@ -239,7 +245,8 @@ def plan(rows: Iterable[dict], *, prices: dict,
         if row["harness"] == "claude" and current is not None:
             fix(row, "modele", "\"unknown\" model → %s (%s)" % (model, source), model=model)
             continue
-        triplet = _price(prices, row["harness"], model)
+        triplet = _price(prices, row["harness"], model,
+                         service_tier=row.get("service_tier"))
         if triplet is None:
             fix(row, "modele", "\"unknown\" model → %s (%s), no price list: cost "
                 "unchanged" % (model, source), model=model)
@@ -331,7 +338,8 @@ def _codex_cumulative(first: dict, prices: dict, fix, repriced: dict,
         model = first.get("model") or ""
         if model in UNKNOWN_MODELS and codex_model:
             model = codex_model(first["session"]) or ""
-        triplet = _price(prices, "codex", model)
+        triplet = _price(prices, "codex", model,
+                         service_tier=first.get("service_tier"))
         if triplet is None:
             fix(first, "cumul", "cumulative usage of the resumed session counted for one "
                 "turn; model %s has no price list" % (model or "unknown"),

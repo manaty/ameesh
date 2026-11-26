@@ -5883,16 +5883,16 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
             # L80b : le coût est celui du TOUR qui a servi le message, partagé
             # avec les autres messages du même tour — jamais divisé.
             print("turns serving message %s (turn cost, not divided)" % args.message)
-        print("%-19s %-16s %-6s %-9s %10s %10s %9s %10s  %s" % (
-            "WHEN", "AGENT", "LOT", "HARNESS", "INPUT", "CACHE", "OUTPUT", "USD",
+        print("%-19s %-16s %-6s %-9s %-7s %10s %10s %9s %10s  %s" % (
+            "WHEN", "AGENT", "LOT", "HARNESS", "TIER", "INPUT", "CACHE", "OUTPUT", "USD",
             "ATTRIBUTION"))
         for row in rows:
             # #6005 : l'attribution d'appelant du tour hors lot, à côté du lot
             attribution = cost_attribution.render(row.get("attribution"))
-            print("%-19s %-16s %-6s %-9s %10d %10d %9d %10.4f  %s" % (
+            print("%-19s %-16s %-6s %-9s %-7s %10d %10d %9d %10.4f  %s" % (
                 _fmt_moment(row["recorded_ts"]), row["agent"][:16],
                 "#%d" % row["work_item_id"] if row.get("work_item_id") else "—",
-                row["harness"][:9],
+                row["harness"][:9], row.get("service_tier") or "—",
                 row["input_tokens"], row["cached_input_tokens"], row["output_tokens"],
                 row["usd"], attribution[:60] + ("…" if len(attribution) > 60 else "")))
         return 0
