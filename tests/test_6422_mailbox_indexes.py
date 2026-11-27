@@ -16,7 +16,7 @@ from ameesh import storage
 from ameesh.storage.postgres.decisions import PROSE_CANDIDATES_SQL
 from ameesh.storage.postgres.mailbox import human_messages_query
 
-from .support import PgTestCase
+from .support import PgTestCase, fill_fixture
 
 HUMAN_INDEX = "agent_mailbox_human_chat_recent_idx"
 PROSE_INDEX = "agent_mailbox_decision_source_mail_idx"
@@ -89,43 +89,44 @@ class PlanTest(PgTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        with cls.db.transaction() as tx:
-            tx.execute("SET LOCAL statement_timeout = 0")
-            tx.execute("ALTER TABLE agent_mailbox DISABLE TRIGGER agent_mailbox_notify")
-            tx.execute(
-                """
-                INSERT INTO agent_mailbox
-                       (sender, recipient, body, kind, payload, work_item_id,
-                        created_at)
-                SELECT CASE WHEN g % 100 = 0 THEN 'human:alice'
-                            WHEN g % 500 = 0 THEN 'chat-alice'
-                            ELSE 'agent-' || (g % 20) END,
-                       CASE WHEN g % 100 = 0 THEN 'bureau'
-                            WHEN g % 500 = 0 THEN 'orch'
-                            WHEN g % 7 = 0 THEN 'human:alice'
-                            ELSE 'bureau' END,
-                       repeat('x', 120) || g::text,
-                       CASE WHEN g % 37 = 0 THEN 'request'
-                            WHEN g % 23 = 0 THEN 'reply'
-                            WHEN g % 29 = 0 THEN 'event'
-                            ELSE 'notify' END,
-                       CASE WHEN g % 100 = 0 THEN '{"human": true}'::jsonb
-                            WHEN g % 37 = 0 THEN jsonb_build_object(
-                                'decision', jsonb_build_object(
-                                    'source_mail', (g - 1)::text))
-                            ELSE '{}'::jsonb END,
-                       CASE WHEN g % 5 = 0 THEN (g % 50)::text END,
-                       now() - ((100000 - g) * interval '20 seconds')
-                  FROM generate_series(1, 100000) g
-                """
-            )
-            tx.execute("ALTER TABLE agent_mailbox ENABLE TRIGGER agent_mailbox_notify")
+        # #8346 : `fill_fixture` lève aussi le délai client du pilote psql
+        # (statement_timeout_ms/1000 + 5 s), que `SET LOCAL` ne couvrait pas :
+        # sous la charge de la nocturne, le remplissage le dépassait.
+        fill_fixture(
+            cls.db,
+            """
+            INSERT INTO agent_mailbox
+                   (sender, recipient, body, kind, payload, work_item_id,
+                    created_at)
+            SELECT CASE WHEN g % 100 = 0 THEN 'human:alice'
+                        WHEN g % 500 = 0 THEN 'chat-alice'
+                        ELSE 'agent-' || (g % 20) END,
+                   CASE WHEN g % 100 = 0 THEN 'bureau'
+                        WHEN g % 500 = 0 THEN 'orch'
+                        WHEN g % 7 = 0 THEN 'human:alice'
+                        ELSE 'bureau' END,
+                   repeat('x', 120) || g::text,
+                   CASE WHEN g % 37 = 0 THEN 'request'
+                        WHEN g % 23 = 0 THEN 'reply'
+                        WHEN g % 29 = 0 THEN 'event'
+                        ELSE 'notify' END,
+                   CASE WHEN g % 100 = 0 THEN '{"human": true}'::jsonb
+                        WHEN g % 37 = 0 THEN jsonb_build_object(
+                            'decision', jsonb_build_object(
+                                'source_mail', (g - 1)::text))
+                        ELSE '{}'::jsonb END,
+                   CASE WHEN g % 5 = 0 THEN (g % 50)::text END,
+                   now() - ((100000 - g) * interval '20 seconds')
+              FROM generate_series(1, 100000) g
+            """,
+            triggers=[("agent_mailbox", "agent_mailbox_notify")],
+        )
         cls.db.execute(
             "INSERT INTO agent_registry (name, harness, host, status, mode)"
             " VALUES ('chat-alice', 'claude', 'test', 'idle', 'externe'),"
             "        ('chat-bob', 'claude', 'test', 'idle', 'execute')"
             " ON CONFLICT (name) DO UPDATE SET mode = excluded.mode")
-        cls.db.execute("ANALYZE agent_mailbox")
+        fill_fixture(cls.db, "ANALYZE agent_mailbox")
 
     def _plan(self, sql, params):
         with self.db.transaction() as tx:

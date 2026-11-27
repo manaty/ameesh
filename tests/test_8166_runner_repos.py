@@ -37,7 +37,7 @@ from unittest import mock
 from ameesh import agent_peek as peek, config, registry, storage
 from ameesh.runner import AgentWorker, Runner
 
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 
 
 def _git(root, *args):
@@ -371,11 +371,20 @@ class FilDuWorkerCouvert(unittest.TestCase):
 
 
 class BattementGroupeReel(PgTestCase):
-    """Trois workers au repos, bail de 6 s : le battement groupé les tient
-    seul, sans renouvellement par worker."""
+    """Trois workers au repos, bail de 6 s (à l'échelle du banc) : le
+    battement groupé les tient seul, sans renouvellement par worker.
+
+    #8346 : le battement groupé renouvelle aux deux tiers du bail, le fil du
+    worker reprend au tiers restant ; leur écart (TTL/3) doit couvrir la durée
+    d'un appel groupé (connexion, contrôle, UPDATE). Sous la charge de la
+    nocturne psql (38,6 pour 8 vCPU), 2 s ne la couvraient pas : les workers
+    renouvelaient seuls, ou perdaient le bail avant leur premier repos. Le bail
+    suit donc `scaled` ; le témoin attend trois battements groupés au-delà d'un
+    bail entier, au lieu d'un sommeil fixe de 14 s."""
 
     def test_baux_tenus_par_le_battement_groupe(self):
-        cfg = dataclasses.replace(self.cfg, idle_passes_per_s=0.01, lease_ttl=6.0)
+        ttl = scaled(6.0)
+        cfg = dataclasses.replace(self.cfg, idle_passes_per_s=0.01, lease_ttl=ttl)
         runner = Runner(cfg, self.db)
         runner.poll = 1.0
         runner.listener = object()  # écoute établie : pas de repos long
@@ -392,27 +401,43 @@ class BattementGroupeReel(PgTestCase):
             par_worker.append((self_.name, self_._resting))
             return original_call(self_)
 
+        battu = threading.Condition()
+
         def renew_many(self_, owner, leases):
-            groupes.append(len(leases))
-            return original_many(self_, owner, leases)
+            try:
+                return original_many(self_, owner, leases)
+            finally:
+                with battu:
+                    groupes.append(len(leases))
+                    battu.notify_all()
 
         with mock.patch.object(AgentWorker, "_renew_call", renew_call), \
                 mock.patch.object(type(storage.of(self.db).leases), "renew_many", renew_many):
             runner.start_group_beat()
             workers = []
-            for name in names:  # prise et départ aussitôt : bail de 6 s
-                lease = registry.claim(self.db, name, runner.runner_id, 6)
+            for name in names:  # prise et départ aussitôt : bail court
+                lease = registry.claim(self.db, name, runner.runner_id, int(ttl))
                 worker = AgentWorker(runner, registry.get(self.db, name), lease)
                 runner.workers[name] = worker
                 workers.append(worker)
                 worker.start()
             try:
-                deadline = time.monotonic() + 60
+                deadline = time.monotonic() + scaled(60)
                 while not all(getattr(w, "_resting", False) for w in workers):
-                    self.assertLess(time.monotonic(), deadline, "workers never rested")
+                    self.assertLess(time.monotonic(), deadline, "workers never rested: %s" % [
+                        (w.name, w.is_alive(), w.lease_lost.is_set()) for w in workers])
                     time.sleep(0.05)
-                debut = len(par_worker)
-                time.sleep(14)  # plus de deux baux
+                debut, depart = len(par_worker), time.monotonic()
+                with battu:
+                    premier = len(groupes)
+                # trois battements groupés, au-delà d'un bail entier : sans
+                # eux, les baux seraient échus
+                fin = depart + ttl + 1.0
+                with battu:
+                    self.assertTrue(battu.wait_for(
+                        lambda: (len(groupes) - premier >= 3
+                                 and time.monotonic() >= fin),
+                        timeout=ttl + scaled(60)), "group beat stalled: %s" % groupes)
                 au_repos = par_worker[debut:]
                 vivants = [registry.get(self.db, w.name) for w in workers]
             finally:
