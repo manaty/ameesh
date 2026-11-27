@@ -9,6 +9,6 @@
     "RUNNER_NAME": "ameesh-job-${OFFLOAD_JOB}",
     "CI": "true"
   },
-  "before": "for d in backend website desktop mobile shared/*; do\n  [ -f \"$d/package-lock.json\" ] || continue\n  echo \"nexlink: npm ci $d\" >&2\n  (cd \"$d\" && npm ci --prefer-offline --no-audit --no-fund) >&2\ndone",
+  "before": "export PATH=\"$OFFLOAD_CACHE/node/bin:$OFFLOAD_CACHE/bin:$PATH\"\nfor d in backend website desktop mobile shared/*; do\n  [ -f \"$d/package-lock.json\" ] || continue\n  echo \"nexlink: npm ci $d\" >&2\n  (cd \"$d\" && npm ci --prefer-offline --no-audit --no-fund) >&2\ndone",
   "after": "podman ps -aq --filter \"label=nexlink.ci.owner=ameesh-job-$OFFLOAD_JOB\" | xargs -r podman rm -f -v -t 2 >/dev/null 2>&1 || true"
 }
