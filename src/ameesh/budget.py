@@ -27,8 +27,11 @@ couvre toute sa lignée — sa dépense et celle de tous les éphémères dont l
 sur un éphémère reste son plafond propre ; plafond du mesh, plafond propre de
 l'agent et plafond de lignée s'appliquent ensemble, le plus strict gagne. Une
 lignée rompue (créateur absent, cycle) refuse le tour : on ne somme jamais une
-lignée partielle. La vue `ameesh budget --json` publie `lineages` (racine,
-enfants vivants/échus, totaux 1 h/24 h).
+lignée partielle. L'admission d'un tour réserve atomiquement sa part du
+plafond de la racine (migration 0611) : deux clones ne lisent pas le même
+reste, la réservation est rendue au règlement ou expire. La vue `ameesh
+budget --json` publie `lineages` (racine, enfants vivants/échus, totaux
+1 h/24 h).
 
 **À chaud.** Les exécuteurs relisent la table au plus tous les `DEFAULT_TTL`
 secondes (cache court, partagé par leurs workers), et tout de suite sur le
@@ -443,6 +446,121 @@ def lineage_warning(cfg: Config, db, agent: str) -> str:
         return book.over(agent, pace=False, account_checked=True)
     except Exception:  # noqa: BLE001 - avertissement seulement : jamais bloquant
         return ""
+
+
+#: #8347 : durée d'une réservation de lignée quand le règlement n'arrive pas
+LINEAGE_RESERVATION_TTL_S = 2 * 3600.0
+
+
+def reserve_lineage(cfg: Config, db, agent: str, spend_key: str | None, *,
+                    reserve_usd: float) -> str:
+    """#8347 : réserve atomiquement une part du plafond de la lignée de `agent`.
+
+    La garde lue seule (`CostBook.over`) laissait deux clones lire le même
+    reste avant que l'un des deux ne règle son tour. L'admission d'un tour
+    prend ici le verrou de la racine, relit la dépense payée et les
+    réservations des tours en vol, et réserve `reserve_usd` (borné au reste)
+    sous la clé comptable du tour : un second clone ne peut plus être admis
+    sur le même reste. Le règlement (`release_lineage`) ou l'expiration rend
+    la place ; le rejeu de la même clé est idempotent.
+
+    Rend '' quand le tour est admis (ou qu'aucun plafond de lignée ne
+    s'applique), sinon la raison du refus. Une base ou une lignée illisible
+    refuse : on ne réserve pas sur une somme partielle."""
+    from . import cost as cost_mod
+    if not spend_key or storage.is_remote(db):
+        return ""
+    try:
+        with db.transaction() as tx:
+            store = storage.of(tx)
+            try:
+                paid = tuple(cost_mod.paid_harnesses_of())
+            except cost_mod.CostError:
+                paid = ()
+            if not paid:
+                return ""
+            limits = resolve(cfg, store.budgets.limits())
+            if not limits.agents:
+                return ""
+            lineage = store.agents.lineage(agent)
+            if lineage.get("broken"):
+                return ("lineage budget (pay-per-token): %s; no turn until the "
+                        "created_by lineage is repaired"
+                        % (lineage.get("error") or "broken lineage for %s" % agent))
+            root = lineage.get("root") or agent
+            caps = {int(window): float(cap)
+                    for window, cap in (limits.agents.get(root) or {}).items()
+                    if cap and float(cap) > 0 and int(window) in LABELS}
+            if not caps:
+                return ""
+            row = store.agents.get(agent) or {}
+            harness = row.get("harness") or ""
+            # L49 : un agent au forfait n'est jamais mis en pause par ces
+            # plafonds, il ne réserve donc rien pour sa lignée.
+            if harness and harness not in paid:
+                return ""
+            # Une seule admission à la fois par lignée, avant toute lecture de
+            # dépense ou de réservation : deux frères s'ordonnent ici.
+            tx.query("select pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':budget-lineage:' || %s, 0))", (root,))
+            rejeu = store.budgets.lineage_reserve_get(spend_key)
+            if rejeu is not None:
+                same = (rejeu.get("root") == root and rejeu.get("agent") == agent)
+                if same and float(rejeu.get("expires_ts") or 0.0) > time.time():
+                    return ""
+                if not same:
+                    return ("lineage reservation %s already belongs to %s/%s"
+                            % (spend_key, rejeu.get("root"), rejeu.get("agent")))
+                # expirée : elle ne compte plus, on la remplace par une neuve
+                store.budgets.lineage_release(spend_key)
+            members = [str(m.get("agent")) for m in lineage.get("members") or ()
+                       if m.get("agent")] or [agent]
+            book = cost_mod.CostBook(state_dir=cfg.state_dir, db=tx, tools={},
+                                     **limits.book_kwargs())
+            reserved = store.budgets.lineage_reserved(root)
+            parts: dict = {}
+            for window, cap in sorted(caps.items()):
+                spent = book.paid_spent(paid, window, tuple(members))
+                garde = float(reserved.get(window, 0.0))
+                reste = cap - spent - garde
+                if reste <= 0:
+                    return ("%s budget of lineage %s (pay-per-token): %.2f $ "
+                            "spent + %.2f $ reserved by in-flight turns, cap %.2f $"
+                            % ("hourly" if window == 3600 else "daily", root,
+                               spent, garde, cap))
+                part = float(reserve_usd) if reserve_usd and reserve_usd > 0 else reste
+                parts[window] = min(part, reste)
+            ecrit = store.budgets.lineage_reserve_put(
+                root=root, agent=agent, spend_key=spend_key,
+                hour_usd=parts.get(3600, 0.0), day_usd=parts.get(86400, 0.0),
+                expires_s=LINEAGE_RESERVATION_TTL_S)
+            if not ecrit:
+                # course sur la même clé : un rejeu identique reste admis
+                rejeu = store.budgets.lineage_reserve_get(spend_key)
+                if rejeu is not None and rejeu.get("root") == root \
+                        and rejeu.get("agent") == agent:
+                    return ""
+                return "lineage reservation for %s could not be written" % spend_key
+            return ""
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError as exc:
+        return ("lineage budget unreadable: %s"
+                % " ".join(str(exc).split())[:160])
+
+
+def release_lineage(db, spend_key: str | None) -> bool:
+    """#8347 : rend la réservation d'un tour réglé, annulé ou réparé.
+
+    Sans effet sur un pilote qui ne réserve pas ; une panne de base est
+    avalée (la réservation expirera) — le règlement, lui, a déjà écrit la
+    dépense."""
+    if not spend_key or storage.is_remote(db):
+        return False
+    try:
+        return bool(storage.of(db).budgets.lineage_release(spend_key))
+    except db_mod.DbError:
+        return False
 
 
 def _moment(epoch) -> str:

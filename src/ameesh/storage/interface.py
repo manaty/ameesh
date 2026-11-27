@@ -1249,6 +1249,39 @@ class Budgets(Domain):
         """Les derniers changements, récents d'abord : scope, window_s,
         old_usd, new_usd, actor, at_ts."""
 
+    # -- #8347 : réservations du plafond d'une lignée (migration 0611) -----
+    # Ces opérations sont CONCRÈTES : le contrat de l'exécuteur médié ne
+    # change pas. Le repli ne réserve rien (l'exécuteur médié compte la
+    # dépense au relais) ; un pilote qui sait réserver les surcharge.
+    def lineage_reserved(self, root: str) -> dict[int, float]:
+        """#8347 : la part du plafond de `root` réservée par des tours en vol.
+
+        Rend `{window_s: usd}` (3600, 86400), lignes expirées exclues. Repli :
+        aucune réservation — la garde lit alors la seule dépense écrite."""
+        return {}
+
+    def lineage_reserve_get(self, spend_key: str) -> dict | None:
+        """#8347 : la réservation du tour `spend_key`, ou None.
+
+        Rend `spend_key, root, agent, hour_usd, day_usd, expires_ts`. Repli :
+        None (aucune réservation connue)."""
+        return None
+
+    def lineage_reserve_put(self, *, root: str, agent: str, spend_key: str,
+                            hour_usd: float, day_usd: float,
+                            expires_s: float) -> bool:
+        """#8347 : écrit la réservation d'un tour admis, en une écriture.
+
+        Idempotent : la clé `spend_key` déjà présente n'est pas réécrite
+        (False). Repli : False, le pilote ne réserve pas."""
+        return False
+
+    def lineage_release(self, spend_key: str) -> bool:
+        """#8347 : efface la réservation d'un tour réglé ou annulé.
+
+        False quand elle n'existait pas (ou pilote sans réservation)."""
+        return False
+
 
 # --------------------------------------------------------------------------
 # API idempotency (L87, migration 0440)

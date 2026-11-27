@@ -3377,6 +3377,19 @@ class CostBook:
             return self._agent_caps_reason(agent, paid, cache=cache)
         return ""
 
+    def _lineage_reserved(self, root: str) -> dict:
+        """#8347 : la part déjà réservée par des tours en vol de la lignée.
+
+        Lecture de garde : sans base, ou si le pilote ne réserve pas, aucune
+        réservation (la dépense écrite reste la seule somme). Une erreur de
+        lecture ne casse pas la garde — l'admission, elle, reste fail-closed."""
+        if self.db is None:
+            return {}
+        try:
+            return storage.of(self.db).budgets.lineage_reserved(root)
+        except Exception:  # noqa: BLE001 - une lecture de garde ne plante pas
+            return {}
+
     def _agent_caps_reason(self, agent: str, paid: Sequence[str], *,
                            cache: dict | None = None) -> str:
         """#8347 : plafonds propres et plafond de la lignée, le plus strict.
@@ -3384,7 +3397,8 @@ class CostBook:
         Un plafond posé sur la racine somme la lignée entière ; celui posé
         sur un éphémère (ou sur une racine sans descendant) reste propre à
         l'agent. Une lignée rompue refuse, faute de pouvoir attribuer la
-        dépense à une racine."""
+        dépense à une racine. Les réservations des tours en vol comptent
+        comme un reste déjà consommé : deux clones ne lisent pas le même."""
         lineage = self.lineage_of(agent)
         if lineage.get("broken"):
             return ("lineage budget (pay-per-token): %s; no turn until the "
@@ -3396,6 +3410,8 @@ class CostBook:
                  if m.get("agent")]
         own = self.agent_limits.get(agent) or {}
         root_caps = self.agent_limits.get(root) or {}
+        reserved = (self._lineage_reserved(root)
+                    if (root == agent and known) or root_caps else {})
         # Le plafond de l'agent d'abord : sur un éphémère, c'est son plafond
         # propre, plus strict que celui de la racine s'il est plus bas.
         for window, cap in sorted(own.items()):
@@ -3415,6 +3431,12 @@ class CostBook:
                 return ("%s budget of %s (pay-per-token): %.2f $ over %s "
                         "(cap %.2f $)" % (WINDOW_LABELS[window][0], label, total,
                                           WINDOW_LABELS[window][1], cap))
+            if root == agent and known:
+                garde = float(reserved.get(window, 0.0))
+                if total + garde >= cap:
+                    return ("%s budget of %s (pay-per-token): %.2f $ spent + "
+                            "%.2f $ reserved by in-flight turns (cap %.2f $)"
+                            % (WINDOW_LABELS[window][0], label, total, garde, cap))
         if root != agent:
             for window, cap in sorted(root_caps.items()):
                 if not (cap and cap > 0 and window in WINDOW_LABELS):
@@ -3424,6 +3446,11 @@ class CostBook:
                     return ("%s budget of lineage %s (pay-per-token): %.2f $ over %s "
                             "(cap %.2f $)" % (WINDOW_LABELS[window][0], root, total,
                                               WINDOW_LABELS[window][1], cap))
+                garde = float(reserved.get(window, 0.0))
+                if total + garde >= cap:
+                    return ("%s budget of lineage %s (pay-per-token): %.2f $ spent + "
+                            "%.2f $ reserved by in-flight turns (cap %.2f $)"
+                            % (WINDOW_LABELS[window][0], root, total, garde, cap))
         return ""
 
     # -- rapport ------------------------------------------------------------

@@ -23,6 +23,7 @@ import contextlib
 import dataclasses
 import io
 import json
+import threading
 import time
 import unittest
 from unittest import mock
@@ -41,6 +42,7 @@ class LigneeBudgetTest(PgTestCase):
         self.db.execute("DELETE FROM turn_costs")
         self.db.execute("DELETE FROM budget_limits")
         self.db.execute("DELETE FROM budget_events")
+        self.db.execute("DELETE FROM budget_lineage_reservations")
 
     # -- fixtures ----------------------------------------------------------
     def _agent(self, name: str, *, harness: str = "deepseek",
@@ -161,6 +163,97 @@ class LigneeBudgetTest(PgTestCase):
         self.assertEqual(data["root"], "r")
         self.assertEqual({m["agent"] for m in data["members"]}, {"r", "c1"})
         self.assertEqual(storage.of(self.db).agents.lineage("r")["root"], "r")
+
+    # -- admission atomique (B de cx2) -------------------------------------
+    def test_admission_reserve_le_reste_de_la_lignee(self):
+        self._agent("r")
+        self._agent("c1", creator="r")
+        self._agent("c2", creator="r")
+        self._depense("r", 0.6)
+        self._cap("r", 1.0)
+        self.assertEqual(
+            budget.reserve_lineage(self.cfg, self.db, "c1", "k1", reserve_usd=2.0), "")
+        refus = budget.reserve_lineage(self.cfg, self.db, "c2", "k2", reserve_usd=2.0)
+        self.assertIn("lineage r", refus)
+        self.assertIn("reserved by in-flight turns", refus)
+        # la garde lue compte la réservation : 0.60 + 0.40 = 1.00
+        book = self._book(agents={"r": {3600: 1.0}})
+        self.assertIn("reserved by in-flight turns",
+                      book.over("c2", paid_harnesses=PAID, pace=False))
+        # rejeu de la même clé : idempotent, une seule ligne
+        self.assertEqual(
+            budget.reserve_lineage(self.cfg, self.db, "c1", "k1", reserve_usd=2.0), "")
+        rows = self.db.query(
+            "select spend_key, hour_usd::float8 as hour_usd"
+            " from budget_lineage_reservations order by spend_key")
+        self.assertEqual([row["spend_key"] for row in rows], ["k1"])
+        self.assertEqual(rows[0]["hour_usd"], 0.4)
+        # la place rendue au règlement, le frère est admis
+        self.assertTrue(budget.release_lineage(self.db, "k1"))
+        self.assertEqual(
+            budget.reserve_lineage(self.cfg, self.db, "c2", "k2", reserve_usd=2.0), "")
+
+    def test_admission_concurrente_une_seule_gagne(self):
+        self._agent("r")
+        self._agent("c1", creator="r")
+        self._agent("c2", creator="r")
+        self._depense("r", 0.6)
+        self._cap("r", 1.0)
+        barriere = threading.Barrier(2)
+        resultats: dict = {}
+
+        def course(agent: str) -> None:
+            db = self.connect()
+            try:
+                barriere.wait(5)
+                resultats[agent] = budget.reserve_lineage(
+                    self.cfg, db, agent, "k-" + agent, reserve_usd=2.0)
+            except Exception as exc:  # noqa: BLE001 - le fil doit rendre la main
+                resultats[agent] = "EXCEPTION: %s" % exc
+            finally:
+                db.close()
+
+        fils = [threading.Thread(target=course, args=(agent,))
+                for agent in ("c1", "c2")]
+        for fil in fils:
+            fil.start()
+        for fil in fils:
+            fil.join(30)
+        refus = [raison for raison in resultats.values() if raison]
+        self.assertEqual(len(refus), 1, resultats)
+        self.assertIn("lineage r", refus[0])
+        self.assertEqual(
+            self.db.query("select count(*)::int as n from budget_lineage_reservations")[0]["n"],
+            1, "deux réservations écrites pour un seul reste")
+
+    def test_admission_forfait_ne_reserve_pas(self):
+        self._agent("cr", harness="claude")
+        self._cap("cr", 1.0)
+        self._depense("cr", 2.0, harness="claude")
+        self.assertEqual(
+            budget.reserve_lineage(self.cfg, self.db, "cr", "kc", reserve_usd=2.0), "")
+        self.assertEqual(
+            self.db.query("select count(*)::int as n from budget_lineage_reservations")[0]["n"],
+            0, "un agent au forfait (L49) ne réserve pas un plafond payé au token")
+
+    def test_annulation_avant_lancement_rend_la_reservation(self):
+        self._agent("r")
+        self._agent("c1", creator="r")
+        self._cap("r", 2.0)
+        cfg = dataclasses.replace(self.cfg, budget_usd_per_hour=100.0,
+                                  budget_check_interval=0.0)
+        runner = Runner(cfg, self.db, once=True)
+        lease = registry.claim(self.db, "c1", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "c1"), lease)
+        try:
+            self.assertEqual(
+                budget.reserve_lineage(cfg, self.db, "c1", "k1", reserve_usd=2.0), "")
+            worker._annule_tour_avant_lancement({"spend_key": "k1"}, "k1")
+        finally:
+            worker.watchdog_stop.set()
+        self.assertEqual(
+            self.db.query("select count(*)::int as n from budget_lineage_reservations")[0]["n"],
+            0, "un tour refusé avant lancement doit rendre sa réservation de lignée")
 
     def test_pause_du_worker_nomme_la_racine(self):
         self._agent("r")
