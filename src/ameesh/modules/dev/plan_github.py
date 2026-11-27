@@ -833,12 +833,12 @@ class SharedReads:
         Le quota est rangé par ressource d'API (`X-RateLimit-Resource`, sinon
         `resource`, celle du chemin, sinon `core`) : le bucket REST core et le
         bucket GraphQL ne se confondent plus (R1 #848 ; le pilote l'a demandé
-        à 10:40Z). Une limite secondaire (403/429 dont `body` la cite) bloque
-        aussi, même quota restant : `Retry-After`, sinon le reset si le quota
-        est à zéro, sinon `RATE_LIMIT_WAIT` (#1405, N3). #8358 : GraphQL peut
-        rendre sa limite secondaire en HTTP 200 (`submitted too quickly`) ;
-        elle bloque de même, `Retry-After` compris. Rend l'instant (epoch)
-        jusqu'auquel cette ressource est épuisée, sinon None."""
+        à 10:40Z). Une limite secondaire bloque aussi, même quota restant :
+        tout 429 (#8357), un 403 dont `body` cite l'un des deux marqueurs, et
+        la limite GraphQL rendue en HTTP 200 (#8358) ; `Retry-After`, sinon le
+        reset si le quota est à zéro, sinon `RATE_LIMIT_WAIT` (#1405, N3).
+        Rend l'instant (epoch) jusqu'auquel cette ressource est épuisée, sinon
+        None."""
         now = float(self.clock() if now is None else now)
         values = {key: _int_or_none(header_of(headers, header))
                   for key, header in QUOTA_HEADERS.items()}
