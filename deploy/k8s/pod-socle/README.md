@@ -100,8 +100,9 @@ référence).
 ## Carte Host correspondante (canon)
 
 La fiche décrit le runtime, pas un secret. `isolation_ref` cite le chart et
-son témoin ; en P1 la carte reste en `api-key` (aucun siège : P3 rouvre
-Q2 bis). Le nom `title` est celui de `AMEESH_HOST`, pas `metadata.name`.
+son témoin ; P3 bis (#7911, décision #233251) y ouvre `subscription` aux
+conditions de Q2 bis, la connexion du siège restant un pod dédié. Le nom
+`title` est celui de `AMEESH_HOST`, pas `metadata.name`.
 
 ```yaml
 type: Host
@@ -145,10 +146,12 @@ n'est pas le chart d'exploitation.
 - **P2** : [`../pod-shared/`](../pod-shared/README.md) — N conteneurs de
   tenant, N PVC, publication des profils, bail « un seul superviseur »,
   témoin complet ;
-- **P3** : carte Host pod **sans abonnement** (décision owner du 20/11) :
-  `credential_modes: [api-key]`, `host-pod-subscription-unproven` refuse
-  `subscription` et `allow_subscription` ; connexion du siège par pod dédié,
-  jamais `pods/exec` sur ce pod partagé ;
+- **P3** : carte Host pod (sans abonnement dans #7696, décision owner du
+  20/11) ; **P3 bis #7911** (décision #233251 du 27/11) ouvre `subscription`
+  aux conditions de Q2 bis (`allow_subscription`, `require_isolation`,
+  volume par tenant, `runtime.isolation_ref` citable) et livre la connexion
+  du siège par pod dédié ([`../pod-login/`](../pod-login/README.md)), jamais
+  `pods/exec` sur ce pod partagé ;
 - **P4** : pourvoyeur d'enfants ([`../pod-provisioner/`](../pod-provisioner/README.md),
   `pod_hosts`, RBAC, admission, TTL) ;
 - **P5** : déplacement poste ↔ pod partagé ↔ pod dédié, runbook

@@ -5793,27 +5793,75 @@ class Tenancy(Domain):
     @abc.abstractmethod
     def bindings(self, host: str | None = None) -> list[dict]:
         """Liaisons (avec la présence de leur runner : `seen_ts`, `version`,
-        `profiles`)."""
+        `profiles`, `state`) et, #7911, la fenêtre `login` ouverte
+        (`login_until_ts`, `login_terms`, `login_opened_by`, `login_pod`,
+        `login_pod_ended_ts`)."""
+
+    @abc.abstractmethod
+    def login_active(self, host: str, tenant: str) -> bool:
+        """#7911 : la garde de connexion du siège est active pour ce tenant
+        (la fonction SQL `ameesh_tenant_login_active`) : fenêtre ouverte et
+        fin du pod de connexion non observée. Une fenêtre sans pod reste
+        bornée par son échéance ; une fenêtre avec pod ne se rouvre pas à
+        l'expiration seule, la fin observée du pod est requise."""
+
+    @abc.abstractmethod
+    def login_window(self, host: str, tenant: str) -> dict | None:
+        """#7911 : la fenêtre `login` ouverte du tenant, ou None : `pod_name`,
+        `expires_ts`, `pod_ended_ts`, `pod_ended_by`, `opened_ts`, `opened_by`.
+        Le runner s'en sert pour observer la fin du pod sur le volume avant de
+        reprendre (B/P2 #46731)."""
+
+    @abc.abstractmethod
+    def login_open(self, host: str, tenant: str, *, terms_ref: str,
+                   actor: str, ttl_s: float, pod_name: str | None = None) -> dict:
+        """#7911 : ouvre la fenêtre `login` d'un tenant (geste humain/avatar,
+        `terms_ref` = preuve citable des conditions du fournisseur, D2).
+
+        `pod_name` est le pod de connexion désigné, rendu au bureau AVANT sa
+        création (défaut : nom unique dérivé du tenant). Une fenêtre dont la
+        fin du pod a été observée, ou une fenêtre expirée sans pod, est fermée
+        au passage ; une fenêtre encore ouverte et non terminée est refusée
+        (`tenant-login-already-open`). Rend la ligne (id, host, tenant,
+        pod_name, terms_ref, opened_by, opened_at, expires_at).
+        """
+
+    @abc.abstractmethod
+    def login_pod_ended(self, host: str, tenant: str, *, pod_name: str,
+                        by: str) -> bool:
+        """#7911 : enregistre la fin observée du pod de connexion de la
+        fenêtre ouverte (battement silencieux du volume, ou suppression
+        constatée). Idempotent ; vrai si cette passe a écrit la fin."""
+
+    @abc.abstractmethod
+    def login_close(self, host: str, tenant: str, *, actor: str) -> dict:
+        """#7911 : ferme la fenêtre `login` ouverte du tenant ; rend
+        `{closed: bool, ...}` (idempotent si aucune fenêtre ouverte)."""
 
     @abc.abstractmethod
     def beat(self, host: str, tenant: str, runner_id: str, *, uid: int | None,
              version: str | None, profiles: Sequence[str] = (),
-             pod_uid: str | None = None) -> bool:
+             pod_uid: str | None = None, login_ack: bool = False) -> bool:
         """Battement du runner d'un tenant ; faux sans liaison qui le nomme.
 
         #7108 : `profiles` publie les profils de compte `harnais/compte` que
         ce runner peut offrir (noms seulement, jamais un chemin ni un secret).
         #7697 : `pod_uid` est le UID Kubernetes observé par un runner d'enfant
         porté par un pod ; la garde de réclamation l'exige égal à
-        `pod_hosts.pod_uid` (les hôtes non pod l'ignorent)."""
+        `pod_hosts.pod_uid` (les hôtes non pod l'ignorent).
+        #7911 : `login_ack` est l'acquittement du runner — baux rendus et
+        tours arrêtés. L'état `state` ne vaut `login` que si la fenêtre
+        `tenant_logins` est encore ouverte **et** que cet acquittement est
+        vrai : un simple battement pendant la fenêtre ne suffit pas à dire au
+        bureau que le PVC peut être monté par le pod de connexion."""
 
     @abc.abstractmethod
     def presence(self, host: str, tenant: str) -> dict | None:
         """Dernier battement du tenant sur l'hôte (`seen_ts`, `now_ts`,
-        `runner_id`, `profiles`, `pod_uid`, `uid` observé et `binding_uid` de
-        `host_tenants`), ou None. #7698 : le lecteur compare l'UID observé à
-        celui de la liaison ; sur un hôte enfant, `pod_uid` doit encore être
-        celui de `pod_hosts`."""
+        `runner_id`, `profiles`, `pod_uid`, `uid` observé, `binding_uid` de
+        `host_tenants` et #7911 `state`), ou None. #7698 : le lecteur compare
+        l'UID observé à celui de la liaison ; sur un hôte enfant, `pod_uid`
+        doit encore être celui de `pod_hosts`."""
 
 
 class PodProvisioning(Domain):

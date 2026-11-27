@@ -789,6 +789,20 @@ d'un seul conteneur, créé pour la session :
    voisin ; un relais sûr demanderait un namespace réseau par tenant,
    c'est-à-dire le pod dédié.
 
+**Fin observée du pod (B/P2 #46731).** L'échéance SQL et
+`activeDeadlineSeconds` ne sont pas une preuve de fin : le pod peut démarrer
+après l'ouverture de la fenêtre, survivre à `expires_at` ou être détruit plus
+tard que prévu, et écrire le PVC pendant que le runner reprend. Le pod de
+connexion écrit donc un **battement** et tient un **verrou** dans
+`.ameesh/seat-login/` sur le volume de la personne ; le runner, qui monte le
+même volume, n'enregistre la fin (`tenant_logins.pod_ended_at`) qu'après
+verrou libre et battement silencieux depuis plus que la grâce de terminaison.
+La garde `ameesh_tenant_login_active` reste vraie tant que cette fin n'est pas
+observée, même fenêtre expirée ; un pod qui ne démarre jamais laisse la
+fenêtre fermée et se ferme par `logout`, après suppression constatée. Le
+`pod_name` est rendu par `host tenant login` **avant** la création, pour que
+le runner sache quel battement observer.
+
 **Witness (contrôle 6, §5.3)** : aucun RoleBinding `pods/exec` ne vise le pod
 partagé ; un `SelfSubjectAccessReview` `create pods/exec` nommant le pod
 partagé rend `allowed: false` ; le Role du pod de connexion porte
