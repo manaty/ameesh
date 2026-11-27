@@ -3432,10 +3432,18 @@ def run(cfg, db, args) -> int:
                 print("the fire is the pilot's gesture (a human, an orchestrator or a design "
                       "agent with a declared role): %s" % exc, file=sys.stderr)
                 return 1
+        # #8323 : le checkout choisi d'office est vérifié contre le dépôt de la
+        # PR (marque du gel) : le clone nexlink de l'assigné d'un lot dont la
+        # PR vit dans manaty-its est écarté, ni le feu ni le passage ne le lisent.
         if args.sha and repo is None:
             item = work.get(db, args.id)
             if item is not None:
-                repo = review_checkout(cfg, db, item, caller=True)
+                try:
+                    marks = work.milestones(db, args.id)
+                except Exception:  # noqa: BLE001 - jalons illisibles : l'issue
+                    marks = None
+                repo = review_checkout(cfg, db, item, caller=True,
+                                       slug=_slug(cfg, item, None, marks))
         if args.sha:
             row = give(db, args.id, sha=args.sha, actor=actor, note=args.note, repo=repo,
                        exception=args.exception or "", reason=args.reason or "", cfg=cfg)

@@ -185,7 +185,8 @@ class FirePassageTest(unittest.TestCase):
     """Relecture ameesh-cx2 / ameesh-dev3 B/P2 : le parcours complet du passage,
     garde, voie d'atterrissage et portes du §2, jusqu'à la fusion directe."""
 
-    def _act(self, cfg, *, marks=None, status=None, verdicts=(True, ""), pr=(True, "")):
+    def _act(self, cfg, *, marks=None, status=None, verdicts=(True, ""), pr=(True, ""),
+             assignee_checkout=None):
         marks = marks or [_freeze(), {"kind": "fire", "sha": A, "actor": "orchestrateur",
                                       "at_ts": 2.0, "id": 2}]
         ops = mock.Mock()
@@ -197,7 +198,7 @@ class FirePassageTest(unittest.TestCase):
         row = dict(ITEM, state="validated")
         with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched, \
                 mock.patch.object(fire.storage, "of", return_value=mock.Mock(work=ops)):
-            patched["_repo_of"].return_value = None
+            patched["_repo_of"].return_value = assignee_checkout
             patched["review_checkout"].return_value = None
             patched["_pr_status"].return_value = status or _status()
             patched["_repo_info"].return_value = {"slug": "manaty/manaty-its",
@@ -228,6 +229,21 @@ class FirePassageTest(unittest.TestCase):
         calls["_merge_pr"].assert_called_once()
         self.assertIn(A, repr(calls["_merge_pr"].call_args))
 
+    def test_a_foreign_assignee_checkout_is_set_aside(self):
+        """Relecture ameesh-dev3 de 9976aaae : le clone nexlink de l'assigné
+        ne choisit ni le projet ni la voie quand la PR vit dans manaty-its."""
+        tmp = tempfile.mkdtemp(prefix="ameesh-8323-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for argv in (["init", "-q"],
+                     ["remote", "add", "origin", "git@github.com:manaty/nexlink.git"]):
+            subprocess.run(["git", "-C", tmp, *argv], check=True, capture_output=True)
+        out, calls = self._act(_cfg(its=ITS, nexlink=NEXLINK), assignee_checkout=tmp)
+        self.assertEqual((out["slug"], out["project"], out["landing"]),
+                         ("manaty/manaty-its", "its", "direct"))
+        self.assertNotEqual(out["repo"], tmp)
+        calls["_queue"].assert_not_called()
+        calls["_merge_pr"].assert_called_once()
+
     def test_the_section_2_gates_still_hold(self):
         for label, kw in (("reviews", {"verdicts": (False, "no review verdict ok")}),
                           ("green CI", {"pr": (False, "CI not green on the frozen head")})):
@@ -249,6 +265,47 @@ class FirePassageTest(unittest.TestCase):
         calls["_merge_pr"].assert_not_called()
         self.assertIn("§11 bis", out.get("detail", "") + out.get("why", ""))
 
+
+class FireCommandTest(unittest.TestCase):
+    """`ameesh work fire 8095 --sha …` sans `--repo` (relecture ameesh-dev3 de
+    9976aaae) : le checkout choisi d'office est vérifié contre le dépôt de la
+    PR ; le clone nexlink de l'assigné n'atteint ni le feu ni le passage."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-8323-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _clone(self, name, url):
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path)
+        for argv in (["init", "-q"], ["remote", "add", "origin", url]):
+            subprocess.run(["git", "-C", path, *argv], check=True, capture_output=True)
+        return path
+
+    def _run(self, checkout, repo_arg=None):
+        args = types.SimpleNamespace(id=8095, sha=A, withdraw=False, repo=repo_arg,
+                                     actor="orchestrateur", note="", exception="",
+                                     reason="", json=False, dry_run=False)
+        row = dict(ITEM, assignee="codex1")
+        with mock.patch.object(fire.work, "get", return_value=row), \
+                mock.patch.object(fire.work, "milestones", return_value=[_freeze()]), \
+                mock.patch.object(fire.work, "corrector", return_value="orchestrateur"), \
+                mock.patch("ameesh.registry.get", return_value={"cwd": checkout}), \
+                mock.patch.object(os, "getcwd", return_value=checkout), \
+                mock.patch.object(fire, "give", return_value={"sha": A}) as give, \
+                mock.patch.object(fire, "run_pass", return_value=[]) as passage:
+            fire.run(_cfg(its=dict(ITS, repo=os.path.join(self.tmp, "absent")),
+                          nexlink=dict(NEXLINK, repo=os.path.join(self.tmp, "absent"))),
+                     None, args)
+        return give.call_args.kwargs["repo"], passage.call_args.kwargs["repo"]
+
+    def test_the_nexlink_checkout_of_the_assignee_is_set_aside(self):
+        nexlink = self._clone("nexlink", "git@github.com:manaty/nexlink.git")
+        self.assertEqual(self._run(nexlink), (None, None))
+
+    def test_a_checkout_of_the_pr_repository_serves_both_steps(self):
+        its = self._clone("its", "git@github.com:manaty/manaty-its.git")
+        self.assertEqual(self._run(its), (its, its))
 
 if __name__ == "__main__":
     unittest.main()
