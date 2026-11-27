@@ -12,15 +12,25 @@ Témoins de ce module :
 
 * le choix d'un passage au repos dont le sommeil précédent s'est terminé seul
   et dont l'empreinte n'a pas changé est **sauté** : zéro requête quand la
-  passe groupée #8166 est vivante, **une** lecture bornée quand elle ne l'est
-  pas (exécuteur médié, passe en panne, premier passage) ;
+  passe groupée #8166 est vivante, **une** lecture bornée `idle_signatures`
+  quand elle ne l'est pas (exécuteur médié, passe en panne, premier passage) ;
+* quand `lot_wake` est actif (défaut) et que le repos dépasse
+  `mail_batch` + `lot_wake_margin`, **une** lecture bornée `actionable`
+  départage le réveil de lot dû (throttle `LOT_WAKE_CHECK_S` et backoff
+  `lot_wake_allowed` compris) : un lot dû garde la sélection complète, son
+  absence ne coûte que cette lecture (revue B P1) ;
+* la première lecture de repli sans base ne saute jamais : elle pose la base
+  du plein choix qui suit, sinon un changement survenu entre le choix et la
+  lecture attendrait le filet (revue B P2) ;
 * aucun réveil n'est perdu : NOTIFY pendant le sommeil, réveil programmé dû,
   relance au repos, relance après plafond, travail local, rôle élu, attach,
   changement d'empreinte et filet `IDLE_SAFETY_S` gardent la sélection
   complète ;
-* le banc à 31 agents au repos ne prend aucune acquisition d'admission (ou
-  une lecture bornée par agent) même quand un détenteur `document` tient la
-  connexion ; le choix complet, lui, en prend plusieurs.
+* le banc à 31 agents au repos (lot_wake désactivé) ne prend aucune
+  acquisition d'admission (ou une lecture bornée par agent) même quand un
+  détenteur `document` tient la connexion ; un agent à lot_wake actif sans
+  lot actionable saute avec sa seule lecture bornée ; le choix complet, lui,
+  en prend plusieurs.
 """
 from __future__ import annotations
 
@@ -78,13 +88,32 @@ def _worker(*, row=None, gen=0, alive=True, name="quiet"):
     worker._quiet_full_at = time.monotonic()
     worker._quiet_gen = gen
     worker._quiet_sig = None
+    worker._quiet_keep_sig = False
     worker._quiet_probe_unsupported = False
     worker._quiet_skips = 0
     worker._quiet_logged = False
+    worker._lot_wake_checked = float("-inf")
     return worker
 
 
 ROW = {"sig": "x", "pending": False, "wake_ts": None}
+
+
+def _lot_row(**over):
+    row = {"id": 7, "title": "lot", "state": "build", "priority": 2,
+           "wakes": 0, "last_wake_ts": None, "activity_ts": None,
+           "wake_activity_ts": None}
+    row.update(over)
+    return row
+
+
+def _lots(rows, lectures=None):
+    def actionable(name, *, today=None):
+        if lectures is not None:
+            lectures.append(name)
+        return rows
+    return types.SimpleNamespace(
+        lot_sessions=types.SimpleNamespace(actionable=actionable))
 
 
 class SautDuChoixTest(unittest.TestCase):
@@ -98,6 +127,9 @@ class SautDuChoixTest(unittest.TestCase):
 
     def test_sans_passe_groupee_une_seule_lecture(self):
         worker = _worker(alive=False)
+        # Base posée par le plein choix précédent (revue B2) : le passage
+        # suivant compare à cette base et saute.
+        worker._quiet_sig = "x"
         lectures = []
 
         def lire(names):
@@ -118,6 +150,7 @@ class SautDuChoixTest(unittest.TestCase):
 
     def test_sans_passe_groupee_empreinte_changee_plein_choix(self):
         worker = _worker(alive=False)
+        worker._quiet_sig = "x"
         vues = iter([dict(ROW), dict(ROW, sig="y")])
         leases = types.SimpleNamespace(
             idle_signatures=lambda names: {"host": "", "agents": {worker.name: next(vues)}})
@@ -131,6 +164,37 @@ class SautDuChoixTest(unittest.TestCase):
             self.assertIsNone(AgentWorker._pick(worker))
         self.assertEqual(appels, ["quiet"])  # le changement relance la sélection
         self.assertIsNone(worker._quiet_sig)
+
+    def test_sans_passe_groupee_premiere_lecture_plein_choix(self):
+        """Revue B2 : la première lecture de repli est une base, pas un saut.
+
+        Sans passe groupée, `_quiet_sig` est vide après le plein choix : le
+        changement survenu entre ce choix et la lecture ne doit pas être
+        absorbé comme base (il attendrait alors le filet de 900 s). La lecture
+        pose la base, le plein choix la garde, le passage suivant saute."""
+        worker = _worker(alive=False)
+        lectures = []
+
+        def lire(names):
+            lectures.append(list(names))
+            return {"host": "", "agents": {worker.name: dict(ROW)}}
+
+        leases = types.SimpleNamespace(idle_signatures=lire)
+        appels = []
+        with mock.patch("ameesh.runner.storage.of",
+                        return_value=types.SimpleNamespace(leases=leases)), \
+                mock.patch.object(registry, "get",
+                                  side_effect=lambda db, name: appels.append(name)):
+            self.assertIsNone(AgentWorker._pick(worker))
+            self.assertEqual(appels, ["quiet"])
+            self.assertEqual(worker._quiet_sig, "x")
+            self.assertFalse(worker._quiet_keep_sig)
+            worker.stopping.clear()
+            worker._quiet_eligible = True
+            self.assertIsNone(AgentWorker._pick(worker))
+        self.assertEqual(appels, ["quiet"])
+        self.assertEqual(len(lectures), 2)
+        self.assertEqual(worker._quiet_skips, 1)
 
     def test_stockage_sans_empreinte_plein_choix(self):
         from ameesh.mediated_executor.contract import NotSupportedRemotely
@@ -199,10 +263,60 @@ class PasDeReveilPerduTest(unittest.TestCase):
         self._full(worker)
 
     def test_reveil_de_lot_du(self):
+        """Revue B (P1) : au-delà de la base, un lot actionable dû réveille.
+
+        Ce n'est plus « repos > base » qui suffit : le contrôle de throttle
+        et le backoff de `_lot_wake_spec` sont lus par la sonde bornée."""
         worker = _worker(row=dict(ROW))
         worker.cfg = types.SimpleNamespace(lot_wake=True, lot_wake_margin=60.0)
         worker.last_activity -= 120.0
-        self._full(worker)
+        with mock.patch("ameesh.runner.storage.of",
+                        return_value=_lots([_lot_row()])):
+            self._full(worker)
+
+    def test_lot_wake_actif_sans_lot_actionnable_saute(self):
+        """Le cas des 31 agents : lot_wake actif, repos au-delà de la base,
+        aucun lot actionable — le réveil n'est pas dû, le choix est sauté
+        (une lecture bornée `actionable` par passage, pas la sélection)."""
+        worker = _worker(row=dict(ROW))
+        worker.cfg = types.SimpleNamespace(lot_wake=True, lot_wake_margin=60.0)
+        worker.last_activity -= 120.0
+        lectures = []
+        with mock.patch("ameesh.runner.storage.of",
+                        return_value=_lots([], lectures=lectures)), \
+                mock.patch.object(registry, "get",
+                                  side_effect=AssertionError("pas de sélection")):
+            self.assertIsNone(AgentWorker._pick(worker))
+        self.assertEqual(lectures, ["quiet"])
+        self.assertEqual(worker._quiet_skips, 1)
+        self.assertGreaterEqual(worker._lot_wake_checked, 0.0)
+
+    def test_reveil_de_lot_en_backoff_saute(self):
+        now = time.time()
+        worker = _worker(row=dict(ROW))
+        worker.cfg = types.SimpleNamespace(lot_wake=True, lot_wake_margin=60.0)
+        worker.last_activity -= 120.0
+        lectures = []
+        row = _lot_row(wakes=1, last_wake_ts=now - 1.0,
+                       activity_ts=now - 100.0, wake_activity_ts=now - 100.0)
+        with mock.patch("ameesh.runner.storage.of",
+                        return_value=_lots([row], lectures=lectures)), \
+                mock.patch.object(registry, "get",
+                                  side_effect=AssertionError("pas de sélection")):
+            self.assertIsNone(AgentWorker._pick(worker))
+        self.assertEqual(lectures, ["quiet"])
+        self.assertEqual(worker._quiet_skips, 1)
+
+    def test_reveil_de_lot_actionable_illisible_plein_choix(self):
+        def casse(name, *, today=None):
+            raise RuntimeError("base illisible")
+        worker = _worker(row=dict(ROW))
+        worker.cfg = types.SimpleNamespace(lot_wake=True, lot_wake_margin=60.0)
+        worker.last_activity -= 120.0
+        with mock.patch("ameesh.runner.storage.of",
+                        return_value=types.SimpleNamespace(
+                            lot_sessions=types.SimpleNamespace(actionable=casse))):
+            self._full(worker)
 
     def test_relance_apres_plafond_due(self):
         worker = _worker(row=dict(ROW))
@@ -311,6 +425,11 @@ class BancTrenteEtUnAgents(unittest.TestCase):
         for worker in workers:
             worker.state_dir = os.path.join(etat, worker.name)
             os.makedirs(worker.state_dir, exist_ok=True)
+        if not alive:
+            # Base posée par le plein choix précédent (revue B2) : la passe
+            # comptée est une comparaison, pas la première lecture.
+            for worker in workers:
+                worker._quiet_sig = "x"
         # les 31 workers partagent l'exécuteur (empreintes communes)
         for worker in workers:
             worker.runner = runner
@@ -422,9 +541,11 @@ class ChoixAuReposReel(PgTestCase):
     def test_une_seule_lecture_sans_la_passe_groupee(self):
         self.worker._quiet_gen = None
         # Comme un exécuteur en régime : la sonde de schéma de `wake_at` est
-        # déjà chaude (une seule fois par processus, pas par lecture).
+        # déjà chaude (une seule fois par processus, pas par lecture), et la
+        # base d'empreinte vient du plein choix précédent (revue B2).
         from ameesh import storage
-        storage.of(self.db).leases.idle_signatures([self.NAME])
+        lu = storage.of(self.db).leases.idle_signatures([self.NAME])
+        self.worker._quiet_sig = lu["agents"][self.NAME]["sig"]
         patchers = self._compter()
         mocks = [p.start() for p in patchers]
         try:

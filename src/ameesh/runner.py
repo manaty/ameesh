@@ -975,6 +975,7 @@ class AgentWorker(threading.Thread):
         self._quiet_full_at: float | None = None
         self._quiet_gen: int | None = None
         self._quiet_sig: str | None = None
+        self._quiet_keep_sig = False
         self._quiet_probe_unsupported = False
         self._quiet_skips = 0
         self._quiet_logged = False
@@ -7115,10 +7116,18 @@ class AgentWorker(threading.Thread):
 
     # -- #8326 : choix du tour borné au repos -------------------------------
     def _lot_wake_due(self, now: float) -> bool:
-        """#8326 : une échéance de réveil de lot inactif est-elle atteinte ?
+        """#8326 : un réveil de lot inactif est-il dû à cet instant ?
 
-        Même calcul que `_lot_wake_spec` (règle 1, #408), sans requête : une
-        échéance atteinte demande la sélection complète, jamais le saut."""
+        Même règle que `_lot_wake_spec` (règle 1, #408) : au-delà de
+        `mail_batch` + `lot_wake_margin`, le réveil n'est dû que si un lot
+        `actionable` passe `lot_wake_allowed` (premier réveil, lot vivant
+        depuis, ou délai doublé) et si le contrôle de `LOT_WAKE_CHECK_S` est
+        échu. Sans requête, on ne peut pas savoir : cette sonde fait **une**
+        lecture bornée `actionable` et ne note rien ; un lot dû demande la
+        sélection complète, qui refait la lecture et note le réveil. Quand
+        aucun lot n'est dû, le contrôle vaut celui de `_lot_wake_spec` et la
+        prochaine lecture attend le throttle. Un doute (base illisible) :
+        sélection complète, jamais le saut."""
         try:
             if not self.lot_wake_enabled():
                 return False
@@ -7133,7 +7142,25 @@ class AgentWorker(threading.Thread):
                 repos = min(repos, time.time() - float(dernier))
             except (TypeError, ValueError):
                 pass
-        return repos >= base
+        if repos < base:
+            return False
+        if time.monotonic() - self._lot_wake_checked < self.LOT_WAKE_CHECK_S:
+            return False
+        import datetime as _dt
+        try:
+            lots = storage.of(self.db).lot_sessions.actionable(
+                self.name, today=_dt.date.today().isoformat())
+        except Exception:  # noqa: BLE001 - la sélection complète journalise
+            return True
+        now_wall = time.time()
+        try:
+            for row in lots:
+                if self.lot_wake_allowed(row, now_wall, base):
+                    return True
+        except Exception:  # noqa: BLE001 - ligne illisible : plein choix
+            return True
+        self._lot_wake_checked = time.monotonic()
+        return False
 
     def _quiet_row(self) -> dict | None:
         """#8326 : l'empreinte de ce worker, sans requête quand la passe
@@ -7208,8 +7235,6 @@ class AgentWorker(threading.Thread):
             return False
         if self.idle_due():
             return False
-        if self._lot_wake_due(now):
-            return False
         row = self._quiet_row()
         if row is None or row.get("pending"):
             return False
@@ -7228,26 +7253,42 @@ class AgentWorker(threading.Thread):
             if sig is None:
                 return False
             if self._quiet_sig is None:
-                self._quiet_sig = sig  # première lecture : base de comparaison
-            elif sig != self._quiet_sig:
+                # Première lecture : elle sert de base à la sélection
+                # complète qui suit, jamais de saut. Le changement survenu
+                # entre le plein choix précédent et cette lecture est ainsi
+                # vu par la sélection, pas avalé comme base.
+                self._quiet_sig = sig
+                self._quiet_keep_sig = True
+                return False
+            if sig != self._quiet_sig:
                 self._quiet_sig = None  # la sélection complète repose la base
                 return False
+        #: #8326 : dernier contrôle, celui qui coûte une lecture bornée quand
+        #: lot_wake est actif et le repos dépasse la base : un réveil de lot
+        #: dû demande la sélection complète, jamais le saut (revue B,
+        #: mty-amh-impl-12).
+        if self._lot_wake_due(now):
+            return False
         self._quiet_skips += 1
         if not self._quiet_logged:
             self._quiet_logged = True
-            log_async("[%s] nothing due: turn choice skipped (no admission%s)"
-                      % (self.name, "" if callable(alive) and alive()
-                         else ", one bounded read"))
+            log_async("[%s] nothing due: turn choice skipped" % self.name)
         return True
 
     def _pick(self) -> dict | None:
         if self._turn_selection_quiet():
             return None
         #: #8326 : une sélection complète a eu lieu — borne du filet et base
-        #: de l'empreinte pour les sauts suivants.
+        #: de l'empreinte pour les sauts suivants. La première lecture de
+        #: repli a posé la base avant ce plein choix : on la garde (le plein
+        #: choix a lu le même état, un changement ultérieur fera différer) ;
+        #: toute autre sélection repose la base à la lecture suivante.
+        keep_sig = bool(getattr(self, "_quiet_keep_sig", False))
+        self._quiet_keep_sig = False
         self._quiet_full_at = time.monotonic()
         self._quiet_gen = self._idle_generation()
-        self._quiet_sig = None
+        if not keep_sig:
+            self._quiet_sig = None
         agent = registry.get(self.db, self.name)
         if agent is None or agent.get("status") == "stopped":
             if agent is not None:
