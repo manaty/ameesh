@@ -556,7 +556,8 @@ def _journal_rewind(db: Db, host: str, canon: Canon | None, key: str,
 
 def record_state(db: Db, host: str, status: str, diagnostic: str,
                  canon: Canon | None = None, *, key: str | None = None,
-                 allow_rewind: bool = False) -> None:
+                 allow_rewind: bool = False,
+                 refused_commit: str | None = None) -> None:
     """Écrit l'état du canon de `host` ; le dernier commit valide ne suit que `ok`.
 
     L42 (0031) : `key` ('' = canon par défaut, sinon l'identifiant du canon) ;
@@ -567,7 +568,10 @@ def record_state(db: Db, host: str, status: str, diagnostic: str,
     (`allow_rewind`, `canon sync --allow-rewind`) ; ce retour-là est journalisé.
     L'écriture est conditionnelle (`expected`, CAS) puis rejouée : une synchro
     concurrente qui enregistre un commit plus récent entre notre lecture et
-    notre écriture n'est jamais écrasée par une plus ancienne."""
+    notre écriture n'est jamais écrasée par une plus ancienne.
+
+    #8340 : `refused_commit` accompagne un état non-`ok` (refus d'un module) ;
+    il est toujours effacé par un état `ok`."""
     commit = None
     if status == CANON_OK and canon is not None and canon.sources:
         commit = canon.sources[0].commit or None
@@ -585,7 +589,8 @@ def record_state(db: Db, host: str, status: str, diagnostic: str,
             host, status, root=canon.root if canon is not None else "",
             source=canon.source_label() if canon is not None and canon.sources else "",
             commit=commit, good=status == CANON_OK, diagnostic=diagnostic,
-            canon=key, canon_id=canon_id, expected=expected)
+            canon=key, canon_id=canon_id, expected=expected,
+            refused_commit=refused_commit if status != CANON_OK else None)
 
     if status != CANON_OK or not commit:
         write(None)

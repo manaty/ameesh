@@ -247,9 +247,11 @@ def _recorded_line(host: str, recorded: dict | None) -> str:
         st["status"], host, _moment(st.get("checked_ts")),
         (st.get("last_good_commit") or "—")[:12], _moment(st.get("last_good_ts")))
     if st["status"] != canon_sync.CANON_OK:
-        line += (" — %s\n  → canon agents not claimable on %s until an "
-                 "\"ameesh canon sync\" reads a valid canon" % (st.get("diagnostic") or "?",
-                                                                    host))
+        refused = str(st.get("refused_commit") or "")
+        suffix = " (refused commit %s)" % refused[:12] if refused else ""
+        line += (" — %s%s\n  → canon agents not claimable on %s until an "
+                 "\"ameesh canon sync\" reads a valid canon"
+                 % (st.get("diagnostic") or "?", suffix, host))
     elif st.get("diagnostic"):
         # #4264 : un état `ok` porte au diagnostic les erreurs propres aux
         # agents ou au plan (`canon_sync.assess`) : elles sont dites, jamais tues
@@ -1385,6 +1387,8 @@ def add_parsers(sub) -> None:
     p_snapshot.set_defaults(func=cmd_snapshot)
     from .canon_confirm import add_parser as add_confirm
     add_confirm(canon_sub)
+    from .canon_refusal import add_parser as add_refusal
+    add_refusal(canon_sub)
     p_sync = canon_sub.add_parser("sync", help="canon → host registry (§4.4)")
     _canon_options(p_sync)
     p_sync.add_argument("--host", default=None, help="host (otherwise AMEESH_HOST / this machine)")

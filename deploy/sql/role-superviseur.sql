@@ -327,7 +327,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L42 (0032) : état par (hôte, canon)
         'canon', 'canon_id',
         -- #793 (0425) : repère des envois Process
-        'process_commit'
+        'process_commit',
+        -- #8340 (0613) : commit refusé par un module, même classe que `source`
+        'refused_commit'
     ]),
     ('mesh_approvals', ARRAY[
         'id', 'approver', 'action', 'artifact_kind', 'artifact_hash',

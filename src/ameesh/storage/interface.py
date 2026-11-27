@@ -4286,7 +4286,8 @@ class Canon(Domain):
     def record_state(self, host: str, status: str, *, root: str, source: str,
                      commit: str | None, good: bool, diagnostic: str,
                      canon: str = "", canon_id: str | None = None,
-                     expected: str | None = None) -> str | None:
+                     expected: str | None = None,
+                     refused_commit: str | None = None) -> str | None:
         """Écrit l'état du canon de l'hôte ; le dernier commit valide ne suit que
         `good`. L42 (0031) : clé (host, canon), '' = canon par défaut ;
         `canon_id` : identifiant réel du canon (gardé s'il n'est pas fourni).
@@ -4301,7 +4302,11 @@ class Canon(Domain):
         valeur EFFECTIVE de `last_good_commit` après l'écriture (None :
         aucune) : l'appelant qui attend `commit` sait que son écriture a été
         retenue, sinon il relit et rejoue (cas d'usage
-        `canon_sync.record_state`)."""
+        `canon_sync.record_state`).
+
+        #8340 : `refused_commit` est le commit complet qu'un module a refusé
+        (`canon refuse`), gardé à part de `last_good_commit`. Un état `ok`
+        l'efface, un état non-`ok` le remplace (None l'efface aussi)."""
 
     @abc.abstractmethod
     def state(self, host: str, canon: str = "") -> dict | None:

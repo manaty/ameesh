@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.11, 27 November 2026** (bounded public read of the
-account reservations still counted). Scope: an
+Contract revision: **1.12, 27 November 2026** (additive public canon-refusal
+CLI). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -52,6 +52,10 @@ Revision 1.11 adds `ameesh reservations --json` and
 read-only fleet view of the account reservations still counted (`open` and
 `kept`), so a consumer stops querying `account_reservations` directly; it is
 additive to 1.10 and changes no reservation, envelope or admission path.
+Revision 1.12 adds no Python name: it makes the governed canon-refusal write
+public as the CLI `ameesh canon refuse` (#8340, manaty/ameesh#6580), so an
+installed module that has refused a canon no longer imports
+`ameesh.canon_sync`; it is additive to 1.11.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -93,15 +97,15 @@ The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
 revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2), the
 revision 1.6 element (#6573), the revision 1.7 element (#8341), the
 revision 1.8 element (#8342), the revision 1.9 element (#8337), the
-revision 1.10 element (#8339) and the revision 1.11 element (#8343) are
-available only in a released version that
+revision 1.10 element (#8339), the revision 1.11 element (#8343) and the
+revision 1.12 element (#8340) are available only in a released version that
 carries those lots; at the 1.0 baseline they are absent, and a consumer must
 still treat their absence as "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
 [coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5,
-1.6, 1.7, 1.8, 1.9, 1.10 and 1.11 elements from the release that implements
-them, and freeze revision 1.11; the surface keeps the 1.0 commit as its
-comparison point.
+1.6, 1.7, 1.8, 1.9, 1.10, 1.11 and 1.12 elements from the release that
+implements them, and freeze revision 1.12; the surface keeps the 1.0 commit as
+its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -124,6 +128,7 @@ release's `--help`. These entry points cover the module integration:
 | `ameesh modules --json` | Discovered module descriptions and refused entries. Additive since 1.2: `schema`, `requires`, `migrations` (`applied` and `schema_actual` when the database is readable). A refused entry is not an active provider. |
 | `ameesh module list` and `ameesh module NAME …` | Installation evidence and dispatch to the named module's CLI. `list` is reserved. The module owns the arguments after its name. |
 | `ameesh canon check`, `ameesh canon sync` | Validate and admit configured canon through the core's authority checks. |
+| `ameesh canon refuse --reason TEXT [--commit SHA] [--canon ID] [--json]` | Revision 1.12 (#8340): record a refused canon state for the host that runs the command. The reason is one line, bounded and secret-free; a secret-looking reason is refused, never stored. `--commit` pins the full commit the module inspected; `--canon` selects a configured canon (default otherwise). Exit 0 means the refusal is recorded (or already recorded identically); `--json` reports the resulting state. It has no `--host` option and never writes another host. |
 | `ameesh canon snapshot --expect-commit SHA --json` | [E1a immutable canon/directory snapshot](canon-snapshot-v1.md), available in the release containing #7669 / #5862. No database access or registry admission; profile/lease preparation remains E1b. |
 | `agent-runner --agents-file FILE` | Dynamic admission filter; [format and withdrawal](../RUNNER-ADMISSION.md). It narrows canon admission, never grants authority. |
 | `ameesh turn current --json [--expect-turn ID]` | Current turn's versioned authorization document, with identity and database recheck. `--local` omits the database recheck and must not be treated as proof of a live lease. |
@@ -169,6 +174,42 @@ The object uses schema `ameesh-migrate-dry-run/1`:
 A consumer checks `schema` before reading and ignores unknown response fields.
 A module-local `version` is not comparable with a core version: read `module`
 and `label` together.
+
+### Public canon refusal (1.12, #8340)
+
+`ameesh canon refuse` is the supported replacement for an installed module
+calling `canon_sync.record_state(..., "invalid", reason)`. It writes the
+`canon_state` row of the host that runs it (there is no `--host`), for a
+configured canon, and blocks every new claim on that canon until a later
+successful `ameesh canon sync` replaces the state. A running lease, session or
+turn is untouched.
+
+- The reason is ordinary one-line text, at most 1000 characters after
+  whitespace is collapsed. A control character, an empty or oversized reason,
+  or a reason that looks like a secret is refused before any write; the
+  rejected text is never stored or echoed back. `--reason` is required.
+- `--commit SHA` is optional. When present it must be a full 40- or 64-hex
+  commit; it is stored beside the refusal, never as the audited
+  `last_good_commit`. Without it the refusal is not pinned.
+- `--canon ID` selects a configured canon by id or root; otherwise the default
+  canon is used. An unconfigured root is refused (`unknown-canon`).
+- The call is idempotent: repeating the same (host, canon, reason, commit)
+  changes nothing and reports `written: false`. A different reason or commit
+  replaces the recorded refusal; an `ameesh canon sync` that reads a valid
+  canon replaces it with `ok` and clears the refused commit.
+- `--json` returns `ok`, `host`, `canon`, `canon_id`, `commit`, `status`,
+  `diagnostic`, `written`, `checked_ts`, `last_good_commit`, `code` and
+  `detail`. A refusal exits 1 and carries a closed `code` (`no-host`,
+  `no-canon`, `unknown-canon`, `ambiguous-canon`, `invalid-commit`,
+  `empty-reason`, `reason-too-long`, `reason-unreadable`, `reason-secret`,
+  `canon-error`, `changed`) plus a secret-free `detail`; it writes nothing.
+- This command only denies admission. It does not sync, fetch, validate the
+  canon, or replace any other state. Use `ameesh canon sync` for that.
+
+The stored diagnostic begins with `module refusal: ` so `ameesh canon check`
+and `ameesh canon check --json` (under `registry_state`) distinguish it from a
+sync failure; the refused commit is the `refused_commit` field of the same
+state.
 
 ## HTTP boundary
 
