@@ -83,6 +83,10 @@
 --   * sujets de lots (#8193, 0608), lus par `ameesh work subject` et
 --     `work list --subject`, sans lecteur superviseur pour l'instant :
 --       work_subjects.*, work_items.subject_id
+--   * alertes levées par une application (#8344, 0612), lues par la passe
+--     alerts du notificateur et `ameesh notify list` ; leur texte est celui
+--     que l'application pousse à l'humain :
+--       app_alerts.*
 --
 --   * CONTENUS — texte libre écrit par les agents ou les humains : corps et
 --     charges des messages, consignes, extraits de fil, arguments et notes

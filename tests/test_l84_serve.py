@@ -348,6 +348,7 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/hosts": "/api/v1/hosts",
             "/api/v1/hosts/{host}": "/api/v1/hosts/h1",
             "/api/v1/budget": "/api/v1/budget",
+            "/api/v1/reservations": "/api/v1/reservations?limit=10&state=all",
             "/api/v1/threads/{project}": "/api/v1/threads/demo",
             "/api/v1/threads/{project}/{lot}": "/api/v1/threads/demo/" + lot,
             "/api/v1/openapi.json": "/api/v1/openapi.json",

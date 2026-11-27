@@ -230,6 +230,7 @@ dans le canon :
 ```sh
 ameesh accounts list [--json]          # comptes, dernier choix, état, jauges, pertes, bascules
 ameesh accounts profiles [--json]      # profils déclarés expurgés, sans base (#8337, contrat 1.9)
+ameesh reservations [--json]           # réservations open et kept du jour courant, par agent et compte (#8343, contrat 1.11)
 ameesh accounts use claude secondaire --for 1h
                                        # forçage manuel, avec échéance (levé seul au seuil si un autre compte est libre)
 ameesh accounts use claude secondaire --force "sonde de jauge" --for 15m
