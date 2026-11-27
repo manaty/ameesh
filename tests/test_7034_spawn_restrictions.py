@@ -106,6 +106,11 @@ class SpawnPolicyTest(_CanonDbCase):
             canon_sync.spawn(self.db, "aide", "orchestre", 3600, canon=self.loaded(),
                              mcp=["transport-readonly"], cwd=self.cwd)
         self.assertIn("spawn-mcp-not-found", str(ctx.exception))
+        # #8350: the diagnostic names the directory the source was expected in.
+        with self.assertRaises(spawn.SpawnToolsError) as direct:
+            spawn.mcp_servers(self.cwd, ".mcp.json", ["transport-readonly"])
+        self.assertIn(os.path.join(self.cwd, ".mcp.json"), str(direct.exception))
+        self.assertIn("MCP source directory: %s" % self.cwd, str(direct.exception))
 
     def test_context_is_bounded_and_stored_with_the_child(self):
         text = "mission: read the note\n"
