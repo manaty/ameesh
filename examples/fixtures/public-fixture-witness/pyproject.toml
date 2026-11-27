@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ameesh-public-fixture-witness"
-version = "1.6.0"
-description = "External witness of the ameesh public fixture and production-connection surfaces (contract 1.6)"
+version = "1.7.0"
+description = "External witness of the ameesh public fixture and production-connection surfaces and fixture agent states (contract 1.7)"
 requires-python = ">=3.9"
 dependencies = []
 

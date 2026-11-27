@@ -21,11 +21,25 @@ dépense des harnais **payés au token** compte, et un agent au forfait n'est
 jamais mis en pause par ces plafonds (L49) ; le plafond du mesh somme tous les
 agents, celui d'un agent sa seule dépense.
 
+**Lignée** (#8347) : le plafond posé sur un agent **racine** (non éphémère)
+couvre toute sa lignée — sa dépense et celle de tous les éphémères dont le
+`created_by` y remonte — et c'est la somme qui est comparée. Un plafond posé
+sur un éphémère reste son plafond propre ; plafond du mesh, plafond propre de
+l'agent et plafond de lignée s'appliquent ensemble, le plus strict gagne. Une
+lignée rompue (créateur absent, cycle) refuse le tour : on ne somme jamais une
+lignée partielle. L'admission d'un tour réserve atomiquement sa part du
+plafond de la racine (migration 0611) : deux clones ne lisent pas le même
+reste, et un tour dont la borne ne tient pas dans ce reste est refusé plutôt
+que tronqué. La réservation est rendue au règlement ou expire. La vue `ameesh
+budget --json` publie `lineages` (racine, enfants vivants/échus, totaux
+1 h/24 h).
+
 **À chaud.** Les exécuteurs relisent la table au plus tous les `DEFAULT_TTL`
 secondes (cache court, partagé par leurs workers), et tout de suite sur le
-réveil `ameesh_budget` qu'émet la base à chaque changement. Une base sans la
-migration 0042, ou injoignable au moment de la lecture, laisse la dernière
-valeur lue — à défaut, la configuration de l'hôte.
+réveil `ameesh_budget` qu'émet la base à chaque changement ; la lignée suit le
+même cache et le même réveil. Une base sans la migration 0042, ou injoignable
+au moment de la lecture, laisse la dernière valeur lue — à défaut, la
+configuration de l'hôte.
 
 **Autorité.** Seul un humain habilité règle le budget : une session d'agent
 (`AGENT_MAIL_NAME` posée, ou session liée par `ameesh mail bind`) est
@@ -161,11 +175,40 @@ class Cache:
         self._lock = threading.Lock()
         self._rows: list = []
         self._at: float | None = None
+        #: #8347 : lignées lues pendant le même délai (`{agent: lignée}`)
+        self._lineage: dict = {}
+        self._lineage_at: float | None = None
         self.error = ""
 
     def invalidate(self) -> None:
         with self._lock:
             self._at = None
+            self._lineage = {}
+            self._lineage_at = None
+
+    def lineage(self, db, agent: str) -> dict:
+        """#8347 : la lignée de `agent`, relue au plus tous les `ttl` secondes.
+
+        Le réveil `ameesh_budget` (`invalidate`) la relit tout de suite : un
+        `created_by` corrigé ou un enfant créé compte sans attendre. Une
+        lecture en échec devient une lignée rompue (l'appelant refuse) ; elle
+        n'est pas relue avant le délai suivant."""
+        from . import storage
+        with self._lock:
+            now = self.clock()
+            if self._lineage_at is None or now - self._lineage_at >= self.ttl:
+                self._lineage = {}
+                self._lineage_at = now
+            if agent in self._lineage:
+                return self._lineage[agent]
+            try:
+                data = storage.of(db).agents.lineage(agent)
+            except Exception as exc:  # noqa: BLE001 - fail-closed
+                data = {"root": None, "members": [], "broken": True,
+                        "error": "lineage unreadable for %s: %s"
+                                 % (agent, " ".join(str(exc).split())[:160])}
+            self._lineage[agent] = data
+            return data
 
     def rows(self, db) -> list:
         with self._lock:
@@ -287,6 +330,7 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
     limits = current(cfg, db)
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
     spend: dict = {"paid_harnesses": None, "1h_usd": None, "24h_usd": None, "agents": {}}
+    lineages: list = []
     try:
         paid = cost_mod.paid_harnesses_of()
         spend["paid_harnesses"] = list(paid)
@@ -298,10 +342,20 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
         spend["24h_usd"] = round(book.spent("all", 86400, harnesses=paid), 6)
         # #513 : idem contre le plafond par jour glissant
         spend["24h_counted_usd"] = round(book.paid_spent(paid, 86400), 6)
-        for agent in sorted(limits.agents):
+        # #8347 : deux lectures pour tous les agents à plafond, pas une par
+        # agent (même agrégat que `book.spent`, une requête par fenêtre).
+        capped = sorted(limits.agents)
+        capped_one = (book.spent_by_agent(capped, 3600, harnesses=paid)
+                      if capped else {})
+        capped_day = (book.spent_by_agent(capped, 86400, harnesses=paid)
+                      if capped else {})
+        for agent in capped:
             spend["agents"][agent] = {
-                "1h_usd": round(book.spent(agent, 3600, harnesses=paid), 6),
-                "24h_usd": round(book.spent(agent, 86400, harnesses=paid), 6)}
+                "1h_usd": round(capped_one.get(agent, 0.0), 6),
+                "24h_usd": round(capped_day.get(agent, 0.0), 6)}
+        # #8347 : vue de lignée, une lecture de lignées et deux sommes pour
+        # tous les enfants — jamais une requête par enfant.
+        lineages = _lineage_view(db, limits, book, paid)
     except cost_mod.CostError as exc:
         spend["error"] = str(exc)
     paused = [{"agent": r["name"], "reason": (r.get("status_text") or "")[len(PAUSE_PREFIX):]}
@@ -315,12 +369,222 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
     from . import account_budget, provider_credits, host_budget
     return {"schema": "ameesh-budget/1", "limits": limits.as_dict(),
             "rows": list(limits.rows), "spend": spend, "paused": paused, "events": events,
+            # #8347 : racines, enfants (vivants/échus), totaux 1 h et 24 h
+            "lineages": lineages,
             # #1469 : enveloppes par compte de facturation (jour calendaire)
             "accounts": account_budget.usage(db),
             "infrastructure": host_budget.status(cfg, db),
             # #4164 : l'état réel des crédits de chaque compte fournisseur, à
             # côté des enveloppes (une enveloppe ne voit pas un compte épuisé)
             "provider_credits": provider_credits.listing(db)}
+
+
+def _caps_json(caps) -> dict | None:
+    """La forme JSON d'un plafond d'agent, ou None."""
+    if not caps:
+        return None
+    return {"per_hour_usd": caps.get(3600), "per_day_usd": caps.get(86400)}
+
+
+def _lineage_view(db, limits: Limits, book, paid) -> list:
+    """#8347 : la dépense d'une lignée, racine et enfants, 1 h / 24 h.
+
+    Les racines rendues sont celles à plafond, plus celles qui ont au moins un
+    éphémère descendant. Tous les membres de toutes les racines sont
+    dédupliqués avant le rendu : `spent_by_agent` lit les deux fenêtres en une
+    requête chacune, donc le coût ne dépend ni du nombre d'enfants ni du
+    nombre de racines (l'ancien rendu relisait le grand livre par racine)."""
+    roots = tuple(sorted(limits.agents))
+    groups = storage.of(db).agents.lineages(roots)
+    now = time.time()
+    names = sorted({str(m["agent"]) for group in groups
+                    for m in group.get("members") or () if m.get("agent")})
+    one = book.spent_by_agent(names, 3600, harnesses=paid) if names else {}
+    day = book.spent_by_agent(names, 86400, harnesses=paid) if names else {}
+    out = []
+    for group in groups:
+        members = group.get("members") or []
+        if not any(m.get("agent") for m in members):
+            continue
+        children = []
+        total_one = total_day = 0.0
+        own = {"1h_usd": 0.0, "24h_usd": 0.0}
+        for member in members:
+            agent = str(member["agent"])
+            spent = {"1h_usd": round(one.get(agent, 0.0), 6),
+                     "24h_usd": round(day.get(agent, 0.0), 6)}
+            total_one += one.get(agent, 0.0)
+            total_day += day.get(agent, 0.0)
+            if member.get("depth") == 0:
+                own = spent
+                continue
+            expires = member.get("expires_ts")
+            expired = expires is not None and float(expires) <= now
+            children.append(dict(
+                {"agent": agent,
+                 "state": "expired" if expired else
+                          "stopped" if member.get("status") == "stopped" else "alive",
+                 "expires_ts": expires,
+                 "caps": _caps_json(limits.agents.get(agent))},
+                **spent))
+        out.append({"root": group["root"],
+                    "caps": _caps_json(limits.agents.get(group["root"])),
+                    "own": own, "children": children,
+                    "total": {"1h_usd": round(total_one, 6),
+                              "24h_usd": round(total_day, 6)}})
+    return out
+
+
+def lineage_warning(cfg: Config, db, agent: str) -> str:
+    """#8347 : la lignée de `agent` est-elle déjà au-dessus d'un plafond ?
+
+    Lecture seule, pour l'avertissement de `agent spawn` (option 3 du lot) :
+    on n'interdit pas la création, l'enfant sera mis en pause à son premier
+    tour comme le reste de la lignée. '' quand aucun plafond ne s'applique
+    (mesh compris) ou quand la dépense est illisible — le spawn ne dépend
+    jamais d'une lecture de coût."""
+    from . import cost as cost_mod
+    try:
+        limits = current(cfg, db)
+        if not limits.agents:
+            return ""
+        # le harnais du créateur : un agent au forfait (L49) ne doit pas
+        # recevoir l'avertissement d'un plafond payé au token
+        row = registry.get(db, agent) or {}
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db,
+                                 tools={agent: row.get("harness") or ""},
+                                 **limits.book_kwargs())
+        return book.over(agent, pace=False, account_checked=True)
+    except Exception:  # noqa: BLE001 - avertissement seulement : jamais bloquant
+        return ""
+
+
+#: #8347 : durée d'une réservation de lignée quand le règlement n'arrive pas
+LINEAGE_RESERVATION_TTL_S = 2 * 3600.0
+
+
+def reserve_lineage(cfg: Config, db, agent: str, spend_key: str | None, *,
+                    reserve_usd: float) -> str:
+    """#8347 : réserve atomiquement une part du plafond de la lignée de `agent`.
+
+    La garde lue seule (`CostBook.over`) laissait deux clones lire le même
+    reste avant que l'un des deux ne règle son tour. L'admission d'un tour
+    prend ici le verrou de la racine, relit la dépense payée et les
+    réservations des tours en vol, et réserve `reserve_usd` — la borne d'un
+    tour — sous la clé comptable du tour. Un second clone ne peut plus être
+    admis sur le même reste. Une borne qui ne tient pas entièrement dans le
+    reste **refuse le tour** : la tronquer laisserait le tour dépenser sa
+    borne pleine et dépasser le plafond (B de cx2, #46864). Le règlement
+    (`release_lineage`) ou l'expiration rend la place ; le rejeu de la même
+    clé est idempotent.
+
+    Rend '' quand le tour est admis (ou qu'aucun plafond de lignée ne
+    s'applique), sinon la raison du refus. Une base ou une lignée illisible
+    refuse : on ne réserve pas sur une somme partielle."""
+    from . import cost as cost_mod
+    if not spend_key or storage.is_remote(db):
+        return ""
+    try:
+        with db.transaction() as tx:
+            store = storage.of(tx)
+            try:
+                paid = tuple(cost_mod.paid_harnesses_of())
+            except cost_mod.CostError:
+                paid = ()
+            if not paid:
+                return ""
+            limits = resolve(cfg, store.budgets.limits())
+            if not limits.agents:
+                return ""
+            lineage = store.agents.lineage(agent)
+            if lineage.get("broken"):
+                return ("lineage budget (pay-per-token): %s; no turn until the "
+                        "created_by lineage is repaired"
+                        % (lineage.get("error") or "broken lineage for %s" % agent))
+            root = lineage.get("root") or agent
+            caps = {int(window): float(cap)
+                    for window, cap in (limits.agents.get(root) or {}).items()
+                    if cap and float(cap) > 0 and int(window) in LABELS}
+            if not caps:
+                return ""
+            row = store.agents.get(agent) or {}
+            harness = row.get("harness") or ""
+            # L49 : un agent au forfait n'est jamais mis en pause par ces
+            # plafonds, il ne réserve donc rien pour sa lignée.
+            if harness and harness not in paid:
+                return ""
+            # Une seule admission à la fois par lignée, avant toute lecture de
+            # dépense ou de réservation : deux frères s'ordonnent ici.
+            tx.query("select pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':budget-lineage:' || %s, 0))", (root,))
+            rejeu = store.budgets.lineage_reserve_get(spend_key)
+            if rejeu is not None:
+                same = (rejeu.get("root") == root and rejeu.get("agent") == agent)
+                if same and float(rejeu.get("expires_ts") or 0.0) > time.time():
+                    return ""
+                if not same:
+                    return ("lineage reservation %s already belongs to %s/%s"
+                            % (spend_key, rejeu.get("root"), rejeu.get("agent")))
+                # expirée : elle ne compte plus, on la remplace par une neuve
+                store.budgets.lineage_release(spend_key)
+            members = [str(m.get("agent")) for m in lineage.get("members") or ()
+                       if m.get("agent")] or [agent]
+            book = cost_mod.CostBook(state_dir=cfg.state_dir, db=tx, tools={},
+                                     **limits.book_kwargs())
+            reserved = store.budgets.lineage_reserved(root)
+            parts: dict = {}
+            borne = float(reserve_usd) if reserve_usd and reserve_usd > 0 else 0.0
+            for window, cap in sorted(caps.items()):
+                spent = book.paid_spent(paid, window, tuple(members))
+                garde = float(reserved.get(window, 0.0))
+                reste = cap - spent - garde
+                label = "hourly" if window == 3600 else "daily"
+                if reste <= 0:
+                    return ("%s budget of lineage %s (pay-per-token): %.2f $ "
+                            "spent + %.2f $ reserved by in-flight turns, cap %.2f $"
+                            % (label, root, spent, garde, cap))
+                part = borne if borne > 0 else reste
+                if part > reste + 1e-9:
+                    # une réservation tronquée ne borne pas la dépense du tour
+                    # (il peut dépenser sa borne pleine) : on refuse plutôt que
+                    # de laisser la lignée dépasser le plafond.
+                    return ("%s budget of lineage %s (pay-per-token): %.2f $ "
+                            "spent + %.2f $ reserved by in-flight turns, cap "
+                            "%.2f $; the turn bound %.2f $ exceeds the remaining "
+                            "%.2f $" % (label, root, spent, garde, cap, part,
+                                        reste))
+                parts[window] = min(part, reste)
+            ecrit = store.budgets.lineage_reserve_put(
+                root=root, agent=agent, spend_key=spend_key,
+                hour_usd=parts.get(3600, 0.0), day_usd=parts.get(86400, 0.0),
+                expires_s=LINEAGE_RESERVATION_TTL_S)
+            if not ecrit:
+                # course sur la même clé : un rejeu identique reste admis
+                rejeu = store.budgets.lineage_reserve_get(spend_key)
+                if rejeu is not None and rejeu.get("root") == root \
+                        and rejeu.get("agent") == agent:
+                    return ""
+                return "lineage reservation for %s could not be written" % spend_key
+            return ""
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError as exc:
+        return ("lineage budget unreadable: %s"
+                % " ".join(str(exc).split())[:160])
+
+
+def release_lineage(db, spend_key: str | None) -> bool:
+    """#8347 : rend la réservation d'un tour réglé, annulé ou réparé.
+
+    Sans effet sur un pilote qui ne réserve pas ; une panne de base est
+    avalée (la réservation expirera) — le règlement, lui, a déjà écrit la
+    dépense."""
+    if not spend_key or storage.is_remote(db):
+        return False
+    try:
+        return bool(storage.of(db).budgets.lineage_release(spend_key))
+    except db_mod.DbError:
+        return False
 
 
 def _moment(epoch) -> str:
@@ -359,6 +623,29 @@ def format_status(data: dict) -> str:
                 agent, LABELS[3600], _fmt_usd(caps["per_hour_usd"]),
                 LABELS[86400], _fmt_usd(caps["per_day_usd"]),
                 _fmt_usd(dep.get("1h_usd")), _fmt_usd(dep.get("24h_usd"))))
+    if data.get("lineages"):
+        out.append("lineages (pay-per-token; a root cap covers its whole lineage):")
+        for lin in data["lineages"]:
+            caps = lin.get("caps") or {}
+            cap_text = " · ".join(
+                "%s %s" % (LABELS[w], _fmt_usd(caps.get(key)))
+                for w, key in ((3600, "per_hour_usd"), (86400, "per_day_usd"))
+                if caps.get(key)) or "none"
+            out.append("  %-16s own 1 h %s · 24 h %s · %d child(ren)   total 1 h %s · 24 h %s"
+                       "   cap %s" % (
+                           lin["root"], _fmt_usd(lin["own"]["1h_usd"]),
+                           _fmt_usd(lin["own"]["24h_usd"]), len(lin["children"]),
+                           _fmt_usd(lin["total"]["1h_usd"]),
+                           _fmt_usd(lin["total"]["24h_usd"]), cap_text))
+            for child in lin["children"]:
+                own_caps = child.get("caps") or {}
+                own_text = " · own cap " + " · ".join(
+                    "%s %s" % (LABELS[w], _fmt_usd(own_caps.get(key)))
+                    for w, key in ((3600, "per_hour_usd"), (86400, "per_day_usd"))
+                    if own_caps.get(key)) if own_caps else ""
+                out.append("    %-14s %-8s 1 h %s · 24 h %s%s" % (
+                    child["agent"], child["state"], _fmt_usd(child["1h_usd"]),
+                    _fmt_usd(child["24h_usd"]), own_text))
     sp = data["spend"]
     if sp.get("error"):
         out.append("pay-per-token spend: unreadable (%s)" % sp["error"])

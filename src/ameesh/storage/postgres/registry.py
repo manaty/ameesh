@@ -794,6 +794,96 @@ class Agents(interface.Agents):
     def overview(self) -> list[dict]:
         return self.db.query(OVERVIEW_SQL)
 
+    #: #8347 : les lignées d'éphémères en UNE requête récursive. `down` part
+    #: de chaque racine (agent non éphémère) demandée ou ayant au moins un
+    #: enfant direct ; la borne et le chemin coupent cycles et chaînes trop
+    #: longues, comme `canon_governed_sql`.
+    _LINEAGES_SQL = """
+        WITH RECURSIVE down(root, name, ephemeral, created_by, status,
+                            expires_ts, depth, path) AS (
+            SELECT r.name, r.name, coalesce(r.ephemeral, false), r.created_by,
+                   r.status,
+                   extract(epoch from r.ephemeral_expires_at)::float8,
+                   0, ARRAY[r.name]
+              FROM agent_registry r
+             WHERE NOT coalesce(r.ephemeral, false)
+               AND (r.name = ANY(%s::text[])
+                    OR EXISTS (SELECT 1 FROM agent_registry c
+                                WHERE c.created_by = r.name AND c.ephemeral))
+            UNION ALL
+            SELECT d.root, c.name, coalesce(c.ephemeral, false), c.created_by,
+                   c.status,
+                   extract(epoch from c.ephemeral_expires_at)::float8,
+                   d.depth + 1, d.path || c.name
+              FROM down d
+              JOIN agent_registry c ON c.created_by = d.name
+             WHERE c.ephemeral
+               AND d.depth < %s
+               AND NOT (c.name = ANY(d.path))
+        )
+        SELECT root, name, ephemeral, created_by, status, expires_ts, depth
+          FROM down
+         ORDER BY root, depth, name"""
+
+    def lineages(self, roots=()) -> list[dict]:
+        rows = self.db.query(self._LINEAGES_SQL, (list(roots or ()), LINEAGE_MAX))
+        groups: list[dict] = []
+        current = None
+        for row in rows:
+            if row["root"] != current:
+                current = row["root"]
+                groups.append({"root": current, "members": [], "broken": False})
+            groups[-1]["members"].append({
+                "agent": row["name"],
+                "ephemeral": bool(row["ephemeral"]),
+                "status": row["status"],
+                "expires_ts": row["expires_ts"],
+                "depth": int(row["depth"]),
+            })
+        return groups
+
+    def lineage(self, name) -> dict:
+        # La remontée `up` s'arrête au premier ancêtre non éphémère ; si elle
+        # n'en trouve pas (créateur absent, cycle, chaîne trop longue), la
+        # lignée est rompue et le disent `broken` + `error`. Un nom absent du
+        # registre (coût d'un agent retiré, banc) n'est pas une lignée
+        # rompue : il est sa propre racine, sans descendant.
+        rows = self.db.query(
+            """
+            WITH RECURSIVE up(name, created_by, ephemeral, depth, path) AS (
+                SELECT r.name, r.created_by, coalesce(r.ephemeral, false),
+                       0, ARRAY[r.name]
+                  FROM agent_registry r WHERE r.name = %s
+                UNION ALL
+                SELECT c.name, c.created_by, coalesce(c.ephemeral, false),
+                       u.depth + 1, u.path || c.name
+                  FROM up u
+                  JOIN agent_registry c ON c.name = u.created_by
+                 WHERE u.ephemeral
+                   AND u.depth < %s
+                   AND NOT (c.name = ANY(u.path))
+            )
+            SELECT name, ephemeral, depth FROM up
+             ORDER BY depth""",
+            (name, LINEAGE_MAX))
+        if not rows:
+            return {"root": name, "members": [{"agent": name, "ephemeral": False,
+                                               "status": None, "expires_ts": None,
+                                               "depth": 0}],
+                    "broken": False, "known": False}
+        root = next((row for row in rows if not row["ephemeral"]), None)
+        if root is None:
+            return {"root": None, "members": [], "broken": True,
+                    "error": ("incomplete created_by lineage for %s (unknown creator, "
+                              "cycle or more than %d levels)" % (name, LINEAGE_MAX))}
+        groups = self.lineages((root["name"],))
+        # `lineages` rend aussi les autres racines qui ont des enfants : on
+        # prend le groupe de la racine trouvée, pas le premier de l'ordre SQL.
+        group = next((g for g in groups if g.get("root") == root["name"]), None) \
+            or {"root": root["name"], "members": [], "broken": False}
+        group["broken"] = False
+        return group
+
     def reachability(self) -> list[dict]:
         # #3631 : la passe de redésignation n'a besoin que de ces sept
         # colonnes ; `overview()` y ajoutait le canon, les baux, les jauges et

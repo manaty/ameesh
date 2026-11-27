@@ -181,6 +181,9 @@ CAP_LABEL_PRIMARY = "primary cap"
 #: L242b (2): a non-critical agent stops this much below the pace cap, so that
 #: the critical agents keep the margin up to it
 RESERVE = 0.10
+#: #8347 : borne d'un tour réservée par défaut sur un plafond de lignée, quand
+#: aucun profil de compte ne fournit son `reserve_usd`
+DEFAULT_RESERVE_USD = 2.0
 #: #7006 : marge de résumé d'un agent critique. Il quitte son compte de session
 #: à sa saturation (100 %) ; or le tour de résumé d'une rotation est refusé sur
 #: une jauge saturée (`account_turn.summary_possible`) : sans cette marge, la
@@ -348,8 +351,9 @@ class Profile:
     #: empty = no daily account envelope applies
     billing_account: str = ""
     #: #1469: dollars reserved before each turn on that billing account (the
-    #: bound of one turn), settled at the real cost when the turn ends
-    reserve_usd: float = 2.0
+    #: bound of one turn), settled at the real cost when the turn ends;
+    #: #8347 : same bound reserved on a lineage cap when no profile exists
+    reserve_usd: float = DEFAULT_RESERVE_USD
     #: #3779: provider short-window admission of this account. `None` = the
     #: harness default (`account_window`) for a plan account (`config_dir`);
     #: #5783: an `api_key_env` account has no such default (metered key, no

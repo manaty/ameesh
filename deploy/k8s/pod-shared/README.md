@@ -335,8 +335,9 @@ tourne sur la tête gelée (canon §3/§11 bis), le pilote le lance à la main.
 
 ## Ce que ce chart ne fait pas
 
-- Pas de connexion de siège ni de `pods/exec` : la connexion P3 passe par un
-  pod dédié (design §7.3).
+- Pas de connexion de siège ni de `pods/exec` : la connexion passe par un pod
+  dédié, [`../pod-login/`](../pod-login/README.md) (design §7.3, #7911) ;
+  aucun `pods/exec` n'est délivré sur ce pod partagé.
 - Pas d'isolation réseau/IPC entre conteneurs d'un même pod, ni de protection
   contre l'admin du cluster : limites du design §5.1.
 - Pas de fournisseur de pods enfants (`pod_hosts`, RBAC, admission, TTL) :

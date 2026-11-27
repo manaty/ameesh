@@ -207,6 +207,11 @@ FERMEES = {
     "tranche_events": {"id", "tranche_id", "reservation_id", "action", "actor",
                        "reason", "at", "data"},
     "tranche_relay_requests": {"id", "turn_id", "state", "created_at", "recorded_at"},
+    # #8347 (0611) : la part du plafond d'une lignée réservée par un tour
+    # admis est une autorité interne de l'admission de budget, effacée au
+    # règlement ; le rôle superviseur ne la lit pas, aucun GRANT ajouté.
+    "budget_lineage_reservations": {"spend_key", "root", "agent", "hour_usd",
+                                    "day_usd", "created_at", "expires_at"},
     # #4867 / 0520: dormant native sandbox authority, immutable admissions and
     # application-bound receipts/results. Preserve the existing closed rights
     # for BOTH supervisor roles; S5 owns any explicit read projection/grant.
@@ -464,6 +469,11 @@ FERMEES = {
     # #7697 (0601) : UID Kubernetes observé par un runner d'enfant pod ;
     # identité interne de la garde `pod-host-unknown`, fermée aux superviseurs.
     "runner_presence": {"profiles", "pod_uid"},
+    # #7911 (0610) : fenêtre de connexion du siège. Le superviseur lit l'état,
+    # les dates et le pod désigné (nom et fin observée) ; `id` (interne) et
+    # `terms_ref` (la preuve D2 du bureau, une référence de personne) restent
+    # fermés.
+    "tenant_logins": {"id", "terms_ref"},
     # #7034 (0571) : état privé d'un enfant restreint (politique d'outils et
     # de MCP, contexte borné, état des rapports) ; rien à superviser ici, le
     # rôle de base n'en lit aucune colonne, aucun GRANT ajouté.

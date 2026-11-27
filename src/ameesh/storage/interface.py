@@ -80,6 +80,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    launch settle replace cancel
    action_source   columns rows
    canon           record_state state record_auth_state host_rows
+                   confirm_fresh
                    write_declared clear_responsible set_placement
                    lineage_rows revive clear_pending_stop move_host
                    stop_removed
@@ -241,6 +242,62 @@ class Domain(abc.ABC):
 # registre des agents (`agent_registry`) : lignes et baux
 # --------------------------------------------------------------------------
 
+#: profondeur maximale d'une lignée suivie (comme `postgres.registry.LINEAGE_MAX`)
+LINEAGE_MAX = 32
+
+
+def _lineage_groups(rows: Sequence[dict], roots: Sequence[str] = ()) -> list[dict]:
+    """Groupes de lignée calculés en Python depuis des lignes de registre.
+
+    Repli des opérations `Agents.lineages`/`lineage` pour un pilote qui ne
+    sait pas faire la récursion en SQL. `rows` portent au moins `name`,
+    `ephemeral`, `created_by`, `status` et `ephemeral_expires_ts`. Une racine
+    est un agent non éphémère ; un plafond posé sur un éphémère reste son
+    plafond propre et ne crée donc pas de groupe (`roots` l'ignore)."""
+    by_name = {r.get("name"): r for r in rows if r.get("name")}
+    children: dict = {}
+    for row in rows:
+        parent = row.get("created_by")
+        if row.get("ephemeral") and parent:
+            children.setdefault(parent, []).append(row)
+    wanted = {str(r) for r in roots if str(r)}
+    seeds = wanted | {row.get("name") for row in rows
+                      if row.get("ephemeral") and row.get("created_by")}
+    groups = []
+    for root in sorted(seeds):
+        row = by_name.get(root)
+        if row is None or row.get("ephemeral"):
+            if root in wanted:
+                groups.append({"root": root, "members": [], "broken": True,
+                               "error": "unknown or ephemeral root %s" % root})
+            continue
+        if root not in wanted and root not in children:
+            continue
+        members = []
+        seen = set()
+        stack = [(root, 0)]
+        while stack:
+            name, depth = stack.pop()
+            if name in seen or depth > LINEAGE_MAX:
+                continue
+            seen.add(name)
+            member = by_name.get(name)
+            if member is None:
+                continue
+            members.append({
+                "agent": name,
+                "ephemeral": bool(member.get("ephemeral")),
+                "status": member.get("status"),
+                "expires_ts": member.get("ephemeral_expires_ts"),
+                "depth": depth,
+            })
+            for child in children.get(name, ()):
+                stack.append((child.get("name"), depth + 1))
+        members.sort(key=lambda m: (m["depth"], m["agent"]))
+        groups.append({"root": root, "members": members, "broken": False})
+    return groups
+
+
 class Agents(Domain):
     """Lignes du registre hors bail : inscription, lecture, statut."""
 
@@ -371,6 +428,70 @@ class Agents(Domain):
     @abc.abstractmethod
     def overview(self) -> list[dict]:
         """Vue d'observabilité (`mesh list --json`), colonnes du canon comprises."""
+
+    def lineages(self, roots: Sequence[str] = ()) -> list[dict]:
+        """#8347 : les lignées d'éphémères, une par agent **racine**.
+
+        Une lignée est la racine (agent non éphémère) et tous les agents dont
+        la chaîne `created_by` y remonte, échus et arrêtés compris ; les noms
+        de `roots` sont rendus même sans descendant (une racine à plafond
+        reste visible). Rend `[{root, members, broken}]`, `members` étant
+        `[{agent, ephemeral, status, expires_ts, depth}]` trié par profondeur
+        puis nom ; `broken` est faux ici (le repli ne fabrique pas de lignée
+        partielle).
+
+        Le repli lit `overview()` et calcule les groupes en Python : correct
+        pour tout pilote, plus lourd qu'une récursion SQL (le pilote Postgres
+        la fait en une requête). Lecture seule, aucune décision."""
+        return _lineage_groups(self.overview(), roots)
+
+    def lineage(self, name: str) -> dict:
+        """#8347 : la lignée de `name` — `{root, members, broken, error}`.
+
+        `root` est l'ancêtre non éphémère, `members` la même forme que
+        `lineages()` (racine incluse). Une chaîne rompue (créateur absent,
+        cycle, profondeur au-delà de `LINEAGE_MAX`) rend `broken: true`,
+        `root: null` et un `error` lisible : l'appelant décide de refuser,
+        jamais de replier sur un maillon trouvé. Le repli marche la chaîne
+        avec `get()` puis groupe depuis `overview()`."""
+        rows = self.overview()
+        by_name = {r.get("name"): r for r in rows if r.get("name")}
+        seen: list[str] = []
+        current: str | None = name
+        while current:
+            if current in seen:
+                return {"root": None, "members": [], "broken": True,
+                        "error": "cycle in created_by lineage at %s" % current}
+            if len(seen) >= LINEAGE_MAX:
+                return {"root": None, "members": [], "broken": True,
+                        "error": "lineage of more than %d creators" % LINEAGE_MAX}
+            seen.append(current)
+            row = by_name.get(current)
+            if row is None:
+                if len(seen) == 1:
+                    # Nom absent du registre : sa propre racine, sans
+                    # descendant (coût d'un agent retiré, banc).
+                    return {"root": name, "members": [{
+                        "agent": name, "ephemeral": False, "status": None,
+                        "expires_ts": None, "depth": 0}],
+                        "broken": False, "known": False}
+                return {"root": None, "members": [], "broken": True,
+                        "error": "creator %s is unknown to the registry" % current}
+            if not row.get("ephemeral"):
+                groups = _lineage_groups(rows, (current,))
+                # `_lineage_groups` rend aussi les autres racines semées par
+                # leurs enfants : prendre CELLE de la racine trouvée, jamais
+                # la première venue.
+                group = next((g for g in groups if g.get("root") == current), None) \
+                    or {"root": current, "members": [], "broken": False}
+                group["broken"] = False
+                return group
+            current = row.get("created_by") or None
+            if current is None:
+                return {"root": None, "members": [], "broken": True,
+                        "error": "ephemeral %s has no created_by" % row.get("name")}
+        return {"root": None, "members": [], "broken": True,
+                "error": "empty lineage for %s" % name}
 
     @abc.abstractmethod
     def reachability(self) -> list[dict]:
@@ -1016,6 +1137,32 @@ class TurnCosts(Domain):
         Les lignes `source = 'device'` (L111) ne comptent jamais : la dépense
         d'un appareil médié est celle que le relais a mesurée."""
 
+    def spent_agents(self, seconds: float, *, agents: Sequence[str],
+                     harnesses: Sequence[str] | None) -> dict[str, float]:
+        """#8347 : la dépense de plusieurs agents dans la même fenêtre.
+
+        Rend `{agent: usd}` pour chaque agent demandé (0 compris), avec les
+        mêmes exclusions que `spent()` : lignes écartées (`void_reason`) et
+        appareils médiés (`source = 'device'`) hors somme. La garde de lignée
+        et la vue budget s'en servent pour sommer racine et clones sans une
+        requête par enfant (le pilote Postgres la fait en un `GROUP BY`).
+
+        Le repli appelle `spent()` agent par agent : correct sur tout pilote,
+        un aller-retour par agent."""
+        return {str(agent): self.spent(seconds, agent=str(agent),
+                                       harnesses=harnesses)
+                for agent in agents}
+
+    def by_agent(self, from_ts: float, to_ts: float, *,
+                 harnesses: Sequence[str] | None = None) -> list[dict]:
+        """#8347 : `turn_costs` groupé par agent sur ]from_ts, to_ts].
+
+        Rend `[{agent, usd, turns}]` (agents ayant au moins un tour compté),
+        hors lignes écartées et hors appareils médiés. Lecture seule pour
+        `ameesh cost lineage` : le regroupement par racine se fait ensuite en
+        Python depuis `Agents.lineages()`, sans une requête par agent."""
+        raise NotImplementedError("turn_costs.by_agent: not supported by this storage")
+
     @abc.abstractmethod
     def spent_between(self, from_ts: float, to_ts: float, *,
                       harnesses: Sequence[str]) -> float:
@@ -1102,6 +1249,39 @@ class Budgets(Domain):
     def events(self, limit: int, scope: str | None = None) -> list[dict]:
         """Les derniers changements, récents d'abord : scope, window_s,
         old_usd, new_usd, actor, at_ts."""
+
+    # -- #8347 : réservations du plafond d'une lignée (migration 0611) -----
+    # Ces opérations sont CONCRÈTES : le contrat de l'exécuteur médié ne
+    # change pas. Le repli ne réserve rien (l'exécuteur médié compte la
+    # dépense au relais) ; un pilote qui sait réserver les surcharge.
+    def lineage_reserved(self, root: str) -> dict[int, float]:
+        """#8347 : la part du plafond de `root` réservée par des tours en vol.
+
+        Rend `{window_s: usd}` (3600, 86400), lignes expirées exclues. Repli :
+        aucune réservation — la garde lit alors la seule dépense écrite."""
+        return {}
+
+    def lineage_reserve_get(self, spend_key: str) -> dict | None:
+        """#8347 : la réservation du tour `spend_key`, ou None.
+
+        Rend `spend_key, root, agent, hour_usd, day_usd, expires_ts`. Repli :
+        None (aucune réservation connue)."""
+        return None
+
+    def lineage_reserve_put(self, *, root: str, agent: str, spend_key: str,
+                            hour_usd: float, day_usd: float,
+                            expires_s: float) -> bool:
+        """#8347 : écrit la réservation d'un tour admis, en une écriture.
+
+        Idempotent : la clé `spend_key` déjà présente n'est pas réécrite
+        (False). Repli : False, le pilote ne réserve pas."""
+        return False
+
+    def lineage_release(self, spend_key: str) -> bool:
+        """#8347 : efface la réservation d'un tour réglé ou annulé.
+
+        False quand elle n'existait pas (ou pilote sans réservation)."""
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -4187,6 +4367,19 @@ class Canon(Domain):
         withdrawn when the failure recorded a non-ok state."""
 
     @abc.abstractmethod
+    def confirm_fresh(self, host: str, canon: str, *, commit: str, root: str,
+                      max_span_s: float) -> dict | None:
+        """#8354 : rafraîchit SEULEMENT `checked_at` d'un canon inchangé.
+
+        Une seule instruction conditionnelle : la ligne (host, canon) doit
+        être encore `ok`, au `last_good_commit` `commit`, à la racine `root`,
+        et sa dernière application complète (`last_good_at`) dater de moins
+        de `max_span_s` secondes (horloge de la base). Une invalidation
+        concurrente au même commit, un commit avancé ou une application trop
+        ancienne ne sont jamais recouverts : None, rien d'écrit. Rend
+        `checked_ts` et `last_good_ts` (époque) sinon."""
+
+    @abc.abstractmethod
     def shared_sync(self, host: str, canon: str) -> dict | None:
         """Last completed state, kept while a newer claim is pending (#5493)
         and after a claim that failed on an `ok` state (#5649); None if no
@@ -5600,27 +5793,75 @@ class Tenancy(Domain):
     @abc.abstractmethod
     def bindings(self, host: str | None = None) -> list[dict]:
         """Liaisons (avec la présence de leur runner : `seen_ts`, `version`,
-        `profiles`)."""
+        `profiles`, `state`) et, #7911, la fenêtre `login` ouverte
+        (`login_until_ts`, `login_terms`, `login_opened_by`, `login_pod`,
+        `login_pod_ended_ts`)."""
+
+    @abc.abstractmethod
+    def login_active(self, host: str, tenant: str) -> bool:
+        """#7911 : la garde de connexion du siège est active pour ce tenant
+        (la fonction SQL `ameesh_tenant_login_active`) : fenêtre ouverte et
+        fin du pod de connexion non observée. Une fenêtre sans pod reste
+        bornée par son échéance ; une fenêtre avec pod ne se rouvre pas à
+        l'expiration seule, la fin observée du pod est requise."""
+
+    @abc.abstractmethod
+    def login_window(self, host: str, tenant: str) -> dict | None:
+        """#7911 : la fenêtre `login` ouverte du tenant, ou None : `pod_name`,
+        `expires_ts`, `pod_ended_ts`, `pod_ended_by`, `opened_ts`, `opened_by`.
+        Le runner s'en sert pour observer la fin du pod sur le volume avant de
+        reprendre (B/P2 #46731)."""
+
+    @abc.abstractmethod
+    def login_open(self, host: str, tenant: str, *, terms_ref: str,
+                   actor: str, ttl_s: float, pod_name: str | None = None) -> dict:
+        """#7911 : ouvre la fenêtre `login` d'un tenant (geste humain/avatar,
+        `terms_ref` = preuve citable des conditions du fournisseur, D2).
+
+        `pod_name` est le pod de connexion désigné, rendu au bureau AVANT sa
+        création (défaut : nom unique dérivé du tenant). Une fenêtre dont la
+        fin du pod a été observée, ou une fenêtre expirée sans pod, est fermée
+        au passage ; une fenêtre encore ouverte et non terminée est refusée
+        (`tenant-login-already-open`). Rend la ligne (id, host, tenant,
+        pod_name, terms_ref, opened_by, opened_at, expires_at).
+        """
+
+    @abc.abstractmethod
+    def login_pod_ended(self, host: str, tenant: str, *, pod_name: str,
+                        by: str) -> bool:
+        """#7911 : enregistre la fin observée du pod de connexion de la
+        fenêtre ouverte (battement silencieux du volume, ou suppression
+        constatée). Idempotent ; vrai si cette passe a écrit la fin."""
+
+    @abc.abstractmethod
+    def login_close(self, host: str, tenant: str, *, actor: str) -> dict:
+        """#7911 : ferme la fenêtre `login` ouverte du tenant ; rend
+        `{closed: bool, ...}` (idempotent si aucune fenêtre ouverte)."""
 
     @abc.abstractmethod
     def beat(self, host: str, tenant: str, runner_id: str, *, uid: int | None,
              version: str | None, profiles: Sequence[str] = (),
-             pod_uid: str | None = None) -> bool:
+             pod_uid: str | None = None, login_ack: bool = False) -> bool:
         """Battement du runner d'un tenant ; faux sans liaison qui le nomme.
 
         #7108 : `profiles` publie les profils de compte `harnais/compte` que
         ce runner peut offrir (noms seulement, jamais un chemin ni un secret).
         #7697 : `pod_uid` est le UID Kubernetes observé par un runner d'enfant
         porté par un pod ; la garde de réclamation l'exige égal à
-        `pod_hosts.pod_uid` (les hôtes non pod l'ignorent)."""
+        `pod_hosts.pod_uid` (les hôtes non pod l'ignorent).
+        #7911 : `login_ack` est l'acquittement du runner — baux rendus et
+        tours arrêtés. L'état `state` ne vaut `login` que si la fenêtre
+        `tenant_logins` est encore ouverte **et** que cet acquittement est
+        vrai : un simple battement pendant la fenêtre ne suffit pas à dire au
+        bureau que le PVC peut être monté par le pod de connexion."""
 
     @abc.abstractmethod
     def presence(self, host: str, tenant: str) -> dict | None:
         """Dernier battement du tenant sur l'hôte (`seen_ts`, `now_ts`,
-        `runner_id`, `profiles`, `pod_uid`, `uid` observé et `binding_uid` de
-        `host_tenants`), ou None. #7698 : le lecteur compare l'UID observé à
-        celui de la liaison ; sur un hôte enfant, `pod_uid` doit encore être
-        celui de `pod_hosts`."""
+        `runner_id`, `profiles`, `pod_uid`, `uid` observé, `binding_uid` de
+        `host_tenants` et #7911 `state`), ou None. #7698 : le lecteur compare
+        l'UID observé à celui de la liaison ; sur un hôte enfant, `pod_uid`
+        doit encore être celui de `pod_hosts`."""
 
 
 class PodProvisioning(Domain):

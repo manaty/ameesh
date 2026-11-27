@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.6, 27 November 2026** (additive public production
-connection for an installed module). Scope: an
+Contract revision: **1.7, 27 November 2026** (additive agent qualification
+states of the public fixture). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -27,6 +27,11 @@ Revision 1.6 adds `ameesh.public.database` (#6573): the production connection
 for the same public Python surfaces, opened from the usual configuration with
 an immediate schema check and no internal import; it is additive to revision
 1.5.
+Revision 1.7 adds the fixture's agent qualification states
+(`Fixture.agent`/`Fixture.agent_state`, #8341, manaty/ameesh#6581): a module
+test puts an agent in a lease, canon, placement, spend-marker, reservation or
+cost state through the core's own code, without writing a core table; it is
+additive to revision 1.6.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -65,14 +70,14 @@ In particular, the baseline here is ameesh commit
 `aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`; an open PR is not an installed feature.
 The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
 (#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b), the
-revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2) and the
-revision 1.6 element (#6573) are available only in a released version that
+revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2), the
+revision 1.6 element (#6573) and the revision 1.7 element (#8341) are available only in a released version that
 carries those lots; at the 1.0 baseline they are absent, and a consumer must
 still treat their absence as "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
-[coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5
-and 1.6 elements from the release that implements them, and freeze revision
-1.6; the surface keeps the 1.0 commit as its comparison point.
+[coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5,
+1.6 and 1.7 elements from the release that implements them, and freeze revision
+1.7; the surface keeps the 1.0 commit as its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -515,6 +520,73 @@ own DSN; no host default is read. The witness that exercises this surface is
 `tests/test_7701_public_fixture.py` runs it on `AMEESH_TEST_DSN` and proves that
 the reported `ameesh_fixture_*` database is gone afterwards.
 
+### Agent qualification states (1.7, #8341)
+
+Revision 1.7 raises `ameesh.public.fixture.CONTRACT_VERSION` to `"1.7"` and
+adds the states a module test needs an agent in (manaty/ameesh#6581,
+IMA#1803): an expired or foreign lease, a stale canon, a refused placement, an
+ambiguous spend marker, an open or settled reservation, a cost row. A consumer
+asks the fixture for the state instead of writing `agent_registry`,
+`canon_state`, `spend_pending`, `account_reservations` or `turn_costs`; the
+fixture reaches it through the core's own code on its disposable database and
+proves it with the read-only agent observation (`ameesh agent observe`). Enable
+it when the fixture's `CONTRACT_VERSION` is `"1.7"` or a compatible later
+minor; `ameesh.public.CONTRACT_VERSION` is then at least `"1.7"`.
+
+| Element | Contract |
+| --- | --- |
+| `agent(name, *, host=None, harness="claude", model="fixture-model", team="fixture", responsible="human:fixture", governed=True) -> dict` | Register `name` in the fixture registry and return its state report. A governed agent pins the fixture canon commit (the one `canon()` returned, else a fixed placeholder), has a fresh canon state on `host`, an admitted placement and no lease: it is claimable. `host` defaults to the agent's own `fixture-host-<name>`; agents given the same explicit host share its canon state. `governed=False` registers a row with no canon reference and no placement verdict. Calling it again rewrites the declared profile; it refuses while the agent holds a live lease and releases an expired one. |
+| `agent_state(name, state, **options) -> dict` | Put the registered agent into `state`, one of `AGENT_STATES`, then read it back. Options are strings or numbers, and only the options listed for that state are accepted. The report is described below. |
+| `AGENT_STATES` | The closed list of states, below. A later minor may add a state; it never changes what an existing one means. |
+| `FixtureStateError` (code `state`) | The state was not reached or not observed: agent not registered, claim refused (the report's reasons explain why, e.g. a refused placement), reservation over its envelope. Its message carries no DSN or password. An unknown state, a non-plain agent name or an option that is neither a string nor a number is `FixtureRefused` (code `refused`), as is an option the state does not take. |
+
+| State | Reached by | Observed as | Options |
+| --- | --- | --- | --- |
+| `lease_live` | the core's claim, owner `fixture-runner` | `lease.owner` set, `lease.live` true | `owner`, `ttl` (seconds, default 300) |
+| `lease_foreign` | the same claim, owner `fixture-foreign` | the same, another owner | `owner`, `ttl` |
+| `lease_expired` | the same claim with a past expiry (a runner that died without releasing) | `lease.owner` set, `lease.live` false | `owner`, `ttl` (negative, default -60) |
+| `lease_free` | the core's release | `lease.owner` null | — |
+| `canon_fresh` | the canon synchronisation's state write, pinned commit | `canon.fresh` true | — |
+| `canon_stale` | the same write, then its check aged past `canon.max_age_s` (a host whose synchronisation stopped) | `canon.fresh` false, reason `canon_stale` | `age_s` (default `max_age_s` + 60) |
+| `placement_admitted` | the canon synchronisation's placement verdict, current profile | `placement.ok` true | — |
+| `placement_refused` | the same verdict, refused | `placement.ok` false, reason `placement_refused` | `diagnostic` |
+| `spend_ambiguous` | the turn's spend marker, its ledger key lost, beside an open reservation of another turn at the same index | `spend.ledger_ambiguous` true | `start_index`, `account` |
+| `spend_clear` | the marker cleared and this agent's open or kept reservations released | `spend.marker` false | — |
+| `reservation_open` | the core's admission on the billing account (an envelope of 100 USD per day is set when the account has none) | `reservation.state` `open` | `account`, `usd`, `spend_key`, `limit_usd` |
+| `reservation_settled` | the agent's open reservation (or `spend_key`, or a new one) settled after its cost row, like a turn | `reservation.state` `settled`, `budget.settled` | `account`, `usd`, `spend_key`, `cost_usd`, `limit_usd` |
+| `cost` | one row in the cost ledger | `cost.rows` ≥ 1 | `usd`, `input_tokens`, `output_tokens`, `spend_key`, `account` |
+
+Every report carries `agent`, `lease` (`owner`, `epoch`, `live`, `expires_ts`),
+`canon` (`state`, `last_good_commit`, `age_s`, `max_age_s`, `fresh`,
+`ref_matches`), `placement` (`ok`, `ref`, `diagnostic`), `reasons` (the
+observation's admission reasons) and `spend` (`marker`, `spend_key`,
+`ledger_ambiguous`); `agent_state` adds `state`. The budget states add
+`account`, `spend_key`, `reservation` (`state`, `usd`) and `budget` (`usd`,
+`settled`, `reserved`, `kept`); `cost` adds `cost` (`spend_key`, `turn`,
+`usd`, `rows`, `recorded_usd`). The observation is taken from the fixture
+environment's host, not the agent's, so `responsible_policy_unavailable` may
+appear among the reasons; it never means a state was missed.
+
+States are isolated and reversible, on the fixture's own database only. A
+state touches the named agent's rows and the named billing account. The
+exception is the canon states: the core keeps one canon state per host, so
+`canon_stale` and `canon_fresh` change the canon state of the agent's host.
+That is why each agent gets its own host by default. Agents registered on one
+explicit host share its canon state. Four reverse states undo the
+others: `lease_free` undoes the lease states, `canon_fresh` undoes
+`canon_stale`, `placement_admitted` undoes `placement_refused`, and
+`spend_clear` undoes the spend marker and the open or kept reservations. A
+cost row stays in the ledger, as it would in production. A lease state
+releases the previous lease first. States compose with the core's claim
+rules: a refused placement makes the next lease state refuse, exactly as a
+runner's claim would. The claim checks the canon state's status, not its age:
+after `canon_stale`, a lease state still succeeds and `canon_stale` stays in
+`reasons`. The age gates a new turn, not the lease.
+`canon_stale` and `spend_ambiguous` have no production write path, since time
+and a lost key produce them; the fixture writes those two facts itself, inside
+the core package and only on its disposable database. The consumer still
+writes no core table.
+
 ## Public production connection (1.6, #6573)
 
 Revision 1.6 adds :mod:`ameesh.public.database` and its re-export
@@ -525,7 +597,7 @@ installed core command (`AMEESH_DSN` or the configured DSN, `AMEESH_SCHEMA`,
 driver and backend) instead of importing `ameesh.config`, `ameesh.db` and
 `require_schema()`. Enable the surface when `ameesh.public.CONTRACT_VERSION` is
 `"1.6"` or a compatible later minor; `ameesh.public.mail` stays at `"1.4"` and
-`ameesh.public.fixture` at `"1.5"`.
+`ameesh.public.fixture` at `"1.5"` (`"1.7"` from revision 1.7).
 
 | Element | Contract |
 | --- | --- |
@@ -560,7 +632,8 @@ element → test table is [module-contract-v1-coverage.md](module-contract-v1-co
 [#7701](https://github.com/manaty/ameesh/issues/5902) supplies the Python
 fixture surface and its external witness
 ([public-fixture-witness](../../examples/fixtures/public-fixture-witness)),
-frozen as revision 1.5.
+frozen as revision 1.5; [#8341](https://github.com/manaty/ameesh/issues/6581)
+adds its agent qualification states as revision 1.7, with the same witness.
 [#6573](https://github.com/manaty/ameesh/issues/6573) supplies the Python
 production connection, frozen as revision 1.6; its witness runs in the same
 external distribution and in `tests/test_8333_public_connect.py`. Existing

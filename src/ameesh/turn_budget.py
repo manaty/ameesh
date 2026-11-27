@@ -57,17 +57,37 @@ def local_tranche(cfg, db, agent, *, canon_id=None, memory=None):
 
 
 def reserve_local(cfg, db, agent, profile, spend_key, turn_id, *, canon_id=None, retry=False, memory=None):
+    from . import accounts as accounts_mod
+    from . import budget as budget_mod
+    # #8347 : la part du plafond de la lignée se réserve AVANT l'enveloppe du
+    # compte (une seule admission par lignée, verrou commun) ; un refus plus
+    # loin rend la réservation, un tour refusé ne laisse rien d'ouvert.
+    reserve_usd = float(getattr(profile, "reserve_usd", 0.0) or 0.0)
+    if reserve_usd <= 0:
+        reserve_usd = float(accounts_mod.DEFAULT_RESERVE_USD)
     try:
         tranche = local_tranche(cfg,db,agent,canon_id=canon_id,memory=memory)
+        refus = budget_mod.reserve_lineage(cfg, db, agent, spend_key,
+                                           reserve_usd=reserve_usd)
+        if refus:
+            return 'lineage admission refused: %s' % refus
         if tranche is None:
-            return account_budget.reserve(db,agent,profile,spend_key)
-        account = account_budget.billing_of(profile)
-        if not account or not spend_key or not turn_id:
-            return 'tranche-unavailable: missing billing account or turn identity'
-        ameesh_admit_turn(db,agent,account,profile.reserve_usd,spend_key,tranche,
-                          'retry' if retry else 'runner',turn_id=turn_id)
-        return ''
+            refus = account_budget.reserve(db,agent,profile,spend_key)
+        else:
+            account = account_budget.billing_of(profile)
+            if not account or not spend_key or not turn_id:
+                refus = 'tranche-unavailable: missing billing account or turn identity'
+            else:
+                ameesh_admit_turn(db,agent,account,profile.reserve_usd,spend_key,
+                                  tranche,'retry' if retry else 'runner',
+                                  turn_id=turn_id)
+                refus = ''
+        if refus:
+            budget_mod.release_lineage(db, spend_key)
+        return refus
     except db_mod.Unavailable:
+        budget_mod.release_lineage(db, spend_key)
         raise
     except (Refusal,canon.CanonError,db_mod.DbError) as exc:
+        budget_mod.release_lineage(db, spend_key)
         return 'tranche admission refused: %s' % exc

@@ -772,8 +772,10 @@ class WitnessTest(unittest.TestCase):
     def test_rendu_placeholders_remplaces(self):
         self.assertEqual(len(self.of_kind("PersistentVolumeClaim")), 2)
         # #7698 : le pod dédié du déplacement pod partagé -> pod dédié.
-        self.assertEqual(len(self.of_kind("Pod")), 4)
+        # #7911 : le pod de connexion du siège, rendu par pod-login.
+        self.assertEqual(len(self.of_kind("Pod")), 5)
         rendered = self.rendu.stdout
+        self.assertIn("ameesh-login-alice", rendered)
         for placeholder in ("__UID_A__", "__UID_B__", "__FS_GROUP__", "__IMAGE__",
                             "__GIT_IMAGE__", "__SUPERVISOR_UID__"):
             self.assertNotIn(placeholder, rendered)

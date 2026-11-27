@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""External witness of the public surfaces, contract v1.6 (#7701/#6573).
+"""External witness of the public surfaces, contract v1.7 (#7701/#6573/#8341).
 
 This distribution is outside ``src/`` on purpose: it is an installed consumer,
 not part of the package.  It imports only the published Python surfaces
@@ -22,7 +22,10 @@ docs/api/module-contract-v1-coverage.md:
 * a clean child process of the fixture environment connects with the only
   public surface (``ameesh.public.database.connect()``), submits and reads
   through ``ameesh.public.mail``, closes, and observes the documented schema,
-  storage and unavailable refusals without an internal import.
+  storage and unavailable refusals without an internal import;
+* an agent is put into two qualification states (an expired lease, a stale
+  canon) and back with ``Fixture.agent_state`` (1.7, #8341), never by writing a
+  core table, and an unknown state is refused with its code.
 
 Run it with ``AMEESH_FIXTURE_ADMIN_DSN`` set to a DSN allowed to CREATE DATABASE
 (see README.md).  It prints one JSON report and exits 0 only if every check
@@ -46,6 +49,7 @@ PEER = "relecteur"
 HOST = "atelier"
 PIPELINE = "witness-delivery"
 PROJECT = "witness"
+STATE_AGENT = "witness-states"
 
 
 #: A clean child of the fixture environment.  ``connect()`` reads the process
@@ -508,7 +512,10 @@ def run(admin_dsn: str, report: dict) -> None:
                                  % connect.get("bodies"))
         report["connect"] = connect
 
-        # 6. The named read views are the only SQL the fixture exposes.
+        # 6. Qualification states through the fixture, never a core table.
+        report["states"] = _states(fixture)
+
+        # 7. The named read views are the only SQL the fixture exposes.
         agents = fixture.read_view("agent_mesh_overview", ("name", "host"))
         registered = {row["name"] for row in agents}
         if not {ACTOR, PEER} <= registered:
@@ -519,8 +526,38 @@ def run(admin_dsn: str, report: dict) -> None:
     report["teardown"] = {"database": database, "closed": True}
     report["checks"] = [name for name in
                         ("fixture", "canon", "process", "usage", "mail", "connect",
-                         "views", "teardown")
+                         "states", "views", "teardown")
                         if name in report]
+
+
+def _states(fixture) -> dict:
+    """Two agent states and their reverse, read back from the fixture report."""
+    registered = fixture.agent(STATE_AGENT)
+    if registered["lease"]["owner"] or not registered["canon"]["fresh"]:
+        raise WitnessFailure("a registered agent is not claimable: %r" % registered)
+    expired = fixture.agent_state(STATE_AGENT, "lease_expired")
+    if not expired["lease"]["owner"] or expired["lease"]["live"]:
+        raise WitnessFailure("lease_expired: %r" % expired["lease"])
+    freed = fixture.agent_state(STATE_AGENT, "lease_free")
+    if freed["lease"]["owner"]:
+        raise WitnessFailure("lease_free: %r" % freed["lease"])
+    stale = fixture.agent_state(STATE_AGENT, "canon_stale")
+    if stale["canon"]["fresh"] is not False or "canon_stale" not in stale["reasons"]:
+        raise WitnessFailure("canon_stale: %r" % stale["canon"])
+    fresh = fixture.agent_state(STATE_AGENT, "canon_fresh")
+    if fresh["canon"]["fresh"] is not True or "canon_stale" in fresh["reasons"]:
+        raise WitnessFailure("canon_fresh: %r" % fresh["canon"])
+    refusal = _error(lambda: fixture.agent_state(STATE_AGENT, "no_such_state"),
+                     "unknown agent state")
+    return {"agent": STATE_AGENT,
+            "lease_expired": {"owner": expired["lease"]["owner"],
+                              "live": expired["lease"]["live"]},
+            "lease_free": {"owner": freed["lease"]["owner"]},
+            "canon_stale": {"fresh": stale["canon"]["fresh"],
+                            "reasons": stale["reasons"]},
+            "canon_fresh": {"fresh": fresh["canon"]["fresh"]},
+            "unknown": refusal,
+            "contract": public_fixture.CONTRACT_VERSION}
 
 
 def main(argv=None) -> int:

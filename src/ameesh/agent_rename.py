@@ -102,6 +102,15 @@ KEPT = (
     # Admission/settlement use account + attempt_id, never this spelling.
     "credit_cycles.actor", "credit_requests.agent",
     "credit_reconciliations.actor",  # Operator reconciliation audit evidence.
+    # #8347 (0611): the lineage reservation's `agent` is a dated attribution
+    # of the admitted turn (the row lives 2 h and is deleted at settlement).
+    # The cap is summed by lineage `root`, and admission/settlement/replay use
+    # `spend_key`, never this spelling as a lookup key. A rename happens
+    # between turns (refused under a live lease); an orphan reservation left
+    # by a crashed turn expires and stops counting. Rewriting it would also
+    # need `root` (outside the rename contract) plus a write-time trigger, for
+    # no per-agent read.
+    "budget_lineage_reservations.agent",
     # #7066: the spelling is bound by the owner's signature. A renamed agent
     # needs a fresh decision; rewriting this index must not widen authority.
     "account_turn_exceptions.agent",
@@ -112,6 +121,14 @@ KEPT = (
     # #7106 (0575): who registered a tenant of a shared host, dated evidence
     # like `executors.enrolled_by`; a rename does not rewrite it.
     "host_tenants.registered_by",
+    # #7911 (0610): the seat-connection window keeps dated attributions:
+    # `opened_by` and `closed_by` are the human or avatar's gesture (or the
+    # closure cause, `pod-end`/`expiry`), and `pod_ended_by` is the tenant
+    # runner's id (`host/tenant`, never an agent spelling) that observed the
+    # connection pod's end. Like `host_tenants.registered_by`, evidence of a
+    # dated gesture, not an identity link; a rename does not rewrite it.
+    "tenant_logins.closed_by", "tenant_logins.opened_by",
+    "tenant_logins.pod_ended_by",
     # #8193 (0608): who created or closed a lot subject, dated attribution
     # like `host_tenants.registered_by`, never an authority; not rewritten.
     "work_subjects.author", "work_subjects.closed_by",
