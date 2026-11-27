@@ -2489,12 +2489,20 @@ class Notifier:
                 self._app_routes = {}
         channels = []
         for name in self._app_routes.get(human) or ():
-            channel = self.ncfg.channels.get(name)
-            if channel is None and name in ("desktop", "slack", "app"):
-                channel = _channel(name, {})
+            channel = self._channel_named(name)
             if channel is not None:
                 channels.append(channel)
         return channels
+
+    def _channel_named(self, name):
+        """Le canal `name` de l'hôte ; `desktop`, `slack` et `app` existent
+        sans déclaration (comme dans `notify.routes`), y compris quand une
+        route d'application les nomme seule (#8344 B3) : la levée, les
+        reprises et la résolution les retrouvent ici."""
+        channel = self.ncfg.channels.get(name)
+        if channel is None and name in ("desktop", "slack", "app"):
+            channel = _channel(name, {})
+        return channel
 
     # -- passage --------------------------------------------------------------
     def _deliverable(self, alert: dict) -> bool:
@@ -4406,7 +4414,7 @@ class Notifier:
             st = entry["channels"][name]
             if st.get("fallback_of"):
                 continue                # un repli : traité après les primaires
-            channel = self.ncfg.channels.get(name)
+            channel = self._channel_named(name)
             if channel is None:          # canal retiré de la configuration
                 st.update(attempts=self.ncfg.max_attempts, error="channel removed")
                 continue
@@ -5441,14 +5449,16 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
 
 def main(argv: list | None = None) -> int:
+    from .platform.child_environment import install
+    # Avant toute commande : `psql` et `git` lancés par le chemin canon/base
+    # ne doivent jamais hériter des secrets de canal accordés à `notify`
+    # (#8344 B5).
+    install()
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in app_alerts.COMMANDS:
         # #8344 : une application lève, résout ou relit ses propres alertes ;
-        # aucune livraison ni secret de canal ici : la passe `alerts` du
-        # notificateur les pousse.
+        # aucune livraison ici : la passe `alerts` du notificateur les pousse.
         return app_alerts.main(argv)
-    from .platform.child_environment import install
-    install()
     args = build_parser().parse_args(argv)
     if not args.once and not args.test:
         from .platform.child_environment import harden

@@ -325,6 +325,21 @@ class DeliveryTest(_PgCase):
         self.pass_()
         self.assertEqual(self.sent()[-1], ("team", "ima: resolved — triage stalled (q1)"))
 
+    def test_route_app_sans_declaration_livre_et_resout(self):
+        """B3 (mty-amh-docs-01) : `app`, `slack`, `desktop` n'ont pas besoin
+        d'être déclarés, y compris pour une route d'application."""
+        _canon(self.root, ALERTS_BLOCK.replace("[team]", "[app]"))
+        notifier = self.make_notifier(ncfg=notify.parse_config({}))
+        self.raise_(route="triage-team")
+        self.pass_(notifier)
+        self.assertEqual(self.sent(), [("app", "ima: triage stalled (q1)")])
+        [entry] = notifier.state["active"].values()
+        self.assertEqual(entry["channels"]["app"]["ok"], True)
+        self.resolve()
+        self.now += 60
+        self.pass_(notifier)
+        self.assertEqual(self.sent()[-1], ("app", "ima: resolved — triage stalled (q1)"))
+
     def test_route_sans_canal_sur_l_hote_attend(self):
         notifier = self.make_notifier(ncfg=notify.parse_config({
             "routes": {ALICE: ["app"]}}))
@@ -412,8 +427,15 @@ class AvatarTest(_PgCase):
 class CliTest(_PgCase):
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
+        order = []
+        self.install = mock.patch("ameesh.platform.child_environment.install",
+                                  side_effect=lambda: order.append("install")).start()
+        self.addCleanup(mock.patch.stopall)
+        opened = mock.patch("ameesh.db.open_db",
+                            side_effect=lambda cfg: order.append("db") or self.db)
+        self.order = order
         with mock.patch.object(config, "load", return_value=self.cfg), \
-                mock.patch("ameesh.db.open_db", return_value=self.db), \
+                opened, \
                 mock.patch.object(self.db, "close"), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = notify.main(list(argv))
@@ -429,6 +451,12 @@ class CliTest(_PgCase):
         self.assertEqual([row["key"] for row in json.loads(out)], ["q1"])
         code, out, _ = self.run_cli("resolve", *base, "--json")
         self.assertEqual(json.loads(out)["state"], "resolved")
+
+    def test_le_filtre_enfant_precede_la_base(self):
+        """B5 (mty-amh-docs-01) : `psql`/`git` du chemin CLI n'héritent pas
+        des secrets de canal : le filtre enfant est posé avant la base."""
+        self.run_cli("list")
+        self.assertEqual(self.order, ["install", "db"])
 
     def test_type_inconnu_refuse(self):
         code, _, err = self.run_cli("raise", "--app", APP, "--type", "unknown",

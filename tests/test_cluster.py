@@ -127,6 +127,12 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #8344 (0612) : alertes levées par une application, lues par la passe
+    # alerts du notificateur et `ameesh notify list` ; le texte est celui que
+    # l'application pousse à l'humain. Table fermée aux deux rôles
+    # superviseur, aucun GRANT modifié.
+    "app_alerts": {"app", "type", "key", "recipient", "route", "urgent", "episode",
+                   "text", "raised_by", "raised_at", "resolved_at", "resolved_by"},
     # #8193 (0608) : sujets de lots (et `work_items.subject_id`), lus par
     # `ameesh work subject`/`work list --subject` ; aucun lecteur superviseur
     # pour l'instant, aucun GRANT modifié.
