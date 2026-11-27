@@ -35,6 +35,15 @@ geste à faire. Il n'écrit rien : aucun commit, aucune étiquette.
 (manaty/home), que le bureau fusionne (#2511), en est exclu : il se lit dans
 la configuration (les canons approuvés, `canon_repositories`), jamais en dur
 (§7). Un dépôt inconnu ou illisible reste refusé (le doute refuse).
+
+#8323 : le §11 bis ne nomme que les cibles portées par les paquets. Une cible
+**déclarée** sans paquet (`radar.projects.<p>.packets = false`, avec `github`
+et `target`) passe ici : manaty-its/main pour un lot nexlink (#8095), dont le
+dépôt réel est celui de la marque du gel (`ameesh-freeze-repo`). Un dépôt
+porteur de paquets (`github.projects`, autre déclaration radar) n'est jamais
+exempté, même déclaré `packets = false`. Le feu lui
+applique les gardes du §2 (gel, avis, CI verte sur la tête gelée, tête
+gardée). Sans cette déclaration positive, le doute refuse toujours.
 """
 from __future__ import annotations
 
@@ -149,6 +158,65 @@ def outside_packets(repo, cfg) -> str:
     return ident if ident and ident in canon_repositories(cfg) else ""
 
 
+def packet_carriers(cfg) -> frozenset | None:
+    """#8323 : les dépôts qui restent portés par les paquets, et ne peuvent
+    donc jamais être déclarés sans paquet : ceux des projets `github.projects`
+    et ceux des `radar.projects` sans `packets = false` (par `github`, sinon par
+    l'`origin` de leur clone). None quand l'un d'eux ne s'identifie pas ou
+    qu'une section est illisible : le doute refuse (relecture ameesh-dev3)."""
+    from . import radar
+    from . import plan_github
+    found = set()
+    try:
+        slugs = list(plan_github.settings_of(cfg).projects.values())
+        projects = list(radar.settings_of(cfg).projects.values())
+    except Exception:  # noqa: BLE001 - section illisible : aucune preuve
+        return None
+    for slug in slugs:
+        ident = repository(slug)
+        if not ident:
+            return None
+        found.add(ident)
+    for project in projects:
+        if not getattr(project, "packets", True):
+            continue
+        github = getattr(project, "github", "") or ""
+        path = getattr(project, "repo", "") or ""
+        ident = repository(github) if github else (
+            repository(os.path.abspath(os.path.expanduser(path))) if path else "")
+        if not ident:
+            return None
+        found.add(ident)
+    return frozenset(found)
+
+
+def without_packet(repo, target, cfg) -> str:
+    """#8323 : l'identité du dépôt quand sa cible `target` est **déclarée**
+    sans paquet (`radar.projects.<p>.packets = false`, même `github`, même
+    `target`), sinon "". Il faut une preuve positive, et aucun veto : un dépôt
+    porteur de paquets (`packet_carriers` : `github.projects`, ou une autre
+    déclaration radar du même dépôt) n'est jamais exempté. Un dépôt, une
+    configuration ou un porteur illisibles rendent "" (le doute refuse)."""
+    ident = repository(repo)
+    wanted = branch_of(target)
+    if not ident or not wanted or cfg is None:
+        return ""
+    from . import radar
+    try:
+        projects = list(radar.settings_of(cfg).projects.values())
+    except Exception:  # noqa: BLE001 - configuration illisible : aucune preuve
+        return ""
+    declared = any(not getattr(project, "packets", True)
+                   and repository(project.github) == ident
+                   and branch_of(project.target) == wanted for project in projects)
+    if not declared:
+        return ""
+    carriers = packet_carriers(cfg)
+    if carriers is None or ident in carriers:
+        return ""
+    return ident
+
+
 def exception_of(exception: str, reason: str) -> tuple[str, str]:
     """Valide la nature et le motif d'une exception, sans tête.
 
@@ -260,6 +328,12 @@ def _outside_why(ident: str) -> str:
             "outside the packets of canon §11 bis" % ident)
 
 
+def _without_packet_why(ident: str, target: str) -> str:
+    return ("target %s of repository %s is declared without packet (packets=false): it is "
+            "outside canon §11 bis, the §2 gates apply (freeze, reviews, green CI "
+            "on the frozen head, --match-head-commit)" % (target or "?", ident))
+
+
 def _merge_refusal(source: str, target: str) -> str:
     return (
         "direct merge of %s into %s refused: canon §11 bis (owner decision of "
@@ -290,7 +364,8 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
     de travail ne déplace pas `main`/`develop`. La cible vide est traitée
     comme une cible d'intégration (le doute refuse). #5497 : la cible d'un
     dépôt hors paquets (`repo` est celui du canon, `outside_packets`) passe ;
-    sans `repo` ni `cfg`, le refus reste celui d'avant. Une exception explicite
+    sans `repo` ni `cfg`, le refus reste celui d'avant. #8323 : une cible
+    déclarée sans paquet (`without_packet`) passe aussi. Une exception explicite
     est journalisée ici, sur la tête `sha` ; une exception déjà déclarée est
     relue. Rend la déclaration retenue, ou lève `PacketGuardError`."""
     source_name, target_name = branch_of(source), branch_of(target)
@@ -311,6 +386,10 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
     if outside:
         return {"allowed": True, "why": _outside_why(outside), "exception": "",
                 "journaled": False}
+    alone = without_packet(repo, target_name, cfg)
+    if alone:
+        return {"allowed": True, "why": _without_packet_why(alone, target_name),
+                "exception": "", "journaled": False}
     if exception:
         return {"allowed": True, **declare(db, lot, exception, reason, sha, actor=actor)}
     found = declared(db, lot, sha)
