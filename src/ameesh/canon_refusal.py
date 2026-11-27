@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """`ameesh canon refuse` : un module enregistre un canon qu'il a refusé (#8340).
 
-Constat (manaty/ameesh#6580, IMA#1803) : IMA valide le canon à un commit
-épinglé et, quand ses propres contrôles le refusent, écrit un `canon_state`
-`invalid` avec son motif en important `canon_sync.record_state(...)`. Aucun
-chemin public ne permettait cette écriture ; ce module en est un, sans import
-interne.
+Constat (manaty/ameesh#6580) : un module consommateur valide le canon à un
+commit épinglé et, quand ses propres contrôles le refusent, écrit un
+`canon_state` `invalid` avec son motif en important
+`canon_sync.record_state(...)`. Aucun chemin public ne permettait cette
+écriture ; ce module en est un, sans import interne.
 
 L'écriture reste gouvernée :
 
