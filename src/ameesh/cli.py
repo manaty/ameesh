@@ -99,8 +99,10 @@
   agent-mail read-journal                        hook (#7859): journals one allowed avatar MCP read,
                                                  tool and target identifiers only, never content
   agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
-  agent-mail migrate [--dry-run | --additive-only] [--allow-live-executors REASON]
+  agent-mail migrate [--dry-run [--json] | --additive-only] [--allow-live-executors REASON]
                                                  applies the versioned migrations
+                                                 (--dry-run --json: one
+                                                 ameesh-migrate-dry-run/1 object)
   agent-mail doctor [--notify-test | --probe [--all-bases] | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY and the OS desktop channel (L66); host harnesses (L106)
                                                  (--probe: lightweight container probe)
 
@@ -2736,7 +2738,8 @@ def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
 
 
 def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
-                allow_live_executors: str | None = None) -> int:
+                allow_live_executors: str | None = None,
+                json_output: bool = False) -> int:
     """`--dry-run` : migrations manquantes, additives ou non, sans rien écrire.
     `--additive-only` : n'applique rien (code 3) si l'une d'elles n'est pas
     additive — c'est le garde de « migrer avant d'installer » (L151).
@@ -2744,7 +2747,15 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
     pour que le préflight de staging constate le refus avant toute sauvegarde.
 
     P1a #7649 : le noyau et les schémas de module sont lus et appliqués dans
-    la même passe ; `--additive-only` couvre les deux flux."""
+    la même passe ; `--additive-only` couvre les deux flux.
+
+    #8339 : `--dry-run --json` écrit sur stdout un seul objet
+    ``ameesh-migrate-dry-run/1`` (migrations en attente, modifiées et versions
+    inconnues), sans texte mêlé ; les diagnostics restent sur stderr. L'option
+    exige `--dry-run` : l'application des migrations garde son journal texte."""
+    if json_output and not dry_run:
+        print("migration failed: --json requires --dry-run", file=sys.stderr)
+        return 1
     try:
         modules = migrations.installed_modules()
     except (ValueError, OSError) as exc:
@@ -2756,6 +2767,30 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
         print("migration failed: %s" % exc, file=sys.stderr)
         return 1
     try:
+        if json_output:
+            # #8339 : lecture seule, un seul objet sur stdout (aucun texte
+            # mêlé) ; le code de sortie garde son sens 0/3/1.
+            try:
+                report = migrations.dry_run(db, modules=modules, core_schema=cfg.schema)
+            except db_mod.DbError as exc:
+                print("migration failed: %s" % exc, file=sys.stderr)
+                return 1
+            print(json.dumps(report.as_dict(additive_only=additive_only),
+                             ensure_ascii=False, sort_keys=True))
+            if report.modified:
+                print("migration failed: %s modified after being applied"
+                      % ",".join(migration.label for migration, _applied
+                                 in report.modified), file=sys.stderr)
+                return 1
+            refused = [migration for migration in report.pending
+                       if migrations.non_additive(migration)]
+            if refused:
+                print("%d non-additive migration(s): the previous code would break on the "
+                      "migrated database" % len(refused), file=sys.stderr)
+            if additive_only and refused:
+                print("nothing applied (--additive-only)", file=sys.stderr)
+                return 3
+            return 0
         if dry_run or additive_only:
             # Lecture seule : `check` et `pending_modules` n'exécutent aucun
             # DDL, contrairement à `pending` (qui crée le registre noyau).
@@ -3511,7 +3546,7 @@ def main(argv: list[str] | None = None) -> int:
         if command == "hook":
             return cmd_hook(cfg, rest[0] if rest else "?")
         if command == "migrate":
-            allowed = {'--dry-run', '--additive-only', '--allow-live-executors'}
+            allowed = {'--dry-run', '--additive-only', '--allow-live-executors', '--json'}
             reason = None
             if '--allow-live-executors' in rest:
                 index = rest.index('--allow-live-executors')
@@ -3523,7 +3558,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError('unknown migrate option')
             return cmd_migrate(cfg, dry_run="--dry-run" in rest,
                                additive_only="--additive-only" in rest,
-                               allow_live_executors=reason)
+                               allow_live_executors=reason,
+                               json_output="--json" in rest)
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
                               probe="--probe" in rest, harness="--harness" in rest,

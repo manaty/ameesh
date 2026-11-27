@@ -57,7 +57,24 @@ def lists(card, canon):
     return tools, mcp, values[1], mcp_tools, connectors
 
 
-def prepare(cfg, agent, state_dir, cwd, *, harness=None) -> Applied | None:
+def declared_cwd(agent, fallback: str | None = None) -> str | None:
+    """#8350: the agent's declared directory, never a turn-derived cwd.
+
+    `prepare` is given the directory of the turn: a secondary project, a
+    worktree, or a cwd inherited from the session after a `cd`. The MCP source
+    (`.mcp.json`) is a property of the agent's project, so it is read from the
+    declared directory the registry holds (`ameesh show`: `directory`). The
+    turn directory is only a fallback when the agent has none (mediated depot,
+    older rows); it never overrides a declared directory.
+    """
+    declared = agent.get('cwd')
+    if declared:
+        return os.path.abspath(os.path.expanduser(str(declared)))
+    return fallback
+
+
+def prepare(cfg, agent, state_dir, cwd, *, harness=None,
+            mcp_root: str | None = None) -> Applied | None:
     if agent.get('created_by') or (agent.get('canon_ref') is None and not agent.get('canon_governed')):
         return None
     owner = None
@@ -83,7 +100,11 @@ def prepare(cfg, agent, state_dir, cwd, *, harness=None) -> Applied | None:
         raise spawn.SpawnToolsError('avatar-tools-unsupported',
                                    'harness cannot apply the complete avatar tool policy')
     profile = dict(child=agent['name'], harness=harness, tools=tools, mcp=mcp, deny=deny)
-    path, mcp_path = spawn.write_profile(state_dir, profile, cwd)
+    # #8350: a cwd inherited from a turn (session `cd`, secondary project)
+    # must not move the MCP source; the mediated depot is the explicit
+    # exception, and only the caller knows it.
+    source_dir = mcp_root if mcp_root is not None else declared_cwd(agent, cwd)
+    path, mcp_path = spawn.write_profile(state_dir, profile, source_dir)
     args = spawn.argv(profile, path)
     files = [path, mcp_path]
     if connectors or mcp_tools:

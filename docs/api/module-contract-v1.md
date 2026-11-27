@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.9, 27 November 2026** (additive public read of the
-declared account profiles). Scope: an
+Contract revision: **1.10, 27 November 2026** (machine-readable migration
+dry-run report). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -41,6 +41,12 @@ Revision 1.9 adds `ameesh accounts profiles --json` (#8337,
 manaty/ameesh#6577): the redacted list of the host's declared account
 profiles, so a consumer checks its account layout without importing
 `accounts.parse`; it is additive to 1.8.
+Revision 1.10 adds `ameesh migrate --dry-run --json` (#8339,
+manaty/ameesh#6579): one versioned `ameesh-migrate-dry-run/1` object on
+standard output with the pending core and module migrations (checksum and
+non-additive reasons), the applied migrations modified since application, and
+the database versions unknown to this code. It is additive to 1.9: the text
+dry-run, the application path and the 0/3/1 exit codes are unchanged.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -81,13 +87,14 @@ The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
 (#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b), the
 revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2), the
 revision 1.6 element (#6573), the revision 1.7 element (#8341), the
-revision 1.8 element (#8342) and the revision 1.9 element (#8337) are available only in a released version that
+revision 1.8 element (#8342), the revision 1.9 element (#8337) and the
+revision 1.10 element (#8339) are available only in a released version that
 carries those lots; at the 1.0 baseline they are absent, and a consumer must
 still treat their absence as "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
 [coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5,
-1.6, 1.7, 1.8 and 1.9 elements from the release that implements them, and freeze
-revision 1.9; the surface keeps the 1.0 commit as its comparison point.
+1.6, 1.7, 1.8, 1.9 and 1.10 elements from the release that implements them, and
+freeze revision 1.10; the surface keeps the 1.0 commit as its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -118,7 +125,7 @@ release's `--help`. These entry points cover the module integration:
 | `ameesh accounts profiles [--json]` | Read-only `ameesh-account-profiles/1` (revision 1.9, #8337): every profile declared in this host's configuration, sorted by `harness` then `name`, with `kind` (`api_key_env`/`config_dir`), `env` and `key_env` (variable **names**), `key_source` (`env`, `file` or `null`), `reserve_usd` and `billing_account`. Never a key value, a key file's path or content, nor a configuration directory; no database read and no credential read (a key's value is never read from the environment or a file). `valid` combines the runner's admission of the whole `accounts` configuration with the completeness of this read: it is false as soon as any profile is refused (a non-empty `refused` implies `valid` false). An unreadable profile does not hide the others: it is listed under `refused` with `harness`/`index`/`name` (`null` unless a valid identifier) and a closed `reason` (`invalid_accounts`, `unknown_harness`, `invalid_profile_list`, `not_an_object`, `invalid_name`, `duplicate_name`, `invalid_profile`, `shared_configuration_dir`, `unpublishable_variable_name`), never the error text. A synthetic `(default)` profile is never declared, so never listed. Exit 0 whenever the document is printed. |
 | `ameesh list --json`, `ameesh show --json` | `ameesh-agents/1`: the same bounded `deferral` block (revision 1.2, #7675), closed reasons; its absence or `null` is not permission to run. |
 | `agent-mail send`, `agent-mail show` | Ordinary governed mail. The help documents flags and stdin. These commands alone do not provide IMA's atomic request/reply/deduplication protocol (E2). |
-| `ameesh migrate --dry-run --additive-only` | Core migration classification; the module does not import or invoke the migration implementation. Actual application retains its operator and staging gates. |
+| `ameesh migrate --dry-run [--additive-only] [--json]` | Core and module migration classification; `--json` returns the read-only `ameesh-migrate-dry-run/1` report, the text forms stay diagnostic. The module does not import or invoke the migration implementation; actual application retains its operator and staging gates. |
 | `ameesh action propose\|approve\|execute\|reconcile` | Governed action lifecycle. From revision 1.8 an installed module supplies external action connectors through `ACTION_CONNECTORS` and `ameesh.public.connectors`, below. |
 
 Use JSON only where the command offers it. Human tables, log text, Python
@@ -126,6 +133,34 @@ tracebacks and private exit details are not machine schemas. A successful exit
 means the documented command completed, not that a deferred request is already
 delivered or that a turn is authorized. Preserve the command's refusal and retry
 semantics; do not convert an unavailable observation into permission.
+
+### Migration dry-run report (revision 1.10, #8339)
+
+When the migration state is readable, `ameesh migrate --dry-run --json` writes
+exactly one JSON object on standard output and no other text; human diagnostics
+stay on standard error. `--json` requires `--dry-run`: applying migrations
+keeps its text journal and its operator gates. The call executes no DDL, not
+even the migration registry, and its exit code keeps the existing meaning: `0`,
+the report was produced (non-additive pending migrations do not fail a plain
+`--dry-run`); `3`, `--additive-only` refused because at least one pending
+migration is non-additive; `1`, an applied migration was modified (the object
+still lists it), or the state could not be read (no object is then written, the
+reason is on standard error).
+
+The object uses schema `ameesh-migrate-dry-run/1`:
+
+| Field | Type and meaning |
+| --- | --- |
+| `schema` | constant `ameesh-migrate-dry-run/1`. |
+| `dry_run` | boolean, `true`. |
+| `additive_only` | boolean, the flag given. |
+| `pending` | array of core then module migrations not recorded as applied, in application order. Each entry: `module` (string, or `null` for the core), `version` (integer; module-local for a module migration), `label`, `checksum` (SHA-256 of the SQL file) and `non_additive` (array of reasons; empty when the migration only adds). |
+| `modified` | array of applied migrations whose recorded checksum differs from this code's. Each entry has the same fields plus `applied_checksum` (the recorded value). A non-empty array is exit `1`. |
+| `unknown` | array of database versions this code does not know: `module` (string or `null`) and `version`. Informational; it does not by itself change the exit code. |
+
+A consumer checks `schema` before reading and ignores unknown response fields.
+A module-local `version` is not comparable with a core version: read `module`
+and `label` together.
 
 ## HTTP boundary
 
