@@ -630,6 +630,19 @@ def _gh_write(args) -> bool:
     return True
 
 
+class _GHWriteRefused(Exception):
+    """A write's read-back was itself refused by GitHub (#8358).
+
+    The inner `TransientReleaseError` keeps its `github_refusal`: a secondary
+    limit's `Retry-After` must reach `release._quota_wait_until`, never be
+    swallowed as an unknown write state.
+    """
+
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
 def _gh_reconcile(reconcile, project, command):
     """The forge's verdict on an ambiguous write, or GH_WRITE_UNKNOWN (#8358)."""
     if reconcile is None:
@@ -637,6 +650,8 @@ def _gh_reconcile(reconcile, project, command):
     try:
         return reconcile()
     except Exception as exc:  # noqa: BLE001 - an unreadable state is not "not done"
+        if getattr(exc, "github_refusal", None) is not None:
+            raise _GHWriteRefused(exc) from exc
         print("%s: %s: state unreadable after a transient refusal, no replay: %s"
               % (project.name, command, exc), file=sys.stderr, flush=True)
         return GH_WRITE_UNKNOWN
@@ -659,12 +674,19 @@ def gh(project, args, *, reconcile=None):
     and `GH_WRITE_UNKNOWN` when the state cannot tell (no blind replay). A
     secondary limit is never replayed: its `Retry-After` reaches
     `release._quota_wait_until` through the attached refusal.
+
+    #8358 (review B): when the read-back itself is refused by a secondary
+    limit, that inner refusal is the useful answer — it carries the
+    `Retry-After` — so it is preserved on the final error instead of being
+    flattened into an unknown write state. The mutation is still never
+    replayed: the durable intent decides on the next tick.
     """
     command = ("gh " + " ".join(args))[:200]
     write = _gh_write(args)
     auth_attempts = len(GH_AUTH_RETRY_DELAYS)
     transient_attempts = len(GH_TRANSIENT_RETRY_DELAYS)
     auth_used = transient_used = attempt = 0
+    reconcile_refusal = reconcile_error = None
     budget = auth_attempts + 1
     runner = rc.plan_github.Gh(env=dict(os.environ, GH_DEBUG="api"))
     while True:
@@ -691,7 +713,15 @@ def gh(project, args, *, reconcile=None):
         if status in GH_TRANSIENT_STATUSES:
             budget = transient_attempts + 1
             if write:
-                recovered = _gh_reconcile(reconcile, project, command)
+                try:
+                    recovered = _gh_reconcile(reconcile, project, command)
+                except _GHWriteRefused as refused:
+                    reconcile_refusal = refused.error.github_refusal
+                    reconcile_error = str(refused.error)
+                    print("%s: %s: HTTP %d, read-back refused, no replay: %s"
+                          % (project.name, command, status, reconcile_error),
+                          file=sys.stderr, flush=True)
+                    break
                 if recovered is GH_WRITE_UNKNOWN:
                     break
                 if isinstance(recovered, str):
@@ -712,7 +742,15 @@ def gh(project, args, *, reconcile=None):
         if (status == 422 and write and "already exists" in detail.lower()):
             # A replay whose first response was lost can lose the race with
             # GitHub's own duplicate check: the created object is the answer.
-            recovered = _gh_reconcile(reconcile, project, command)
+            try:
+                recovered = _gh_reconcile(reconcile, project, command)
+            except _GHWriteRefused as refused:
+                reconcile_refusal = refused.error.github_refusal
+                reconcile_error = str(refused.error)
+                print("%s: %s: HTTP 422, read-back refused, no replay: %s"
+                      % (project.name, command, reconcile_error),
+                      file=sys.stderr, flush=True)
+                break
             if isinstance(recovered, str):
                 print("%s: %s: already exists, write found done: %s" % (
                     project.name, command, recovered[:80]),
@@ -724,8 +762,12 @@ def gh(project, args, *, reconcile=None):
     else:
         text = ("Nexlink GitHub operation failed: %s: HTTP %d after %d "
                 "attempt(s): %s" % (command, status, attempt, detail))
+    if reconcile_error is not None:
+        text += "; the read-back was refused: %s" % reconcile_error
     error = rc.TransientReleaseError(text)
-    if refusal is not None:
+    if reconcile_refusal is not None:
+        error.github_refusal = reconcile_refusal
+    elif refusal is not None:
         error.github_refusal = refusal
     raise error
 

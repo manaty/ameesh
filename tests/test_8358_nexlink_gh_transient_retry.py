@@ -80,6 +80,21 @@ GH_DEBUG_422_EXISTS = """< HTTP/2.0 422 Unprocessable Entity
 gh: A pull request already exists for manaty:release/11ci (HTTP 422)
 """
 
+#: The read-back itself can be refused (review B): a REST 403 carrying the
+#: secondary limit's `Retry-After` is the only place that wait exists.
+GH_DEBUG_403_SECONDARY = """* Request at 2026-11-27 10:41:30.000000000 +0000 UTC
+* Request to https://api.github.com/repos/manaty/nexlink/actions/runs
+> GET /repos/manaty/nexlink/actions/runs?event=workflow_dispatch HTTP/1.1
+> Authorization: token ████████████████████
+
+< HTTP/2.0 403 Forbidden
+< Content-Type: application/json; charset=utf-8
+< Retry-After: 60
+
+{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}
+gh: You have exceeded a secondary rate limit (HTTP 403)
+"""
+
 GRAPHQL_LIMIT_TEXT = ("Nexlink GitHub operation failed: gh pr create -R "
                       "manaty/nexlink --head release/11ci --base main: HTTP 200 "
                       "after 1 attempt(s): was submitted too quickly "
@@ -435,6 +450,118 @@ class GraphQLSecondaryLimitTest(unittest.TestCase):
             report = rc.execute(self.cfg, None, project(), now=1089.0)
         self.assertEqual(report["result"], "waiting-quota")
         engine.execute.assert_not_called()
+
+
+class RefusedReadBackTest(unittest.TestCase):
+    """Review B (#8358): the refusal of the read-back is the useful answer.
+
+    A `pr create` whose 504 response was lost is read back; if that read is
+    itself refused by a secondary limit, the inner refusal carries the only
+    `Retry-After` GitHub ever sent. It must reach `_quota_wait_until` instead
+    of being flattened into `GH_WRITE_UNKNOWN`, while the mutation is still
+    never replayed.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = config.Config(state_dir=self.temp.name)
+
+    @contextlib.contextmanager
+    def fake_gh(self, replies):
+        fake = FakeGh(replies)
+        err = io.StringIO()
+        with mock.patch.object(rc.plan_github, "Gh", fake.factory), \
+                mock.patch.object(nx.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(err):
+            yield fake, sleep, err
+
+    def _publish_through_a_refused_read_back(self):
+        sha = "a" * 40
+        pending = {"sha": sha, "tag": "release-11ci", "version": "11ci"}
+        replies = [(0, "[]", ""),                       # no PR before opening
+                   (1, "", GH_DEBUG_504),               # the create's response is lost
+                   (1, "", GH_DEBUG_GRAPHQL_LIMIT)]     # its read-back is refused
+        with self.fake_gh(replies) as (fake, sleep, err):
+            with mock.patch.object(nx, "ensure_ref"), \
+                    mock.patch.object(rc, "remote_tag", return_value=sha):
+                with self.assertRaises(rc.TransientReleaseError) as caught:
+                    nx.publish(project(), pending)
+        return caught.exception, fake, sleep, err.getvalue()
+
+    def test_a_refused_read_back_keeps_its_retry_after(self):
+        error, fake, sleep, log = self._publish_through_a_refused_read_back()
+        self.assertEqual([call[:2] for call in fake.calls],
+                         [["pr", "list"], ["pr", "create"], ["pr", "list"]])
+        sleep.assert_not_called()
+        self.assertIn("read-back refused, no replay", log)
+        self.assertEqual(error.github_refusal[0], 200)
+        self.assertEqual(error.github_refusal[1]["Retry-After"], "30")
+        text = str(error)
+        self.assertIn("HTTP 504 after 1 attempt(s)", text)
+        self.assertIn("the read-back was refused", text)
+        self.assertIn("submitted too quickly", text)
+        with mock.patch.object(release, "_quota_probe") as probe:
+            until = release._quota_wait_until(
+                self.cfg, text, 1000.0, error.github_refusal)
+        self.assertEqual(until, 1030.0)
+        probe.assert_not_called()
+
+    def test_the_refused_read_back_waits_durably_without_a_new_create(self):
+        error, fake, _sleep, _log = self._publish_through_a_refused_read_back()
+        rc.save_state(self.cfg, {"schema": rc.SCHEMA,
+                                 "projects": {"nexlink": {}}})
+        send = mock.Mock()
+        with mock.patch.object(rc, "compiled_rules",
+                               return_value=(None, types.SimpleNamespace(commit="d" * 40))), \
+                mock.patch.object(rc, "cutoff_slot", return_value=(1000.0, "23:00")), \
+                mock.patch.object(release, "_quota_probe") as probe, \
+                mock.patch.object(rc, "send_report", send):
+            waited = release._report_error(
+                self.cfg, object(), project(), error, 1000.0)
+        self.assertTrue(waited)
+        probe.assert_not_called()
+        self.assertEqual(send.call_args.args[4]["result"], "waiting-quota")
+        slot = rc.load_state(self.cfg)["projects"]["nexlink"]
+        self.assertEqual(slot["quota_wait_reset"], 1030.0)
+        self.assertEqual(slot["quota_wait_until"], 1090.0)
+        self.assertEqual(
+            [call[:2] for call in fake.calls],
+            [["pr", "list"], ["pr", "create"], ["pr", "list"]])
+
+        engine = types.SimpleNamespace(
+            execute=mock.Mock(return_value={"result": "waiting-ci"}))
+        with mock.patch.object(rc, "release_provider", return_value=engine):
+            report = rc.execute(self.cfg, None, project(), now=1089.0)
+        self.assertEqual(report["result"], "waiting-quota")
+        engine.execute.assert_not_called()
+
+    def test_a_refused_dispatch_read_back_keeps_the_rest_limit(self):
+        pending = {"sha": "a" * 40, "version": "11ci",
+                   "integration": "integration/11ci", "main": "b" * 40,
+                   "ci_parts": [{"workflow": "mobile-android-release.yml"}]}
+        replies = [(1, "", GH_DEBUG_504),
+                   (1, "", GH_DEBUG_403_SECONDARY)]
+        with self.fake_gh(replies) as (fake, sleep, _err):
+            with self.assertRaises(rc.TransientReleaseError) as caught:
+                nx.workflow_step(
+                    project(), pending, "mobile-android-release.yml",
+                    staging=False, save=mock.Mock(), now=1000.0)
+        error = caught.exception
+        self.assertEqual([call[:2] for call in fake.calls],
+                         [["workflow", "run"], ["run", "list"]])
+        sleep.assert_not_called()
+        self.assertEqual(error.github_refusal[0], 403)
+        self.assertEqual(error.github_refusal[1]["Retry-After"], "60")
+        self.assertIn("the read-back was refused", str(error))
+        with mock.patch.object(release, "_quota_probe") as probe:
+            until = release._quota_wait_until(
+                self.cfg, str(error), 1000.0, error.github_refusal)
+        self.assertEqual(until, 1060.0)
+        probe.assert_not_called()
+        attempt = pending["dispatches"]["ci/mobile-android-release.yml"]
+        self.assertEqual(attempt["intent_at"], 1000.0)
+        self.assertNotIn("accepted", attempt)
 
 
 if __name__ == "__main__":
