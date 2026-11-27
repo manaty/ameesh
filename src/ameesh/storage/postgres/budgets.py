@@ -71,6 +71,49 @@ class Budgets(CycleBudgets, interface.Budgets):
             + (" where " + " and ".join(clauses) if clauses else "")
             + " order by at desc, id desc limit %s", tuple(params))
 
+    # -- #8347 (migration 0611): réservations du plafond d'une lignée --------
+    def lineage_reserved(self, root):
+        rows = self.db.query(
+            "select coalesce(sum(hour_usd), 0)::float8 as hour_usd,"
+            " coalesce(sum(day_usd), 0)::float8 as day_usd"
+            " from budget_lineage_reservations"
+            " where root = %s and expires_at > clock_timestamp()", (root,))
+        row = rows[0] if rows else {"hour_usd": 0.0, "day_usd": 0.0}
+        return {3600: float(row["hour_usd"]), 86400: float(row["day_usd"])}
+
+    def lineage_reserve_get(self, spend_key):
+        rows = self.db.query(
+            "select spend_key, root, agent, hour_usd::float8 as hour_usd,"
+            " day_usd::float8 as day_usd,"
+            " extract(epoch from expires_at)::float8 as expires_ts"
+            " from budget_lineage_reservations where spend_key = %s",
+            (spend_key,))
+        return rows[0] if rows else None
+
+    def lineage_reserve_put(self, *, root, agent, spend_key, hour_usd,
+                            day_usd, expires_s):
+        # une réservation orpheline (tour perdu, règlement jamais rejoué) est
+        # ignorée dès son expiration ; on purge aussi les vieilles lignes pour
+        # que la table ne grossisse pas indéfiniment.
+        self.db.execute(
+            "delete from budget_lineage_reservations"
+            " where expires_at < clock_timestamp() - interval '1 day'")
+        rows = self.db.query(
+            "insert into budget_lineage_reservations"
+            " (spend_key, root, agent, hour_usd, day_usd, expires_at)"
+            " values (%s, %s, %s, %s, %s,"
+            "         clock_timestamp() + make_interval(secs => %s))"
+            " on conflict (spend_key) do nothing returning spend_key",
+            (spend_key, root, agent, float(hour_usd), float(day_usd),
+             float(expires_s)))
+        return bool(rows)
+
+    def lineage_release(self, spend_key):
+        rows = self.db.query(
+            "delete from budget_lineage_reservations where spend_key = %s"
+            " returning spend_key", (spend_key,))
+        return bool(rows)
+
     # -- #1469 (migration 0443): daily envelope per billing account ----------
     #: the calendar day of each envelope, in its own zone, and its bounds
     _USAGE = (

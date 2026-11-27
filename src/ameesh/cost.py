@@ -1312,6 +1312,7 @@ class CostBook:
         daily_usd: float = 0.0,
         agent_limits: dict | None = None,
         codex_homes: Sequence[str] | None = None,
+        lineage_cache=None,
     ) -> None:
         self.state_dir = state_dir if state_dir is not None else config_mod.load().state_dir
         self.prices_path = prices_path if prices_path is not None else os.environ.get(
@@ -1333,6 +1334,11 @@ class CostBook:
         #: L95 : dossiers Codex des comptes déclarés (`CODEX_HOME`), où chercher
         #: le journal d'un fil (modèle, total avant le tour) en plus du défaut
         self.codex_homes = [h for h in (codex_homes or []) if h]
+        #: #8347 : lecture des lignées d'éphémères, partagée par les workers de
+        #: l'exécuteur (même TTL et même réveil `ameesh_budget` que les plafonds)
+        #: quand l'appelant en fournit une ; sinon lue à la demande.
+        self.lineage_cache = lineage_cache
+        self._lineage_memo: dict = {}
         # Workers create a CostBook each poll: reuse verified observations,
         # not account selection or budget decisions, across those instances.
         self._claude_gauge_cache = CLAUDE_GAUGES
@@ -3090,6 +3096,48 @@ class CostBook:
             return None
         return found
 
+    # -- lignée (#8347) -----------------------------------------------------
+    def lineage_of(self, agent: str) -> dict:
+        """La lignée de `agent` : `{root, members, broken, error}`.
+
+        Lue une fois par instance (un garde ne la relit pas pour chaque
+        fenêtre) ; avec `lineage_cache`, le cache court de l'exécuteur la
+        partage entre tours et le réveil `ameesh_budget` l'invalide. Une base
+        sans l'opération, ou en panne, rend une lignée rompue : l'appelant
+        refuse au lieu de sommer une lignée partielle."""
+        if self.db is None:
+            return {"root": agent, "members": [], "broken": False}
+        cached = self._lineage_memo.get(agent)
+        if cached is not None:
+            return cached
+        try:
+            if self.lineage_cache is not None:
+                data = self.lineage_cache.lineage(self.db, agent)
+            else:
+                data = storage.of(self.db).agents.lineage(agent)
+        except Exception as exc:  # noqa: BLE001 - fail-closed, la garde refuse
+            data = {"root": None, "members": [], "broken": True,
+                    "error": "lineage unreadable for %s: %s"
+                             % (agent, " ".join(str(exc).split())[:160])}
+        self._lineage_memo[agent] = data
+        return data
+
+    def spent_by_agent(self, agents: Sequence[str], seconds: float = 3600.0,
+                       harnesses: Sequence[str] | None = None) -> dict:
+        """#8347 : `{agent: usd}` sur la fenêtre, une lecture pour tous."""
+        names = [str(agent) for agent in agents]
+        if self.db is None:
+            return {name: 0.0 for name in names}
+        if not names:
+            return {}
+        return storage.of(self.db).turn_costs.spent_agents(
+            seconds, agents=names, harnesses=harnesses)
+
+    def spent_agents(self, agents: Sequence[str], seconds: float = 3600.0,
+                     harnesses: Sequence[str] | None = None) -> float:
+        """#8347 : la dépense d'un ensemble d'agents (racine + clones)."""
+        return sum(self.spent_by_agent(agents, seconds, harnesses).values())
+
     # -- dépense ------------------------------------------------------------
     def spent(self, agent: str = "all", seconds: float = 3600.0,
               harnesses: Sequence[str] | None = None,
@@ -3130,27 +3178,34 @@ class CostBook:
         return self.paid_spent(paid, 3600.0)
 
     def paid_spent(self, paid: Sequence[str], seconds: float = 3600.0,
-                   agent: str = "all", *, cache: dict | None = None) -> float:
+                   agent: str | Sequence[str] = "all", *,
+                   cache: dict | None = None) -> float:
         """#513 : `paid_hour` sur les `seconds` dernières secondes, pour le
-        mesh (`agent="all"`) ou pour un agent. La dépense mesurée (baisse des
+        mesh (`agent="all"`), pour un agent, ou pour un **ensemble** d'agents
+        (#8347 : la lignée d'une racine). La dépense mesurée (baisse des
         soldes) fait foi ; l'estimation du grand livre ne sert qu'entre deux
         relevés, corrigée par le rapport réel/estimé de son compte.
 
         La fenêtre décide d'abord ce que le mesh compte de chaque baisse
         (L242b, `paid_hour`) ; un agent reçoit, de ce montant, la part de ses
-        estimations dans celles de son compte **dans la fenêtre**. Une baisse
-        sans estimation dans la fenêtre n'est attribuable à personne : la part
-        de l'agent est nulle (le mesh garde, lui, le repli temporel).
+        estimations dans celles de son compte **dans la fenêtre**. Un
+        ensemble d'agents reçoit la somme de leurs parts : c'est la dépense
+        de la lignée, mesurée sur les mêmes baisses. Une baisse sans
+        estimation dans la fenêtre n'est attribuable à personne : la part est
+        nulle (le mesh garde, lui, le repli temporel).
 
         `cache` (#3923) : un dict fourni par une **passe** (la prise
         automatique) partage la lecture des soldes entre ses appels — les
         fenêtres du mesh sont les mêmes pour chaque candidat. Sans cache,
         chaque appel relit comme avant : un appelant qui rend la main entre
         deux passes n'obtient jamais une valeur d'une autre passe."""
-        key = (tuple(paid), float(seconds), agent) if cache is not None else None
+        many = not isinstance(agent, str)
+        key_agent = tuple(sorted(str(a) for a in agent)) if many else agent
+        key = (tuple(paid), float(seconds), key_agent) if cache is not None else None
         if key is not None and key in cache:
             return cache[key]
-        ledger = self.spent(agent, seconds, harnesses=paid)
+        ledger = (self.spent_agents(agent, seconds, harnesses=paid) if many
+                  else self.spent(agent, seconds, harnesses=paid))
         if self.db is None or not paid:
             return ledger
         # l'heure réelle, comme les relevés et le grand livre (datés par la
@@ -3164,7 +3219,7 @@ class CostBook:
             cache[key] = total
         return total
 
-    def _paid_spent(self, paid: list, start: float, now: float, agent: str) -> float:
+    def _paid_spent(self, paid: list, start: float, now: float, agent) -> float:
         from . import balance
         rows = storage.of(self.db).operations.balances(provider=None,
                                                        since_s=now - start + 1.0)
@@ -3185,9 +3240,14 @@ class CostBook:
         def estimated(mine, low, high):
             return sum(float(line["usd"]) for line in mine if low < float(line["ts"]) <= high)
 
+        names = None if isinstance(agent, str) else {str(a) for a in agent}
+
         def counted(mine):
-            return mine if agent == "all" else [line for line in mine
-                                                if line.get("agent") == agent]
+            if agent == "all":
+                return mine
+            if names is None:
+                return [line for line in mine if line.get("agent") == agent]
+            return [line for line in mine if line.get("agent") in names]
 
         total = 0.0
         for harness in paid:
@@ -3274,6 +3334,15 @@ class CostBook:
         (`agent_limits`, sa seule dépense payée au token). Un plafond nul ou
         absent ne s'applique pas.
 
+        #8347 : le plafond posé sur un agent **racine** (non éphémère)
+        couvre sa lignée — sa dépense et celle de tous les éphémères dont le
+        `created_by` y remonte — et c'est la somme qui est comparée. Un
+        plafond posé sur un éphémère reste son plafond propre ; le plafond du
+        mesh et le plafond propre de l'agent continuent de s'appliquer, le
+        plus strict gagne. Un agent au forfait est déjà sorti plus haut (L49).
+        Une lignée rompue (créateur absent, cycle) refuse : on ne somme
+        jamais une lignée partielle.
+
         #513 : tous ces plafonds comptent la dépense mesurée sur les soldes
         (`paid_spent`), l'estimation ne servant qu'entre deux relevés.
 
@@ -3304,14 +3373,84 @@ class CostBook:
                                 WINDOW_LABELS[window][0], total, WINDOW_LABELS[window][1],
                                 cap, ", %.2f $ for a non-critical agent" % held
                                 if held < cap else ""))
-        if agent != "all":
-            for window, cap in sorted((self.agent_limits.get(agent) or {}).items()):
-                if cap and cap > 0 and window in WINDOW_LABELS:
-                    total = self.paid_spent(paid, window, agent, cache=cache)
-                    if total >= cap:
-                        return ("%s budget of agent %s (pay-per-token): %.2f $ over %s "
-                                "(cap %.2f $)" % (WINDOW_LABELS[window][0], agent, total,
-                                                      WINDOW_LABELS[window][1], cap))
+        if agent != "all" and self.agent_limits:
+            return self._agent_caps_reason(agent, paid, cache=cache)
+        return ""
+
+    def _lineage_reserved(self, root: str) -> dict:
+        """#8347 : la part déjà réservée par des tours en vol de la lignée.
+
+        Lecture de garde : sans base, ou si le pilote ne réserve pas, aucune
+        réservation (la dépense écrite reste la seule somme). Une erreur de
+        lecture ne casse pas la garde — l'admission, elle, reste fail-closed."""
+        if self.db is None:
+            return {}
+        try:
+            return storage.of(self.db).budgets.lineage_reserved(root)
+        except Exception:  # noqa: BLE001 - une lecture de garde ne plante pas
+            return {}
+
+    def _agent_caps_reason(self, agent: str, paid: Sequence[str], *,
+                           cache: dict | None = None) -> str:
+        """#8347 : plafonds propres et plafond de la lignée, le plus strict.
+
+        Un plafond posé sur la racine somme la lignée entière ; celui posé
+        sur un éphémère (ou sur une racine sans descendant) reste propre à
+        l'agent. Une lignée rompue refuse, faute de pouvoir attribuer la
+        dépense à une racine. Les réservations des tours en vol comptent
+        comme un reste déjà consommé : deux clones ne lisent pas le même."""
+        lineage = self.lineage_of(agent)
+        if lineage.get("broken"):
+            return ("lineage budget (pay-per-token): %s; no turn until the "
+                    "created_by lineage is repaired"
+                    % (lineage.get("error") or "broken lineage for %s" % agent))
+        root = lineage.get("root") or agent
+        known = lineage.get("known", True)
+        names = [str(m.get("agent")) for m in lineage.get("members") or ()
+                 if m.get("agent")]
+        own = self.agent_limits.get(agent) or {}
+        root_caps = self.agent_limits.get(root) or {}
+        reserved = (self._lineage_reserved(root)
+                    if (root == agent and known) or root_caps else {})
+        # Le plafond de l'agent d'abord : sur un éphémère, c'est son plafond
+        # propre, plus strict que celui de la racine s'il est plus bas.
+        for window, cap in sorted(own.items()):
+            if not (cap and cap > 0 and window in WINDOW_LABELS):
+                continue
+            if root == agent and known:
+                total = (self.paid_spent(paid, window, tuple(names), cache=cache)
+                         if names else self.paid_spent(paid, window, agent, cache=cache))
+                # une racine sans descendant garde le libellé historique ;
+                # « lineage » n'apparaît que si la somme couvre des clones.
+                label = ("lineage %s" % agent if len(names) > 1
+                         else "agent %s" % agent)
+            else:
+                total = self.paid_spent(paid, window, agent, cache=cache)
+                label = "agent %s" % agent
+            if total >= cap:
+                return ("%s budget of %s (pay-per-token): %.2f $ over %s "
+                        "(cap %.2f $)" % (WINDOW_LABELS[window][0], label, total,
+                                          WINDOW_LABELS[window][1], cap))
+            if root == agent and known:
+                garde = float(reserved.get(window, 0.0))
+                if total + garde >= cap:
+                    return ("%s budget of %s (pay-per-token): %.2f $ spent + "
+                            "%.2f $ reserved by in-flight turns (cap %.2f $)"
+                            % (WINDOW_LABELS[window][0], label, total, garde, cap))
+        if root != agent:
+            for window, cap in sorted(root_caps.items()):
+                if not (cap and cap > 0 and window in WINDOW_LABELS):
+                    continue
+                total = self.paid_spent(paid, window, tuple(names), cache=cache)
+                if total >= cap:
+                    return ("%s budget of lineage %s (pay-per-token): %.2f $ over %s "
+                            "(cap %.2f $)" % (WINDOW_LABELS[window][0], root, total,
+                                              WINDOW_LABELS[window][1], cap))
+                garde = float(reserved.get(window, 0.0))
+                if total + garde >= cap:
+                    return ("%s budget of lineage %s (pay-per-token): %.2f $ spent + "
+                            "%.2f $ reserved by in-flight turns (cap %.2f $)"
+                            % (WINDOW_LABELS[window][0], root, total, garde, cap))
         return ""
 
     # -- rapport ------------------------------------------------------------

@@ -5541,6 +5541,9 @@ class AgentWorker(threading.Thread):
         book = cost_mod.CostBook(
             state_dir=self.cfg.state_dir, db=self.db,
             tools={self.name: self.agent.get("harness") or ""},
+            # #8347 : la lignée suit le même cache court et le même réveil
+            # `ameesh_budget` que les plafonds
+            lineage_cache=self.runner.budget_cache,
             **limites.book_kwargs())
         critique = account_turn.is_critical(self)
         if not critique:
@@ -5976,6 +5979,9 @@ class AgentWorker(threading.Thread):
             if not self.runner.mediated:
                 state = "kept" if incertain else ("released" if released else "settled")
                 account_budget.settle(self.db, cle, state=state)
+            # #8347 : la dépense écrite prend la place de la réservation de
+            # lignée (même clé comptable) ; une réservation orpheline expire.
+            budget_mod.release_lineage(self.db, cle)
             registry.pending_spend_clear(self.db, self.name, travail)
             self._compta_travail = None
             self._annonce_ram = ""
@@ -6277,6 +6283,8 @@ class AgentWorker(threading.Thread):
             except db_mod.DbError as exc:
                 log_async("[%s] account reservation not released (%s)"
                           % (self.name, db_mod.explain(exc)))
+            # #8347 : rien n'est parti, la part de lignée réservée est rendue
+            budget_mod.release_lineage(self.db, spend_key)
         self._compta_travail = None
 
     def _purge_turn_context(self) -> None:

@@ -207,6 +207,11 @@ FERMEES = {
     "tranche_events": {"id", "tranche_id", "reservation_id", "action", "actor",
                        "reason", "at", "data"},
     "tranche_relay_requests": {"id", "turn_id", "state", "created_at", "recorded_at"},
+    # #8347 (0611) : la part du plafond d'une lignée réservée par un tour
+    # admis est une autorité interne de l'admission de budget, effacée au
+    # règlement ; le rôle superviseur ne la lit pas, aucun GRANT ajouté.
+    "budget_lineage_reservations": {"spend_key", "root", "agent", "hour_usd",
+                                    "day_usd", "created_at", "expires_at"},
     # #4867 / 0520: dormant native sandbox authority, immutable admissions and
     # application-bound receipts/results. Preserve the existing closed rights
     # for BOTH supervisor roles; S5 owns any explicit read projection/grant.

@@ -241,6 +241,62 @@ class Domain(abc.ABC):
 # registre des agents (`agent_registry`) : lignes et baux
 # --------------------------------------------------------------------------
 
+#: profondeur maximale d'une lignée suivie (comme `postgres.registry.LINEAGE_MAX`)
+LINEAGE_MAX = 32
+
+
+def _lineage_groups(rows: Sequence[dict], roots: Sequence[str] = ()) -> list[dict]:
+    """Groupes de lignée calculés en Python depuis des lignes de registre.
+
+    Repli des opérations `Agents.lineages`/`lineage` pour un pilote qui ne
+    sait pas faire la récursion en SQL. `rows` portent au moins `name`,
+    `ephemeral`, `created_by`, `status` et `ephemeral_expires_ts`. Une racine
+    est un agent non éphémère ; un plafond posé sur un éphémère reste son
+    plafond propre et ne crée donc pas de groupe (`roots` l'ignore)."""
+    by_name = {r.get("name"): r for r in rows if r.get("name")}
+    children: dict = {}
+    for row in rows:
+        parent = row.get("created_by")
+        if row.get("ephemeral") and parent:
+            children.setdefault(parent, []).append(row)
+    wanted = {str(r) for r in roots if str(r)}
+    seeds = wanted | {row.get("name") for row in rows
+                      if row.get("ephemeral") and row.get("created_by")}
+    groups = []
+    for root in sorted(seeds):
+        row = by_name.get(root)
+        if row is None or row.get("ephemeral"):
+            if root in wanted:
+                groups.append({"root": root, "members": [], "broken": True,
+                               "error": "unknown or ephemeral root %s" % root})
+            continue
+        if root not in wanted and root not in children:
+            continue
+        members = []
+        seen = set()
+        stack = [(root, 0)]
+        while stack:
+            name, depth = stack.pop()
+            if name in seen or depth > LINEAGE_MAX:
+                continue
+            seen.add(name)
+            member = by_name.get(name)
+            if member is None:
+                continue
+            members.append({
+                "agent": name,
+                "ephemeral": bool(member.get("ephemeral")),
+                "status": member.get("status"),
+                "expires_ts": member.get("ephemeral_expires_ts"),
+                "depth": depth,
+            })
+            for child in children.get(name, ()):
+                stack.append((child.get("name"), depth + 1))
+        members.sort(key=lambda m: (m["depth"], m["agent"]))
+        groups.append({"root": root, "members": members, "broken": False})
+    return groups
+
+
 class Agents(Domain):
     """Lignes du registre hors bail : inscription, lecture, statut."""
 
@@ -371,6 +427,70 @@ class Agents(Domain):
     @abc.abstractmethod
     def overview(self) -> list[dict]:
         """Vue d'observabilité (`mesh list --json`), colonnes du canon comprises."""
+
+    def lineages(self, roots: Sequence[str] = ()) -> list[dict]:
+        """#8347 : les lignées d'éphémères, une par agent **racine**.
+
+        Une lignée est la racine (agent non éphémère) et tous les agents dont
+        la chaîne `created_by` y remonte, échus et arrêtés compris ; les noms
+        de `roots` sont rendus même sans descendant (une racine à plafond
+        reste visible). Rend `[{root, members, broken}]`, `members` étant
+        `[{agent, ephemeral, status, expires_ts, depth}]` trié par profondeur
+        puis nom ; `broken` est faux ici (le repli ne fabrique pas de lignée
+        partielle).
+
+        Le repli lit `overview()` et calcule les groupes en Python : correct
+        pour tout pilote, plus lourd qu'une récursion SQL (le pilote Postgres
+        la fait en une requête). Lecture seule, aucune décision."""
+        return _lineage_groups(self.overview(), roots)
+
+    def lineage(self, name: str) -> dict:
+        """#8347 : la lignée de `name` — `{root, members, broken, error}`.
+
+        `root` est l'ancêtre non éphémère, `members` la même forme que
+        `lineages()` (racine incluse). Une chaîne rompue (créateur absent,
+        cycle, profondeur au-delà de `LINEAGE_MAX`) rend `broken: true`,
+        `root: null` et un `error` lisible : l'appelant décide de refuser,
+        jamais de replier sur un maillon trouvé. Le repli marche la chaîne
+        avec `get()` puis groupe depuis `overview()`."""
+        rows = self.overview()
+        by_name = {r.get("name"): r for r in rows if r.get("name")}
+        seen: list[str] = []
+        current: str | None = name
+        while current:
+            if current in seen:
+                return {"root": None, "members": [], "broken": True,
+                        "error": "cycle in created_by lineage at %s" % current}
+            if len(seen) >= LINEAGE_MAX:
+                return {"root": None, "members": [], "broken": True,
+                        "error": "lineage of more than %d creators" % LINEAGE_MAX}
+            seen.append(current)
+            row = by_name.get(current)
+            if row is None:
+                if len(seen) == 1:
+                    # Nom absent du registre : sa propre racine, sans
+                    # descendant (coût d'un agent retiré, banc).
+                    return {"root": name, "members": [{
+                        "agent": name, "ephemeral": False, "status": None,
+                        "expires_ts": None, "depth": 0}],
+                        "broken": False, "known": False}
+                return {"root": None, "members": [], "broken": True,
+                        "error": "creator %s is unknown to the registry" % current}
+            if not row.get("ephemeral"):
+                groups = _lineage_groups(rows, (current,))
+                # `_lineage_groups` rend aussi les autres racines semées par
+                # leurs enfants : prendre CELLE de la racine trouvée, jamais
+                # la première venue.
+                group = next((g for g in groups if g.get("root") == current), None) \
+                    or {"root": current, "members": [], "broken": False}
+                group["broken"] = False
+                return group
+            current = row.get("created_by") or None
+            if current is None:
+                return {"root": None, "members": [], "broken": True,
+                        "error": "ephemeral %s has no created_by" % row.get("name")}
+        return {"root": None, "members": [], "broken": True,
+                "error": "empty lineage for %s" % name}
 
     @abc.abstractmethod
     def reachability(self) -> list[dict]:
@@ -1016,6 +1136,32 @@ class TurnCosts(Domain):
         Les lignes `source = 'device'` (L111) ne comptent jamais : la dépense
         d'un appareil médié est celle que le relais a mesurée."""
 
+    def spent_agents(self, seconds: float, *, agents: Sequence[str],
+                     harnesses: Sequence[str] | None) -> dict[str, float]:
+        """#8347 : la dépense de plusieurs agents dans la même fenêtre.
+
+        Rend `{agent: usd}` pour chaque agent demandé (0 compris), avec les
+        mêmes exclusions que `spent()` : lignes écartées (`void_reason`) et
+        appareils médiés (`source = 'device'`) hors somme. La garde de lignée
+        et la vue budget s'en servent pour sommer racine et clones sans une
+        requête par enfant (le pilote Postgres la fait en un `GROUP BY`).
+
+        Le repli appelle `spent()` agent par agent : correct sur tout pilote,
+        un aller-retour par agent."""
+        return {str(agent): self.spent(seconds, agent=str(agent),
+                                       harnesses=harnesses)
+                for agent in agents}
+
+    def by_agent(self, from_ts: float, to_ts: float, *,
+                 harnesses: Sequence[str] | None = None) -> list[dict]:
+        """#8347 : `turn_costs` groupé par agent sur ]from_ts, to_ts].
+
+        Rend `[{agent, usd, turns}]` (agents ayant au moins un tour compté),
+        hors lignes écartées et hors appareils médiés. Lecture seule pour
+        `ameesh cost lineage` : le regroupement par racine se fait ensuite en
+        Python depuis `Agents.lineages()`, sans une requête par agent."""
+        raise NotImplementedError("turn_costs.by_agent: not supported by this storage")
+
     @abc.abstractmethod
     def spent_between(self, from_ts: float, to_ts: float, *,
                       harnesses: Sequence[str]) -> float:
@@ -1102,6 +1248,39 @@ class Budgets(Domain):
     def events(self, limit: int, scope: str | None = None) -> list[dict]:
         """Les derniers changements, récents d'abord : scope, window_s,
         old_usd, new_usd, actor, at_ts."""
+
+    # -- #8347 : réservations du plafond d'une lignée (migration 0611) -----
+    # Ces opérations sont CONCRÈTES : le contrat de l'exécuteur médié ne
+    # change pas. Le repli ne réserve rien (l'exécuteur médié compte la
+    # dépense au relais) ; un pilote qui sait réserver les surcharge.
+    def lineage_reserved(self, root: str) -> dict[int, float]:
+        """#8347 : la part du plafond de `root` réservée par des tours en vol.
+
+        Rend `{window_s: usd}` (3600, 86400), lignes expirées exclues. Repli :
+        aucune réservation — la garde lit alors la seule dépense écrite."""
+        return {}
+
+    def lineage_reserve_get(self, spend_key: str) -> dict | None:
+        """#8347 : la réservation du tour `spend_key`, ou None.
+
+        Rend `spend_key, root, agent, hour_usd, day_usd, expires_ts`. Repli :
+        None (aucune réservation connue)."""
+        return None
+
+    def lineage_reserve_put(self, *, root: str, agent: str, spend_key: str,
+                            hour_usd: float, day_usd: float,
+                            expires_s: float) -> bool:
+        """#8347 : écrit la réservation d'un tour admis, en une écriture.
+
+        Idempotent : la clé `spend_key` déjà présente n'est pas réécrite
+        (False). Repli : False, le pilote ne réserve pas."""
+        return False
+
+    def lineage_release(self, spend_key: str) -> bool:
+        """#8347 : efface la réservation d'un tour réglé ou annulé.
+
+        False quand elle n'existait pas (ou pilote sans réservation)."""
+        return False
 
 
 # --------------------------------------------------------------------------

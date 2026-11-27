@@ -284,6 +284,37 @@ class TurnCosts(interface.TurnCosts):
             + " and ".join(clauses), tuple(params))
         return float(rows[0]["usd"]) if rows else 0.0
 
+    def spent_agents(self, seconds, *, agents, harnesses) -> dict:
+        names = [str(agent) for agent in agents]
+        if not names:
+            return {}
+        clauses = ["recorded_at >= now() - make_interval(secs => %s)",
+                   "void_reason IS NULL", "source <> 'device'",
+                   "agent = ANY(%s::text[])"]
+        params: list = [float(seconds), names]
+        if harnesses:
+            clauses.append("harness in (%s)" % ", ".join(["%s"] * len(harnesses)))
+            params.extend(harnesses)
+        rows = self.db.query(
+            "select agent, coalesce(sum(usd), 0)::float8 as usd from turn_costs"
+            " where " + " and ".join(clauses) + " group by agent", tuple(params))
+        # chaque agent demandé est rendu, même sans ligne : un zéro explicite
+        found = {str(row["agent"]): float(row["usd"]) for row in rows}
+        return {name: found.get(name, 0.0) for name in names}
+
+    def by_agent(self, from_ts, to_ts, *, harnesses=None) -> list[dict]:
+        clauses = ["recorded_at > to_timestamp(%s)",
+                   "recorded_at <= to_timestamp(%s)",
+                   "void_reason IS NULL", "source <> 'device'"]
+        params: list = [float(from_ts), float(to_ts)]
+        if harnesses:
+            clauses.append("harness in (%s)" % ", ".join(["%s"] * len(harnesses)))
+            params.extend(harnesses)
+        return self.db.query(
+            "select agent, coalesce(sum(usd), 0)::float8 as usd, count(*)::int as turns"
+            " from turn_costs where " + " and ".join(clauses)
+            + " group by agent order by usd desc, agent", tuple(params))
+
     def spent_between(self, from_ts, to_ts, *, harnesses) -> float:
         names = list(harnesses)
         if not names:

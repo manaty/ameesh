@@ -814,14 +814,45 @@ class Relay:
     def _over_with_unrecorded(self, book, identity: Identity, paid) -> str:
         pending_all = sum(r["usd"] for r in self._unrecorded)
         pending_mine = sum(r["usd"] for r in self._unrecorded if r["agent"] == identity.agent)
+        # #8347 : le plafond de la racine couvre la lignée ; la dépense pas
+        # encore écrite de ses clones compte donc avant de rendre la main.
+        lineage = book.lineage_of(identity.agent) if book.agent_limits else {}
+        if lineage.get("broken"):
+            return ("lignée budget illisible : %s ; relais fermé"
+                    % (lineage.get("error") or "lignée incomplète"))
+        root = (lineage.get("root") or identity.agent) if lineage else identity.agent
+        names = {str(m.get("agent")) for m in lineage.get("members") or ()
+                 if m.get("agent")}
+        if not names:
+            names = {identity.agent}
+        pending_lineage = sum(r["usd"] for r in self._unrecorded
+                              if str(r["agent"]) in names)
         for window, cap in ((3600, book.hourly_usd), (86400, book.daily_usd)):
             if cap and cap > 0 and book.paid_spent(paid, window) + pending_all >= cap:
                 return "budget du mesh atteint (dépense non encore écrite comprise)"
         for window, cap in (book.agent_limits.get(identity.agent) or {}).items():
-            if cap and cap > 0 and (book.paid_spent(paid, window, identity.agent)
-                                    + pending_mine) >= cap:
-                return "budget de l'agent %s atteint (dépense non encore écrite comprise)" \
-                    % identity.agent
+            if not (cap and cap > 0):
+                continue
+            if root == identity.agent:
+                # #8347 : le plafond de la racine couvre la lignée, la dépense
+                # non écrite des clones compte donc aussi avant de rendre la main.
+                depense = book.paid_spent(paid, window, tuple(sorted(names)))
+                label = ("la lignée %s" % root if len(names) > 1
+                         else "l'agent %s" % identity.agent)
+                en_attente = pending_lineage
+            else:
+                depense = book.paid_spent(paid, window, identity.agent)
+                label = "agent %s" % identity.agent
+                en_attente = pending_mine
+            if depense + en_attente >= cap:
+                return "budget de %s atteint (dépense non encore écrite comprise)" % label
+        if root != identity.agent:
+            for window, cap in (book.agent_limits.get(root) or {}).items():
+                if cap and cap > 0 and (
+                        book.paid_spent(paid, window, tuple(sorted(names)))
+                        + pending_lineage) >= cap:
+                    return ("budget de la lignée %s atteint (dépense non encore "
+                            "écrite comprise)" % root)
         return ""
 
     def _models(self, handler, identity: Identity) -> None:
