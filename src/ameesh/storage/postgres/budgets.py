@@ -297,7 +297,14 @@ class Budgets(CycleBudgets, interface.Budgets):
         """Les réservations encore comptées (`open`, `kept`), la plus ancienne
         d'abord, bornées à `limit` lignes (+1 pour que l'appelant dise la
         troncature). Une seule instruction, donc un seul instantané ; `at`
-        (epoch) fixe l'âge affiché.
+        (epoch) fixe l'âge affiché et le jour courant.
+
+        Une `open` est toujours comptée, quel que soit son jour : le tour est
+        en vol. Une `kept` ne l'est que si sa période est le jour calendaire
+        courant de son enveloppe, avec le même `at` et le même fuseau que
+        `_USAGE` (lignes 136-138) ; hors enveloppe, rien ne la compte. C'est
+        la même règle que l'admission, pour qu'une vieille `kept` ne sature
+        jamais la borne et ne masque pas les `open` récentes.
 
         `agent_known` et `session_account` viennent de `agent_registry` (le
         profil enregistré pour l'agent, jamais une clé) ;
@@ -313,6 +320,9 @@ class Budgets(CycleBudgets, interface.Budgets):
         if agent is not None:
             conditions.append("r.agent = %s")
             params.append(agent)
+        conditions.append(
+            "(r.state = 'open' or (b.billing_account is not null"
+            " and r.period = (p.at at time zone b.tz)::date))")
         params.append(int(limit))
         return self.db.query(
             "with p as (select to_timestamp(%s) as at)"

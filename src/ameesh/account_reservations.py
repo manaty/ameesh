@@ -4,10 +4,12 @@
 `ameesh reservations --json` (`ameesh-reservations/1`) et
 `GET /api/v1/reservations` publient, pour toute la flotte, les réservations
 de compte encore comptées contre l'enveloppe d'un compte de facturation :
-`open` (le tour est en vol) et `kept` (le tour ne s'est jamais réglé ; la
-réservation compte toujours jusqu'à sa libération humaine ou la fin de son
-jour calendaire). Une réservation est la propriété du cœur : cette lecture
-n'ouvre, ne règle et ne libère rien.
+`open` (le tour est en vol, quel que soit son jour) et `kept` (le tour ne
+s'est jamais réglé ; la réservation compte jusqu'à sa libération humaine ou
+la fin de son jour calendaire — seule une `kept` du jour courant de
+l'enveloppe est rendue, au même fuseau et au même instant que `_USAGE`).
+Une réservation est la propriété du cœur : cette lecture n'ouvre, ne règle
+et ne libère rien.
 
 La projection est fermée : identifiant, agent, compte de facturation, profil
 enregistré pour l'agent, montant, état, période, âge. Jamais `spend_key`,
@@ -159,9 +161,11 @@ def open_reservations(db, *, limit: int = DEFAULT_LIMIT, account: str | None = N
     Lecture seule : une transaction `REPEATABLE READ, READ ONLY` porte l'instant
     `observed_ts` et toutes les lignes, puis rien n'est écrit. `account` et
     `agent` filtrent exactement (`None` : tous) ; `state` vaut `open`, `kept`
-    ou `all`. Une erreur de base remonte (une absence de lecture n'est pas une
-    absence de réservation) ; une ligne illisible est signalée dans
-    `unreadable`.
+    ou `all`. Une `open` est toujours rendue ; une `kept` seulement si sa
+    période est le jour courant de l'enveloppe (même règle que l'admission),
+    sinon elle ne compte plus. Une erreur de base remonte (une absence de
+    lecture n'est pas une absence de réservation) ; une ligne illisible est
+    signalée dans `unreadable`.
     """
     _check_limit(limit)
     if state not in STATE_FILTERS:

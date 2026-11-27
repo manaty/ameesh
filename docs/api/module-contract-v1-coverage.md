@@ -111,7 +111,8 @@ together with the public-only module-connector bench. Revision 1.9 (#8337)
 adds `ameesh accounts profiles`; its redaction and refusal witnesses join the
 `cli:ameesh accounts profiles` row. Revision 1.10 (#8343) adds
 `ameesh reservations` and `GET /api/v1/reservations`; its ordering, bounding,
-unknown-agent, unreadable-row and no-secret witnesses join the
-`cli:ameesh reservations` row, and the route's schema and shared-serialisation
-witnesses are already exercised by the `http:schemas` row and
+unknown-agent, expired-kept, timezone-day-boundary, unreadable-row and
+no-secret witnesses join the `cli:ameesh reservations` row, and the route's
+schema and shared-serialisation witnesses are already exercised by the
+`http:schemas` row and
 `tests.test_8343_account_reservations.AccountReservationsTest.test_cli_and_http_are_one_document`.

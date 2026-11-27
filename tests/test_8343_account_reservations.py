@@ -11,8 +11,9 @@ rendu.
 from __future__ import annotations
 
 import json
-import math
 import unittest
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from ameesh import account_reservations, registry, serve, storage
 
@@ -20,6 +21,7 @@ from .support import PgTestCase
 
 ACCOUNT_A = "acct-a"
 ACCOUNT_B = "acct-b"
+PARIS = ZoneInfo("Europe/Paris")
 
 
 class AccountReservationsTest(PgTestCase):
@@ -45,15 +47,26 @@ class AccountReservationsTest(PgTestCase):
                 % ", ".join("%s = %%s" % key for key in values),
                 tuple(values.values()) + (name,))
 
+    def today(self):
+        return datetime.now(PARIS).date().isoformat()
+
     def reservation(self, agent, account, usd, state="open", *, age="5 minutes",
-                    period="2026-11-27"):
+                    period=None, created_ts=None):
         self._keys += 1
         key = "k-%d" % self._keys
-        self.db.execute(
-            "INSERT INTO account_reservations (billing_account, agent, usd,"
-            " period, state, spend_key, created_at)"
-            " VALUES (%s, %s, %s, %s::date, %s, %s, now() - %s::interval)",
-            (account, agent, usd, period, state, key, age))
+        period = period or self.today()
+        if created_ts is None:
+            self.db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES (%s, %s, %s, %s::date, %s, %s, now() - %s::interval)",
+                (account, agent, usd, period, state, key, age))
+        else:
+            self.db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES (%s, %s, %s, %s::date, %s, %s, to_timestamp(%s))",
+                (account, agent, usd, period, state, key, float(created_ts)))
         return self.db.query(
             "SELECT id FROM account_reservations WHERE spend_key = %s",
             (key,))[0]["id"]
@@ -98,7 +111,7 @@ class AccountReservationsTest(PgTestCase):
         self.assertEqual(rows[oldest]["agent"], "a2")
         self.assertEqual(rows[oldest]["billing_account"], ACCOUNT_B)
         self.assertEqual(rows[oldest]["usd"], 3.5)
-        self.assertEqual(rows[oldest]["period"], "2026-11-27")
+        self.assertEqual(rows[oldest]["period"], self.today())
         self.assertTrue(rows[oldest]["account_envelope"])
         self.assertGreater(rows[oldest]["period_reset_ts"],
                            rows[oldest]["created_ts"])
@@ -120,6 +133,54 @@ class AccountReservationsTest(PgTestCase):
                          [oldest])
         self.assertEqual([row["id"] for row in
                           self.document(agent="a1")["reservations"]], [middle])
+
+    def test_expired_kept_is_not_counted_and_old_open_is(self):
+        self.agent("a1")
+        expired = self.reservation("a1", ACCOUNT_A, 3.0, "kept",
+                                   period="2020-01-01", age="2 hours")
+        opened = self.reservation("a1", ACCOUNT_A, 2.0, "open",
+                                  period="2020-01-01", age="1 hour")
+        current = self.reservation("a1", ACCOUNT_A, 1.0, "kept",
+                                   age="5 minutes")
+        document = self.document(limit=10)
+        self.assertEqual([row["id"] for row in document["reservations"]],
+                         [opened, current])
+        self.assertNotIn(expired,
+                         [row["id"] for row in document["reservations"]])
+        self.assertEqual(document["unreadable"], [])
+        self.assertEqual([row["id"] for row in
+                          self.document(state="kept", limit=10)["reservations"]],
+                         [current])
+        # an old open is still in flight, whatever its period
+        self.assertEqual([row["id"] for row in
+                          self.document(state="open", limit=10)["reservations"]],
+                         [opened])
+
+    def test_kept_counts_only_in_the_envelope_timezone_day(self):
+        account = "acct-tz"
+        self.api.account_put(account, 10.0, actor="human:t", tz="Pacific/Auckland")
+        # 2026-11-27 10:59Z = 23:59 in Auckland (NZDT); one minute later is
+        # midnight there, so the calendar day of the envelope changes.
+        before = datetime(2026, 11, 27, 10, 59, tzinfo=timezone.utc).timestamp()
+        after = datetime(2026, 11, 27, 11, 1, tzinfo=timezone.utc).timestamp()
+        old_kept = self.reservation("a1", account, 2.0, "kept",
+                                    period="2026-11-27", created_ts=before - 120)
+        old_open = self.reservation("a1", account, 1.0, "open",
+                                    period="2026-11-27", created_ts=before - 60)
+        new_kept = self.reservation("a1", account, 3.0, "kept",
+                                    period="2026-11-28", created_ts=after + 60)
+
+        def listed(at):
+            return [row["id"] for row in self.api.account_open_reservations(
+                limit=10, account=account, states=["open", "kept"], at=at)]
+
+        self.assertEqual(listed(before), [old_kept, old_open])
+        self.assertEqual(listed(after), [old_open, new_kept])
+        rows = {row["id"]: row for row in self.api.account_open_reservations(
+            limit=10, account=account, states=["open", "kept"], at=before)}
+        # midnight in the envelope's zone is 11:00Z, one minute after `before`
+        self.assertAlmostEqual(rows[old_kept]["period_reset_ts"], before + 60,
+                               places=3)
 
     def test_unknown_agent_is_listed_not_fatal(self):
         self.agent("a1")
@@ -143,8 +204,8 @@ class AccountReservationsTest(PgTestCase):
         self.db.execute(
             "INSERT INTO account_reservations (billing_account, agent, usd,"
             " period, state, spend_key)"
-            " VALUES (%s, 'a1', 'NaN'::float8, '2026-11-27', 'kept', 'nan-key')",
-            (ACCOUNT_A,))
+            " VALUES (%s, 'a1', 'NaN'::float8, %s::date, 'kept', 'nan-key')",
+            (ACCOUNT_A, self.today()))
         bad_id = self.db.query(
             "SELECT id FROM account_reservations WHERE spend_key = 'nan-key'"
         )[0]["id"]
