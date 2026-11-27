@@ -127,6 +127,29 @@ class WriterAdmissionConcurrencyTest(unittest.TestCase):
             migrations.admit_writer_connection(db)
         self.assertEqual(self.reads, 1)
 
+    def test_nested_admission_on_the_same_thread_does_not_wait_for_itself(self):
+        # ScopedDb ouvre sa connexion pendant la lecture : l'admission
+        # imbriquée du même fil ne doit pas attendre son propre vol (30 s).
+        db = SimpleNamespace(cfg=self.cfg)
+        calls = []
+
+        def nested(*args):
+            calls.append(threading.get_ident())
+            if len(calls) == 1:
+                migrations.admit_writer_connection(db)
+            return []
+
+        with mock.patch.object(migrations, 'incompatible_migrations', side_effect=nested):
+            thread = threading.Thread(target=migrations.admit_writer_connection, args=(db,))
+            started = time.monotonic()
+            thread.start()
+            thread.join(5)
+            elapsed = time.monotonic() - started
+        self.assertFalse(thread.is_alive(), 'nested admission waited on its own flight')
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(migrations._WRITER_ADMISSION_FLIGHTS, {})
+
 
 if __name__ == '__main__':
     unittest.main()
