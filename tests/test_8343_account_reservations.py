@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import unittest
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 from ameesh import account_reservations, registry, serve, storage
 
@@ -21,7 +20,6 @@ from .support import PgTestCase
 
 ACCOUNT_A = "acct-a"
 ACCOUNT_B = "acct-b"
-PARIS = ZoneInfo("Europe/Paris")
 
 
 class AccountReservationsTest(PgTestCase):
@@ -48,7 +46,10 @@ class AccountReservationsTest(PgTestCase):
                 tuple(values.values()) + (name,))
 
     def today(self):
-        return datetime.now(PARIS).date().isoformat()
+        # the database clock, like the period written by the reservation
+        return self.db.query(
+            "SELECT (now() at time zone 'Europe/Paris')::date::text AS day"
+        )[0]["day"]
 
     def reservation(self, agent, account, usd, state="open", *, age="5 minutes",
                     period=None, created_ts=None):
