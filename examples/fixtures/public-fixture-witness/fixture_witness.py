@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""External witness of the public fixture surface, contract v1.5 (#7701).
+"""External witness of the public surfaces, contract v1.6 (#7701/#6573).
 
 This distribution is outside ``src/`` on purpose: it is an installed consumer,
 not part of the package.  It imports only the published Python surfaces
-(:mod:`ameesh.public.fixture` and :mod:`ameesh.public.mail`), runs the installed
-executables as subprocesses, and never imports ``tests.support`` or an internal
-ameesh module.
+(:mod:`ameesh.public.fixture`, :mod:`ameesh.public.mail` and
+:mod:`ameesh.public.database`), runs the installed executables as subprocesses,
+and never imports ``tests.support`` or an internal ameesh module.
 
-It proves the Fixture row of docs/api/module-contract-v1-coverage.md:
+It proves the Fixture and production-connection rows of
+docs/api/module-contract-v1-coverage.md:
 
 * a consumer-owned disposable database is created, migrated through
   ``ameesh migrate``, used by public commands, and dropped again;
@@ -17,7 +18,11 @@ It proves the Fixture row of docs/api/module-contract-v1-coverage.md:
 * usage and accounting observations (``ameesh cost turns``, ``ameesh budget``)
   are readable on the fixture;
 * mail usage, refusals and races go through :mod:`ameesh.public.mail`, with one
-  connection per racing thread.
+  connection per racing thread;
+* a clean child process of the fixture environment connects with the only
+  public surface (``ameesh.public.database.connect()``), submits and reads
+  through ``ameesh.public.mail``, closes, and observes the documented schema,
+  storage and unavailable refusals without an internal import.
 
 Run it with ``AMEESH_FIXTURE_ADMIN_DSN`` set to a DSN allowed to CREATE DATABASE
 (see README.md).  It prints one JSON report and exits 0 only if every check
@@ -31,6 +36,7 @@ import sys
 import threading
 from typing import Any, Mapping
 
+from ameesh.public import database as public_database
 from ameesh.public import fixture as public_fixture
 from ameesh.public import mail as public_mail
 
@@ -40,6 +46,68 @@ PEER = "relecteur"
 HOST = "atelier"
 PIPELINE = "witness-delivery"
 PROJECT = "witness"
+
+
+#: A clean child of the fixture environment.  ``connect()`` reads the process
+#: environment, so only a subprocess proves that the fixture environment is
+#: enough; it imports only ``ameesh.public.*``, like an installed consumer.
+CONNECT_WITNESS = r"""
+import json
+import os
+
+from ameesh.public import database, mail
+
+
+def refusal(env):
+    # Run connect() under one refusal environment and restore it.
+    saved = {key: os.environ.get(key) for key in env}
+    os.environ.update(env)
+    try:
+        try:
+            database.connect()
+        except database.DatabaseError as exc:
+            message = str(exc)
+            return {"error": type(exc).__name__, "code": exc.code,
+                    "shows_dsn": ("postgresql://" in message
+                                  or "password=" in message)}
+        return {"error": "", "code": "", "shows_dsn": False}
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+report = {"ok": False}
+connection = None
+try:
+    connection = database.connect()
+    report["package_contract"] = database.CONTRACT_VERSION
+    report["mail_contract"] = mail.CONTRACT_VERSION
+    sent = mail.submit(
+        connection, os.environ["CONNECT_ACTOR"],
+        mail.Submission(os.environ["CONNECT_PEER"], "public connect hello"))
+    page = mail.history(connection, os.environ["CONNECT_ACTOR"],
+                        peer=os.environ["CONNECT_PEER"])
+    report["id"] = sent.id
+    report["bodies"] = [entry.body for entry in page.entries]
+    report["repr"] = repr(connection)
+    report["repr_shows_dsn"] = ("postgresql://" in report["repr"]
+                                or "password=" in report["repr"])
+    report["refusals"] = {
+        "schema": refusal({"AMEESH_SCHEMA": "witness_absent"}),
+        "storage": refusal({"AMEESH_BACKEND": "mediated",
+                            "AMEESH_EXEC_URL": "http://127.0.0.1:9"}),
+        "unavailable": refusal({"AMEESH_DSN": "postgresql://nobody@127.0.0.1:1/none",
+                                "AMEESH_CONNECT_TIMEOUT": "2"}),
+    }
+    report["ok"] = True
+finally:
+    if connection is not None:
+        connection.close()
+print(json.dumps(report, sort_keys=True))
+"""
 
 
 class WitnessFailure(AssertionError):
@@ -406,7 +474,41 @@ def run(admin_dsn: str, report: dict) -> None:
                           "identical": identical, "conflicting": conflicting,
                           "history": len(history.entries)}
 
-        # 5. The named read views are the only SQL the fixture exposes.
+        # 5. The production connection in a clean child of the fixture
+        # environment: no argument, only the public surface, then refusals.
+        connect_proc = fixture.run(
+            [sys.executable, "-c", CONNECT_WITNESS],
+            env={"CONNECT_ACTOR": ACTOR, "CONNECT_PEER": PEER})
+        if connect_proc.returncode != 0:
+            raise WitnessFailure(
+                "public connect child failed (exit %d): %s%s"
+                % (connect_proc.returncode, (connect_proc.stdout or "")[-800:],
+                   (connect_proc.stderr or "")[-800:]))
+        connect = _document(connect_proc, "public connect")
+        if not connect.get("ok"):
+            raise WitnessFailure("public connect child: %r" % connect)
+        if connect.get("package_contract") != public_database.CONTRACT_VERSION:
+            raise WitnessFailure(
+                "child contract %r != published %r"
+                % (connect.get("package_contract"),
+                   public_database.CONTRACT_VERSION))
+        if connect.get("repr_shows_dsn"):
+            raise WitnessFailure("the returned connection repr exposes the DSN")
+        for name, code in (("schema", "schema"), ("storage", "unsupported"),
+                           ("unavailable", "unavailable")):
+            outcome = (connect.get("refusals") or {}).get(name) or {}
+            if outcome.get("code") != code:
+                raise WitnessFailure("public connect %s refusal: %r"
+                                     % (name, outcome))
+            if outcome.get("shows_dsn"):
+                raise WitnessFailure("public connect %s refusal exposes the DSN"
+                                     % name)
+        if "public connect hello" not in connect.get("bodies", []):
+            raise WitnessFailure("public connect child did not read its mail: %r"
+                                 % connect.get("bodies"))
+        report["connect"] = connect
+
+        # 6. The named read views are the only SQL the fixture exposes.
         agents = fixture.read_view("agent_mesh_overview", ("name", "host"))
         registered = {row["name"] for row in agents}
         if not {ACTOR, PEER} <= registered:
@@ -416,7 +518,8 @@ def run(admin_dsn: str, report: dict) -> None:
         fixture.close()
     report["teardown"] = {"database": database, "closed": True}
     report["checks"] = [name for name in
-                        ("fixture", "canon", "process", "usage", "mail", "views", "teardown")
+                        ("fixture", "canon", "process", "usage", "mail", "connect",
+                         "views", "teardown")
                         if name in report]
 
 

@@ -12,10 +12,10 @@ library, never `tests.support`).
 `tests.test_7665_module_contract.CoverageTableTest` checks that every element
 has exactly one row and that every cited test exists.
 
-The surface freezes revision 1.5; its baseline commit stays the revision 1.0
-comparison point, and the elements that revisions 1.1, 1.2, 1.3 and 1.5 add are
-now listed (revision 1.4 adds no name). The comparison is additive-compatible, as the contract's compatibility
-rule states:
+The surface freezes revision 1.6; its baseline commit stays the revision 1.0
+comparison point, and the elements that revisions 1.1, 1.2, 1.3, 1.5 and 1.6
+add are now listed (revision 1.4 adds no name). The comparison is
+additive-compatible, as the contract's compatibility rule states:
 
 - HTTP: every schema is flattened per field (type, `const`, `enum`, bounds,
   `pattern`, `format`, `required`, `additionalProperties`), for parameters,
@@ -78,6 +78,7 @@ rule states:
 | `canon:resource-policy` | `tests.test_7665_module_contract.CanonPolicyContractTest.test_the_frozen_resource_keys_are_native_thresholds`, `tests.test_7675_qualification.PressureTest.test_cpu_used_is_the_ima_cpu_gate_and_needs_the_new_key`, `tests.test_7675_qualification.PressureTest.test_throttled_periods_and_wall_time_are_distinct_and_both_kept`, `tests.test_7675_qualification.PressureTest.test_the_new_keys_accept_fractions_like_the_other_ceilings` |
 | `deferral` | `tests.test_7665_module_contract.DeferralContractTest.test_the_frozen_block_shape_and_closed_enums`, `tests.test_7675_deferral.MappingTest.test_the_block_validates_against_the_public_schema`, `tests.test_7675_deferral.PublicViewsTest.test_show_json_carries_the_block`, `tests.test_7675_deferral.PublicViewsTest.test_list_json_carries_the_same_block` |
 | `python:mail` | `tests.test_7665_module_contract.PythonMailContractTest.test_the_public_mail_signatures_are_frozen`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_value_objects_keep_their_frozen_fields`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_published_bounds_enums_and_errors_are_frozen`, `tests.test_7665_module_contract.PythonMailContractTest.test_the_served_contract_version_is_frozen`, `tests.test_7671_mail_contract.ContractSurfaceTest.test_version_and_exported_surface`, `tests.test_7671_mail_contract.BatchTest.test_a_batch_is_bounded_before_any_deposit`, `tests.test_7671_mail_contract.HistoryTest.test_cursor_is_bounded_and_stable_under_new_mail`, `tests.test_7706_mail_contract.ReservedActorTest.test_core_sender_identities_are_refused_before_deposit`, `tests.test_7672_pending_reply_contract.ContractSurfaceTest.test_version_and_exported_surface`, `tests.test_7672_pending_reply_contract.ContractSurfaceTest.test_values_are_json_ready`, `tests.test_7672_pending_reply_contract.PendingTest.test_pending_lists_the_current_turn_request`, `tests.test_7672_pending_reply_contract.ReplyTest.test_reply_is_correlated_addressed_and_inherits_the_lot`, `tests.test_7672_pending_reply_contract.ReplyTest.test_another_body_or_payload_is_a_deterministic_conflict`, `tests.test_7672_pending_reply_contract.ConcurrencyTest.test_concurrent_identical_replies_make_one_durable_row`, `tests.test_7673_interrupted_requeue.RequeueContractTest.test_requeued_request_is_no_longer_pending_and_refuses_a_late_reply` |
+| `python:connect` | `tests.test_7665_module_contract.PythonDatabaseContractTest.test_the_public_connect_signature_is_frozen`, `tests.test_7665_module_contract.PythonDatabaseContractTest.test_the_published_error_codes_are_frozen`, `tests.test_7665_module_contract.PythonDatabaseContractTest.test_the_served_contract_version_is_frozen`, `tests.test_8333_public_connect.PublicConnectBoundaryTest`, `tests.test_8333_public_connect.PublicConnectDatabaseTest`, `tests.test_8333_public_connect.DeliberateBreakTest` |
 | `python:fixture` | `tests.test_7665_module_contract.PythonFixtureContractTest.test_the_public_fixture_signatures_and_constants_are_frozen`, `tests.test_7665_module_contract.PythonFixtureContractTest.test_the_published_error_codes_are_frozen`, `tests.test_7665_module_contract.PythonFixtureContractTest.test_the_served_contract_version_is_frozen`, `tests.test_7665_module_contract.PythonFixtureContractTest.test_the_external_fixture_witness_is_its_own_distribution`, `tests.test_7701_public_fixture.DatabaseNameTest`, `tests.test_7701_public_fixture.FixtureBoundaryTest`, `tests.test_7701_public_fixture.WitnessBoundaryTest`, `tests.test_7701_public_fixture.DeliberateBreakTest` |
 | `view:agent_mesh_overview` | `tests.test_7665_module_contract.StoreAndViewsTest.test_named_views_keep_their_admitted_columns`, `tests.test_cluster.ContratDesColonnesTest` |
 | `view:mesh_keys` | `tests.test_7665_module_contract.StoreAndViewsTest.test_named_views_keep_their_admitted_columns`, `tests.test_cluster.ContratDesColonnesTest` |
@@ -92,4 +93,7 @@ same surface and have their rows above (mapping,
 [IMA public contract](../design/ima-public-contract-mapping.md)). Revision 1.4
 (E2c, #7673) adds no name; its witness joins the `python:mail` row. Revision 1.5
 (F2, #7701) adds the public fixture; its external witness and the deliberate
-break join the `python:fixture` and `fixture` rows.
+break join the `python:fixture` and `fixture` rows. Revision 1.6 (#6573) adds
+the public production connection; its external witness joins the same
+`python:connect` row, and the deliberate break of the frozen surface is cited
+there too.

@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.5",
+  "contract": "1.6",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -5060,6 +5060,19 @@
         "ScopeRefused": "refused",
         "CanonInventoryUnavailable": "refused",
         "RecipientRefused": "refused",
+        "UnsupportedStorage": "unsupported"
+      }
+    },
+    "connect": {
+      "module": "ameesh.public.database",
+      "contract_version": "1.6",
+      "signatures": {
+        "connect": "()"
+      },
+      "returns": "Db",
+      "errors": {
+        "DatabaseUnavailable": "unavailable",
+        "SchemaRefused": "schema",
         "UnsupportedStorage": "unsupported"
       }
     }

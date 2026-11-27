@@ -1,12 +1,14 @@
 # Public fixture witness
 
 An installed external consumer of `ameesh.public.fixture` (contract revision
-1.5, [#7701](https://github.com/manaty/ameesh/issues/5902)). This directory is
-its own distribution, outside `src/`: it imports only `ameesh.public.fixture`,
-`ameesh.public.mail` and the Python standard library, and runs the installed
-`ameesh`/`agent-mail` executables as subprocesses. It never imports
-`tests.support` or a private ameesh module, and it writes no core table: the
-fixture's only SQL read surface is the three admitted named views.
+1.5, [#7701](https://github.com/manaty/ameesh/issues/5902)) and
+`ameesh.public.database` (revision 1.6,
+[#6573](https://github.com/manaty/ameesh/issues/6573)). This directory is its
+own distribution, outside `src/`: it imports only `ameesh.public.fixture`,
+`ameesh.public.mail`, `ameesh.public.database` and the Python standard library,
+and runs the installed `ameesh`/`agent-mail` executables as subprocesses. It
+never imports `tests.support` or a private ameesh module, and it writes no core
+table: the fixture's only SQL read surface is the three admitted named views.
 
 ## What it proves
 
@@ -23,7 +25,11 @@ and then, on that database only:
   reserved-actor, unknown-recipient and idempotency-conflict refusals, one
   identical-key race (one durable row, one reuse) and one conflicting-key race
   (one success, one `IdempotencyConflict`);
-- reads only the admitted named views with explicit columns.
+- reads only the admitted named views with explicit columns;
+- runs a clean child process of the fixture environment that calls
+  `ameesh.public.database.connect()` with no argument, submits and reads through
+  `ameesh.public.mail`, closes, and observes the documented schema, storage and
+  unavailable refusals without exposing the DSN.
 
 It prints one JSON report and exits 0 only if every check passed. The fixture
 drops its database and its private root before the report is printed, so the
