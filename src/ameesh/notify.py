@@ -44,6 +44,13 @@
         `ameesh.ci.Watcher`).
   ameesh notify --test human:<id> [--json]
         sends a test message on each of this human's channels.
+  ameesh notify raise --app A --type T --key K (--to human:<id> | --route R)
+                      [--severity normal|urgent] --text TEXT [--json]
+  ameesh notify resolve --app A --type T --key K [--json]
+  ameesh notify list [--app A] [--all] [--json]
+        #8344: an application raises and resolves its own alerts, typed by
+        the `alerts:` block of its canon Application card; the `alerts` pass
+        delivers them like the mesh's (`ameesh.app_alerts`).
 
 Alerts used to be PULLED only (`ameesh alerts`): nothing told a human that
 an orchestrator had stopped with mail (seen on 2026-10-07). This service
@@ -121,7 +128,7 @@ from dataclasses import dataclass, field, replace
 from . import migrations
 from . import config as config_mod
 from . import db as db_mod
-from . import alert_briefs, avatars, exploitation, fil, mail, notify_gap, \
+from . import alert_briefs, app_alerts, avatars, exploitation, fil, mail, notify_gap, \
     sous_utilisation, storage, work
 from . import vocab
 from .config import Config
@@ -520,6 +527,8 @@ TYPE_LABELS = {
     "budget_drift": "counted spend strays from the provider balance",
     "reservations_kept_burst": "kept account reservations pile up for an agent",
     "account_cap_kept": "billing account blocked by kept reservations",
+    # #8344 : levée par une application (`ameesh notify raise`)
+    "app_alert": "application alert",
 }
 
 
@@ -966,6 +975,10 @@ def _account(alert: dict) -> str | None:
 
 
 def _subject(alert: dict, vocabulary=None) -> str:
+    if (alert or {}).get("type") == app_alerts.ALERT_TYPE:
+        return "app %s/%s %s" % (_clean(alert.get("app") or "?", 64),
+                                 _clean(alert.get("app_type") or "?", 64),
+                                 _clean(alert.get("app_key") or "", 120))
     vocabulary = vocab.active() if vocabulary is None else vocabulary
     parts = []
     if _account(alert):
@@ -998,8 +1011,44 @@ def _readable(title: str, body: str, detail_line: str | None) -> tuple:
     return title, body
 
 
+def _app_alert(alert: dict) -> bool:
+    return (alert or {}).get("type") == app_alerts.ALERT_TYPE
+
+
+def _render_app(alert: dict, event: str, now: float, raised_ts=None) -> Message:
+    """#8344 : le message d'une alerte d'application — son application, son
+    type déclaré au canon, sa clé et le texte qu'elle a levé."""
+    app = _clean(alert.get("app") or "?", 64)
+    kind = _clean(alert.get("app_type") or "?", 64)
+    key = _clean(alert.get("app_key") or "", 120)
+    label = kind.replace("_", " ")
+    since = alert.get("since")
+    start = float(since) if since is not None else (float(raised_ts) if raised_ts else None)
+    head = "[%s/%s] %s" % (app, kind, key)
+    if event == "resolved":
+        lines = [head]
+        if start is not None:
+            lines.append("resolved after %s (raised on %s)" % (duration(now - start),
+                                                               local_time(start)))
+        else:
+            lines.append("resolved")
+        return _identify(Message("%s: resolved — %s (%s)" % (app, label, key),
+                                 "\n".join(lines), low=True), alert, event, now)
+    detail = _clean(alert.get("detail"), app_alerts.TEXT_MAX)
+    lines = [head]
+    if detail:
+        lines.append(detail)
+    if start is not None:
+        lines.append("since %s (%s)" % (local_time(start), duration(now - start)))
+    title, body = _readable("%s: %s (%s)" % (app, label, key), "\n".join(lines), detail)
+    return _identify(Message(title, body, urgent=bool(alert.get("urgent"))),
+                     alert, event, now)
+
+
 def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     """Le message d'une alerte levée (`raised`) ou résolue (`resolved`)."""
+    if _app_alert(alert):
+        return _render_app(alert, event, now, raised_ts)
     vocabulary = vocab.active()
     kind = str(alert.get("type") or "?")
     if kind == "orphan_lot" and alert.get("grouped"):
@@ -1575,6 +1624,11 @@ class Router:
             human = normalize_human(self.ncfg.default_human)
             if human:
                 return human, "defaut"
+        if alert.get("type") == app_alerts.ALERT_TYPE and alert.get("route"):
+            # #8344 : une route d'équipe déclarée par la fiche Application ;
+            # elle a sa propre limite de débit et son propre registre, et
+            # jamais d'avatar.
+            return app_alerts.route_id(alert.get("app") or "?", alert["route"]), "route"
         if alert.get("type") == "module_deviation" and alert.get("project"):
             # A project procedure finding belongs to the lot, even when its
             # assignee (or their host/responsible human) belongs elsewhere.
@@ -2347,7 +2401,9 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "cluster", "health_key",
          # #8196 : la bascule de `follow_up_unfollowed` vers l'humain reste
          # lisible à la résolution (`_deliverable`)
-         "human_due", "wake_ts")
+         "human_due", "wake_ts",
+         # #8344 : l'identité d'une alerte d'application et sa route
+         "app", "app_type", "app_key", "app_episode", "route")
 
 
 # --------------------------------------------------------------------------
@@ -2408,6 +2464,45 @@ class Notifier:
         #: #8119 : le rattrapage des refus historiques se fait une fois par
         #: processus (les notes sont idempotentes, pas le balayage).
         self._take_history_done = False
+        #: #8344 : canaux des routes d'application du canon, lus une fois par
+        #: passe (`_channels_for`)
+        self._app_routes = None
+
+    def _channels_for(self, human) -> list:
+        """Les canaux d'un destinataire : ceux de l'humain sur cet hôte
+        (`notify.routes`, `notify.default`), ou ceux d'une route
+        d'application déclarée au canon (`route:<app>/<route>`, #8344).
+
+        Une route nomme des canaux de `notify.channels` de l'hôte qui livre
+        (les secrets restent dans sa configuration) ; `desktop`, `slack` et
+        `app` n'ont pas besoin d'être déclarés, comme dans `notify.routes`.
+        Un canal que l'hôte ne déclare pas est ignoré : sans canal, l'alerte
+        attend (`sans_canal`) et repart quand l'hôte le déclare."""
+        if not app_alerts.is_route(human):
+            return self.ncfg.channels_for(human)
+        if self._app_routes is None:
+            try:
+                self._app_routes = app_alerts.route_channels(self.cfg)
+            except Exception as exc:  # noqa: BLE001 — un canon illisible n'arrête pas la passe
+                self.log("application routes unreadable (%s): route alerts wait"
+                         % type(exc).__name__)
+                self._app_routes = {}
+        channels = []
+        for name in self._app_routes.get(human) or ():
+            channel = self._channel_named(name)
+            if channel is not None:
+                channels.append(channel)
+        return channels
+
+    def _channel_named(self, name):
+        """Le canal `name` de l'hôte ; `desktop`, `slack` et `app` existent
+        sans déclaration (comme dans `notify.routes`), y compris quand une
+        route d'application les nomme seule (#8344 B3) : la levée, les
+        reprises et la résolution les retrouvent ici."""
+        channel = self.ncfg.channels.get(name)
+        if channel is None and name in ("desktop", "slack", "app"):
+            channel = _channel(name, {})
+        return channel
 
     # -- passage --------------------------------------------------------------
     def _deliverable(self, alert: dict) -> bool:
@@ -2417,6 +2512,10 @@ class Notifier:
         if alert.get("type") == "follow_up_unfollowed" and not alert.get("human_due"):
             # #8196 : l'assigné d'abord (brief) ; l'humain une heure après
             return False
+        if alert.get("type") == app_alerts.ALERT_TYPE:
+            # #8344 : le type de l'application est déclaré par sa fiche au
+            # canon (vérifié à la levée), pas par `notify.types` de l'hôte
+            return True
         return (alert.get("type") in self.ncfg.types
                 or alert.get("type") in MANDATORY_TYPES
                 or forces_owner(alert))
@@ -2459,6 +2558,7 @@ class Notifier:
         if selected is None and self.skip:
             selected = frozenset(ONLY_PASSES) - self.skip
         now = float(self.clock())
+        self._app_routes = None
         # #3057 : la passe restreinte d'une minuterie de rôle ne livre aucune
         # alerte humaine (`_run_tail`). Elle rend donc AVANT le battement de
         # #3007 : sinon une minuterie vivante rafraîchirait `notify_liveness`
@@ -2586,6 +2686,11 @@ class Notifier:
             observer = entry["alert"].get("observation_host")
             if (entry["alert"].get("type") == "staging_interrupted"
                     and "staging.sequence" in unreadable):
+                continue
+            if (entry["alert"].get("type") == app_alerts.ALERT_TYPE
+                    and app_alerts.FAMILY in unreadable):
+                # #8344 : la table des alertes d'application n'a pas été lue ;
+                # son absence n'est pas une résolution.
                 continue
             if (availability.GATE_FAMILY in unreadable
                     and entry["alert"].get("type") in availability.ALERT_TYPES
@@ -3314,6 +3419,14 @@ class Notifier:
         message = render(alert, "raised", now, raised_ts=entry.get("raised_ts"))
         payload = {"alert": alert.get("type"), "human": human,
                    "avatar": avatar, "key": entry.get("key")}
+        if _app_alert(alert):
+            payload.update(app=alert.get("app"), app_type=alert.get("app_type"),
+                           app_key=alert.get("app_key"))
+            if alert.get("urgent"):
+                # #8344 : seule une alerte d'application urgente réveille
+                # l'avatar tout de suite ; les autres attendent sa fenêtre de
+                # regroupement (`reveil`), comme tout événement.
+                payload["urgent"] = True
         if db is None and not self.dry_run:
             entry["status"] = "sans_destinataire"
             self._record("raised", entry, "sans_destinataire", {})
@@ -3349,13 +3462,17 @@ class Notifier:
         directe."""
         if entry.get("signal_ts") is not None or self.dry_run:
             return
-        channels = self.ncfg.channels_for(human)
+        channels = self._channels_for(human)
         if not channels:
             entry["signal_ts"] = now
             return
+        # #8344 : une alerte d'application non urgente ne fait pas sonner
+        # l'humain non plus ; les alertes du mesh gardent leur signal urgent.
+        alert = entry["alert"]
+        urgent = bool(alert.get("urgent")) if _app_alert(alert) else True
         message = Message(title="Ton avatar a besoin de toi",
                           body="Une alerte attend dans la boîte de ton avatar.",
-                          urgent=True, event="raised", kind="signal")
+                          urgent=urgent, event="raised", kind="signal")
         results = {}
         for channel in channels:
             ok, error = self._send(channel, message)
@@ -3435,7 +3552,7 @@ class Notifier:
                       first: bool) -> None:
         """La route directe historique : les canaux configurés de l'humain."""
         alert = entry["alert"]
-        channels = self.ncfg.channels_for(human)
+        channels = self._channels_for(human)
         entry.update(human=human)
         if not channels:
             if entry["status"] != "sans_canal":
@@ -4297,7 +4414,7 @@ class Notifier:
             st = entry["channels"][name]
             if st.get("fallback_of"):
                 continue                # un repli : traité après les primaires
-            channel = self.ncfg.channels.get(name)
+            channel = self._channel_named(name)
             if channel is None:          # canal retiré de la configuration
                 st.update(attempts=self.ncfg.max_attempts, error="channel removed")
                 continue
@@ -4780,7 +4897,7 @@ class Notifier:
             last = self.state["last_summary"].get(human)
             if last is not None and now - float(last) < RATE_WINDOW_S:
                 continue
-            channels = self.ncfg.channels_for(human)
+            channels = self._channels_for(human)
             if not channels:
                 self.log("rate summary for %s lost: no channel left" % human)
                 del self.state["summary"][human]
@@ -5333,8 +5450,15 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
 def main(argv: list | None = None) -> int:
     from .platform.child_environment import install
+    # Avant toute commande : `psql` et `git` lancés par le chemin canon/base
+    # ne doivent jamais hériter des secrets de canal accordés à `notify`
+    # (#8344 B5).
     install()
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in app_alerts.COMMANDS:
+        # #8344 : une application lève, résout ou relit ses propres alertes ;
+        # aucune livraison ici : la passe `alerts` du notificateur les pousse.
+        return app_alerts.main(argv)
     args = build_parser().parse_args(argv)
     if not args.once and not args.test:
         from .platform.child_environment import harden

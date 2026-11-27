@@ -111,6 +111,11 @@ KEPT = (
     # need `root` (outside the rename contract) plus a write-time trigger, for
     # no per-agent read.
     "budget_lineage_reservations.agent",
+    # #8344 (0612): an application alert's `recipient` is a `human:<id>`,
+    # never an agent; `raised_by`/`resolved_by` are the dated attribution of
+    # who raised or resolved it. Nothing looks a row up by these spellings
+    # (the identity is app, type, key), so a rename leaves them as written.
+    "app_alerts.recipient", "app_alerts.raised_by", "app_alerts.resolved_by",
     # #7066: the spelling is bound by the owner's signature. A renamed agent
     # needs a fresh decision; rewriting this index must not widen authority.
     "account_turn_exceptions.agent",
