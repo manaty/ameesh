@@ -31,11 +31,11 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import agent_names, config as config_mod, db as db_mod, registry
+from ameesh import agent_names, config as config_mod, db as db_mod, migrations, registry
 from ameesh.runner import AgentWorker, Runner
 
 from . import EMPTY_CONFIG
-from .support import PgTestCase
+from .support import PgTestCase, scaled
 
 
 def _runner(agents: int, *, rate: float = 0.0, cap: float = 0.0,
@@ -313,11 +313,18 @@ class PasseAuReposReelle(PgTestCase):
             if threading.current_thread() is worker:
                 statements.append((len(passes), " ".join(str(sql).split())))
 
+        # #8346 : l'horloge d'admission est figée (TTL d'une heure) : le témoin
+        # porte sur le partage, pas sur la durée des passes. Avec le TTL réel
+        # de 5 s, trois passes ralenties par la charge de la CI (> 5 s) relisaient
+        # le marqueur à bon droit (« 2 not ≤ 1 », nocturne du 27/11).
         with mock.patch.object(AgentWorker, "_pick_for_turn", pick), \
-                mock.patch.object(db_mod.TRACE, "trip", trip):
+                mock.patch.object(db_mod.TRACE, "trip", trip), \
+                mock.patch.object(migrations, "WRITER_ADMISSION_TTL_S", 3600.0):
+            self._forget_admissions()
+            self.addCleanup(self._forget_admissions)
             worker.start()
             try:
-                self.assertTrue(enough.wait(60), "four idle passes expected")
+                self.assertTrue(enough.wait(scaled(60)), "four idle passes expected")
             finally:
                 runner.stop.set()
                 worker.stopping.set()
@@ -338,6 +345,13 @@ class PasseAuReposReelle(PgTestCase):
                 par_passe[n] = par_passe.get(n, 0) + 1
         self.assertTrue(par_passe, "the pattern must see registry.get's resolver")
         self.assertTrue(all(count <= 1 for count in par_passe.values()), par_passe)
+
+    def _forget_admissions(self):
+        """Aucun succès d'une heure ne survit au témoin (cache du processus)."""
+        with migrations._WRITER_ADMISSION_LOCK:
+            for key in [k for k in migrations._WRITER_ADMISSIONS
+                        if k[2] == self.cfg.schema]:
+                migrations._WRITER_ADMISSIONS.pop(key, None)
 
     def test_debit_regle_tenu_par_la_boucle_reelle(self):
         """B impl-11 : bail de 3 s renouvelé par le vrai battement, pas réglé à
