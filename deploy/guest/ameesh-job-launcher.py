@@ -580,7 +580,9 @@ def cmd_run(args: list[str]) -> int:
     if phase in HOOK_PHASES:
         # the VM's own code (root-owned profile): it keeps the manager
         # (rootless Podman needs it), but never a loader variable, and the
-        # client no longer sends its `--env` here (B1 of the #354 R2 review)
+        # client no longer sends its `--env` here (B1 of the #354 R2 review).
+        # The manager's PATH wins over the profile's PATH: a hook that needs
+        # a profile tool (npm in the nexlink cache, #8328) prepends it itself.
         hook_env = strip_loader(env)
         hook_env.update(manager)
         os.environ.clear()

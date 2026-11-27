@@ -13,21 +13,36 @@ attend, sans élargir les droits de l'invité :
 * le ménage `after` ne retire que les conteneurs de **ce** job (étiquette
   `nexlink.ci.owner` posée par `scripts/sql-tests.sh` depuis `RUNNER_NAME`),
   jamais ceux d'un voisin, y compris par le chemin des orphelins (sans l'env
-  du profil).
+  du profil) ;
+* #8328 : sur un invité `job-user`, le lanceur donne aux hooks le `PATH` du
+  gestionnaire (`sudo` l'a réinitialisé), pas celui du profil : le hook
+  `before` préfixe donc le sien avec les binaires du cache, sinon `npm` est
+  introuvable et chaque prévalidation Nexlink meurt en 127.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from ameesh.platform import offload_shell
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILES = os.path.join(REPO, "deploy", "guest", "profiles")
+
+
+def _load_launcher():
+    path = os.path.join(REPO, "deploy", "guest", "ameesh-job-launcher.py")
+    spec = importlib.util.spec_from_file_location("ameesh_job_launcher_8098",
+                                                  path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _fake(bindir: str, name: str, body: str) -> None:
@@ -114,6 +129,41 @@ class NexlinkProfileTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertEqual(self.calls(),
                          [["ps", "-aq", "--filter", "label=nexlink.ci.owner=ameesh-job-j42"]])
+
+    def test_before_finds_npm_when_the_launcher_replaces_the_path(self):
+        """#8328 : le lanceur repart du PATH du gestionnaire pour un hook.
+
+        `cmd_run` construit l'environnement des phases HOOK_PHASES par
+        `strip_loader(env)` puis `hook_env.update(process_env())` : le PATH du
+        profil (celui du cache) est écrasé. Sous `sudo`, ce PATH ne connaît ni
+        node ni npm. Le hook `before` doit donc poser le sien lui-même.
+        """
+        launcher = _load_launcher()
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(os.path.join(work, "backend"))
+        open(os.path.join(work, "backend", "package-lock.json"), "w").close()
+        node_bin = os.path.join(self.cache, "node", "bin")
+        os.makedirs(node_bin)
+        _fake(node_bin, "npm",
+              'echo "$(basename "$PWD") $*" >> "%s"\n' % self.log)
+        payload = self.env(PATH=node_bin + ":" + self.bin)
+        # le PATH d'un lanceur derrière `sudo` : les outils systèmes, pas node
+        manager_path = self.bin + ":/usr/bin:/bin"
+        with mock.patch.dict(os.environ, {
+                "PATH": manager_path,
+                "XDG_RUNTIME_DIR": self.tmp,
+                "DBUS_SESSION_BUS_ADDRESS":
+                    "unix:path=" + os.path.join(self.tmp, "bus")}):
+            hook_env = launcher.strip_loader(payload)
+            hook_env.update(launcher.process_env())
+        # le témoin reproduit bien l'écrasement reproché
+        self.assertEqual(hook_env["PATH"], manager_path)
+        res = self.sh(self.profile["before"], hook_env, cwd=work)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("nexlink: npm ci backend", res.stderr)
+        with open(self.log, encoding="utf-8") as fh:
+            self.assertEqual(fh.read().splitlines(),
+                             ["backend ci --prefer-offline --no-audit --no-fund"])
 
     def test_before_installs_each_package_with_a_lockfile(self):
         work = os.path.join(self.tmp, "work")

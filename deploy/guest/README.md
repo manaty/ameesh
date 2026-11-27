@@ -146,7 +146,10 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   `${OFFLOAD_WORK}`, `${OFFLOAD_JOB}`, `${HOME}`, `${PATH}` expanded),
   `before` (its `K=V` stdout lines join the job's environment) and `after`
   (teardown, even after a kill). Profiles are root-owned: the client
-  chooses one by name, never writes one.
+  chooses one by name, never writes one. Hooks run with the manager's
+  `PATH`, not the profile's (the launcher resets it after `sudo`): a hook
+  that needs a tool from the cache prepends it itself, as the `nexlink`
+  `before` hook does for `npm` (#8328).
 
 ## Security model (study, section 3)
 
