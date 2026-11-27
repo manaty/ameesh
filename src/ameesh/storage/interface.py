@@ -80,6 +80,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    launch settle replace cancel
    action_source   columns rows
    canon           record_state state record_auth_state host_rows
+                   confirm_fresh
                    write_declared clear_responsible set_placement
                    lineage_rows revive clear_pending_stop move_host
                    stop_removed
@@ -4364,6 +4365,19 @@ class Canon(Domain):
         this claim is still current. The last completed result is kept while
         the canon state is still `ok` (the caller compares signatures); it is
         withdrawn when the failure recorded a non-ok state."""
+
+    @abc.abstractmethod
+    def confirm_fresh(self, host: str, canon: str, *, commit: str, root: str,
+                      max_span_s: float) -> dict | None:
+        """#8354 : rafraîchit SEULEMENT `checked_at` d'un canon inchangé.
+
+        Une seule instruction conditionnelle : la ligne (host, canon) doit
+        être encore `ok`, au `last_good_commit` `commit`, à la racine `root`,
+        et sa dernière application complète (`last_good_at`) dater de moins
+        de `max_span_s` secondes (horloge de la base). Une invalidation
+        concurrente au même commit, un commit avancé ou une application trop
+        ancienne ne sont jamais recouverts : None, rien d'écrit. Rend
+        `checked_ts` et `last_good_ts` (époque) sinon."""
 
     @abc.abstractmethod
     def shared_sync(self, host: str, canon: str) -> dict | None:

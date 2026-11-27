@@ -219,6 +219,20 @@ class Canon(interface.Canon):
             "WHERE host = %s AND canon = %s AND sync_token = %s",
             (host, canon, token))
 
+    def confirm_fresh(self, host, canon, *, commit, root, max_span_s) -> dict | None:
+        # #8354 : la condition et l'écriture sont la même instruction ; sous
+        # READ COMMITTED, une ligne modifiée pendant l'attente du verrou est
+        # réévaluée : une invalidation concurrente au même commit l'emporte.
+        rows = self.db.query(
+            "UPDATE canon_state SET checked_at = now() "
+            "WHERE host = %s AND canon = %s AND status = 'ok' "
+            "AND last_good_commit = %s AND root = %s "
+            "AND last_good_at >= now() - make_interval(secs => %s) "
+            "RETURNING extract(epoch from checked_at)::float8 AS checked_ts, "
+            "extract(epoch from last_good_at)::float8 AS last_good_ts",
+            (host, canon or "", commit, root, float(max_span_s)))
+        return rows[0] if rows else None
+
     def shared_sync(self, host, canon) -> dict | None:
         # #5493: a pending claim no longer hides the last completed result;
         # the caller still compares its signature with its own snapshot.

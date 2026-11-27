@@ -4891,6 +4891,7 @@
     "close_candidates",
     "close_others",
     "complete_sync",
+    "confirm_fresh",
     "fail_sync",
     "flag_default",
     "host_rows",
