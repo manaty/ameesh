@@ -542,6 +542,7 @@ version.
 - **v1.74.1** (2026-11-26): +4 internal lots.
 - **v1.75.0** (2026-11-26): Migrations 0609; +8 internal lots.
 - **v1.75.1** (2026-11-27): +8 internal lots.
+- **v1.76.0** (2026-11-27): Migrations 0610, 0611, 0612; Commands lineage, profiles, reservations; +20 internal lots.
 <!-- generated releases: end -->
 
 ## In progress
