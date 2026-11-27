@@ -165,7 +165,9 @@
         #8113: the durable return queue of mail closed at a retirement;
         --replay re-sends notices and the pilot relay, never twice;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
-  ameesh migrate              apply schema migrations;
+  ameesh migrate [--dry-run [--json] | --additive-only]
+        apply schema migrations; `--dry-run --json` is the stable
+        `ameesh-migrate-dry-run/1` report (pending, modified, unknown);
   ameesh model-report [--json] [--project P] [--days N] [--at T] [--start T] [--end T]
         rapport d'évaluation des modèles en lecture seule (étude #6650, unité
         M1) : fenêtre UTC, cohortes d'intégration et de staging séparées,

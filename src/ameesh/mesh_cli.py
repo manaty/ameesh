@@ -3860,7 +3860,8 @@ def cmd_export_v0(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_migrate(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
     return cli.cmd_migrate(cfg, dry_run=args.dry_run, additive_only=args.additive_only,
-                           allow_live_executors=args.allow_live_executors)
+                           allow_live_executors=args.allow_live_executors,
+                           json_output=args.json)
 
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
@@ -5469,6 +5470,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     p_mig.add_argument("--allow-live-executors", metavar="REASON", default=None,
                        help="non-additive migration despite live executor leases; "
                             "the nonempty reason is journaled (recovery gesture)")
+    p_mig.add_argument("--json", action="store_true",
+                       help="#8339: with --dry-run, one ameesh-migrate-dry-run/1 "
+                            "object on stdout (pending, modified, unknown)")
     p_mig.set_defaults(func=cmd_migrate)
     p_doc = sub.add_parser("doctor")
     p_doc.add_argument("--notify-test", action="store_true")

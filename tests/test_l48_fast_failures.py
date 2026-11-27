@@ -93,6 +93,12 @@ class EchecsRapidesTest(PgTestCase):
                 worker.deferred_reason = ("attach requested" if r == "differe"
                                           else "session lock held")
                 return None
+            if r == "config":
+                # #8350 : faute de configuration (serveur MCP absent) — la
+                # consigne repart en attente, sans compter comme échec rapide.
+                worker.fail_configuration("avatar tool policy unavailable",
+                                          "MCP server 'memoria' is not defined")
+                return False
             worker.fast_failure = r is False
             return bool(r)
 
@@ -153,6 +159,33 @@ class EchecsRapidesTest(PgTestCase):
         worker = self._worker(max_fast_failures=2)
         attentes = self._boucle(worker, [False, "differe", False])
         self.assertAttentes(attentes, [5.0, 0.5])
+        self.assertEqual(worker.fast_failures, 2)
+        row = registry.get(self.db, "rapide")
+        self.assertEqual(row["status"], "stopped")
+        self.assertEqual(row["stop_reason"], "erreur")
+
+    def test_faute_de_configuration_n_arrete_jamais_l_agent(self):
+        """#8350 : un serveur MCP absent est une faute de configuration, pas un
+        plantage du harnais. Cinq (et plus) tours de ce type ne déclenchent pas
+        l'arrêt « 5 échecs rapides » : le statut est marqué distinctement, la
+        consigne reste en attente, et l'attente entre deux essais double sans
+        jamais atteindre le seuil d'arrêt."""
+        worker = self._worker(max_fast_failures=3, failure_backoff_max=30.0)
+        attentes = self._boucle(worker, ["config"] * 6)
+        # cinq fautes de configuration ne comptent pas comme échecs rapides
+        self.assertEqual(worker.fast_failures, 0)
+        self.assertAttentes(attentes, [5.0, 10.0, 20.0, 30.0, 30.0, 30.0])
+        row = registry.get(self.db, "rapide")
+        self.assertEqual(row["status"], "blocked")
+        self.assertTrue(row["status_text"].startswith("configuration fault: "))
+        self.assertIn(row.get("stop_reason"), (None, ""))
+        self.assertEqual(row["pending_prompt"], "tour")
+
+    def test_un_echec_rapide_apres_une_faute_de_configuration_compte(self):
+        """Une faute de configuration ne masque pas les vrais échecs rapides :
+        la série rapide reste à zéro et l'échec suivant compte normalement."""
+        worker = self._worker(max_fast_failures=2)
+        self._boucle(worker, ["config", False, False])
         self.assertEqual(worker.fast_failures, 2)
         row = registry.get(self.db, "rapide")
         self.assertEqual(row["status"], "stopped")

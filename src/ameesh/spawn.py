@@ -222,12 +222,16 @@ def mcp_servers(cwd: str | None, source: str | None,
     """The allowed servers, read from the project's MCP file, filtered.
 
     `source` is declared by the harness descriptor (Claude: `.mcp.json` at the
-    project root). Missing file with no allowed server is fine: the child gets
-    an empty private config, under `--strict-mcp-config`, so it inherits no
-    MCP server. A named server that cannot be resolved is refused at creation.
+    project root). `cwd` is the **declared** project directory, never a cwd
+    inherited from a turn (#8350): a missing server must be reported against
+    the directory the configuration was expected in. Missing file with no
+    allowed server is fine: the child gets an empty private config, under
+    `--strict-mcp-config`, so it inherits no MCP server. A named server that
+    cannot be resolved is refused at creation.
     """
     names = list(names)
     path = os.path.join(cwd or os.getcwd(), source) if source else None
+    directory = cwd or os.getcwd()
     document: dict = {}
     if path and os.path.exists(path):
         try:
@@ -250,7 +254,8 @@ def mcp_servers(cwd: str | None, source: str | None,
         if value not in servers:
             raise SpawnToolsError(
                 "spawn-mcp-not-found",
-                "MCP server %r is not defined in %s" % (value, path or "the project"))
+                "MCP server %r is not defined in %s (MCP source directory: %s)"
+                % (value, path or "the project", directory))
         if _has_secret(json.dumps(servers[value], ensure_ascii=False)):
             raise SpawnToolsError(
                 "spawn-context-secret",

@@ -15,10 +15,10 @@ distribution (copied outside the checkout, imports only
 `tests.test_7665_module_contract.CoverageTableTest` checks that every element
 has exactly one row and that every cited test exists.
 
-The surface freezes revision 1.10; its baseline commit stays the revision 1.0
+The surface freezes revision 1.11; its baseline commit stays the revision 1.0
 comparison point, and the elements that revisions 1.1, 1.2, 1.3, 1.5, 1.6, 1.7,
-1.8, 1.9 and 1.10 add are now listed (revision 1.4 adds no name). The comparison
-is additive-compatible, as the contract's compatibility rule states:
+1.8, 1.9, 1.10 and 1.11 add are now listed (revision 1.4 adds no name). The
+comparison is additive-compatible, as the contract's compatibility rule states:
 
 - HTTP: every schema is flattened per field (type, `const`, `enum`, bounds,
   `pattern`, `format`, `required`, `additionalProperties`), for parameters,
@@ -50,7 +50,7 @@ is additive-compatible, as the contract's compatibility rule states:
 | `cli:ameesh reservations` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_8343_account_reservations.AccountReservationsTest.test_cli_and_http_are_one_document`, `tests.test_8343_account_reservations.AccountReservationsTest.test_several_reservations_are_sorted_bounded_and_aged`, `tests.test_8343_account_reservations.AccountReservationsTest.test_unreadable_row_is_signalled_and_never_breaks_json` |
 | `cli:ameesh list` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7675_deferral.PublicViewsTest.test_list_json_carries_the_same_block` |
 | `cli:ameesh show` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7675_deferral.PublicViewsTest.test_show_json_carries_the_block` |
-| `cli:ameesh migrate` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_migrations_additives` |
+| `cli:ameesh migrate` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_migrations_additives`, `tests.test_8339_migrate_dry_run_json.MigrateDryRunJsonTest` |
 | `cli:ameesh action propose` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options` |
 | `cli:ameesh action approve` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options` |
 | `cli:ameesh action execute` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options` |
@@ -109,10 +109,13 @@ state and the external witness's two states join the `fixture` row. Revision
 declaration and invalid-refusal witnesses join the `python:connectors` row,
 together with the public-only module-connector bench. Revision 1.9 (#8337)
 adds `ameesh accounts profiles`; its redaction and refusal witnesses join the
-`cli:ameesh accounts profiles` row. Revision 1.10 (#8343) adds
-`ameesh reservations` and `GET /api/v1/reservations`; its ordering, bounding,
-unknown-agent, expired-kept, timezone-day-boundary, unreadable-row and
-no-secret witnesses join the `cli:ameesh reservations` row, and the route's
-schema and shared-serialisation witnesses are already exercised by the
-`http:schemas` row and
+`cli:ameesh accounts profiles` row. Revision 1.10 (#8339) adds the
+`ameesh migrate --dry-run --json` report; its option is frozen by the
+`cli:ameesh migrate` help witness and its fields and exit codes join that row.
+Revision 1.11 (#8343) adds `ameesh reservations` and
+`GET /api/v1/reservations`; its ordering, bounding, unknown-agent,
+expired-kept, timezone-day-boundary, unreadable-row and no-secret witnesses
+join the `cli:ameesh reservations` row, and the route's schema and
+shared-serialisation witnesses are already exercised by the `http:schemas`
+row and
 `tests.test_8343_account_reservations.AccountReservationsTest.test_cli_and_http_are_one_document`.

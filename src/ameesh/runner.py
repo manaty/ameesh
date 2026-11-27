@@ -5099,6 +5099,12 @@ class AgentWorker(threading.Thread):
     #: `host_retry_max` (300 s par défaut)
     HOST_BACKOFF_MIN = 15.0
 
+    # -- faute de configuration (#8350) --------------------------------------
+    #: préfixe du statut : une faute de la configuration déclarée (source MCP
+    #: absente, politique d'outils inapplicable), jamais un plantage du
+    #: harnais — la série d'échecs rapides de L48 ne s'y applique pas.
+    CONFIG_STATUS = "configuration fault"
+
     def _host_missing(self, raison: str) -> None:
         """Un tour qui ne peut pas partir faute de harnais (L106).
 
@@ -10407,10 +10413,21 @@ class AgentWorker(threading.Thread):
         if spawn_profile is None:
             try:
                 self._avatar_tools = avatar_tools.prepare(
-                    self.cfg, self.agent, self.state_dir, cwd, harness=harness)
+                    self.cfg, self.agent, self.state_dir, cwd, harness=harness,
+                    # #8350: the mediated depot is the only checkout on the
+                    # device; elsewhere the MCP source follows the declared
+                    # directory, never a cwd inherited from the turn.
+                    mcp_root=cwd if getattr(self.runner, "mediated", False) else None)
                 if self._avatar_tools is not None:
                     spawn_args = list(self._avatar_tools.args)
-            except (spawn_policy.SpawnToolsError, OSError, db_mod.DbError) as exc:
+            except spawn_policy.SpawnToolsError as exc:
+                # #8350: the policy could not be applied (missing MCP server,
+                # unreadable source, unsupported harness): a configuration
+                # fault, distinct from a harness crash.
+                self._close_resident("avatar tool policy unavailable")
+                self.fail_configuration("avatar tool policy unavailable", str(exc))
+                return False
+            except (OSError, db_mod.DbError) as exc:
                 self._close_resident("avatar tool policy unavailable")
                 self.fail_turn("avatar tool policy unavailable", str(exc))
                 return False
@@ -12281,6 +12298,35 @@ class AgentWorker(threading.Thread):
         registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         registry.set_status(self.db, self.name, "blocked",
                             status_text=status_text, error=error)
+
+    def fail_configuration(self, status_text: str, error: str) -> None:
+        """Une faute de configuration de l'agent, pas un plantage du harnais.
+
+        #8350: un serveur MCP absent (ou toute politique d'outils d'avatar
+        impossible à appliquer) est une faute de la configuration déclarée,
+        que le responsable doit corriger — pas un échec du travail de l'agent.
+        La consigne repart en attente et le statut est marqué distinctement ;
+        la série d'échecs rapides de L48 n'est pas touchée, donc cinq fautes
+        de ce type n'arrêtent jamais l'agent. L'attente entre deux essais
+        double quand même (bornée par `failure_wait`), et un tour réussi la
+        remet à zéro : la reprise est automatique dès la configuration
+        corrigée.
+        """
+        self.fast_failure = False
+        # rythme de reprise borné, sans jamais atteindre le seuil d'arrêt
+        self.failure_streak += 1
+        registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        registry.set_status(
+            self.db, self.name, "blocked",
+            status_text="%s: %s" % (self.CONFIG_STATUS, status_text),
+            error=error)
+        if error != getattr(self, "_config_fault_error", None):
+            self._config_fault_error = error
+            self._fil_note(
+                "Configuration fault, not a harness failure: %s. The instruction "
+                "stays queued; the agent is not stopped by fast failures and "
+                "resumes once the configuration is fixed." % error,
+                meta={"action": "configuration_fault", "status": status_text})
 
     def _parse(self, adapter: adapters.HarnessAdapter, line: str) -> dict:
         self._peek_reader = getattr(adapter, "reader", None)

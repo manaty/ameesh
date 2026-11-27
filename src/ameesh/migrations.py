@@ -377,21 +377,33 @@ def _verify_module_schema(db, schema: ModuleSchema, registered: dict[str, dict],
                       % (schema.module, schema.schema_name))
 
 
-def _pending_for(db, schema: ModuleSchema, registered: dict[str, dict],
-                 *, require_schema: bool) -> list[Migration]:
+def _module_survey(db, schema: ModuleSchema, registered: dict[str, dict],
+                   *, require_schema: bool,
+                   ) -> tuple[list[Migration], list[tuple[Migration, str]], dict[int, str]]:
+    """(manquantes, modifiées, appliquées) d'un module ; modifiées porte
+    l'empreinte enregistrée en base."""
     _verify_module_schema(db, schema, registered, require_schema=require_schema)
     done = applied_module(db, schema.module)
-    out = []
+    missing, modified = [], []
     for migration in schema.migrations:
         if migration.version not in done:
-            out.append(migration)
+            missing.append(migration)
         elif done[migration.version] != migration.checksum:
-            raise DbError(
-                "module migration %s modified after being applied (checksum %s != %s): "
-                "an applied migration is immutable, add a new one"
-                % (migration.label, done[migration.version][:12],
-                   migration.checksum[:12]))
-    return out
+            modified.append((migration, done[migration.version]))
+    return missing, modified, done
+
+
+def _pending_for(db, schema: ModuleSchema, registered: dict[str, dict],
+                 *, require_schema: bool) -> list[Migration]:
+    missing, modified, _done = _module_survey(db, schema, registered,
+                                              require_schema=require_schema)
+    if modified:
+        migration, applied = modified[0]
+        raise DbError(
+            "module migration %s modified after being applied (checksum %s != %s): "
+            "an applied migration is immutable, add a new one"
+            % (migration.label, applied[:12], migration.checksum[:12]))
+    return missing
 
 
 def pending_modules(db, schemas) -> list[Migration]:
@@ -1160,6 +1172,16 @@ def _lit(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
+def _compare(known: list[Migration], done: dict[int, str],
+             ) -> tuple[list[Migration], list[Migration], list[int]]:
+    """(manquantes, modifiées, versions inconnues) sur un inventaire déjà lu."""
+    missing = [m for m in known if m.version not in done]
+    modified = [m for m in known if m.version in done and done[m.version] != m.checksum]
+    versions = {m.version for m in known}
+    unknown = sorted(v for v in done if v not in versions)
+    return missing, modified, unknown
+
+
 def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
           ) -> tuple[list[Migration], list[Migration], list[int]]:
     """État des migrations en **lecture seule** (sonde `doctor --probe`).
@@ -1169,13 +1191,7 @@ def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
     après application, versions appliquées inconnues de ce code — base plus
     récente que l'image, par exemple après un retour arrière).
     """
-    done = _applied_readonly(db)
-    known = discover(directory)
-    missing = [m for m in known if m.version not in done]
-    modified = [m for m in known if m.version in done and done[m.version] != m.checksum]
-    versions = {m.version for m in known}
-    unknown = sorted(v for v in done if v not in versions)
-    return missing, modified, unknown
+    return _compare(discover(directory), _applied_readonly(db))
 
 
 #: Gestes qui cassent le code d'avant sur une base migrée (L151) : il lit ou
@@ -1509,6 +1525,75 @@ def describe_pending_non_additive(items) -> str:
     """Les libellés et raisons d'un `pending_non_additive`, en une ligne."""
     return ", ".join("%s (%s)" % (migration.label, "; ".join(reasons))
                      for migration, reasons in items)
+
+
+#: version contractuelle de l'objet de `ameesh migrate --dry-run --json` (#8339)
+DRY_RUN_SCHEMA = "ameesh-migrate-dry-run/1"
+
+
+@dataclass(frozen=True)
+class DryRunReport:
+    """Inventaire en lecture seule d'un `migrate --dry-run --json` (#8339).
+
+    `pending` garde l'ordre d'application (noyau puis modules) ; `modified`
+    porte l'empreinte enregistrée en base, pour nommer les deux côtés d'une
+    migration appliquée puis modifiée ; `unknown` liste les versions que cette
+    base a et que ce code ne connaît pas, noyau (`module` nul) ou module."""
+
+    pending: tuple[Migration, ...]
+    modified: tuple[tuple[Migration, str], ...]
+    unknown: tuple[tuple[str | None, int], ...]
+
+    def as_dict(self, *, additive_only: bool = False) -> dict:
+        """L'objet stable ``ameesh-migrate-dry-run/1`` (jamais du texte)."""
+        return {
+            "schema": DRY_RUN_SCHEMA,
+            "dry_run": True,
+            "additive_only": additive_only,
+            "pending": [
+                {"module": migration.module, "version": migration.version,
+                 "label": migration.label, "checksum": migration.checksum,
+                 "non_additive": non_additive(migration)}
+                for migration in self.pending
+            ],
+            "modified": [
+                {"module": migration.module, "version": migration.version,
+                 "label": migration.label, "checksum": migration.checksum,
+                 "applied_checksum": applied}
+                for migration, applied in self.modified
+            ],
+            "unknown": [{"module": module, "version": version}
+                        for module, version in self.unknown],
+        }
+
+
+def dry_run(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
+            *, modules=None, core_schema: str | None = None) -> DryRunReport:
+    """Inventaire **sans écriture** pour `migrate --dry-run --json` (#8339).
+
+    Même lecture que `check` + `pending_modules` : aucun DDL, pas même le
+    registre des migrations. Une migration de module modifiée après coup est
+    rendue dans `modified` au lieu de lever (le rapport doit nommer les deux
+    empreintes) ; un schéma de module inscrit qui manque ou dont l'identité a
+    changé reste un refus (`DbError`), comme `pending_modules`."""
+    done = _applied_readonly(db)
+    known = discover(directory)
+    missing, modified, unknown = _compare(known, done)
+    pending = list(missing)
+    findings = [(migration, done[migration.version]) for migration in modified]
+    unknown_entries = [(None, version) for version in unknown]
+    schemas = module_schemas(_module_rows(modules), core_schema or db.cfg.schema)
+    registered = _module_schema_rows(db)
+    for schema in schemas:
+        missing_module, modified_module, done_module = _module_survey(
+            db, schema, registered, require_schema=True)
+        pending.extend(missing_module)
+        findings.extend(modified_module)
+        known_versions = {migration.version for migration in schema.migrations}
+        unknown_entries.extend(
+            (schema.module, version) for version in sorted(done_module)
+            if version not in known_versions)
+    return DryRunReport(tuple(pending), tuple(findings), tuple(unknown_entries))
 
 
 def marker_available(db) -> bool:
