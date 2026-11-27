@@ -6,6 +6,10 @@ from connector name to a constructor. The installed module exposes an
 empty `types` list in its descriptor; it does not invent a work item type just
 to publish an action.
 
+Since contract revision 1.8 (#8342), an installed module imports `Action`,
+`Outcome` and `NotSentError` from `ameesh.public.connectors`; `ameesh.connectors`
+is the core's implementation and is not a public import path.
+
 ```python
 NAME = "example"
 
