@@ -1596,8 +1596,40 @@ class AgentWorker(threading.Thread):
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError:
+            # #7911 B/P2 #46761 : `sweep` peut retirer ce fil avant la passe
+            # de connexion ; l'échec du retour doit survivre au worker, sinon
+            # la passe suivante verrait zéro worker et publierait `login`
+            # sans bail rendu.
+            self._seat_login_release_failed()
             return False
+        self._seat_login_release_confirmed()
         return True
+
+    def _seat_login_release_failed(self) -> None:
+        """#7911 : enregistre un retour de bail non confirmé près du runner.
+
+        Le worker peut avoir été retiré de `self.workers` par `sweep` (fil
+        terminé) avant `_tenant_login_pass` : cette trace est alors la seule
+        mémoire de l'échec, et le runner retente jusqu'au retour confirmé."""
+        runner_obj = getattr(self, "runner", None)
+        if runner_obj is None:
+            return
+        pending = getattr(runner_obj, "_seat_login_pending_releases", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            try:
+                runner_obj._seat_login_pending_releases = pending
+            except (AttributeError, TypeError):
+                return
+        pending[self.name] = self
+
+    def _seat_login_release_confirmed(self) -> None:
+        """#7911 : retire la trace d'échec après un retour de bail pris."""
+        runner_obj = getattr(self, "runner", None)
+        pending = (getattr(runner_obj, "_seat_login_pending_releases", None)
+                   if runner_obj is not None else None)
+        if isinstance(pending, dict):
+            pending.pop(self.name, None)
 
     def _reserve_restart(self) -> None:
         """#4086 : un rôle élu rendu parce que l'exécuteur s'arrête (drainage,
@@ -12621,6 +12653,27 @@ def _tenant_candidates(runner, candidates: list[dict]) -> list[dict]:
     return [agent for agent in candidates if tenancy.admits(runner.cfg, policy, agent)]
 
 
+def _seat_login_release(name, worker, pending) -> bool:
+    """#7911 : tente le retour de bail d'un worker, une fois par passe.
+
+    Vrai seulement si le retour est **confirmé** (`release_lease` rend True).
+    Un échec reste dans `pending` et retient `login`, même si le worker a déjà
+    été retiré de `self.workers` par `sweep` : le bail n'est rendu qu'à son
+    échéance et le bureau ne doit pas monter le pod avant (B/P2 #46761).
+    Module-level : les doublures de `Runner` des tests n'ont pas la méthode."""
+    try:
+        result = worker.release_lease()
+    except Exception as exc:  # noqa: BLE001 - un échec ne vaut pas retour
+        log_async("tenant seat login: lease release of %s failed (%s): %s"
+                  % (name, type(exc).__name__, db_mod.brief(exc)))
+        result = False
+    if result is True:
+        pending.pop(name, None)
+        return True
+    pending[name] = worker
+    return False
+
+
 class Runner:
     def __init__(
         self,
@@ -14115,7 +14168,10 @@ class Runner:
         `runner_presence` (`login_ack`), et le bureau attend cet acquittement
         avant de créer le pod. Un arrêt non confirmé (processus pas encore
         publié, annulation sandbox seulement demandée) ou un retour de bail en
-        échec laisse le drapeau faux et sera réessayé.
+        échec laisse le drapeau faux et sera réessayé. Le retour de bail dû
+        survit au retrait du fil par `sweep` (trace près du runner) : `login`
+        n'est jamais publié avant son acquittement, même worker déjà retiré
+        (B/P2 #46761).
 
         La reprise ne dépend pas de la seule échéance SQL : le pod de
         connexion écrit un battement sur le volume partagé, et le runner
@@ -14162,12 +14218,22 @@ class Runner:
             log_async("tenant %s: seat login open, releasing leases and "
                       "pausing claims" % tenant)
         with self.lock:
-            workers = list(self.workers.values())
-        # L'état d'arrêt/retour est rattaché à la fenêtre (`id`) : une nouvelle
-        # fenêtre ne réutilise pas les confirmations de la précédente.
+            workers = list(self.workers.items())
+        pending = getattr(self, "_seat_login_pending_releases", None)
+        if not isinstance(pending, dict):
+            pending = self._seat_login_pending_releases = {}
+        # L'état d'arrêt est rattaché à la fenêtre (`id`) ; le retour de bail,
+        # lui, reste dû tant qu'il n'est pas confirmé — même après que `sweep`
+        # a retiré le fil terminé de `self.workers` (B/P2 #46761).
         token = window.get("id") if window else None
         drained = True
-        for worker in workers:
+        confirmed = set()
+        for name, worker in list(pending.items()):
+            if _seat_login_release(name, worker, pending):
+                confirmed.add(name)
+            else:
+                drained = False
+        for name, worker in workers:
             stopping = getattr(worker, "stopping", None)
             if stopping is not None:
                 stopping.set()
@@ -14178,7 +14244,7 @@ class Runner:
             if not (isinstance(state, tuple) and len(state) == 3
                     and state[0] == token):
                 state = (token, False, False)
-            stopped, released = bool(state[1]), bool(state[2])
+            stopped = bool(state[1])
             alive = getattr(worker, "is_alive", None)
             still_alive = bool(callable(alive) and alive())
             if not still_alive:
@@ -14193,13 +14259,14 @@ class Runner:
                         stopped = True
                     else:
                         drained = False
-            if not released:
-                release = getattr(worker, "release_lease", None)
-                if callable(release):
-                    if release() is True:
-                        released = True
-                    else:
-                        drained = False
+            released = name in confirmed or bool(state[2])
+            if name in pending:
+                # Le retour a déjà été retenté (et a échoué) dans cette passe.
+                released = False
+            elif not released:
+                released = _seat_login_release(name, worker, pending)
+                if not released:
+                    drained = False
             # Recontrôle après l'arrêt : un arrêt local confirmé termine le
             # fil ; le chemin sandbox ne fait que demander l'annulation du Job
             # distant, donc `login` attend que le fil ait réellement fini —
@@ -14208,7 +14275,8 @@ class Runner:
                 drained = False
             worker._seat_login_drain = (token, stopped, released)
         # `login` n'est publié que si l'arrêt et le retour des baux sont
-        # confirmés pour tous les workers ; sinon le bureau continue d'attendre.
+        # confirmés pour tous les workers, y compris ceux que `sweep` a
+        # retirés après un échec de retour ; sinon le bureau attend encore.
         self._tenant_login_drained = drained
         return True
 

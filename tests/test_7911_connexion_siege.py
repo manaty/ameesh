@@ -587,6 +587,42 @@ class LoginDrainTest(unittest.TestCase):
             [call[0] for call in worker.calls],
             ["stop", "release", "release"])
 
+    def test_bail_du_survit_au_retrait_par_sweep(self):
+        # B/P2 #46761 : sweep retire les fils terminés AVANT la passe ; un
+        # retour de bail en échec ne doit pas disparaître avec le worker.
+        runner = self.runner()
+        worker = _Worker(release=False)
+        runner.workers["relecteur"] = worker
+        _, _, _ = self.pass_(runner, window={"id": 1})
+        self.assertFalse(runner._tenant_login_drained)
+        del runner.workers["relecteur"]  # nettoyage réel de sweep
+        _, _, _ = self.pass_(runner, window={"id": 1})
+        self.assertFalse(runner._tenant_login_drained)
+        self.assertIs(runner._seat_login_pending_releases["relecteur"], worker)
+        self.assertEqual([call[0] for call in worker.calls],
+                         ["stop", "release", "release"])
+        worker.release_result = True
+        _, _, _ = self.pass_(runner, window={"id": 1})
+        self.assertTrue(runner._tenant_login_drained)
+        self.assertNotIn("relecteur", runner._seat_login_pending_releases)
+        self.assertEqual([call[0] for call in worker.calls],
+                         ["stop", "release", "release", "release"])
+
+    def test_echec_du_finally_survit_au_retrait_par_sweep(self):
+        # Le `finally` du worker appelle release_lease, qui échoue (DbError) ;
+        # sweep retire ensuite le fil. La trace près du runner est la seule
+        # mémoire de l'échec : login attend le retour confirmé.
+        runner = self.runner()
+        worker = types.SimpleNamespace(
+            name="relecteur", runner=runner, release_lease=lambda: False)
+        runner_mod.AgentWorker._seat_login_release_failed(worker)
+        _, _, _ = self.pass_(runner, window={"id": 1})
+        self.assertFalse(runner._tenant_login_drained)
+        worker.release_lease = lambda: True
+        _, _, _ = self.pass_(runner, window={"id": 1})
+        self.assertTrue(runner._tenant_login_drained)
+        self.assertNotIn("relecteur", runner._seat_login_pending_releases)
+
     def test_annulation_sandbox_attend_la_fin_du_fil(self):
         # Le chemin sandbox ne fait que demander l'annulation du Job distant :
         # `login` attend que le fil du worker ait réellement fini.
