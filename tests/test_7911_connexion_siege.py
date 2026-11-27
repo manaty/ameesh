@@ -623,6 +623,44 @@ class LoginDrainTest(unittest.TestCase):
         self.assertTrue(runner._tenant_login_drained)
         self.assertNotIn("relecteur", runner._seat_login_pending_releases)
 
+    def test_publication_concurrente_du_finally_retient_login(self):
+        # B/P2 #46773 : le `finally` publie un échec APRÈS le snapshot de
+        # `pending`, pendant le contrôle `is_alive` du worker ; la barrière
+        # finale doit retenir l'acquittement, même si le fil est terminé.
+        runner = self.runner()
+        started = threading.Event()
+        published = threading.Event()
+
+        class _FinallyWorker(_Worker):
+            def is_alive(self):
+                started.set()
+                published.wait(5)
+                return False
+
+        worker = _FinallyWorker(release=False)
+        worker.name = "relecteur"
+        worker.runner = runner
+
+        def finally_pass():
+            started.wait(5)
+            runner_mod.AgentWorker._seat_login_release_failed(worker)
+            published.set()
+
+        thread = threading.Thread(target=finally_pass)
+        thread.start()
+        runner.workers["relecteur"] = worker
+        _, _, _ = self.pass_(runner, window={"id": 1})
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(runner._tenant_login_drained)
+        self.assertIs(runner._seat_login_pending_releases["relecteur"], worker)
+        # Après le retrait par sweep, seul un retour confirmé libère.
+        del runner.workers["relecteur"]
+        worker.release_result = True
+        _, _, _ = self.pass_(runner, window={"id": 1})
+        self.assertTrue(runner._tenant_login_drained)
+        self.assertNotIn("relecteur", runner._seat_login_pending_releases)
+
     def test_annulation_sandbox_attend_la_fin_du_fil(self):
         # Le chemin sandbox ne fait que demander l'annulation du Job distant :
         # `login` attend que le fil du worker ait réellement fini.
