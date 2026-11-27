@@ -68,7 +68,7 @@ class StableBinaryTest(unittest.TestCase):
                 mock.patch.object(watch.os.path, "expanduser", return_value=self.home):
             ameesh = watch._ameesh_binary()
         self.assertNotIn("venv-52d1e28", ameesh)
-        service = watch.units("a1", 1800, ameesh, "/usr/bin")[watch.unit_name("a1", "service")]
+        service = watch.units("a1", 1800, ameesh)[watch.unit_name("a1", "service")]
         self.assertIn('ExecStart="%s" watch send --agent a1' % ameesh, service)
 
 

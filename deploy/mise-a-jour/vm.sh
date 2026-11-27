@@ -2501,6 +2501,13 @@ retour_agents() {
   effacer_journal_agents
   echo "code ${complet:0:9} réinstallé depuis src-$court ; previous-sha = ${complet:0:9} (retour idempotent)."
   redemarrer_agents
+  # #8380 : repose les unités de rôle et de veille avec le CLI INSTALLÉ (N-1)
+  # avant de les contrôler. Une unité rendue par N (PATH canonique) serait dite
+  # périmée par le `check_host` de N-1, qui comparait encore le PATH de
+  # l'appelant ; même principe que #6643 pour la minuterie de l'auditeur. Un
+  # échec de pose ne retient pas le retour : le contrôle nommera l'écart.
+  ameesh_agents role timers --install \
+    || echo "retour : pose des minuteries de rôle et de veille en échec (le contrôle nommera l'écart)" >&2
   controler_agents
 }
 

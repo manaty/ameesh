@@ -59,19 +59,20 @@ class TextTest(unittest.TestCase):
         self.assertIsNone(fil.unreadable_reason(text))
 
     def test_units(self):
-        found = watch.units("mesh-design", 1800, "/home/u/.local/bin/ameesh", "/usr/bin:/bin")
+        found = watch.units("mesh-design", 1800, "/home/u/.local/bin/ameesh")
         self.assertEqual(sorted(found), ["ameesh-watch-mesh-design.service",
                                          "ameesh-watch-mesh-design.timer"])
         service = found["ameesh-watch-mesh-design.service"]
         self.assertIn('ExecStart="/home/u/.local/bin/ameesh" watch send --agent mesh-design',
                       service)
-        self.assertIn('Environment="PATH=/usr/bin:/bin"', service)
+        # #8380 : le PATH est canonique, jamais celui de l'appelant
+        self.assertIn('Environment="PATH=%s"' % watch.UNIT_PATH, service)
         # codex r1 (#303): the host's ameesh environment, then the watch's
         # pinned variables (the later file wins in systemd)
         self.assertIn("TimeoutStartSec=300\n", service)
         self.assertIn("EnvironmentFile=-%h/.config/ameesh/env\n"
                       "EnvironmentFile=-/units/ameesh-watch-mesh-design.env\n",
-                      watch.units("mesh-design", 1800, "/a", "/b", "/units")
+                      watch.units("mesh-design", 1800, "/a", "/units")
                       ["ameesh-watch-mesh-design.service"])
         timer = found["ameesh-watch-mesh-design.timer"]
         self.assertIn("OnActiveSec=1800\nOnUnitActiveSec=1800\n", timer)
@@ -870,11 +871,13 @@ class WakeTest(PgTestCase):
 
     def test_the_unit_declares_and_applies_the_identity(self):
         found = watch.wake_units("w121", "deadline", 1800,
-                                 "/home/u/.local/bin/ameesh", "/usr/bin:/bin", "/units")
+                                 "/home/u/.local/bin/ameesh", "/units")
         self.assertEqual(sorted(found),
                          ["ameesh-wake-4-w121-deadline.service",
                           "ameesh-wake-4-w121-deadline.timer"])
         service = found["ameesh-wake-4-w121-deadline.service"]
+        # #8380 : le PATH est canonique, jamais celui de l'appelant
+        self.assertIn('Environment="PATH=%s"' % watch.UNIT_PATH, service)
         # declared, and applied on the exec line: systemd's EnvironmentFile
         # overrides Environment=, so env(1) is what the child really carries
         self.assertIn('Environment="AGENT_MAIL_NAME=w121"', service)
@@ -954,7 +957,7 @@ class WakeTest(PgTestCase):
         self.register_more("x")
         self.register_more("x-deadline")
         for name, text in watch.units("x-deadline", 1800, "/home/u/.local/bin/ameesh",
-                                      "/usr/bin:/bin", self.units).items():
+                                      self.units).items():
             with open(os.path.join(self.units, name), "w", encoding="utf-8") as fh:
                 fh.write(text)
         with open(os.path.join(self.units, watch.env_name("x-deadline")), "w",
@@ -1044,8 +1047,9 @@ class WakeTest(PgTestCase):
         """#4755: the four files of a wake armed before #1039, as they were
         written (`ameesh-watch-<agent>-<slug>.*`)."""
         names = {}
-        for suffix, text in watch.wake_units(agent, slug, 1800, "/home/u/.local/bin/ameesh",
-                                             "/usr/bin:/bin", self.units).items():
+        for suffix, text in watch.wake_units(agent, slug, 1800,
+                                             "/home/u/.local/bin/ameesh",
+                                             self.units).items():
             names[suffix.rsplit(".", 1)[1]] = text
         names["env"] = 'AMEESH_HOST="laptop"\n'
         names["wake.json"] = json.dumps({"agent": agent, "slug": slug,
@@ -1080,7 +1084,7 @@ class WakeTest(PgTestCase):
         self.register_more("x")
         self.register_more("x-deadline")
         for name, text in watch.units("x-deadline", 1800, "/home/u/.local/bin/ameesh",
-                                      "/usr/bin:/bin", self.units).items():
+                                      self.units).items():
             with open(os.path.join(self.units, name), "w", encoding="utf-8") as fh:
                 fh.write(text)
         watch_files = sorted(os.listdir(self.units))

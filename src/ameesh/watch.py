@@ -98,6 +98,15 @@ UNIT_DIR_ENV = "AMEESH_SYSTEMD_USER_DIR"
 #: the configuration of the timer's commands: ameesh's environment file of the
 #: host (the runner's convention), then the variables pinned at enable, which win
 HOST_ENV_FILE = "%h/.config/ameesh/env"
+#: #8380 : le PATH écrit dans une unité de veille ou de réveil. Il est rendu,
+#: jamais recopié de `os.environ["PATH"]` : le lanceur d'ameesh préfixe déjà
+#: son venv, et le préflight de staging (`systemd-run --user`) ne partage pas
+#: le PATH d'un shell d'agent. Même valeur que les unités de `role timers`,
+#: déjà indépendantes de l'appelant.
+UNIT_PATH = "%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+#: #8380 : la ligne de PATH qu'un contrôle neutralise avant de comparer une
+#: unité installée (elle vient de l'appelant, pas du contrat de l'unité).
+_UNIT_PATH_LINE = re.compile(r'^Environment="?PATH=[^"\n]*"?$', re.MULTILINE)
 #: variables that choose the configuration, the database and the host, by
 #: canonical name, with the names `config.load` also reads, in its order. The
 #: values resolved when the watch is enabled are pinned under the canonical
@@ -277,10 +286,14 @@ def pinned_env(env: dict, host: str) -> str:
     return "".join(line + "\n" for line in lines)
 
 
-def units(agent: str, every_s: int, ameesh: str, path: str,
+def units(agent: str, every_s: int, ameesh: str,
           directory: str = "", *, role: str | None = None) -> dict[str, str]:
     """The service and the timer of the watch of `agent` (`directory`: where
     its environment file is written).
+
+    The PATH is `UNIT_PATH`, never the caller's (#8380): the same file must be
+    rendered by an agent's shell and by the staging preflight, or a pose from
+    one is "out of date" for the other.
 
     `role` (the agent's elected role, #7933) wraps the firing in
     ``ameesh role run <role> -- … watch send``: only the lease holder reaches
@@ -305,7 +318,7 @@ def units(agent: str, every_s: int, ameesh: str, path: str,
         "EnvironmentFile=-%(host_env)s\n"
         "EnvironmentFile=-%(own_env)s\n"
         "ExecStart=%(exec_line)s\n"
-        % {"agent": agent, "path": path, "host_env": HOST_ENV_FILE,
+        % {"agent": agent, "path": UNIT_PATH, "host_env": HOST_ENV_FILE,
            "own_env": os.path.join(directory, env_name(agent)),
            "timeout": FIRING_TIMEOUT_S, "exec_line": exec_line})
     tick_s = min(every_s, ROLE_TICK_S) if role else every_s
@@ -360,7 +373,6 @@ def elected_watch_files(host: str, db, *, directory: str, bin_path: str,
     """
     from . import role_run
     source = dict(os.environ if env is None else env)
-    path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
     out = []
     for watched in storage.of(db).watches.list():
         agent = str(watched.get("agent") or "")
@@ -375,7 +387,7 @@ def elected_watch_files(host: str, db, *, directory: str, bin_path: str,
         if host not in (report.get("candidates") or ()):
             continue
         role = str(report.get("role") or agent)
-        files = units(agent, int(watched["every_s"]), bin_path, path, directory,
+        files = units(agent, int(watched["every_s"]), bin_path, directory,
                       role=role)
         files[env_name(agent)] = pinned_env(source, host)
         out.append({"agent": agent, "role": role,
@@ -400,13 +412,28 @@ def reconcile_host(host: str, db, *, directory: str, bin_path: str,
     return {"installed": installed, "timers": timers, "agents": agents}
 
 
+def _without_unit_path(text: str) -> str:
+    """The unit text with its ``Environment=PATH=…`` line blanked (#8380).
+
+    The PATH is not part of the unit's contract: the exec line is absolute and
+    the launcher prepends its venv itself. A unit written before #8380 carries
+    the PATH of whoever installed it (an agent's shell, the preflight's
+    `systemd-run`); comparing that line would call the same file up to date in
+    one environment and stale in the other, and the staging preflight runs
+    `role timers --check` with the installed CLI before installing the fix.
+    """
+    return _UNIT_PATH_LINE.sub('Environment="PATH="', text)
+
+
 def check_host(host: str, db, *, directory: str, bin_path: str,
                env: dict | None = None) -> dict:
     """#7933 : gaps of the elected-role watch units on this candidate host.
 
     Compares the service and timer with what `reconcile_host` would write and
     names a missing environment file; the caller checks systemd. A watch row
-    whose agent is not a candidate here is not a gap."""
+    whose agent is not a candidate here is not a gap. The PATH line is
+    normalised before the comparison (#8380): it is caller-dependent, not a
+    property of the installed unit."""
     problems: list[str] = []
     timers: list[tuple[str, str]] = []
     for entry in elected_watch_files(host, db, directory=directory,
@@ -420,7 +447,7 @@ def check_host(host: str, db, *, directory: str, bin_path: str,
             except OSError:
                 problems.append("watch of %s: missing %s" % (agent, name))
                 continue
-            if content != entry["files"][name]:
+            if _without_unit_path(content) != _without_unit_path(entry["files"][name]):
                 problems.append("watch of %s: %s is out of date; rerun `ameesh "
                                 "role timers --install`" % (agent, name))
         if not os.path.isfile(os.path.join(directory, env_name(agent))):
@@ -446,9 +473,12 @@ def wake_env_name(agent: str, slug: str) -> str:
     return "%s%d-%s-%s.env" % (WAKE_PREFIX, len(agent), agent, slug)
 
 
-def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
+def wake_units(agent: str, slug: str, delay_s: int, ameesh: str,
                directory: str = "", *, deadline: float | None = None) -> dict[str, str]:
     """The service and the timer of the one-shot wake `<slug>` of `agent`.
+
+    The PATH is `UNIT_PATH`, never the caller's (#8380), for the same reason
+    as the periodic watch.
 
     A wake runs outside a turn, where the runner's `AGENT_MAIL_NAME` is
     absent. `Environment=` alone does not hold it: systemd lets an
@@ -476,7 +506,7 @@ def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
         "RestartSec=2min\n"
         "ExecStart=\"%(env)s\" \"%(identity)s=%(agent)s\" "
         "\"%(ameesh)s\" watch fire --agent %(agent)s --wake %(slug)s\n"
-        % {"agent": agent, "slug": slug, "ameesh": ameesh, "path": path,
+        % {"agent": agent, "slug": slug, "ameesh": ameesh, "path": UNIT_PATH,
            "env": _env_binary(),
            "host_env": HOST_ENV_FILE,
            "own_env": os.path.join(directory, wake_env_name(agent, slug)),
@@ -867,8 +897,7 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
             "%s%s.timer (then remove its unit files)" % (agent, LEGACY_PREFIX, agent))
     os.makedirs(directory, exist_ok=True)
     source = os.environ if env is None else env
-    path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
-    files = units(agent, every_s, _ameesh_binary(), path, directory,
+    files = units(agent, every_s, _ameesh_binary(), directory,
                   role=(role.get("role") or agent) if role is not None else None)
     # the pinned variables may hold a DSN with its password: owner only
     files[env_name(agent)] = pinned_env(dict(source), host)
@@ -1687,8 +1716,7 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
     os.makedirs(directory, exist_ok=True)
     prune_legacy_wakes(directory, run)
     source = os.environ if env is None else env
-    path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
-    files = wake_units(agent, slug, delay_s, _ameesh_binary(), path, directory,
+    files = wake_units(agent, slug, delay_s, _ameesh_binary(), directory,
                        deadline=deadline)
     files[wake_env_name(agent, slug)] = pinned_env(dict(source), host)
     files[wake_name(agent, slug, "wake.json")] = json.dumps(
