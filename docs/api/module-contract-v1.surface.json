@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.7",
+  "contract": "1.8",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -4927,6 +4927,46 @@
     ]
   },
   "python": {
+    "connectors": {
+      "module": "ameesh.public.connectors",
+      "contract_version": "1.8",
+      "constants": {
+        "CONTRACT_VERSION": "1.8",
+        "ACTION_CONNECTORS": "ACTION_CONNECTORS",
+        "OUTCOMES": ["confirmed", "failed", "unknown"],
+        "ACTION_CLASSES": ["read", "reversible", "irreversible", "costly"],
+        "DEDUPE": ["guaranteed", "none"],
+        "DEFAULT_TIMEOUT": 60.0
+      },
+      "signatures": {
+        "Outcome.confirmed": "(external_ref=None, detail='')",
+        "Outcome.failed": "(detail, external_ref=None)",
+        "Outcome.unknown": "(detail, external_ref=None)"
+      },
+      "records": {
+        "Action": [
+          "action_id",
+          "project",
+          "connector",
+          "operation",
+          "target",
+          "args",
+          "action_class",
+          "amount",
+          "currency",
+          "policy_version",
+          "attempt",
+          "work_item",
+          "recurrence",
+          "spend_provider",
+          "spend_purpose"
+        ],
+        "Outcome": ["state", "external_ref", "detail", "extra"]
+      },
+      "errors": {
+        "NotSentError": "not-sent"
+      }
+    },
     "fixture": {
       "module": "ameesh.public.fixture",
       "contract_version": "1.7",

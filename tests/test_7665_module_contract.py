@@ -35,11 +35,12 @@ from unittest import mock
 from tests import support  # isolate host config before product imports
 from tests.support import PgTestCase
 from tests.test_canon import commit_all, publish, write
-from ameesh import (accounts, auth_failure, budget, canon, db as db_mod,
-                    deferral_observation, migrations, provider_credits, public,
-                    resources, serve)
+from ameesh import (accounts, auth_failure, budget, canon, connectors as connectors_mod,
+                    db as db_mod, deferral_observation, migrations,
+                    provider_credits, public, resources, serve)
 from ameesh.modules import registry
 from ameesh.modules.storage import ModuleStore
+from ameesh.public import connectors as public_connectors
 from ameesh.public import database, fixture, mail
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -768,6 +769,67 @@ class DeferralContractTest(unittest.TestCase):
                     self.assertLessEqual(set(spec["queue_required_fields"]), set(queue))
                 seen.add(reason)
         self.assertEqual(seen, set(spec["reasons"]))
+
+
+class PythonConnectorsContractTest(unittest.TestCase):
+    """The 1.8 action-connector surface: protocol identity, fields, states, codes."""
+
+    spec = SURFACE["python"]["connectors"]
+
+    def test_the_public_surface_reexports_the_gate_protocol(self):
+        self.assertIs(public_connectors.Action, connectors_mod.Action)
+        self.assertIs(public_connectors.Outcome, connectors_mod.Outcome)
+        self.assertIs(public_connectors.NotSentError, connectors_mod.NotSentError)
+        self.assertIs(public.connectors, public_connectors)
+
+    def test_the_public_outcome_constructors_are_frozen(self):
+        for name, frozen in sorted(self.spec["signatures"].items()):
+            owner_name, _, method = name.partition(".")
+            owner = getattr(public_connectors, owner_name)
+            with self.subTest(name):
+                self.assertEqual(signature_breaks(
+                    frozen_signature(frozen),
+                    inspect.signature(getattr(owner, method))), [])
+
+    def test_the_value_objects_keep_their_frozen_fields(self):
+        for name, fields in sorted(self.spec["records"].items()):
+            with self.subTest(name):
+                self.assertEqual([field.name for field in
+                                  dataclasses.fields(getattr(public_connectors, name))],
+                                 fields)
+
+    def test_the_published_constants_states_and_error_codes_are_frozen(self):
+        for name, value in sorted(self.spec["constants"].items()):
+            with self.subTest(name):
+                actual = getattr(public_connectors, name)
+                if isinstance(value, list) and isinstance(actual, (list, tuple)):
+                    actual = list(actual)
+                self.assertEqual(actual, value)
+        for name, code in sorted(self.spec["errors"].items()):
+            with self.subTest(name):
+                self.assertEqual(getattr(public_connectors, name).code, code)
+        for name in (*self.spec["constants"], "Action", "Outcome", "NotSentError"):
+            self.assertIn(name, public_connectors.__all__)
+
+    def test_the_declaration_attribute_and_closed_outcome_vocabulary(self):
+        self.assertEqual(public_connectors.ACTION_CONNECTORS, "ACTION_CONNECTORS")
+        self.assertEqual(list(public_connectors.OUTCOMES),
+                         ["confirmed", "failed", "unknown"])
+        self.assertEqual(public_connectors.Outcome.confirmed("ref", "done").state,
+                         "confirmed")
+        self.assertEqual(public_connectors.Outcome.failed("certain").state, "failed")
+        self.assertEqual(public_connectors.Outcome.unknown("unreadable").state, "unknown")
+        with self.assertRaises(connectors_mod.ConnectorError):
+            public_connectors.Outcome("made-up")  # closed vocabulary, not free text
+
+    def test_the_served_contract_version_is_frozen(self):
+        self.assertEqual(public_connectors.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.connectors.CONTRACT_VERSION,
+                         public_connectors.CONTRACT_VERSION)
+        self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
+        self.assertGreaterEqual(
+            tuple(int(part) for part in public.CONTRACT_VERSION.split(".")),
+            tuple(int(part) for part in public_connectors.CONTRACT_VERSION.split(".")))
 
 
 class PythonMailContractTest(unittest.TestCase):

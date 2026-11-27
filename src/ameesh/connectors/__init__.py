@@ -58,6 +58,9 @@ class NotSentError(RuntimeError):
     connecteur inconnu ni une configuration invalide.)
     """
 
+    #: code public de l'échec certain avant envoi (surface 1.8, #8342)
+    code = "not-sent"
+
 
 @dataclass(frozen=True)
 class Action:

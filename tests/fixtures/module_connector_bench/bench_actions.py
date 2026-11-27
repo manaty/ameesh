@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Offline example: copied outside the repository, never shipped by ameesh."""
+"""Offline example: copied outside the repository, never shipped by ameesh.
+
+It imports only the public connector surface (contract 1.8, #8342): a real
+external distribution never imports ``ameesh.connectors`` or ``tests``.
+"""
 from pathlib import Path
-from ameesh.connectors import Outcome
+from ameesh.public.connectors import Outcome
 
 NAME = 'bench-actions'
 TYPES = ()
