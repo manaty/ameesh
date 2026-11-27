@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
-from ameesh import debit
+from ameesh import debit, mechanics, packet_candidates
 
+from .test_4572_slo_candidate_cause import _SloBase
+from .test_l1616_mechanics import MECHANICS
 from .test_3256_debit_capacity import H, SPLIT, T as CAP_T, measure, split_lot, team
 from .test_6423_debit_qa_merge_wake import event, frozen, item, mark, run, verdict
 
@@ -69,6 +72,41 @@ class QaMergeGestureTest(unittest.TestCase):
         row = _qa_merge(_report(verdict_at=_ts("2026-11-26 16:10")))
         self.assertIn("dès la fusion du paquet en cours", row["gesture"])
         self.assertNotIn("horaire", row["gesture"])
+
+
+class ReadSlotTest(_SloBase):
+    """Le câblage réel : `read` lit `packets.cutoffs` du canon appliqué."""
+
+    def _report(self, packets: str):
+        document = mechanics.compile_document(MECHANICS + packets)
+        with mock.patch.object(mechanics, "configured", return_value=document), \
+                mock.patch.object(packet_candidates, "candidate_refusal",
+                                  return_value={}):
+            report = debit.read(self.db, cfg=self.cfg, now=self.now,
+                                jobs=False, wait_s=60)
+        rows = [row for row in report["slow_waits"]
+                if row["kind"] == "qa_merge" and row["lot"] == self.lot["id"]]
+        self.assertEqual(len(rows), 1, report["slow_waits"])
+        return rows[0]
+
+    def test_even_hour_slots_are_named(self):
+        # GO + 1801 s = 2026-10-25 18:10Z = 19:10 à Paris (heure d'hiver)
+        packets = "packets:\n  cutoffs: [%s]\n" % ", ".join(
+            '"%02d:00"' % hour for hour in range(0, 24, 2))
+        row = self._report(packets)
+        self.assertIn("dans le paquet de 20:00", row["gesture"])
+
+    def test_without_packets_block_the_gesture_follows_the_current_packet(self):
+        row = self._report("")
+        self.assertIn("dès la fusion du paquet en cours", row["gesture"])
+
+
+class NextPacketTest(unittest.TestCase):
+    def test_after_the_last_slot_of_the_day_comes_tomorrow(self):
+        now = _ts("2026-11-26 22:30")         # 23:30 à Paris
+        self.assertEqual(debit._next_packet(["00:00", "12:00"], "Europe/Paris", now),
+                         _ts("2026-11-26 23:00"))
+        self.assertIsNone(debit._next_packet((), "Europe/Paris", now))
 
 
 class FootprintHoursTest(unittest.TestCase):

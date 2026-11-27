@@ -3247,6 +3247,25 @@ def _epoch(value) -> float | None:
         return None
 
 
+def _next_packet(cutoffs: Iterable[str], zone: str, now: float) -> float | None:
+    """#8320 : le premier créneau de paquet (`packets.cutoffs`, HH:MM locales)
+    strictement après `now` ; `None` sans cadence déclarée. Le `Document`
+    global de `mechanics.configured` ne porte pas `Mechanics.next_packet`."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(zone)
+    today = datetime.datetime.fromtimestamp(now, tz).date()
+    later = []
+    for offset in range(3):
+        day = today + datetime.timedelta(days=offset)
+        for label in cutoffs or ():
+            stamp = datetime.datetime(day.year, day.month, day.day,
+                                      int(label[:2]), int(label[3:]),
+                                      tzinfo=tz).timestamp()
+            if stamp > now:
+                later.append(stamp)
+    return min(later) if later else None
+
+
 def _rows(db, sql: str, params=()) -> list[dict]:
     return [dict(row) for row in db.query(sql, params) or ()]
 
@@ -3527,8 +3546,7 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
         # familles distinctes qui ont relu la tête.
         families = tuple(document.families or ())
         # #8320 : le geste qa_merge nomme le créneau déclaré (`packets.cutoffs`).
-        if document.packet_cutoffs:
-            next_packet = document.next_packet(now)
+        next_packet = _next_packet(document.packet_cutoffs, zone, now)
     except Exception:  # noqa: BLE001 - zone de repli explicite, jamais devinée
         pass
     agents = _rows(db, _AGENTS_SQL)
