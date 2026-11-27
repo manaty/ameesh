@@ -97,6 +97,7 @@ test_8193_work_subjects  # SQL: lot subjects, attachment and list by subject or 
 test_8197_follow_up_inventory  # SQL: follow-up named wait and open inventory by subject (#8197)
 test_8195_subject_github  # SQL: GitHub epic of a subject, adopted or created, closed by the watch (#8195)
 test_831_packages_lock_scope  # storage : un verrou de sync par schéma (tous canons), attente hors statement_timeout (#831)
+test_8339_migrate_dry_run_json  # stockage : dry-run JSON des migrations (attente, modifiée, non additive) (#8339)
 test_8347_budget_lignee  # stockage : lignée lue en une requête récursive, fenêtres de dépense agrégées par lignée (#8347)
 test_811_lot_workdirs  # stockage : dossiers de projets par lot, reprise de session et prise secondaire (L243-4)
 test_753_stop_returns_lots  # stockage : retour transactionnel des lots, journal et réattribution des promus (#753)

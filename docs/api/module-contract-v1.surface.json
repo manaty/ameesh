@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.9",
+  "contract": "1.10",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -35,7 +35,7 @@
     "ameesh accounts profiles": ["--help", "--json"],
     "ameesh list": ["--help", "--json"],
     "ameesh show": ["--help", "--json"],
-    "ameesh migrate": ["--additive-only", "--allow-live-executors", "--dry-run", "--help"],
+    "ameesh migrate": ["--additive-only", "--allow-live-executors", "--dry-run", "--help", "--json"],
     "ameesh action propose": [
       "--amount",
       "--approver",
