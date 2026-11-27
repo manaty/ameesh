@@ -366,6 +366,9 @@ DEFAULT_RESOURCE = "core"
 RATE_LIMIT_WAIT = 60.0
 #: marque d'une limite secondaire dans le corps d'un 403/429 (sans casse)
 SECONDARY_LIMIT_MARK = "secondary rate limit"
+#: #8358 : la limite secondaire de GraphQL, que GitHub peut rendre en HTTP 200
+#: avec un corps `errors` ; le statut seul ne la classe donc jamais.
+GRAPHQL_SECONDARY_LIMIT_MARK = "submitted too quickly"
 
 
 def resource_of(path: str) -> str:
@@ -830,24 +833,35 @@ class SharedReads:
         Le quota est rangé par ressource d'API (`X-RateLimit-Resource`, sinon
         `resource`, celle du chemin, sinon `core`) : le bucket REST core et le
         bucket GraphQL ne se confondent plus (R1 #848 ; le pilote l'a demandé
-        à 10:40Z). Une limite secondaire (403/429 dont `body` la cite) bloque
-        aussi, même quota restant : `Retry-After`, sinon le reset si le quota
-        est à zéro, sinon `RATE_LIMIT_WAIT` (#1405, N3). Rend l'instant
-        (epoch) jusqu'auquel cette ressource est épuisée, sinon None."""
+        à 10:40Z). Une limite secondaire bloque aussi, même quota restant :
+        tout 429 (#8357), un 403 dont `body` cite l'un des deux marqueurs, et
+        la limite GraphQL rendue en HTTP 200 (#8358) ; `Retry-After`, sinon le
+        reset si le quota est à zéro, sinon `RATE_LIMIT_WAIT` (#1405, N3).
+        Rend l'instant (epoch) jusqu'auquel cette ressource est épuisée, sinon
+        None."""
         now = float(self.clock() if now is None else now)
         values = {key: _int_or_none(header_of(headers, header))
                   for key, header in QUOTA_HEADERS.items()}
         retry = _int_or_none(header_of(headers, "Retry-After"))
         resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
             or str(resource or "").strip().lower() or DEFAULT_RESOURCE
+        body = str(body or "").lower()
+        if status == 200 and GRAPHQL_SECONDARY_LIMIT_MARK in body:
+            # #8358: a 200 carrying GraphQL's secondary limit is a GraphQL
+            # refusal, whatever a later `X-RateLimit-Resource` header says.
+            resource = "graphql"
         # #8357 : un 429 est une limite, même sans « secondary rate limit »
         # dans le corps ni Retry-After (GitHub renvoie parfois « Too Many
         # Requests » seul). Sans cette règle, le refus n'était pas mémorisé et
         # le passage suivant le répétait. Un 403 ne bloque que sur un marqueur
         # explicite : un 403 de droits reste une erreur de droits.
+        # #8358 : les deux marqueurs valent aussi pour 403, et la limite
+        # secondaire GraphQL en HTTP 200 bloque comme les autres.
         secondary = status == 429 or (
-            status == 403 and SECONDARY_LIMIT_MARK in str(body or "").lower())
-        primary = status in (403, 429) and "api rate limit exceeded" in str(body or "").lower()
+            status == 403 and (SECONDARY_LIMIT_MARK in body
+                               or GRAPHQL_SECONDARY_LIMIT_MARK in body)) \
+            or (status == 200 and GRAPHQL_SECONDARY_LIMIT_MARK in body)
+        primary = status in (403, 429) and "api rate limit exceeded" in body
         self._ensure_dirs()
         taken = _take_pending(self._pending, self._pending_lock)
         written = False
