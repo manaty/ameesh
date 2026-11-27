@@ -2,7 +2,7 @@
 """#8344 — alerts that an application raises and resolves itself.
 
 `ameesh notify` used to push only the alerts derived from the mesh
-(`ameesh alerts`). An application (issue-manager-agent, IMA#1804) had no way to
+(`ameesh alerts`). An application (a client of the module contract) had no way to
 hand its own durable conditions to the same delivery: routes, avatar first
 (#7634), rate limit per human, retries, the `notified` ledger, liveness.
 
