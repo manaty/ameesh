@@ -303,8 +303,9 @@ def wakeable(listing: list, canons, *, configured: bool, closed_hosts=()) -> lis
 
 def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
             configured: bool, footprint: dict | None = None,
-            closed_hosts=(), baskets=()) -> dict:
-    """`{projet: Measure}` pour chaque projet d'au moins un agent réveillable.
+            closed_hosts=(), baskets=(), projects=()) -> dict:
+    """`{projet: Measure}` pour chaque projet d'au moins un agent réveillable,
+    et pour chaque projet de `projects` (#8364).
 
     Au repos : `idle_agents` (sans lot actionnable, #1677). Démarrable : un
     lot ouvert sans assigné ni exécutant externe, hors file d'amélioration,
@@ -319,7 +320,14 @@ def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
     travail pour un agent au repos. Un panier de l'équipe n'appelle pas un
     découpage, mais il interdit le sommeil « feuille de route épuisée » tant
     qu'il attend : sans cela, les dormeurs ne sont jamais candidats à sa
-    prise, et il reste sans assigné jusqu'au prochain lot de roadmap."""
+    prise, et il reste sans assigné jusqu'au prochain lot de roadmap.
+
+    #8364 : `projects` (les projets endormis, `sleeping_projects`) reçoivent
+    une mesure même sans agent réveillable — les dormeurs sont en pause, donc
+    hors de `wakeable`. Sans elle, un projet dont tous les exécutants dorment
+    n'aurait ni lot démarrable ni panier, et le premier lot libéré (empreinte,
+    prérequis) ne lèverait pas le sommeil. Leur `wakeable` reste vide : la
+    condition de découpage (`held`) ne les retient pas."""
     from . import projects as projects_mod
     pool = wakeable(listing, canons, configured=configured,
                     closed_hosts=closed_hosts)
@@ -330,7 +338,7 @@ def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
         if row["name"] in names}
     startable, _blocked = su.split_startable(su.waiting_project_lots(lots), waits,
                                              footprint)
-    out: dict = {}
+    out: dict = {project: Measure(project) for project in projects or ()}
     for row in pool:
         for project in projects_mod.agent_projects(row):
             item = out.setdefault(project, Measure(project))
@@ -1666,9 +1674,14 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         baskets = st.work.backlog(open_only=True, limit=200, ready_only=True) or ()
     except Exception:  # noqa: BLE001 - une file illisible ne change pas le sommeil
         baskets = ()
+    # #4623 : un projet dont tous les exécutants dorment n'a pas d'agent
+    # réveillable (`measure` écarte les pauses). #8364 : il reçoit quand même
+    # sa mesure de lots démarrables et de paniers, sinon le premier lot libéré
+    # ne lèverait pas le sommeil et seule une note de réouverture le ferait.
+    sleeping = sleeping_projects(listing)
     measures = measure(listing, lots, waits, now, canons, configured=configured,
                        footprint=footprint, closed_hosts=closed_hosts,
-                       baskets=baskets)
+                       baskets=baskets, projects=sleeping)
     due, since = held(measures, state.get(STATE_KEY) or {}, now,
                       settings.repos_part, settings.repos_s)
     state[STATE_KEY] = since
@@ -1680,12 +1693,8 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     if not dry_run:
         out.extend(_wake_work(db, listing, now, cfg=cfg, canons=canons,
                               mail_window_s=settings.mail_window(), lots=lots))
-    # #4623 : un projet dont tous les exécutants dorment n'a plus de mesure
-    # (`measure` écarte les pauses). Il doit rester dans la passe, sinon la
-    # note de réouverture ne serait jamais lue et les dormeurs jamais levés.
-    sleeping = sleeping_projects(listing)
-    for project in sorted(set(measures) | sleeping):
-        item = measures.get(project) or Measure(project)
+    for project in sorted(measures):
+        item = measures[project]
         split = _open_split(db, project)
         verdict = None
         notes = []

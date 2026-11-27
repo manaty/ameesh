@@ -191,10 +191,12 @@ class DispatchTests(unittest.TestCase):
         self.saved.append(json.loads(json.dumps(self.pending)))
 
     def test_dispatch_records_intent_before_side_effect_and_reconciles(self):
-        def run(project, args):
+        def run(project, args, reconcile=None):
             self.assertIn("ci/sql-invariant.yml", self.saved[-1]["dispatches"])
             self.assertIn("expected_sha=" + "a" * 40, args)
             self.assertIn("landing_target=" + "b" * 40, args)
+            # #8358: a 5xx on the dispatch is reconciled by its exact intent.
+            self.assertTrue(callable(reconcile))
             return ""
         with mock.patch.object(nx, "gh", side_effect=run):
             self.assertFalse(nx.workflow_step(self.project, self.pending, "sql-invariant.yml",

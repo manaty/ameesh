@@ -595,9 +595,70 @@ def ensure_ref(project, ref, sha):
 #: waiting for the next one.
 GH_AUTH_RETRY_DELAYS = (2.0, 5.0, 15.0, 40.0)
 
+#: #8358: a 5xx is a transport or forge blip, not an answer. Reads are replayed
+#: straight away; a write only once the forge state proves it did not happen,
+#: because a write whose response was lost may have been applied. The short
+#: exponential waits (1 + 3 + 7 s) cross the blip inside the same tick instead
+#: of failing the cutoff and waiting for the next minute.
+GH_TRANSIENT_STATUSES = frozenset((500, 502, 503, 504))
+GH_TRANSIENT_RETRY_DELAYS = (1.0, 3.0, 7.0)
 
-def gh(project, args):
-    """One release `gh` call, replaying a transient HTTP 401 with backoff.
+#: The answer of a write's `reconcile` when the forge state is unreadable or
+#: still ambiguous: never replay, the durable intent of the next tick decides.
+GH_WRITE_UNKNOWN = object()
+
+#: `gh` verbs whose second word makes the command a read. Anything else is a
+#: write, the conservative side for a retry: a read has no side effect.
+_GH_READ_VERBS = frozenset(("list", "view", "status", "checks", "diff",
+                            "download", "watch"))
+
+
+def _gh_write(args) -> bool:
+    """True when `args` may write at the forge, False for a pure read (#8358)."""
+    argv = [str(arg) for arg in args]
+    if not argv:
+        return True
+    if argv[0] == "api":
+        # `gh api` is a GET unless a method or a field/input is given.
+        return any(arg in ("-X", "--method", "-f", "--field", "-F",
+                           "--raw-field", "--input")
+                   or arg.startswith(("--method=", "--field="))
+                   for arg in argv[1:])
+    if len(argv) > 1 and argv[0] in ("run", "pr", "issue", "workflow",
+                                     "release", "repo", "search"):
+        return argv[1] not in _GH_READ_VERBS
+    return True
+
+
+class _GHWriteRefused(Exception):
+    """A write's read-back was itself refused by GitHub (#8358).
+
+    The inner `TransientReleaseError` keeps its `github_refusal`: a secondary
+    limit's `Retry-After` must reach `release._quota_wait_until`, never be
+    swallowed as an unknown write state.
+    """
+
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
+def _gh_reconcile(reconcile, project, command):
+    """The forge's verdict on an ambiguous write, or GH_WRITE_UNKNOWN (#8358)."""
+    if reconcile is None:
+        return GH_WRITE_UNKNOWN
+    try:
+        return reconcile()
+    except Exception as exc:  # noqa: BLE001 - an unreadable state is not "not done"
+        if getattr(exc, "github_refusal", None) is not None:
+            raise _GHWriteRefused(exc) from exc
+        print("%s: %s: state unreadable after a transient refusal, no replay: %s"
+              % (project.name, command, exc), file=sys.stderr, flush=True)
+        return GH_WRITE_UNKNOWN
+
+
+def gh(project, args, *, reconcile=None):
+    """One release `gh` call, replaying the transient refusals #8256/#8358.
 
     #8182: `GH_DEBUG=api` makes gh print the refusal's status, headers and
     body on stderr. The shared quota detector needs the original response (a
@@ -605,35 +666,108 @@ def gh(project, args):
     the same status to tell a transient authentication refusal from any other
     failure. The command and every HTTP status are journalised; after the
     last attempt the error names both, plus the attempt count.
+
+    A 401 is replayed with the long #8256 backoff: it is refused before any
+    effect. A 502/503/504 is replayed with the short exponential wait of
+    #8358; a write passes `reconcile`, which returns its output when the
+    forge proves the write happened, None when it proves it did not (replay),
+    and `GH_WRITE_UNKNOWN` when the state cannot tell (no blind replay). A
+    secondary limit is never replayed: its `Retry-After` reaches
+    `release._quota_wait_until` through the attached refusal.
+
+    #8358 (review B): when the read-back itself is refused by a secondary
+    limit, that inner refusal is the useful answer — it carries the
+    `Retry-After` — so it is preserved on the final error instead of being
+    flattened into an unknown write state. The mutation is still never
+    replayed: the durable intent decides on the next tick.
     """
     command = ("gh " + " ".join(args))[:200]
-    attempts = len(GH_AUTH_RETRY_DELAYS) + 1
+    write = _gh_write(args)
+    auth_attempts = len(GH_AUTH_RETRY_DELAYS)
+    transient_attempts = len(GH_TRANSIENT_RETRY_DELAYS)
+    auth_used = transient_used = attempt = 0
+    reconcile_refusal = reconcile_error = None
+    budget = auth_attempts + 1
     runner = rc.plan_github.Gh(env=dict(os.environ, GH_DEBUG="api"))
-    for attempt in range(1, attempts + 1):
+    while True:
+        attempt += 1
         code, out, err = runner.run(args)
         if not code:
             if attempt > 1:
                 print("%s: %s: recovered on attempt %d/%d" % (
-                    project.name, command, attempt, attempts),
+                    project.name, command, attempt, budget),
                     file=sys.stderr, flush=True)
             return out
         detail = rc.plan_github.gh_error_line(err, out)
         refusal = rc.plan_github.debug_refusal(err)
         status = refusal[0] if refusal is not None else None
-        if status != 401 or attempt == attempts:
-            break
-        delay = GH_AUTH_RETRY_DELAYS[attempt - 1]
-        print("%s: %s: HTTP 401 on attempt %d/%d, retry in %gs: %s" % (
-            project.name, command, attempt, attempts, delay, detail),
-            file=sys.stderr, flush=True)
-        time.sleep(delay)
+        if status == 401 and auth_used < auth_attempts:
+            delay = GH_AUTH_RETRY_DELAYS[auth_used]
+            auth_used += 1
+            budget = auth_attempts + 1
+            print("%s: %s: HTTP 401 on attempt %d/%d, retry in %gs: %s" % (
+                project.name, command, attempt, budget, delay, detail),
+                file=sys.stderr, flush=True)
+            time.sleep(delay)
+            continue
+        if status in GH_TRANSIENT_STATUSES:
+            budget = transient_attempts + 1
+            if write:
+                try:
+                    recovered = _gh_reconcile(reconcile, project, command)
+                except _GHWriteRefused as refused:
+                    reconcile_refusal = refused.error.github_refusal
+                    reconcile_error = str(refused.error)
+                    print("%s: %s: HTTP %d, read-back refused, no replay: %s"
+                          % (project.name, command, status, reconcile_error),
+                          file=sys.stderr, flush=True)
+                    break
+                if recovered is GH_WRITE_UNKNOWN:
+                    break
+                if isinstance(recovered, str):
+                    print("%s: %s: HTTP %d after %d attempt(s), write found "
+                          "done: %s" % (project.name, command, status, attempt,
+                                        recovered[:80]),
+                          file=sys.stderr, flush=True)
+                    return recovered
+            if transient_used < transient_attempts:
+                delay = GH_TRANSIENT_RETRY_DELAYS[transient_used]
+                transient_used += 1
+                print("%s: %s: HTTP %d on attempt %d/%d, retry in %gs: %s" % (
+                    project.name, command, status, attempt,
+                    transient_attempts + 1, delay, detail),
+                    file=sys.stderr, flush=True)
+                time.sleep(delay)
+                continue
+        if (status == 422 and write and "already exists" in detail.lower()):
+            # A replay whose first response was lost can lose the race with
+            # GitHub's own duplicate check: the created object is the answer.
+            try:
+                recovered = _gh_reconcile(reconcile, project, command)
+            except _GHWriteRefused as refused:
+                reconcile_refusal = refused.error.github_refusal
+                reconcile_error = str(refused.error)
+                print("%s: %s: HTTP 422, read-back refused, no replay: %s"
+                      % (project.name, command, reconcile_error),
+                      file=sys.stderr, flush=True)
+                break
+            if isinstance(recovered, str):
+                print("%s: %s: already exists, write found done: %s" % (
+                    project.name, command, recovered[:80]),
+                    file=sys.stderr, flush=True)
+                return recovered
+        break
     if status is None:
         text = "Nexlink GitHub operation failed: %s: %s" % (command, detail)
     else:
         text = ("Nexlink GitHub operation failed: %s: HTTP %d after %d "
                 "attempt(s): %s" % (command, status, attempt, detail))
+    if reconcile_error is not None:
+        text += "; the read-back was refused: %s" % reconcile_error
     error = rc.TransientReleaseError(text)
-    if refusal is not None:
+    if reconcile_refusal is not None:
+        error.github_refusal = reconcile_refusal
+    elif refusal is not None:
         error.github_refusal = refusal
     raise error
 
@@ -647,6 +781,18 @@ def runs(project, workflow, ref, sha):
         return json.loads(payload)
     except ValueError as exc:
         raise rc.TransientReleaseError("Nexlink workflow runs unreadable") from exc
+
+
+def _dispatch_candidates(project, workflow, ref, sha, since):
+    """The runs a dispatch could have created, from its durable intent (#3529)."""
+    candidates = []
+    for row in runs(project, workflow, ref, sha):
+        stamp = datetime.datetime.fromisoformat(row["createdAt"].replace("Z", "+00:00"))
+        if (row["headSha"] == sha and row["headBranch"] == ref
+                and row["event"] == "workflow_dispatch"
+                and stamp.timestamp() >= since - 1):
+            candidates.append(row)
+    return candidates
 
 
 def workflow_step(project, pending, workflow, *, staging, save, now):
@@ -670,17 +816,21 @@ def workflow_step(project, pending, workflow, *, staging, save, now):
             part = next(part for part in pending["ci_parts"] if part["workflow"] == workflow)
             if part.get("anchor_input"):
                 args += ["-f", part["anchor_input"] + "=" + pending["main"]]
-        gh(project, args)
+
+        def reconcile():
+            # #8358: a dispatch whose response was lost may have run: look for
+            # its exact run before resending. No run visible is not proof it
+            # did not run (the run list converges), so never replay on zero.
+            found = _dispatch_candidates(project, workflow, ref, pending["sha"],
+                                         attempt["intent_at"])
+            return "1" if len(found) == 1 else GH_WRITE_UNKNOWN
+
+        gh(project, args, reconcile=reconcile)
         attempt["accepted"] = True
         save()
         return False
-    candidates = []
-    for row in runs(project, workflow, ref, pending["sha"]):
-        stamp = datetime.datetime.fromisoformat(row["createdAt"].replace("Z", "+00:00"))
-        if (row["headSha"] == pending["sha"] and row["headBranch"] == ref
-                and row["event"] == "workflow_dispatch"
-                and stamp.timestamp() >= attempt["intent_at"] - 1):
-            candidates.append(row)
+    candidates = _dispatch_candidates(project, workflow, ref, pending["sha"],
+                                      attempt["intent_at"])
     if len(candidates) != 1:
         pending["waiting"] = "%s: %s; reconcile dispatch intent, never resend blindly" % (
             key, "run not visible" if not candidates else "ambiguous runs")
@@ -779,6 +929,24 @@ def migration_gate(cfg, project, pending):
     return evidence
 
 
+def pr_url(project, slug, head):
+    """The URL of the release PR on `main` for `head`, else None (#8358).
+
+    Used before opening, and again as the reconciliation of a `pr create`
+    whose 5xx left the creation ambiguous: a created PR is returned, never
+    opened twice.
+    """
+    rows = json.loads(gh(project, ["pr", "list", "-R", slug, "--head", head,
+                                  "--base", "main", "--state", "all", "--json", "url"]))
+    if not isinstance(rows, list):
+        raise rc.TransientReleaseError("Nexlink PR list unreadable")
+    for row in rows:
+        url = str(row.get("url") or "").strip() if isinstance(row, dict) else ""
+        if url:
+            return url
+    return None
+
+
 def publish(project, pending):
     sha, tag = pending["sha"], pending["tag"]
     ensure_ref(project, "refs/heads/release/" + pending["version"], sha)
@@ -797,14 +965,14 @@ def publish(project, pending):
         rc._git(project.repo, "push", project.remote, "refs/tags/" + tag, check=True)
     slug = rc.github_slug(project)
     head = "release/" + pending["version"]
-    existing = json.loads(gh(project, ["pr", "list", "-R", slug, "--head", head,
-                                      "--base", "main", "--state", "all", "--json", "url"]))
+    existing = pr_url(project, slug, head)
     if existing:
-        return existing[0]["url"]
+        return existing
     return gh(project, ["pr", "create", "-R", slug, "--head", head, "--base", "main",
                         "--title", "Nexlink " + pending["version"], "--body",
                         "Frozen final tree: %s. Staging only; production requires owner go."
-                        % sha]).strip()
+                        % sha],
+              reconcile=lambda: pr_url(project, slug, head)).strip()
 
 # #6020: staging handed to the bureau (`staging_handoff`). The cutoff runs
 # the final-tree CI, tags and reports, then opens one attestation lot

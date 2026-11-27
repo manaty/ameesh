@@ -329,24 +329,37 @@ def _alarm_key(text: str, holders: list[dict], tag: dict | None) -> str:
 QUOTA_RESUME_MARGIN_S = 60.0
 
 
-def _quota_probe_resource(text: str) -> str | None:
+def _quota_probe_resource(text: str, refusal=None) -> str | None:
     """The API bucket a GitHub refusal may have exhausted, else None (#8182).
 
-    The text only routes the probe: a GitHub 403/429 is graded by the shared
-    headers, not by its wording (REST vs GraphQL). Other errors — a git
-    timeout, a rights 404 — never buy a probe. The markers are the ones
-    `plan_github.SharedReads.note` already uses.
+    The text and the refusal's body only route the probe: a GitHub 403/429 is
+    graded by the shared headers, not by its wording (REST vs GraphQL). Other
+    errors — a git timeout, a rights 404 — never buy a probe. The markers are
+    the ones `plan_github.SharedReads.note` already uses. #8358: GraphQL's
+    secondary limit can arrive as HTTP 200 with `submitted too quickly` in the
+    body, so the refusal's body routes it to the `graphql` bucket as well.
     """
     from . import plan_github
     lowered = str(text or "").lower()
-    if ("github" not in lowered and "gh:" not in lowered
-            and "gh api" not in lowered):
+    body = ""
+    if refusal is not None:
+        try:
+            body = str(refusal[2] or "").lower()
+        except (IndexError, TypeError):
+            body = ""
+    blob = lowered + "\n" + body
+    if ("github" not in blob and "gh:" not in blob and "gh api" not in blob
+            and plan_github.GRAPHQL_SECONDARY_LIMIT_MARK not in blob):
         return None
-    if not any(mark in lowered for mark in (
+    if not any(mark in blob for mark in (
             "http 403", "http 429", "api rate limit exceeded",
-            plan_github.SECONDARY_LIMIT_MARK)):
+            plan_github.SECONDARY_LIMIT_MARK,
+            plan_github.GRAPHQL_SECONDARY_LIMIT_MARK)):
         return None
-    return "graphql" if "graphql:" in lowered else "core"
+    if (plan_github.GRAPHQL_SECONDARY_LIMIT_MARK in blob
+            or "graphql:" in lowered):
+        return "graphql"
+    return "core"
 
 
 def _quota_probe():
@@ -361,12 +374,15 @@ def _quota_wait_until(cfg, text: str, now: float, refusal=None) -> float | None:
 
     The original refusal (status, headers, body, when the wrapper could keep
     it) is graded first: only it carries a secondary limit's `Retry-After`.
-    Then the `/rate_limit` probe covers a primary budget. Both go through
+    #8358: GraphQL's secondary limit can be an HTTP 200 whose body says
+    `submitted too quickly`; the refusal's body routes it to the `graphql`
+    bucket, where `SharedReads.note` stores the wait. Then the `/rate_limit`
+    probe covers a primary budget. Both go through
     `plan_github.SharedReads.note`, the detector the CI and GitHub readers
     already use; nothing here parses quota headers by hand.
     """
     from . import plan_github
-    resource = _quota_probe_resource(text)
+    resource = _quota_probe_resource(text, refusal)
     if resource is None:
         return None
     state_dir = str(getattr(cfg, "state_dir", "") or "")
@@ -428,7 +444,7 @@ def _report_quota_wait(cfg, db, project, slot, state, text, cutoff_at, label,
     slot["quota_wait_until"] = resume_at
     slot["quota_wait_at"] = now
     slot["last_error_cutoff"] = cutoff_at
-    slot["last_error"] = "GitHub quota exhausted (reset at %s)" % time.strftime(
+    slot["last_error"] = "GitHub calls limited (window ends at %s)" % time.strftime(
         "%H:%M:%SZ", time.gmtime(reset))
     slot["last_error_at"] = now
     # A quota notice is not the previous alarm: a failure after the wait must
@@ -440,9 +456,10 @@ def _report_quota_wait(cfg, db, project, slot, state, text, cutoff_at, label,
     when = time.strftime("%H:%M:%SZ", time.gmtime(reset))
     resume = time.strftime("%H:%M:%SZ", time.gmtime(resume_at))
     body = (
-        "Coupe %s en attente : quota GitHub épuisé (recharge à %s, marge de "
-        "%ds). Reprise automatique à %s ; l'état de reprise est conservé et "
-        "les gestes déjà faits restent acquis. Aucune action attendue.\n\n"
+        "Coupe %s en attente : GitHub refuse les appels (quota épuisé ou "
+        "limite secondaire ; fin de fenêtre à %s, marge de %ds). Reprise "
+        "automatique à %s ; l'état de reprise est conservé et les gestes déjà "
+        "faits restent acquis. Aucune action attendue.\n\n"
         "Détail : %s"
         % (project.name, when, int(QUOTA_RESUME_MARGIN_S), resume, text))
     report = {"schema": release_cutoff.SCHEMA, "result": "waiting-quota",
