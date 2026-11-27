@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import harnesses
-from . import incident_routing
+from . import app_alerts, incident_routing
 from . import review as review_mod
 from . import reveil as reveil_mod
 from .config import NAME_RE, SESSION_POLICIES
@@ -1584,6 +1584,9 @@ class Application:
     id: str = ""
     responsible: str | None = None
     incident: incident_routing.IncidentPolicy | None = None
+    #: #8344 : le bloc `alerts:` — types d'alerte de l'application et routes
+    #: d'équipe (`app_alerts.parse_alerts`) ; None sans bloc
+    alerts: app_alerts.AlertPolicy | None = None
     valid: bool = True
 
     @property
@@ -1596,6 +1599,8 @@ class Application:
                "responsible": self.responsible, "valid": self.valid}
         if self.incident is not None:
             out["incident"] = self.incident.to_dict()
+        if self.alerts is not None:
+            out["alerts"] = self.alerts.to_dict()
         if self.fiche.untrusted:
             out["untrusted"] = True
         return out
@@ -5806,9 +5811,14 @@ class _Loader:
         for code, message in defects:
             self.add(code, ERROR, message, **where, **subject)
             valid = False
+        # #8344 : les types d'alerte de l'application et ses routes d'équipe
+        alerts, defects = app_alerts.parse_alerts(fiche.data.get("alerts"))
+        for code, message in defects:
+            self.add(code, ERROR, message, **where, **subject)
+            valid = False
         self.canon.applications.append(Application(
             fiche=fiche, id=ident or "", responsible=_text(fiche.data.get("responsible")),
-            incident=policy, valid=valid))
+            incident=policy, alerts=alerts, valid=valid))
 
     def _process_day(self, fiche: Fiche, key: str, where: dict, *, required: bool,
                      prefix: str = "process", label: str = "Process",
