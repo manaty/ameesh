@@ -102,6 +102,15 @@ KEPT = (
     # Admission/settlement use account + attempt_id, never this spelling.
     "credit_cycles.actor", "credit_requests.agent",
     "credit_reconciliations.actor",  # Operator reconciliation audit evidence.
+    # #8347 (0611): the lineage reservation's `agent` is a dated attribution
+    # of the admitted turn (the row lives 2 h and is deleted at settlement).
+    # The cap is summed by lineage `root`, and admission/settlement/replay use
+    # `spend_key`, never this spelling as a lookup key. A rename happens
+    # between turns (refused under a live lease); an orphan reservation left
+    # by a crashed turn expires and stops counting. Rewriting it would also
+    # need `root` (outside the rename contract) plus a write-time trigger, for
+    # no per-agent read.
+    "budget_lineage_reservations.agent",
     # #7066: the spelling is bound by the owner's signature. A renamed agent
     # needs a fresh decision; rewriting this index must not widen authority.
     "account_turn_exceptions.agent",
