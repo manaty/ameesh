@@ -464,6 +464,10 @@ FERMEES = {
     # #7697 (0601) : UID Kubernetes observé par un runner d'enfant pod ;
     # identité interne de la garde `pod-host-unknown`, fermée aux superviseurs.
     "runner_presence": {"profiles", "pod_uid"},
+    # #7911 (0610) : fenêtre de connexion du siège. Le superviseur lit l'état
+    # et les dates ; `id` (interne) et `terms_ref` (la preuve D2 du bureau,
+    # une référence de personne) restent fermés.
+    "tenant_logins": {"id", "terms_ref"},
     # #7034 (0571) : état privé d'un enfant restreint (politique d'outils et
     # de MCP, contexte borné, état des rapports) ; rien à superviser ici, le
     # rôle de base n'en lit aucune colonne, aucun GRANT ajouté.

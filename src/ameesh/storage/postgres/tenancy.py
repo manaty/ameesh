@@ -86,19 +86,82 @@ class Tenancy(interface.Tenancy):
             """
             SELECT t.host, t.tenant, t.unix_user, t.uid, t.runner_id, t.registered_by,
                    extract(epoch from t.registered_at)::float8 AS registered_ts,
-                   p.version, p.profiles,
+                   p.version, p.profiles, p.state,
                    extract(epoch from p.seen_at)::float8 AS seen_ts,
+                   l.expires_ts AS login_until_ts,
+                   l.terms_ref AS login_terms, l.opened_by AS login_opened_by,
                    extract(epoch from clock_timestamp())::float8 AS now_ts
               FROM host_tenants t
               LEFT JOIN runner_presence p ON p.host = t.host AND p.tenant = t.tenant
+              LEFT JOIN LATERAL (
+                  SELECT extract(epoch from l.expires_at)::float8 AS expires_ts,
+                         l.terms_ref, l.opened_by
+                    FROM tenant_logins l
+                   WHERE l.host = t.host AND l.tenant = t.tenant
+                     AND l.state = 'open' AND l.expires_at > now()
+                   ORDER BY l.id DESC
+                   LIMIT 1) l ON true
              WHERE %s::text IS NULL OR t.host = %s
              ORDER BY t.host, t.tenant
             """,
             (host, host))
         return [dict(row) for row in rows]
 
+    def login_active(self, host, tenant):
+        rows = self.db.query(
+            "SELECT ameesh_tenant_login_active(%s, %s) AS active", (host, tenant))
+        return bool(rows and rows[0]["active"])
+
+    def login_open(self, host, tenant, *, terms_ref, actor, ttl_s):
+        # Une fenêtre expirée du même tenant est fermée au passage : l'index
+        # partiel `tenant_logins_one_open` ne bloque que les fenêtres vivantes.
+        with self.db.transaction() as tx:
+            tx.execute(
+                """
+                UPDATE tenant_logins
+                   SET state = 'closed', closed_at = now(), closed_by = 'expiry'
+                 WHERE host = %s AND tenant = %s AND state = 'open'
+                   AND expires_at <= now()
+                """, (host, tenant))
+            rows = tx.query(
+                """
+                INSERT INTO tenant_logins
+                    (host, tenant, terms_ref, opened_by, expires_at)
+                VALUES (%s, %s, %s, %s, now() + make_interval(secs => %s))
+                ON CONFLICT (host, tenant) WHERE state = 'open' DO NOTHING
+                RETURNING id, host, tenant, state, terms_ref, opened_by,
+                          extract(epoch from opened_at)::float8 AS opened_ts,
+                          extract(epoch from expires_at)::float8 AS expires_ts
+                """, (host, tenant, terms_ref, actor, float(ttl_s)))
+            if rows:
+                return {"opened": True, **dict(rows[0])}
+            current = tx.query(
+                """
+                SELECT id, terms_ref, opened_by,
+                       extract(epoch from expires_at)::float8 AS expires_ts
+                  FROM tenant_logins
+                 WHERE host = %s AND tenant = %s AND state = 'open'
+                 ORDER BY id DESC
+                 LIMIT 1
+                """, (host, tenant))
+        return {"opened": False, "reason": "already-open",
+                "current": dict(current[0]) if current else None}
+
+    def login_close(self, host, tenant, *, actor):
+        rows = self.db.query(
+            """
+            UPDATE tenant_logins
+               SET state = 'closed', closed_at = now(), closed_by = %s
+             WHERE host = %s AND tenant = %s AND state = 'open'
+             RETURNING id, host, tenant, terms_ref, opened_by, closed_by,
+                       extract(epoch from opened_at)::float8 AS opened_ts,
+                       extract(epoch from expires_at)::float8 AS expires_ts
+            """, (actor, host, tenant))
+        return {"closed": bool(rows),
+                "login": dict(rows[0]) if rows else None}
+
     def beat(self, host, tenant, runner_id, *, uid, version, profiles=(),
-             pod_uid=None):
+             pod_uid=None, login_ack=False):
         # La présence n'existe que sous une liaison qui nomme CE runner : un
         # runner mal configuré ne se déclare pas présent pour un autre tenant.
         # #7694 (design 7633 §3.1) : l'UID du processus doit aussi être celui
@@ -108,32 +171,42 @@ class Tenancy(interface.Tenancy):
         # #7697 : pour un enfant porté par un pod, le UID Kubernetes observé
         # est publié ; la garde de réclamation exige qu'il soit celui de
         # `pod_hosts` (un pod recréé a un UID neuf, l'ancien ne réclame plus).
+        # #7911 : `login` n'est publié que sur l'acquittement du runner
+        # (`login_ack`, baux rendus et tours arrêtés) **et** tant que la
+        # fenêtre est ouverte : un battement ordinaire ne dit pas au bureau
+        # que le PVC peut être monté par le pod de connexion.
         published = [str(p) for p in profiles or () if p]
         pod_uid = str(pod_uid or "").strip() or None
         rows = self.db.query(
             """
             INSERT INTO runner_presence
-                (host, tenant, runner_id, uid, version, profiles, pod_uid, seen_at)
+                (host, tenant, runner_id, uid, version, profiles, pod_uid,
+                 state, seen_at)
             SELECT t.host, t.tenant, t.runner_id, %s, %s,
                    ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)),
-                   %s, clock_timestamp()
+                   %s,
+                   CASE WHEN %s
+                         AND ameesh_tenant_login_active(t.host, t.tenant)
+                        THEN 'login' ELSE 'running' END,
+                   clock_timestamp()
               FROM host_tenants t
              WHERE t.host = %s AND t.tenant = %s AND t.runner_id = %s
                AND t.uid = %s
             ON CONFLICT (host, tenant) DO UPDATE
                SET runner_id = excluded.runner_id, uid = excluded.uid,
                    version = excluded.version, profiles = excluded.profiles,
-                   pod_uid = excluded.pod_uid, seen_at = excluded.seen_at
+                   pod_uid = excluded.pod_uid, state = excluded.state,
+                   seen_at = excluded.seen_at
             RETURNING tenant
             """,
-            (uid, version, json.dumps(published), pod_uid, host, tenant,
-             runner_id, uid))
+            (uid, version, json.dumps(published), pod_uid, bool(login_ack),
+             host, tenant, runner_id, uid))
         return bool(rows)
 
     def presence(self, host, tenant):
         rows = self.db.query(
             """
-            SELECT p.runner_id, p.version, p.profiles, p.pod_uid, p.uid,
+            SELECT p.runner_id, p.version, p.profiles, p.pod_uid, p.uid, p.state,
                    t.uid AS binding_uid,
                    extract(epoch from p.seen_at)::float8 AS seen_ts,
                    extract(epoch from clock_timestamp())::float8 AS now_ts

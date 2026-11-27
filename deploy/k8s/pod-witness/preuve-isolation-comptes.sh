@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# #7694/#7695/#7698/#7699 (design 7633 §5.3, §6, §9.3) — témoin kind d'un
-# hôte pod : identité (UID du chart = UID du processus = entrée passwd),
-# montage (le PVC de B n'est pas dans le conteneur de A), permissions (le
-# dossier de comptes 0700 de B refuse l'UID de A, même monté en lecture
+# #7694/#7695/#7698/#7699/#7911 (design 7633 §5.3, §6, §7.3, §9.3) — témoin
+# kind d'un hôte pod : identité (UID du chart = UID du processus = entrée
+# passwd), montage (le PVC de B n'est pas dans le conteneur de A), permissions
+# (le dossier de comptes 0700 de B refuse l'UID de A, même monté en lecture
 # seule), superviseur (uid 10001, aucun volume de tenant, /tmp propre), base
 # (réclamation par tenant, attach, isolation UID, bail superviseur et préflight
 # de déplacement pod sur un PostgreSQL migré — 0601 comprise). En plus des cinq
@@ -15,7 +15,11 @@
 # dossier de comptes (témoin 3) : c'est le repli « compte re-login » quand le
 # PVC ne peut pas être ré-attaché, jamais une copie. #7699 ajoute le contrôle
 # du chart de référence : objets P6 acceptés par l'API, quota qui mord, PDB
-# 1 pod / 0 interruption, image par digest, preStop et labels.
+# 1 pod / 0 interruption, image par digest, preStop et labels. #7911 ajoute le
+# contrôle 6 bis : le pod de connexion dédié, son Role `pods/exec` borné à ce
+# seul pod par `resourceNames`, un `SubjectAccessReview` autorisé dessus et
+# refusé sur le pod partagé et sur celui d'un pair (jamais `pods/exec` sur le
+# pod partagé, design §7.3).
 #
 # Ce script est un geste de BUREAU/OPÉRATEUR, pas de l'agent intéressé : il
 # crée un cluster kind jetable, applique les gabarits du dossier, exécute les
@@ -97,7 +101,7 @@ render() {
 }
 
 if [ "$RENDER_ONLY" -eq 1 ]; then
-    echo "# #7694/#7695/#7698 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE"
+    echo "# #7694/#7695/#7698/#7911 témoin kind — UID_A=$UID_A UID_B=$UID_B fsGroup=$FS_GROUP image=$IMAGE git_image=$GIT_IMAGE"
     echo "# kubectl create namespace $NS && kubectl -n $NS apply -f -"
     echo "---"
     render temoin-pvc.yaml
@@ -109,6 +113,17 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
     render temoin-lecture.yaml
     echo "---"
     render temoin-canon.yaml
+    echo "---"
+    if python3 -c 'import yaml' 2>/dev/null; then
+        python3 "$REPO_ROOT/deploy/k8s/pod-login/render.py" \
+            --namespace "$NS" --host pod-alice --tenant human:alice \
+            --uid "$UID_A" --pvc pvc-temoin-a --pod ameesh-login-alice \
+            --node node-temoin \
+            --image "ameesh/temoin@sha256:$(printf '0%.0s' {1..64})" \
+            --subject User:temoin-alice
+    else
+        echo "# login: PyYAML absent, rendu non produit"
+    fi
     exit 0
 fi
 
@@ -508,6 +523,89 @@ check_base() {
     pass "base: réclamation par tenant, attach par utilisateur système, isolation UID, bail superviseur, présence pod et préflight de déplacement (#7698)"
 }
 
+# --- contrôle 6 bis (#7911) : connexion du siège, exec borné -----------------
+# Le pod partagé ne reçoit JAMAIS `pods/exec` : `kubectl exec` choisit le
+# conteneur dans la requête, hors de l'objet RBAC. Ce contrôle rend le pod de
+# connexion dédié (#7911, design 7633 §7.3), l'applique, puis interroge l'API
+# d'autorisation : le sujet du RoleBinding peut exec dans SON pod de connexion,
+# jamais dans le pod partagé ni dans celui d'un pair. Aucun conteneur n'y
+# tourne : le pod reste Pending et l'image n'est pas tirée, seule
+# l'autorisation est prouvée.
+check_login() {
+    local pod=ameesh-login-alice peer=ameesh-login-bob partage=ameesh-pod-alice
+    local user=temoin-alice node image manifest allowed denied
+    python3 -c 'import yaml' 2>/dev/null \
+        || { echo "SKIP login: PyYAML absent — contrôle non exécuté (non-concluant)" >&2; return 77; }
+    command -v python3 >/dev/null 2>&1 \
+        || { echo "SKIP login: python3 absent — contrôle non exécuté (non-concluant)" >&2; return 77; }
+    node=$(kubectl -n "$NS" get pod temoin-deux \
+        -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)
+    [ -n "$node" ] || fail "login: nœud du pod partagé illisible"
+    # Image épinglée par digest (le rendu l'exige), volontairement absente :
+    # ce contrôle porte sur le RBAC, pas sur l'exécution d'un harnais.
+    image="ameesh/temoin@sha256:$(printf '0%.0s' {1..64})"
+    manifest=$(python3 "$REPO_ROOT/deploy/k8s/pod-login/render.py" \
+        --namespace "$NS" --host pod-alice --tenant human:alice \
+        --uid "$UID_A" --pvc pvc-temoin-a --pod "$pod" --node "$node" \
+        --image "$image" --subject "User:$user") \
+        || fail "login: le rendu du pod de connexion a échoué"
+    # Un nom de pod partagé est refusé à la source : pas de pods/exec dessus.
+    if python3 "$REPO_ROOT/deploy/k8s/pod-login/render.py" \
+        --namespace "$NS" --host pod-alice --tenant human:alice \
+        --uid "$UID_A" --pvc pvc-temoin-a --pod "$partage" --node "$node" \
+        --image "$image" >/dev/null 2>&1; then
+        fail "login: le rendu accepte le pod partagé comme cible exec"
+    fi
+    grep -q 'resourceNames:' <<<"$manifest" \
+        || fail "login: Role sans resourceNames (exec non borné)"
+    if grep -Eq 'name: (admin|edit|cluster-admin)' <<<"$manifest"; then
+        fail "login: le rendu lie un rôle large"
+    fi
+    printf '%s\n' "$manifest" | kubectl -n "$NS" apply -f - >/dev/null \
+        || fail "login: les objets du pod de connexion sont refusés par l'API"
+    echo "trace: login: pod=$pod (Pending, image non tirée) role=$pod sujet=User:$user"
+    _sar_login() {
+        kubectl create -f - -o jsonpath='{.status.allowed}' <<EOF
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: $1
+  resourceAttributes:
+    namespace: $NS
+    verb: create
+    group: ""
+    resource: pods
+    subresource: exec
+    name: $2
+EOF
+    }
+    allowed=$(_sar_login "$user" "$pod") \
+        || fail "login: SubjectAccessReview impossible sur le pod de connexion"
+    [ "$allowed" = "true" ] \
+        || fail "login: exec refusé sur son propre pod de connexion ($allowed)"
+    for denied in "$partage" "$peer"; do
+        allowed=$(_sar_login "$user" "$denied") \
+            || fail "login: SubjectAccessReview impossible sur $denied"
+        [ "$allowed" = "false" ] \
+            || fail "login: exec autorisé sur $denied (attendu: refusé)"
+    done
+    [ "$(kubectl -n "$NS" get role "$pod" \
+        -o jsonpath='{.rules[0].resourceNames[0]}')" = "$pod" ] \
+        || fail "login: le Role ne nomme pas uniquement le pod de connexion"
+    [ "$(kubectl -n "$NS" get rolebinding "$pod" \
+        -o jsonpath='{.subjects[0].kind}:{.subjects[0].name}')" = "User:$user" ] \
+        || fail "login: le RoleBinding ne lie pas l'utilisateur attendu"
+    if kubectl -n "$NS" get rolebinding "$pod" -o yaml \
+        | grep -q 'kind: ServiceAccount'; then
+        fail "login: le RoleBinding lie un compte de service"
+    fi
+    # Le pod d'abord, puis ses droits : jamais l'inverse (design §7.3, étape 6).
+    kubectl -n "$NS" delete pod "$pod" --wait=true --timeout=120s >/dev/null
+    kubectl -n "$NS" delete role "$pod" rolebinding "$pod" serviceaccount ameesh-login \
+        --ignore-not-found --wait=true >/dev/null
+    pass "login: exec autorisé sur le seul pod de connexion ($pod) pour User:$user, refusé sur le pod partagé ($partage) et sur celui d'un pair ($peer), Role borné, aucun Role large ni compte de service"
+}
+
 
 docker pull --quiet "$IMAGE" >/dev/null
 docker pull --quiet "$GIT_IMAGE" >/dev/null
@@ -632,10 +730,17 @@ check_reference || ref_code=$?
 # Le contrôle base rend 77 quand le DSN manque : non-concluant, jamais vert.
 base_code=0
 check_base || base_code=$?
-if [ "$ref_code" -eq 77 ] || [ "$base_code" -eq 77 ]; then
-    echo "TEMOINS CONTENEURS PASSENT ; référence/base NON EXÉCUTÉE(S) (non-concluant)" >&2
+
+# Le contrôle login (#7911) rend 77 si PyYAML/python3 manque : non-concluant.
+login_code=0
+check_login || login_code=$?
+[ "$login_code" -eq 0 ] || [ "$login_code" -eq 77 ] || exit "$login_code"
+
+if [ "$ref_code" -eq 77 ] || [ "$base_code" -eq 77 ] || [ "$login_code" -eq 77 ]; then
+    echo "TEMOINS CONTENEURS PASSENT ; référence/base/login NON EXÉCUTÉE(S) (non-concluant)" >&2
     exit 77
 fi
 [ "$base_code" -eq 0 ] || exit "$base_code"
+[ "$login_code" -eq 0 ] || exit "$login_code"
 
-echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base, canon #7694 ; #7698 : déplacement pod partagé -> dédié, PVC ré-attaché, présence pod ; #7699 : chart de référence, quota, PDB, digest, preStop)"
+echo "TOUS LES TEMOINS PASSENT (#7695 : identité, montage, permissions, superviseur, base, canon #7694 ; #7698 : déplacement pod partagé -> dédié, PVC ré-attaché, présence pod ; #7699 : chart de référence, quota, PDB, digest, preStop ; #7911 : pod de connexion, exec borné à son seul pod, pod partagé et pair refusés)"

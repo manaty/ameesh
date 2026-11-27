@@ -5600,27 +5600,54 @@ class Tenancy(Domain):
     @abc.abstractmethod
     def bindings(self, host: str | None = None) -> list[dict]:
         """Liaisons (avec la présence de leur runner : `seen_ts`, `version`,
-        `profiles`)."""
+        `profiles`, `state`) et, #7911, la fenêtre `login` ouverte
+        (`login_until_ts`, `login_terms`, `login_opened_by`)."""
+
+    @abc.abstractmethod
+    def login_active(self, host: str, tenant: str) -> bool:
+        """#7911 : une fenêtre de connexion du siège est ouverte et non
+        expirée pour ce tenant (la garde SQL `ameesh_tenant_login_active`)."""
+
+    @abc.abstractmethod
+    def login_open(self, host: str, tenant: str, *, terms_ref: str,
+                   actor: str, ttl_s: float) -> dict:
+        """#7911 : ouvre la fenêtre `login` d'un tenant (geste humain/avatar,
+        `terms_ref` = preuve citable des conditions du fournisseur, D2).
+
+        Une fenêtre expirée du même tenant est fermée au passage ; une fenêtre
+        encore ouverte est refusée (`tenant-login-already-open`). Rend la
+        ligne (id, host, tenant, terms_ref, opened_by, opened_at, expires_at).
+        """
+
+    @abc.abstractmethod
+    def login_close(self, host: str, tenant: str, *, actor: str) -> dict:
+        """#7911 : ferme la fenêtre `login` ouverte du tenant ; rend
+        `{closed: bool, ...}` (idempotent si aucune fenêtre ouverte)."""
 
     @abc.abstractmethod
     def beat(self, host: str, tenant: str, runner_id: str, *, uid: int | None,
              version: str | None, profiles: Sequence[str] = (),
-             pod_uid: str | None = None) -> bool:
+             pod_uid: str | None = None, login_ack: bool = False) -> bool:
         """Battement du runner d'un tenant ; faux sans liaison qui le nomme.
 
         #7108 : `profiles` publie les profils de compte `harnais/compte` que
         ce runner peut offrir (noms seulement, jamais un chemin ni un secret).
         #7697 : `pod_uid` est le UID Kubernetes observé par un runner d'enfant
         porté par un pod ; la garde de réclamation l'exige égal à
-        `pod_hosts.pod_uid` (les hôtes non pod l'ignorent)."""
+        `pod_hosts.pod_uid` (les hôtes non pod l'ignorent).
+        #7911 : `login_ack` est l'acquittement du runner — baux rendus et
+        tours arrêtés. L'état `state` ne vaut `login` que si la fenêtre
+        `tenant_logins` est encore ouverte **et** que cet acquittement est
+        vrai : un simple battement pendant la fenêtre ne suffit pas à dire au
+        bureau que le PVC peut être monté par le pod de connexion."""
 
     @abc.abstractmethod
     def presence(self, host: str, tenant: str) -> dict | None:
         """Dernier battement du tenant sur l'hôte (`seen_ts`, `now_ts`,
-        `runner_id`, `profiles`, `pod_uid`, `uid` observé et `binding_uid` de
-        `host_tenants`), ou None. #7698 : le lecteur compare l'UID observé à
-        celui de la liaison ; sur un hôte enfant, `pod_uid` doit encore être
-        celui de `pod_hosts`."""
+        `runner_id`, `profiles`, `pod_uid`, `uid` observé, `binding_uid` de
+        `host_tenants` et #7911 `state`), ou None. #7698 : le lecteur compare
+        l'UID observé à celui de la liaison ; sur un hôte enfant, `pod_uid`
+        doit encore être celui de `pod_hosts`."""
 
 
 class PodProvisioning(Domain):

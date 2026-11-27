@@ -26,30 +26,34 @@ Sources et limites :
 | témoin `kind` (contrôle de référence inclus) et tests sans cluster | témoin rejoué sur `tpk-stg`, déplacement réel, connexion du siège |
 | ce runbook de qualification et la passation | exécution du runbook, décisions D2/D4 (owner), recette |
 
-**Hors périmètre, décidé par l'owner** : l'abonnement (`subscription`) dans
-un pod n'est pas livré. La carte Host reste en `credential_modes: [api-key]`
-avec `runtime.isolation_ref` citable ; `canon check` refuse
-`subscription`/`allow_subscription` sur un pod
-(`host-pod-subscription-unproven`). D1 (Q2 bis), D2 (conditions du
-fournisseur) et D4 (PVC monté par l'admin du cluster) restent à l'owner ; la
-suite est #7911. D3 (namespace réseau/IPC partagé pour les inactifs) et D5
-(visibilité mémoire évaluée par tenant) ont été tranchées le 20/11.
+**Depuis #7911** (décision owner #233251, option a, 27/11 00:18Z) : Q2 bis
+ouvre `subscription` sur un hôte pod à volume par tenant, sous les conditions
+de la carte Host (`allow_subscription`, `require_isolation`,
+`account_isolation: per-tenant-volume`, `runtime.isolation_ref` citable). D2
+reste une condition **humaine par personne** : le bureau vérifie les
+conditions du fournisseur avec la personne avant toute connexion de siège et
+consigne la preuve sur le lot ; D4 est accepté (l'admin du cluster est dans
+la frontière de confiance). La connexion du siège passe par un pod dédié
+([`connexion-siege-pod.md`](connexion-siege-pod.md)) ; D3 (namespace
+réseau/IPC partagé pour les inactifs) et D5 (visibilité mémoire évaluée par
+tenant) ont été tranchées le 20/11.
 
 ## 2. Décisions et replis portés par le chart
 
 | # | Décision | État au départ de P6 | Ce que le chart fait |
 |---|---|---|---|
-| D1 | Q2 bis : abonnement sur un pod à volume par tenant | non tranché, #7911 | `api-key` seulement ; aucun `subscription` |
-| D2 | conditions du fournisseur sans humain devant l'écran | non tranché | aucune clé de siège dans le pod |
+| D1 | Q2 bis : abonnement sur un pod à volume par tenant | tranché oui, #233251 (27/11) | `subscription` admis si volume par tenant + `isolation_ref` citable ; `api-key` reste le repli |
+| D2 | conditions du fournisseur sans humain devant l'écran | oui sous condition (27/11) | fenêtre `login` avec preuve citable (`--terms`), vérification par personne ; aucune clé de siège hors connexion |
 | D3 | namespace réseau/IPC commun pour les inactifs | tranché oui (20/11) | pas de garde intra-pod ; limite §5.1 documentée |
-| D4 | PVC monté par l'admin du cluster | non tranché | volume par tenant, pas de revendication de protection contre l'admin |
+| D4 | PVC monté par l'admin du cluster | oui (27/11) | volume par tenant ; l'admin du cluster est dans la frontière de confiance, limite assumée |
 | D5 | visibilité mémoire sur un hôte partagé | tranché par tenant (20/11) | `isolation_ref` et témoin de compte ; pas de garde mémoire |
 | D6 | enfant : relais ou clé d'API | repli clé d'API | P4, hors de ce chart |
 | D7 | shared ↔ dedicated : PVC ré-attaché ou re-login | repli re-login | P5 ; `pod: reattach` est une condition, le bureau confirme le volume |
 | D8 | UID stable par personne ou par hôte | repli UID par hôte | `pod_plan()` dérive un UID stable ; le battement vérifie `host_tenants.uid` |
 
-Le chart ne suppose **aucune** de ces décisions au-delà de son repli. Si une
-décision change (D1/D2/D4), elle rouvre une tranche, pas ce runbook.
+Le chart ne suppose **aucune** de ces décisions au-delà de son repli. La
+connexion du siège est un lot distinct (#7911) ; Q-TPK qualifie le RBAC réel
+et la connexion d'une personne sur `tpk-stg`.
 
 ## 3. Ce que le chart livre
 
@@ -232,8 +236,10 @@ palier ; le digest est la seule référence qui rend le retour arrière exact.
 - [ ] mise à jour puis `rollout undo` : retour au digest précédent, schéma
       compatible ;
 - [ ] Secrets hors dépôt, aucun secret dans le dépôt ni dans un journal ;
-- [ ] limites et décisions ouvertes (D1/D2/D4, abonnement #7911) écrites
-      noir sur blanc dans le lot Q-TPK.
+- [ ] décisions D2/D4 tracées **par personne** avec leur preuve sur le lot,
+      et connexion du siège rejouée selon
+      [`connexion-siege-pod.md`](connexion-siege-pod.md) (D1/Q2 bis : carte
+      Host pod avec `isolation_ref` et `subscription`).
 
 La passation est **faite** quand TPK/IMA peut rejouer seuls la séquence 5–8
 sur un namespace neuf et que les critères ci-dessus sont consignés. Un
@@ -254,8 +260,10 @@ série s'arrête au chart et à la preuve `kind` ; Q-TPK porte la plateforme.
   revendiquée.
 - **Intra-pod** : les conteneurs partagent le namespace réseau/IPC ; pas de
   NetworkPolicy intra-pod. La parade est le pod dédié (design §5.1).
-- **Abonnement** : aucune clé de siège dans le pod tant que D2/D4 ne sont pas
-  tranchées (#7911). Ne pas déduire un accord des conditions générales.
+- **Abonnement** : D2/D4 sont tranchées (#233251), mais D2 reste une
+  vérification **par personne** avant chaque connexion de siège ; ne pas
+  déduire un accord des conditions générales. La fenêtre `login` exige une
+  preuve citable et le pod de connexion dédié (design §7.3).
 - **Métadonnées** : `0.0.0.0/0` reçoit `except: 169.254.0.0/16` ; un CNI qui
   ignore `except` doit être signalé (le test de connexion le voit).
 - **Une seule réplique** : un drain de nœud attend le PDB ; l'opérateur

@@ -500,7 +500,14 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'registered_at'
     ]),
     ('runner_presence', ARRAY[
-        'host', 'tenant', 'runner_id', 'uid', 'version', 'seen_at'
+        'host', 'tenant', 'runner_id', 'uid', 'version', 'seen_at', 'state'
+    ]),
+    -- #7911 (0610) : fenêtre de connexion du siège d'un tenant pod — qui l'a
+    -- ouverte, l'état et les dates ; `terms_ref` (la preuve D2 du bureau)
+    -- reste fermée, aucun secret mais une preuve de personne.
+    ('tenant_logins', ARRAY[
+        'host', 'tenant', 'state', 'opened_by', 'opened_at', 'expires_at',
+        'closed_at', 'closed_by'
     ]),
     -- #7695 (0599) : bail d'un seul superviseur par hôte pod — détenteur,
     -- époque de garde et dates ; aucun contenu de compte, aucun secret.

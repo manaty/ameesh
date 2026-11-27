@@ -68,6 +68,16 @@ POD_CHILD_UID_SPAN = 20000
 POD_CHILD_SECRET_PREFIX = "ameesh-child-"
 #: nom du template de pod enfant enregistré par le pourvoyeur.
 POD_CHILD_TEMPLATE = "ameesh-child"
+#: #7911 (design 7633 §7.3) : une fenêtre de connexion du siège dure au plus
+#: 30 min — la même borne est dans `tenant_logins` (0610), et le pod de
+#: connexion porte `activeDeadlineSeconds` sous cette borne.
+LOGIN_TTL_MAX_S = 1800.0
+LOGIN_TTL_DEFAULT_S = 1800.0
+#: Une preuve D2 citable : décision/mail/lot (`#233251`), référence
+#: `owner/repo#123`, ou `card@commit`. Une phrase libre va dans la note du
+#: lot, jamais dans la colonne : la preuve est une référence, pas un récit.
+LOGIN_TERMS_RE = re.compile(
+    r"^(?:[A-Za-z0-9][A-Za-z0-9._/-]*[:#@][A-Za-z0-9._/#@-]+|#?[0-9]+)\Z")
 
 
 class TenancyError(ValueError):
@@ -660,7 +670,8 @@ def published_profiles(cfg) -> list[str]:
     return sorted(out)
 
 
-def beat(cfg, db, *, version: str | None = None) -> bool:
+def beat(cfg, db, *, version: str | None = None,
+         login_ack: bool = False) -> bool:
     """Battement du runner d'un tenant (`runner_presence`) ; faux sans tenant
     configuré ou sans liaison qui nomme ce runner (le superviseur n'a pas
     encore enregistré le tenant, ou l'identifiant diffère). Le battement
@@ -669,7 +680,10 @@ def beat(cfg, db, *, version: str | None = None) -> bool:
     #7697 : sur un hôte enfant, le battement publie aussi le UID Kubernetes
     observé et refuse (`pod-host-unknown`, fail closed) si la ligne
     `pod_hosts` manque, est expirée ou ne porte pas ce UID. Un hôte ordinaire
-    n'a pas de ligne et garde le comportement de #7108."""
+    n'a pas de ligne et garde le comportement de #7108.
+    #7911 : `login_ack` n'est posé par l'exécuteur qu'après avoir arrêté ses
+    tours et rendu ses baux ; sans lui, un battement pendant la fenêtre laisse
+    `state=running` et le bureau n'ouvre pas le pod de connexion."""
     tenant = runner_tenant(cfg)
     if not tenant:
         return False
@@ -684,7 +698,75 @@ def beat(cfg, db, *, version: str | None = None) -> bool:
     return storage.of(db).tenancy.beat(
         cfg.host, tenant, cfg.runner, uid=os.getuid(),
         version=str(version or "") or None, profiles=published_profiles(cfg),
-        pod_uid=pod_uid)
+        pod_uid=pod_uid, login_ack=login_ack)
+
+
+def login_active(db, host: str, tenant: str) -> bool:
+    """#7911 : une fenêtre de connexion du siège est ouverte et non expirée
+    pour ce tenant (la garde SQL `ameesh_tenant_login_active`, 0610)."""
+    return storage.of(db).tenancy.login_active(host, check_tenant(tenant))
+
+
+def login_open(db, host: str, tenant: str, *, terms_ref: str, actor: str,
+               ttl_s: float = LOGIN_TTL_DEFAULT_S) -> dict:
+    """Ouvre la fenêtre `login` d'un tenant pod (geste humain/avatar).
+
+    `terms_ref` est la preuve citable de la vérification D2 (conditions du
+    fournisseur avec la personne, décision owner #233251) : sans elle, aucune
+    connexion de siège. Le runner du tenant rend ses baux et son battement
+    publie `login` ; le bureau attend cet acquittement (`host tenant list`)
+    avant de créer le pod de connexion dédié. Refuse un tenant non lié et une
+    fenêtre déjà ouverte ; la durée est bornée à 30 min (design §7.3)."""
+    tenant = check_tenant(tenant)
+    ref = str(terms_ref or "").strip()
+    if not ref or len(ref) > 300 or not LOGIN_TERMS_RE.match(ref):
+        raise TenancyError(
+            "tenant-login-terms-invalid",
+            "a citable proof of the supplier-terms verification is required "
+            "(D2, decision #233251): e.g. `#233251`, `owner/repo#123` or "
+            "`mail:234666`; the narrative goes in the lot note")
+    try:
+        ttl = float(ttl_s)
+    except (TypeError, ValueError):
+        ttl = 0.0
+    if not (30.0 <= ttl <= LOGIN_TTL_MAX_S):
+        raise TenancyError(
+            "tenant-login-ttl-invalid",
+            "a seat-login window lasts between 30 s and %d s (design 7633 §7.3)"
+            % int(LOGIN_TTL_MAX_S))
+    bound = {row.get("tenant") for row in
+             storage.of(db).tenancy.bindings(host)}
+    if tenant not in bound:
+        raise TenancyError(
+            "tenant-not-bound",
+            "host %s: %s has no binding (run `host tenant add --pod "
+            "--register` first)" % (host, tenant))
+    result = storage.of(db).tenancy.login_open(
+        host, tenant, terms_ref=ref, actor=actor, ttl_s=ttl)
+    if not result.get("opened"):
+        current = result.get("current") or {}
+        raise TenancyError(
+            "tenant-login-already-open",
+            "host %s: %s already has a seat-login window (until %s, by %s); "
+            "run `host tenant logout` first"
+            % (host, tenant, _iso(current.get("expires_ts")),
+               current.get("opened_by") or "?"))
+    return result
+
+
+def login_close(db, host: str, tenant: str, *, actor: str) -> dict:
+    """Ferme la fenêtre `login` du tenant (idempotent : `closed: False` s'il
+    n'y en a pas). Le pod de connexion est supprimé avant, par le bureau."""
+    return storage.of(db).tenancy.login_close(
+        host, check_tenant(tenant), actor=actor)
+
+
+def _iso(ts) -> str:
+    """Horodatage UTC lisible (secondes) pour les messages et `host list`."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return "?"
 
 
 def presence_reason(db, role: Mapping, host: str, *, now: float,
@@ -893,7 +975,10 @@ def describe(rows: list[Mapping[str, Any]]) -> list[str]:
 
     #7695 : les profils de compte publiés par le battement (`harnais/compte`,
     jamais un chemin ni un secret) sont affichés, pour voir d'un coup d'œil
-    quels harnais un tenant peut offrir au déplacement."""
+    quels harnais un tenant peut offrir au déplacement.
+    #7911 : la fenêtre de connexion du siège est montrée (preuve D2 citée,
+    auteur, échéance) ; `runner=login` est l'acquittement du runner — le
+    bureau attend cet état avant de créer le pod de connexion."""
     out = []
     for row in rows:
         seen = row.get("seen_ts")
@@ -901,9 +986,16 @@ def describe(rows: list[Mapping[str, Any]]) -> list[str]:
                else "%ds ago" % int(max(0.0, float(row.get("now_ts") or 0) - float(seen))))
         profiles = "  profiles=%s" % ",".join(row.get("profiles") or ()) \
             if row.get("profiles") else ""
-        out.append("%s  %s  user=%s uid=%s runner=%s  seen %s%s%s" % (
+        login = ""
+        if row.get("login_until_ts") is not None:
+            login = "  login until %s terms=%s by=%s" % (
+                _iso(row.get("login_until_ts")), row.get("login_terms") or "?",
+                row.get("login_opened_by") or "?")
+        state = "  state=%s" % row["state"] if row.get("state") else ""
+        out.append("%s  %s  user=%s uid=%s runner=%s  seen %s%s%s%s%s" % (
             row["host"], row["tenant"], row["unix_user"], row["uid"], row["runner_id"],
-            age, "  (%s)" % row["version"] if row.get("version") else "", profiles))
+            age, "  (%s)" % row["version"] if row.get("version") else "", profiles,
+            state, login))
     return out
 
 
@@ -1003,6 +1095,27 @@ def main(argv=None) -> int:
     drop.add_argument("--host")
     drop.add_argument("--actor",
                       help="who removes (human:<id> or avatar) from an unbound terminal")
+    # #7911 : connexion du siège. Le geste est humain/avatar, jamais un agent
+    # ni le runner du tenant ; `--terms` cite la preuve D2 (conditions du
+    # fournisseur vérifiées avec la personne, décision owner #233251).
+    login = commands.add_parser(
+        "login", help="open a seat-connection window for a pod tenant (D2 proof)")
+    login.add_argument("tenant", help="human:<id>")
+    login.add_argument("--host", help="pod host (default: this host)")
+    login.add_argument("--terms", required=True,
+                       help="citable proof of the supplier-terms verification "
+                            "(D2): e.g. `#233251`, `owner/repo#123`, `mail:234666`")
+    login.add_argument("--ttl", type=int, default=int(LOGIN_TTL_DEFAULT_S),
+                       help="window in seconds (30..%d, default %d)"
+                            % (int(LOGIN_TTL_MAX_S), int(LOGIN_TTL_DEFAULT_S)))
+    login.add_argument("--actor",
+                       help="who opens (human:<id> or avatar) from an unbound terminal")
+    logout = commands.add_parser(
+        "logout", help="close the seat-connection window of a tenant")
+    logout.add_argument("tenant", help="human:<id>")
+    logout.add_argument("--host", help="pod host (default: this host)")
+    logout.add_argument("--actor",
+                        help="who closes (human:<id> or avatar) from an unbound terminal")
     args = parser.parse_args(argv)
     cfg = config.load()
     host = args.host or cfg.host
@@ -1051,6 +1164,21 @@ def main(argv=None) -> int:
                                "tenant bindings: the host supervisor does"
                                % runner_tenant(cfg))
         actor = operator(cfg, db, args.actor)
+        if args.command in ("login", "logout"):
+            if args.command == "login":
+                runtime = pod_runtime(cfg, host)
+                if runtime is None or getattr(runtime, "kind", "") != "pod":
+                    raise TenancyError(
+                        "tenant-not-pod",
+                        "host %s does not declare `policy.runtime.kind: pod` "
+                        "in the canon (design 7633 §7.1); a seat connection "
+                        "runs in a dedicated pod" % host)
+                result = login_open(db, host, args.tenant, terms_ref=args.terms,
+                                    actor=actor, ttl_s=args.ttl)
+            else:
+                result = login_close(db, host, args.tenant, actor=actor)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
         if args.command == "add":
             if args.pod:
                 # Le plan a déjà vérifié la fiche Host ; l'UID vient du chart

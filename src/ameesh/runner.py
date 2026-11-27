@@ -14104,6 +14104,61 @@ class Runner:
             out.extend(done)
         return out
 
+    def _tenant_login_pass(self) -> bool:
+        """#7911 : une fenêtre de connexion du siège est ouverte pour ce tenant.
+
+        Le runner arrête les tours, rend les baux de ses workers et cesse de
+        réclamer, pour que le pod de connexion dédié monte le PVC sans
+        écriture concurrente du harnais (design 7633 §7.3). Une fois les baux
+        rendus, il pose `_tenant_login_drained` : le battement suivant publie
+        `login` dans `runner_presence` (`login_ack`), et le bureau attend cet
+        acquittement avant de créer le pod de connexion. Le drapeau est retiré
+        à la fermeture de la fenêtre, et le battement republie `running`. Rend
+        True si la passe doit s'arrêter là : aucune prise, aucun déplacement
+        pendant la connexion. Une lecture impossible ne retient pas la passe —
+        la garde SQL `ameesh_tenant_claim_ok` refuse de toute façon la
+        réclamation pendant la fenêtre."""
+        from . import tenancy
+        tenant = tenancy.runner_tenant(getattr(self, "cfg", None))
+        if not tenant:
+            return False
+        try:
+            active = tenancy.login_active(self.db, self.host, tenant)
+        except db_mod.DbError as exc:
+            log_async("tenant %s: seat-login state unreadable (%s)"
+                      % (tenant, db_mod.brief(exc)))
+            return False
+        if not active:
+            if getattr(self, "_tenant_login_reported", False):
+                self._tenant_login_reported = False
+                log_async("tenant %s: seat login closed, claims resume" % tenant)
+            self._tenant_login_drained = False
+            return False
+        if not getattr(self, "_tenant_login_reported", False):
+            self._tenant_login_reported = True
+            log_async("tenant %s: seat login open, releasing leases and "
+                      "pausing claims" % tenant)
+        with self.lock:
+            workers = list(self.workers.values())
+        for worker in workers:
+            stopping = getattr(worker, "stopping", None)
+            if stopping is not None:
+                stopping.set()
+            wake = getattr(worker, "wake", None)
+            if wake is not None:
+                wake.set()
+            stop_group = getattr(worker, "stop_group_now", None)
+            if callable(stop_group):
+                stop_group("tenant seat login", grace=3.0)
+        for worker in workers:
+            release = getattr(worker, "release_lease", None)
+            if callable(release):
+                release()
+        # Le harnais est arrêté (SIGTERM puis SIGKILL dans la grâce) et les
+        # baux sont rendus : le battement peut maintenant annoncer `login`.
+        self._tenant_login_drained = True
+        return True
+
     @migrations.writer_tick
     def sweep(self) -> None:
         self.report_liveness()
@@ -14163,6 +14218,12 @@ class Runner:
         # pas avec une logique ancienne. Il précède la reprise des agents : la
         # file est à jour avant les nouvelles prises.
         self.release_stopped_lots_once()
+        # #7911 : une fenêtre de connexion du siège ouverte suspend les prises
+        # et les déplacements du tenant ; le runner a rendu ses baux et son
+        # battement publie `login` (design 7633 §7.3). Rien n'est pris tant
+        # que le bureau n'a pas fermé la fenêtre.
+        if _tenant_runner(self) and self._tenant_login_pass():
+            return
         # #804 : la prise au repos est déclenchée ici, par l'exécuteur de
         # l'hôte, et non par un `ameesh notify` central (mêmes garde-fous).
         # Avant la réclamation : le lot pris et son courrier partent dans la
@@ -15801,7 +15862,9 @@ class Runner:
             try:
                 from .scoped_db import ScopedDb
                 beat_db = ScopedDb(self.cfg, family="runner.scoped.resource")
-                if not tenancy.beat(self.cfg, beat_db):
+                if not tenancy.beat(
+                        self.cfg, beat_db,
+                        login_ack=getattr(self, "_tenant_login_drained", False)):
                     log_async("tenant %s: no binding names runner %s on %s "
                               "(ameesh host tenant add --register)"
                               % (tenancy.runner_tenant(self.cfg), self.cfg.runner,

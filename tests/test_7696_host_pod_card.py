@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#7696 (P3 de #7633) : carte Host d'un pod, sans abonnement.
+"""#7696 (P3 de #7633) : carte Host d'un pod, socle sans abonnement.
 
 Décision owner #228416 b (signée le 20/11 à 10:42Z, approval #401) : la
 tranche P3 part **sans abonnement**. La carte Host d'un pod reste en
@@ -8,17 +8,17 @@ tranche P3 part **sans abonnement**. La carte Host d'un pod reste en
 cluster (D4) restent réservés à l'owner, et la connexion du siège comme l'état
 `login` sont partis dans #7911.
 
-Le design `docs/design/7633-hote-avatars-pod.md` §7.1 dit qu'un abonnement
-n'est admis sur un pod qu'avec Q2 bis *et* la référence d'isolation ; tant que
-D1/D2/D4 ne sont pas tranchées, la traduction mécanique est un refus :
-`host-pod-subscription-unproven`. L'opt-in général des hôtes partagés
-(#5901/#7705, `allow_subscription` + `require_isolation`) ne doit pas rouvrir
-cette porte dans le dos de la décision.
+#7911 a rouvert la partie abonnement (décision owner #233251, option a) : le
+design `docs/design/7633-hote-avatars-pod.md` §7.1 admet `subscription` sur un
+pod avec Q2 bis, un volume par tenant et une référence d'isolation citable.
+Les tests ci-dessous gardent les refus qui restent vrais (sans opt-in, sans
+référence, template) et vérifient l'ouverture étroite ; l'état `login` et le
+pod de connexion sont testés par `tests/test_7911_connexion_siege.py`.
 
 Le témoin A↛B « sur le compte » et le contrôle 6 du design §5.3 restent des
 gestes de bureau/opérateur (`deploy/k8s/pod-witness/`) : ce module vérifie leur
 partie statique disponible sans cluster, et refuse par le canon le seul chemin
-qui les contournerait — un siège déclaré dans la carte d'un pod.
+qui les contournerait — un siège déclaré sans les preuves de Q2 bis.
 """
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ class _CardCase(test_canon._TmpMixin, unittest.TestCase):
 
 
 class PodCardWithoutSubscriptionTest(_CardCase):
-    """P3 sans abonnement : la carte d'un pod n'admet que `api-key`."""
+    """P3 bis : la carte d'un pod ouvre le siège aux conditions de Q2 bis."""
 
     def test_carte_api_key_avec_isolation_ref_valide(self):
         loaded = self.card()
@@ -85,47 +85,51 @@ class PodCardWithoutSubscriptionTest(_CardCase):
     def test_abonnement_refuse_sans_opt_in(self):
         loaded = self.card(credential_modes=("api-key", "subscription"))
         errors = test_canon.codes(canon.validate(loaded), canon.ERROR)
-        # Le refus propre au pod nomme la décision et le lot qui rouvrira la
-        # partie abonnement ; le constat générique des hôtes partagés reste
-        # vrai (Q2, #224052) mais ne dit pas pourquoi le pod est fermé.
+        # Le refus propre au pod nomme Q2 bis ; le constat générique des
+        # hôtes partagés reste vrai (Q2, #224052) sans l'opt-in explicite.
         self.assertIn("host-pod-subscription-unproven", errors)
         self.assertIn("host-shared-credential-mode", errors)
         host = loaded.host("pod-banc")
         reasons = canon.placement_violations(
             {"responsible": ALICE, "harness": "codex", "provider": "openai",
              "credential_mode": "subscription"}, host)
-        self.assertTrue(any("pod host admits" in reason for reason in reasons),
-                        reasons)
+        self.assertTrue(any("Q2 bis" in reason for reason in reasons), reasons)
 
-    def test_abonnement_refuse_meme_avec_l_opt_in_general(self):
-        # #5901/#7705 ouvrent `subscription` sur un hôte partagé VM quand la
-        # fiche porte l'opt-in. Sur un pod, la décision #228416 b ne l'ouvre
-        # pas : l'opt-in ne doit pas contourner le refus de la carte.
+    def test_abonnement_admis_avec_l_opt_in_et_les_conditions(self):
+        # #7911 (Q2 bis, décision #233251) : l'opt-in explicite des hôtes
+        # partagés ouvre le siège quand le pod a un volume par tenant et une
+        # `isolation_ref` citable.
         loaded = self.card(
             credential_modes=("api-key", "subscription"),
             policy_extra="allow_subscription: true\nrequire_isolation: true")
         host = loaded.host("pod-banc")
         self.assertTrue(host.policy.allow_subscription)
         self.assertTrue(host.policy.require_isolation)
-        errors = test_canon.codes(canon.validate(loaded), canon.ERROR)
-        self.assertIn("host-pod-subscription-unproven", errors)
-        # La défense en profondeur tient même pour un appelant qui ne passe
-        # pas par `canon.validate` : le placement refuse le siège.
-        self.assertTrue(canon.shared_violations(
-            {"responsible": ALICE}, host, "subscription"))
+        self.assertEqual(self.errors(), set())
+        self.assertEqual(canon.shared_violations(
+            {"responsible": ALICE}, host, "subscription"), [])
+        self.assertEqual(canon.placement_violations(
+            {"responsible": ALICE, "harness": "claude",
+             "provider": "anthropic", "credential_mode": "subscription"}, host), [])
 
-    def test_opt_in_seul_refuse_sur_un_pod(self):
-        # L'opt-in sans `subscription` dans la liste n'ouvre rien, mais il
-        # annonce une exception non tranchée : la carte est refusée.
+    def test_opt_in_seul_admis_avec_les_conditions(self):
+        # L'opt-in sans `subscription` dans la liste n'ouvre aucun mode, mais
+        # la carte reste valide si les conditions du pod sont prouvées.
         loaded = self.card(
             policy_extra="allow_subscription: true\nrequire_isolation: true")
-        self.assertIn("host-pod-subscription-unproven",
-                      test_canon.codes(canon.validate(loaded), canon.ERROR))
+        self.assertEqual(self.errors(), set())
+        # Sans la référence citable, la même opt-in ne prouve rien.
+        weak = self.card(
+            ref="pas-une-ref", credential_modes=("api-key", "subscription"),
+            policy_extra="allow_subscription: true\nrequire_isolation: true")
+        errors = test_canon.codes(canon.validate(weak), canon.ERROR)
+        self.assertIn("host-pod-subscription-unproven", errors)
 
-    def test_le_refus_bloque_les_agents_de_l_hote(self):
+    def test_une_carte_sans_conditions_bloque_les_agents(self):
         # Un constat d'erreur n'est pas décoratif : `canon.blocking` refuse
         # tout agent placé sur l'hôte dont la carte est en faute.
         loaded = self.card(
+            isolation="per-pod-empty-dir",
             credential_modes=("api-key", "subscription"),
             policy_extra="allow_subscription: true\nrequire_isolation: true")
         blocked = canon.blocking(canon.validate(loaded)).by_host.get("pod-banc") or []
