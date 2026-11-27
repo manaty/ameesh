@@ -3248,22 +3248,28 @@ def _epoch(value) -> float | None:
 
 
 def _next_packet(cutoffs: Iterable[str], zone: str, now: float) -> float | None:
-    """#8320 : le premier créneau de paquet (`packets.cutoffs`, HH:MM locales)
-    strictement après `now` ; `None` sans cadence déclarée. Le `Document`
-    global de `mechanics.configured` ne porte pas `Mechanics.next_packet`."""
-    from zoneinfo import ZoneInfo
-    tz = ZoneInfo(zone)
-    today = datetime.datetime.fromtimestamp(now, tz).date()
-    later = []
-    for offset in range(3):
-        day = today + datetime.timedelta(days=offset)
-        for label in cutoffs or ():
-            stamp = datetime.datetime(day.year, day.month, day.day,
-                                      int(label[:2]), int(label[3:]),
-                                      tzinfo=tz).timestamp()
-            if stamp > now:
-                later.append(stamp)
-    return min(later) if later else None
+    """#8320 : le premier créneau de paquet (`packets.cutoffs`) strictement
+    après `now` ; `None` sans cadence déclarée. Le `Document` global de
+    `mechanics.configured` ne porte pas `Mechanics.next_packet` : on emprunte
+    ses méthodes (heure sautée, heure répétée), sans les recopier."""
+    from . import mechanics
+
+    class _Cadence:
+        zone = mechanics.Mechanics.zone
+        packets_on = mechanics.Mechanics.packets_on
+        next_packet = mechanics.Mechanics.next_packet
+
+        def __init__(self):
+            self.timezone = zone
+            self.packet_cutoffs = tuple(cutoffs or ())
+
+    cadence = _Cadence()
+    if not cadence.packet_cutoffs:
+        return None
+    try:
+        return cadence.next_packet(now)
+    except mechanics.MechanicsError:
+        return None
 
 
 def _rows(db, sql: str, params=()) -> list[dict]:

@@ -108,6 +108,20 @@ class NextPacketTest(unittest.TestCase):
                          _ts("2026-11-26 23:00"))
         self.assertIsNone(debit._next_packet((), "Europe/Paris", now))
 
+    def test_the_skipped_hour_is_not_a_slot(self):
+        # 29/03 : 02:00 n'existe pas à Paris ; 01:30 (00:30Z) → 04:00 (02:00Z)
+        slots = ["%02d:00" % hour for hour in range(0, 24, 2)]
+        self.assertEqual(debit._next_packet(slots, "Europe/Paris",
+                                            _ts("2026-03-29 00:30")),
+                         _ts("2026-03-29 02:00"))
+
+    def test_the_repeated_hour_gives_its_second_slot(self):
+        # 25/10 : 02:30 CEST (00:30Z) → le second 02:00, en CET (01:00Z)
+        slots = ["%02d:00" % hour for hour in range(0, 24, 2)]
+        self.assertEqual(debit._next_packet(slots, "Europe/Paris",
+                                            _ts("2026-10-25 00:30")),
+                         _ts("2026-10-25 01:00"))
+
 
 class FootprintHoursTest(unittest.TestCase):
     def test_one_held_lot_counts_once_for_five_idle_agents(self):
