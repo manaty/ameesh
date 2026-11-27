@@ -13,6 +13,10 @@ ameesh-dev3 / ameesh-cx2 de 99864bef).
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -90,6 +94,52 @@ class PacketGuardDeclarationTest(unittest.TestCase):
                 packet_guard.check_merge(None, 8095, "lot/8095-x", target, A,
                                          repo=repo, cfg=cfg)
             self.assertIn("§11 bis", str(caught.exception))
+
+
+class PacketCarrierVetoTest(unittest.TestCase):
+    """Relecture ameesh-dev3 de 90e65bd2 : `packets = false` ne lève jamais le
+    paquet d'un dépôt porteur, et un porteur non identifiable fait douter."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-8323-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _clone(self, name, url):
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path)
+        for argv in (["init", "-q"], ["remote", "add", "origin", url]):
+            subprocess.run(["git", "-C", path, *argv], check=True, capture_output=True)
+        return path
+
+    def test_a_packet_repository_cannot_be_declared_without_packet(self):
+        for repo, target, github in (("manaty/ameesh", "main", {"ameesh": "manaty/ameesh"}),
+                                     ("manaty/nexlink", "develop",
+                                      {"nexlink": "manaty/nexlink"})):
+            cfg = types.SimpleNamespace(
+                github={"projects": github},
+                radar={"projects": {"p": {"repo": "/srv/p", "github": repo,
+                                          "target": target, "land": "off",
+                                          "packets": False}}})
+            with self.subTest(repo=repo), self.assertRaises(packet_guard.PacketGuardError):
+                packet_guard.check_merge(None, 8323, "lot/8323-x", target, A,
+                                         repo=repo, cfg=cfg)
+
+    def test_a_carrier_declared_by_its_clone_only_vetoes(self):
+        alias = {"repo": self._clone("its", "git@github.com:manaty/manaty-its.git"),
+                 "target": "main"}
+        with self.assertRaises(packet_guard.PacketGuardError):
+            _check("manaty/manaty-its", cfg=_cfg(its=ITS, alias=alias))
+
+    def test_an_unidentified_carrier_refuses(self):
+        for label, alias in (("no origin", {"repo": os.path.join(self.tmp, "missing"),
+                                            "target": "main"}),):
+            with self.subTest(label), self.assertRaises(packet_guard.PacketGuardError):
+                _check("manaty/manaty-its", cfg=_cfg(its=ITS, alias=alias))
+
+    def test_a_carrier_of_another_repository_does_not_veto(self):
+        alias = {"repo": self._clone("am", "git@github.com:manaty/ameesh.git"),
+                 "target": "main"}
+        self.assertTrue(_check("manaty/manaty-its", cfg=_cfg(its=ITS, alias=alias))["allowed"])
 
 
 class FireRepositoryTest(unittest.TestCase):

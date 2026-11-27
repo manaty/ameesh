@@ -39,7 +39,9 @@ la configuration (les canons approuvés, `canon_repositories`), jamais en dur
 #8323 : le §11 bis ne nomme que les cibles portées par les paquets. Une cible
 **déclarée** sans paquet (`radar.projects.<p>.packets = false`, avec `github`
 et `target`) passe ici : manaty-its/main pour un lot nexlink (#8095), dont le
-dépôt réel est celui de la marque du gel (`ameesh-freeze-repo`). Le feu lui
+dépôt réel est celui de la marque du gel (`ameesh-freeze-repo`). Un dépôt
+porteur de paquets (`github.projects`, autre déclaration radar) n'est jamais
+exempté, même déclaré `packets = false`. Le feu lui
 applique les gardes du §2 (gel, avis, CI verte sur la tête gelée, tête
 gardée). Sans cette déclaration positive, le doute refuse toujours.
 """
@@ -156,12 +158,45 @@ def outside_packets(repo, cfg) -> str:
     return ident if ident and ident in canon_repositories(cfg) else ""
 
 
+def packet_carriers(cfg) -> frozenset | None:
+    """#8323 : les dépôts qui restent portés par les paquets, et ne peuvent
+    donc jamais être déclarés sans paquet : ceux des projets `github.projects`
+    et ceux des `radar.projects` sans `packets = false` (par `github`, sinon par
+    l'`origin` de leur clone). None quand l'un d'eux ne s'identifie pas ou
+    qu'une section est illisible : le doute refuse (relecture ameesh-dev3)."""
+    from . import radar
+    from .modules.dev import plan_github
+    found = set()
+    try:
+        slugs = list(plan_github.settings_of(cfg).projects.values())
+        projects = list(radar.settings_of(cfg).projects.values())
+    except Exception:  # noqa: BLE001 - section illisible : aucune preuve
+        return None
+    for slug in slugs:
+        ident = repository(slug)
+        if not ident:
+            return None
+        found.add(ident)
+    for project in projects:
+        if not getattr(project, "packets", True):
+            continue
+        github = getattr(project, "github", "") or ""
+        path = getattr(project, "repo", "") or ""
+        ident = repository(github) if github else (
+            repository(os.path.abspath(os.path.expanduser(path))) if path else "")
+        if not ident:
+            return None
+        found.add(ident)
+    return frozenset(found)
+
+
 def without_packet(repo, target, cfg) -> str:
     """#8323 : l'identité du dépôt quand sa cible `target` est **déclarée**
     sans paquet (`radar.projects.<p>.packets = false`, même `github`, même
-    `target`), sinon "". Il faut une preuve positive : un dépôt illisible, une
-    configuration illisible ou sans déclaration, ou une autre déclaration du
-    même dépôt qui ne l'exclut pas des paquets rendent "" (le doute refuse)."""
+    `target`), sinon "". Il faut une preuve positive, et aucun veto : un dépôt
+    porteur de paquets (`packet_carriers` : `github.projects`, ou une autre
+    déclaration radar du même dépôt) n'est jamais exempté. Un dépôt, une
+    configuration ou un porteur illisibles rendent "" (le doute refuse)."""
     ident = repository(repo)
     wanted = branch_of(target)
     if not ident or not wanted or cfg is None:
@@ -171,11 +206,13 @@ def without_packet(repo, target, cfg) -> str:
         projects = list(radar.settings_of(cfg).projects.values())
     except Exception:  # noqa: BLE001 - configuration illisible : aucune preuve
         return ""
-    mine = [project for project in projects
-            if getattr(project, "github", "") and repository(project.github) == ident]
-    if not mine or any(getattr(project, "packets", True) for project in mine):
+    declared = any(not getattr(project, "packets", True)
+                   and repository(project.github) == ident
+                   and branch_of(project.target) == wanted for project in projects)
+    if not declared:
         return ""
-    if not any(branch_of(project.target) == wanted for project in mine):
+    carriers = packet_carriers(cfg)
+    if carriers is None or ident in carriers:
         return ""
     return ident
 
