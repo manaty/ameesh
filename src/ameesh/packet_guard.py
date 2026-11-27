@@ -165,7 +165,7 @@ def packet_carriers(cfg) -> frozenset | None:
     l'`origin` de leur clone). None quand l'un d'eux ne s'identifie pas ou
     qu'une section est illisible : le doute refuse (relecture ameesh-dev3)."""
     from . import radar
-    from .modules.dev import plan_github
+    from . import plan_github
     found = set()
     try:
         slugs = list(plan_github.settings_of(cfg).projects.values())
