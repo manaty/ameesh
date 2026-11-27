@@ -153,9 +153,11 @@ a listed harness without a descriptor is an error (`agent-harness-unknown`).
 
 **Avatar tool policy** (spec avatars §3.5, #7630). An avatar's `tools`
 list applies to its own harness on every host, including resident sessions and
-local or remote attach. `mcp:<server>` selects an MCP server from the host's
-project `.mcp.json`; other servers are excluded. `tools: []` disables all tools
-and all MCP servers. Optional `deny_tools` contains harness-native deny rules:
+local or remote attach. `mcp:<server>` selects an MCP server from the
+`.mcp.json` of the agent's declared project directory (never a working
+directory inherited from a turn); other servers are excluded. `tools: []`
+disables all tools and all MCP servers. Optional `deny_tools` contains
+harness-native deny rules:
 
 ```yaml
 avatar:
