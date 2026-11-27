@@ -341,12 +341,27 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
                     if guard.problems(text, public=True):
                         continue
                 body = marker + "\n" + plan_github._quiet(text)
-                report["comments"].append({"work_item": lot, "number": number, "event": key,
-                                            "body": body})
                 if not gh_repo.dry_run:
                     gh_repo.comment(number, body)
                     saved["seen"].append(key)
+                report["comments"].append({"work_item": lot, "number": number, "event": key,
+                                            "body": body})
             save()
+        except plan_github.ContentLimitReached:
+            # #8357 : le plafond du passage est atteint (20 commentaires) ;
+            # les marqueurs restants repartent au passage suivant. Ce n'est
+            # pas une erreur : on enregistre l'acquis et on s'arrête.
+            save()
+            return
+        except plan_github.GithubRateLimited as exc:
+            # #8357 : limite primaire ou secondaire. Le passage s'arrête ici :
+            # aucun lot suivant ne retente le POST. `SharedReads` a mémorisé
+            # la fenêtre et son Retry-After pour les passages suivants.
+            report["errors"].append({"work_item": lot, "number": number,
+                                     "action": "stage-comment",
+                                     "detail": plan_github._one_line(exc)})
+            save()
+            return
         except (plan_github.GithubError, OSError) as exc:
             report["errors"].append({"work_item": lot, "number": number,
                                      "action": "stage-comment", "detail": plan_github._one_line(exc)})

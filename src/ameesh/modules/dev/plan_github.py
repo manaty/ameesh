@@ -231,6 +231,27 @@ def _http_headers(head: str) -> dict:
     return headers
 
 
+def gh_api_http(gh, argv: list[str], stdin: str | None = None,
+                *, path: str | None = None) -> tuple[int, dict, str]:
+    """Un appel `gh api -i` : (code HTTP, en-têtes, corps) (#8357).
+
+    Le code de sortie de `gh` n'est pas le code HTTP : un 304 ou un 403 sort
+    en 1 avec ses en-têtes et son corps sur la sortie standard. Lève
+    `GithubError` si aucune ligne d'état n'est lisible (gh absent, panne de
+    transport)."""
+    if stdin is None:
+        _code, out, err = gh.run(argv)
+    else:
+        _code, out, err = gh.run(argv, stdin)
+    head, body = _split_http(out)
+    lines = head.splitlines()
+    match = _HTTP_STATUS_RE.match(lines[0]) if lines else None
+    if match is None:
+        raise GithubError("gh api %s: %s"
+                          % (path or "?", " ".join((err or out or "—").split())[:300]))
+    return int(match.group(1)), _http_headers(head), body
+
+
 def gh_api_response(gh, path: str, *, etag: str | None = None) -> tuple[int, dict, str]:
     """`gh api -i` : (code HTTP, en-têtes, corps), `If-None-Match` pour revalider.
 
@@ -241,14 +262,7 @@ def gh_api_response(gh, path: str, *, etag: str | None = None) -> tuple[int, dic
     argv = ["api", str(path), "-i"]
     if etag:
         argv += ["-H", "If-None-Match: %s" % etag]
-    _code, out, err = gh.run(argv)
-    head, body = _split_http(out)
-    lines = head.splitlines()
-    match = _HTTP_STATUS_RE.match(lines[0]) if lines else None
-    if match is None:
-        raise GithubError("gh api %s: %s"
-                          % (path, " ".join((err or out or "—").split())[:300]))
-    return int(match.group(1)), _http_headers(head), body
+    return gh_api_http(gh, argv, path=path)
 
 
 def debug_refusal(text: str) -> tuple[int, dict, str] | None:
@@ -1692,12 +1706,136 @@ ISSUES_PAGE = 100
 ISSUES_MAX_PAGES = 1000
 ISSUES_PAGE_TIMEOUT = 120.0
 
+#: #8357 : création de contenu par passage de la projection. Les reçus de
+#: livraison d'un rattrapage (89 tickets) partaient en ~80 POST d'affilée,
+#: contre la limite secondaire de GitHub ; un passage ne poste désormais
+#: qu'au plus `MAX_COMMENTS_PER_PASS`, espacés, et le suivant reprend le reste.
+MAX_COMMENTS_PER_PASS = 20
+COMMENT_INTERVAL_S = 1.0
+
+
+class ContentLimitReached(Exception):
+    """#8357 : le quota de commentaires du passage est dépensé.
+
+    Ce n'est pas une panne GitHub : aucune requête n'est partie, et le
+    passage suivant reprend les marqueurs restants. Distinct de
+    `GithubError` pour que les boucles s'arrêtent proprement au lieu de
+    compter chaque lot comme une erreur."""
+
+
+class _Writes:
+    """#8357 : écritures GitHub par le quota partagé, débitées par passage.
+
+    Les lectures passent par `Api`/`GhApi`, qui mémorisent une limite primaire
+    ou secondaire et son `Retry-After` dans `SharedReads` (#1405). Les POST et
+    PATCH de la projection appelaient `gh api` directement, hors de ce quota :
+    le 403 secondaire n'était jamais retenu, et chaque lot suivant le
+    répétait. Ici chaque écriture :
+
+    * refuse sans requête pendant la fenêtre mémorisée (`SharedReads.blocked`) ;
+    * lit les en-têtes (`gh api -i`) et les remet à `SharedReads.note` : une
+      limite primaire ou secondaire arrête le passage, et son `Retry-After`
+      est respecté au passage suivant ;
+    * borne les commentaires à `comments_per_pass`, espacés d'au moins
+      `comment_interval` : un rattrapage s'étale sur plusieurs passages.
+    """
+
+    def __init__(self, gh, reads: "SharedReads | None" = None, *, clock=time.time,
+                 sleep=time.sleep, comments_per_pass: int = MAX_COMMENTS_PER_PASS,
+                 comment_interval: float = COMMENT_INTERVAL_S):
+        self.gh = gh
+        self.reads = reads
+        self.clock = clock
+        self.sleep = sleep
+        self.comments_per_pass = int(comments_per_pass)
+        self.comment_interval = float(comment_interval)
+        #: commentaires tentés dans ce passage (le plafond se vérifie avant).
+        self.comments = 0
+        self._last_comment: float | None = None
+
+    def _refuse_while_blocked(self, path: str, now: float) -> None:
+        if self.reads is None:
+            return
+        until = self.reads.blocked(now, DEFAULT_RESOURCE)
+        if until:
+            raise GithubRateLimited(
+                path, until, reserve=self.reads.reserve_only(now, DEFAULT_RESOURCE))
+
+    def write(self, method: str, path: str, payload: dict | None = None) -> dict:
+        """Un POST/PATCH/DELETE derrière le quota partagé, en-têtes compris."""
+        now = float(self.clock())
+        self._refuse_while_blocked(path, now)
+        argv = ["api", "-X", method.upper(), path]
+        stdin = None
+        if payload is not None:
+            argv += ["--input", "-"]
+            stdin = json.dumps(payload)
+        # `-i` en dernier : `gh api` accepte les options dans n'importe quel
+        # ordre, et les appels de test gardent `["api", "-X", <méthode>, …]`.
+        argv.append("-i")
+        try:
+            status, headers, body = gh_api_http(self.gh, argv, stdin, path=path)
+        except GithubError as exc:
+            # Repli : un `gh` qui renvoie le refus dans stderr sans ligne
+            # d'état ne donne pas ses en-têtes. Le texte suffit à reconnaître
+            # une limite ; `SharedReads` retient alors la fenêtre par défaut,
+            # et le passage s'arrête au lieu de répéter sur chaque lot.
+            text = "%s %s" % (exc, getattr(exc, "body", "") or "")
+            if (SECONDARY_LIMIT_MARK in text.lower()
+                    or "api rate limit exceeded" in text.lower()):
+                until = self.reads.note({}, status=403, now=float(self.clock()),
+                                        body=text) if self.reads is not None else None
+                raise GithubRateLimited(path, until) from exc
+            raise
+        now = float(self.clock())
+        until = None
+        if self.reads is not None:
+            resource = _resource_header(headers) or resource_of(path)
+            until = self.reads.note(headers, status=status, now=now,
+                                    resource=resource, body=body)
+        limited = (status in (403, 429)
+                   and (until or SECONDARY_LIMIT_MARK in body.lower()
+                        or "api rate limit exceeded" in body.lower()))
+        if limited:
+            raise GithubRateLimited(path, until)
+        if status >= 400:
+            raise GithubError("GitHub %s: HTTP %d" % (path, status),
+                              status=status, body=body)
+        try:
+            return json.loads(body) if body.strip() else {}
+        except ValueError as exc:
+            raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
+
+    def comment(self, path: str, body: str) -> dict:
+        """Un commentaire, borné et espacé par passage (#8357)."""
+        if self.comments >= self.comments_per_pass:
+            raise ContentLimitReached(
+                "GitHub comments: %d per pass reached; the next pass resumes"
+                % self.comments_per_pass)
+        now = float(self.clock())
+        self._refuse_while_blocked(path, now)
+        if self._last_comment is not None:
+            wait = self.comment_interval - (now - self._last_comment)
+            if wait > 0:
+                self.sleep(wait)
+                now = float(self.clock())
+        self.comments += 1
+        try:
+            return self.write("POST", path, {"body": body})
+        finally:
+            self._last_comment = float(self.clock())
+
 
 class _Repo:
-    """Opérations REST (`gh api`) sur un dépôt ; écritures refusées en essai."""
+    """Opérations REST (`gh api`) sur un dépôt ; écritures refusées en essai.
 
-    def __init__(self, gh, repo: str, dry_run: bool):
+    `writes` (#8357) route les POST/PATCH par le quota partagé et borne les
+    commentaires du passage ; sans lui, les appels directs gardent le
+    comportement des appelants qui n'ont pas d'état d'hôte."""
+
+    def __init__(self, gh, repo: str, dry_run: bool, writes: "_Writes | None" = None):
         self.gh, self.repo, self.dry_run = gh, repo, dry_run
+        self.writes = writes
 
     def labels(self) -> set[str]:
         return {row.get("name") for row in _lines(self.gh, [
@@ -1706,9 +1844,13 @@ class _Repo:
 
     def create_label(self, name: str, description: str | None = None) -> None:
         key = name.split(":", 1)[1] if ":" in name else ""
+        payload = {"name": name, "color": LABEL_COLORS.get(key, "ededed"),
+                   "description": description or "ameesh projection (L29)"}
+        if self.writes is not None:
+            self.writes.write("POST", "repos/%s/labels" % self.repo, payload)
+            return
         _json(self.gh, ["api", "-X", "POST", "repos/%s/labels" % self.repo, "--input", "-"],
-              json.dumps({"name": name, "color": LABEL_COLORS.get(key, "ededed"),
-                          "description": description or "ameesh projection (L29)"}))
+              json.dumps(payload))
 
     def info(self) -> dict | None:
         """Le dépôt (`gh api repos/R`), ou None s'il est illisible (L126)."""
@@ -1727,9 +1869,11 @@ class _Repo:
         # shared with humans, so author identity cannot serve as a filter.
         if "<!-- ameesh:" not in body:
             body += "\n\n<!-- ameesh:projection:v1 -->"
-        return _json(self.gh, ["api", "-X", "POST",
-                               "repos/%s/issues/%d/comments" % (self.repo, number),
-                               "--input", "-"], json.dumps({"body": body})) or {}
+        path = "repos/%s/issues/%d/comments" % (self.repo, number)
+        if self.writes is not None:
+            return self.writes.comment(path, body) or {}
+        return _json(self.gh, ["api", "-X", "POST", path, "--input", "-"],
+                     json.dumps({"body": body})) or {}
 
     def comments(self, number: int) -> list[dict]:
         return _lines(self.gh, ["api", "--paginate",
@@ -1763,12 +1907,18 @@ class _Repo:
         return [r for r in rows if not r.get("pull_request")]
 
     def create(self, payload: dict) -> dict:
-        return _json(self.gh, ["api", "-X", "POST", "repos/%s/issues" % self.repo,
-                               "--input", "-"], json.dumps(payload)) or {}
+        path = "repos/%s/issues" % self.repo
+        if self.writes is not None:
+            return self.writes.write("POST", path, payload) or {}
+        return _json(self.gh, ["api", "-X", "POST", path, "--input", "-"],
+                     json.dumps(payload)) or {}
 
     def update(self, number: int, payload: dict) -> dict:
-        return _json(self.gh, ["api", "-X", "PATCH", "repos/%s/issues/%d" % (self.repo, number),
-                               "--input", "-"], json.dumps(payload)) or {}
+        path = "repos/%s/issues/%d" % (self.repo, number)
+        if self.writes is not None:
+            return self.writes.write("PATCH", path, payload) or {}
+        return _json(self.gh, ["api", "-X", "PATCH", path, "--input", "-"],
+                     json.dumps(payload)) or {}
 
     def sub_issues(self, number: int) -> list[dict] | None:
         """Les sous-issues, ou None si l'API sub-issues est indisponible."""
@@ -1783,14 +1933,30 @@ class _Repo:
             return None
 
     def add_sub_issue(self, number: int, sub_id: int) -> None:
-        _json(self.gh, ["api", "-X", "POST",
-                        "repos/%s/issues/%d/sub_issues" % (self.repo, number), "--input", "-"],
-              json.dumps({"sub_issue_id": int(sub_id), "replace_parent": True}))
+        path = "repos/%s/issues/%d/sub_issues" % (self.repo, number)
+        payload = {"sub_issue_id": int(sub_id), "replace_parent": True}
+        if self.writes is not None:
+            self.writes.write("POST", path, payload)
+            return
+        _json(self.gh, ["api", "-X", "POST", path, "--input", "-"], json.dumps(payload))
 
     def remove_sub_issue(self, number: int, sub_id: int) -> None:
-        _json(self.gh, ["api", "-X", "DELETE",
-                        "repos/%s/issues/%d/sub_issue" % (self.repo, number), "--input", "-"],
-              json.dumps({"sub_issue_id": int(sub_id)}))
+        path = "repos/%s/issues/%d/sub_issue" % (self.repo, number)
+        payload = {"sub_issue_id": int(sub_id)}
+        if self.writes is not None:
+            self.writes.write("DELETE", path, payload)
+            return
+        _json(self.gh, ["api", "-X", "DELETE", path, "--input", "-"], json.dumps(payload))
+
+
+def _writes_for(db, gh) -> _Writes:
+    """Les écritures d'une projection, derrière le quota partagé de l'hôte.
+
+    #8357 : sans `state_dir`, la fenêtre n'est pas mémorisée, mais le plafond
+    et l'espacement des commentaires tiennent quand même le débit."""
+    state_dir = str(getattr(getattr(db, "cfg", None), "state_dir", "") or "").strip()
+    reads = SharedReads(state_dir, caller="github-projection") if state_dir else None
+    return _Writes(gh, reads=reads)
 
 
 def _payload(view: Desired, body: str, issue: dict | None) -> dict:
@@ -1816,7 +1982,7 @@ def project_github(db, gh, repo: str, *, dry_run: bool = False,
     packages = st.packages.all()
     items = st.progress.package_items()
     views = desired_views(packages, items, canon_url=canon_url)
-    gh_repo = _Repo(gh, repo, dry_run)
+    gh_repo = _Repo(gh, repo, dry_run, writes=_writes_for(db, gh))
     report: dict = {"repo": repo, "dry_run": bool(dry_run), "issues": [], "proposals": [],
                     "labels_created": [], "sub_issues": [], "sub_issues_api": None,
                     "orphans": [], "duplicates": [], "notes": []}
@@ -2835,7 +3001,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
     settings = settings or Settings()
     st = storage.of(db)
     feed = list(st.work.issue_feed(FEED_LIMIT) if feed is None else feed)
-    gh_repo = _Repo(gh, repo, dry_run)
+    gh_repo = _Repo(gh, repo, dry_run, writes=_writes_for(db, gh))
     visibility = repo_visibility(gh_repo, cache=cache, now=now)
     public = visibility != "private"
     report: dict = {"project": project, "repo": repo, "visibility": visibility,
@@ -3010,29 +3176,77 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
                 report["labels_created"].append(name)
                 if not dry_run:
                     gh_repo.create_label(name, _label_description(name))
+    halted = False
     if not dry_run:
-        for plan in plans:
-            _execute(db, st, gh_repo, report, plan)
-        # issue retrouvée par son marqueur (ou adoptée) : l'issue_ref du lot la
-        # désigne, sauf si elle désigne déjà une issue existante de ce dépôt.
-        # #2130/D : un lot pinné refusé n'écrit rien, pas même son issue_ref
-        # (le refus n'est pas une adoption, et l'état legacy ne décide pas).
-        for item, issue in mine:
-            if int(item["id"]) in refused_lots:
-                continue
-            ref = _ref_parts(item.get("issue_ref"))
-            if issue is None or (ref and ref[0].casefold() == repo.casefold()
-                                 and ref[1] in by_number):
-                continue
-            _remember_ref(db, st, gh_repo, report, item, int(issue["number"]), created=False)
-    from ... import github_stage_comments
-    github_stage_comments.project(db, st, gh_repo, report, mine, guard=guard,
-                                  refused=refused_lots, project=project, closings=stage_closings)
+        for index, plan in enumerate(plans):
+            try:
+                _execute(db, st, gh_repo, report, plan)
+            except ContentLimitReached:
+                _defer_plans(plans[index:])
+                halted = True
+                break
+            except GithubRateLimited as exc:
+                _note_write_limit(report, plan["entry"], exc)
+                _defer_plans(plans[index:])
+                halted = True
+                break
+        if not halted:
+            # issue retrouvée par son marqueur (ou adoptée) : l'issue_ref du lot
+            # la désigne, sauf si elle désigne déjà une issue existante de ce
+            # dépôt. #2130/D : un lot pinné refusé n'écrit rien, pas même son
+            # issue_ref (le refus n'est pas une adoption, et l'état legacy ne
+            # décide pas).
+            for item, issue in mine:
+                if int(item["id"]) in refused_lots:
+                    continue
+                ref = _ref_parts(item.get("issue_ref"))
+                if issue is None or (ref and ref[0].casefold() == repo.casefold()
+                                     and ref[1] in by_number):
+                    continue
+                try:
+                    _remember_ref(db, st, gh_repo, report, item, int(issue["number"]),
+                                  created=False)
+                except ContentLimitReached:
+                    halted = True
+                    break
+                except GithubRateLimited as exc:
+                    report["errors"].append({
+                        "work_item": int(item["id"]), "number": int(issue["number"]),
+                        "action": "issue_ref", "detail": _one_line(exc)})
+                    halted = True
+                    break
+    if not halted:
+        # #8357 : une limite atteinte arrête le PASSAGE ; les commentaires
+        # restants repartiront au passage suivant, jamais dans la même fenêtre.
+        from ... import github_stage_comments
+        github_stage_comments.project(db, st, gh_repo, report, mine, guard=guard,
+                                      refused=refused_lots, project=project,
+                                      closings=stage_closings)
     return _tally_lots(report)
 
 
+def _defer_plans(plans: list[dict]) -> None:
+    """#8357 : les écritures non tentées du passage repartent au suivant."""
+    for plan in plans:
+        entry = plan["entry"]
+        if not entry.get("error") and entry.get("action") not in ("deferred", "refused"):
+            entry["action"] = "deferred"
+
+
+def _note_write_limit(report: dict, entry: dict, exc: GithubRateLimited) -> None:
+    """#8357 : une limite arrête le passage ; elle est notée une seule fois."""
+    detail = _one_line(exc)
+    entry["error"] = detail
+    report["errors"].append({"work_item": entry.get("work_item"),
+                             "number": entry.get("number"),
+                             "action": entry.get("action"), "detail": detail})
+
+
 def _execute(db, st, gh_repo: "_Repo", report: dict, plan: dict) -> None:
-    """Écrit une issue planifiée ; une erreur de GitHub est notée, jamais levée."""
+    """Écrit une issue planifiée ; une erreur de GitHub est notée, jamais levée.
+
+    Une limite de quota (#8357) sort : l'appelant arrête le passage au lieu de
+    tenter les lots suivants."""
     entry = plan["entry"]
     try:
         if entry["action"] == "create":
@@ -3043,6 +3257,8 @@ def _execute(db, st, gh_repo: "_Repo", report: dict, plan: dict) -> None:
             _remember_ref(db, st, gh_repo, report, plan["item"], entry["number"], created=True)
             return
         gh_repo.update(int(entry["number"]), plan["payload"])
+    except GithubRateLimited:
+        raise
     except GithubError as exc:
         entry["error"] = _one_line(exc)
         report["errors"].append({"work_item": entry["work_item"], "number": entry.get("number"),
@@ -3091,6 +3307,8 @@ def _remember_ref(db, st, gh_repo: "_Repo", report: dict, item: dict, number: in
             gh_repo.comment(int(number), "Duplicate of #%d, created at the same time for "
                                          "the same work item: closed by ameesh."
                                          % other[1])
+        except GithubRateLimited:
+            raise                       # #8357 : arrête le passage, pas ce lot seul
         except GithubError as exc:
             report["errors"].append({"work_item": lot_id, "number": int(number),
                                      "action": "duplicate", "detail": _one_line(exc)})
@@ -3368,6 +3586,17 @@ class Projector:
                                       cache=self.cache,
                                       forge_hosts=getattr(self.cfg, "forge_hosts", None) or (),
                                       local_host=here, now=now)
+            except GithubRateLimited as exc:
+                # #8357 : une limite de quota arrête le passage, pas le rôle.
+                # On attend le reset mémorisé (ou l'intervalle) sans compter
+                # de panne : ce n'est ni une erreur GitHub ni une panne d'hôte.
+                until = float(exc.reset or 0.0)
+                self.backoff[name] = max(now + settings.interval, until)
+                self._once(("quota", name, until),
+                           "GitHub issues %s (%s): quota, pass stopped until %s"
+                           % (name, repo, time.strftime("%H:%M:%SZ", time.gmtime(until))
+                              if until else "the next interval"))
+                continue
             except Exception as exc:  # noqa: BLE001 - GitHub, gh, base : jamais fatal
                 self.backoff[name] = now + settings.interval
                 detail = _one_line(exc)
