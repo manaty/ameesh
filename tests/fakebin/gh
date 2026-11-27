@@ -92,6 +92,10 @@ def main():
             state = load(path)
             code, out, err = fake_github.handle(state, argv, stdin)
             save(path, state)
+        if "-i" in argv:
+            # #8357 : les écritures de la projection passent par `gh api -i`
+            # pour lire les en-têtes de quota, comme le faux en processus.
+            code, out, err = fake_github._with_headers(argv, code, out, err)
         sys.stdout.write(out)
         sys.stderr.write(err)
         return code
