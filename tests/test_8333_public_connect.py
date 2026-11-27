@@ -42,6 +42,20 @@ ACTOR = "orchestre"
 PEER = "relecteur"
 SCHEMA_ADMIN = os.environ.get("AMEESH_TEST_DSN") or support.TEST_DSN
 
+
+def source_pythonpath() -> str:
+    """The checkout on a child executable's path: the suite runs it uninstalled.
+
+    A consumer runs *installed* executables, but here the package lives in
+    ``src`` and ``Fixture`` starts ``python -m ameesh`` as a child.
+    ``scripts/test.sh`` exports ``PYTHONPATH=src`` for that; a prevalidation
+    guest runs ``scripts/test-parts.py``, which only patches the parent's
+    ``sys.path``, so the child did not import the package (#8363, #4044)."""
+    parts = [str(ROOT / "src")]
+    parts += [part for part in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+              if part]
+    return os.pathsep.join(dict.fromkeys(parts))
+
 INDEX = """---
 type: Index
 title: connect canon
@@ -352,6 +366,13 @@ class PublicConnectDatabaseTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # The fixture runs "installed" executables as children (``ameesh
+        # migrate``, ``canon sync``): give them the checkout that the parent
+        # imports from (see source_pythonpath).
+        pythonpath = mock.patch.dict(
+            os.environ, {"PYTHONPATH": source_pythonpath()})
+        pythonpath.start()
+        cls.addClassCleanup(pythonpath.stop)
         if not bench_can_create_database():
             raise unittest.SkipTest(
                 "bench role has no CREATEDB: ameesh.public.connect needs a "
