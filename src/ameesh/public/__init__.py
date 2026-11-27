@@ -16,12 +16,16 @@ the queue the requests of a turn it interrupted, under the captured lease
 (tranche E2c, #7673). Contract 1.5 adds :mod:`ameesh.public.fixture`, the
 consumer-owned disposable-database witness used by an installed module to
 qualify its own Process, mail and observation paths (tranche F2, #7701).
+Contract 1.6 adds :mod:`ameesh.public.database` and its ``connect()`` re-export:
+the production connection for the same public surfaces, opened from the usual
+configuration with an immediate schema check (#6573); it is additive to 1.5.
 """
 from __future__ import annotations
 
 #: revision of the written contract served by this package
-CONTRACT_VERSION = "1.5"
+CONTRACT_VERSION = "1.6"
 
-from . import fixture, mail  # noqa: E402  (the version is defined before the surface)
+from . import database, fixture, mail  # noqa: E402  (the version is defined before the surface)
+from .database import connect  # noqa: E402
 
-__all__ = ["CONTRACT_VERSION", "fixture", "mail"]
+__all__ = ["CONTRACT_VERSION", "connect", "database", "fixture", "mail"]

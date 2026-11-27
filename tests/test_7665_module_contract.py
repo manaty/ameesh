@@ -40,7 +40,7 @@ from ameesh import (accounts, auth_failure, budget, canon, db as db_mod,
                     resources, serve)
 from ameesh.modules import registry
 from ameesh.modules.storage import ModuleStore
-from ameesh.public import fixture, mail
+from ameesh.public import database, fixture, mail
 
 ROOT = Path(__file__).resolve().parents[1]
 WITNESS = ROOT / "examples" / "modules" / "contract-witness"
@@ -220,6 +220,36 @@ def fixture_breaks(module):
             actual = list(actual)
         if actual != expected:
             breaks.append("%s: %r → %r" % (name, expected, actual))
+    for name, code in sorted(spec["errors"].items()):
+        actual = getattr(module, name, _MISSING)
+        if actual is _MISSING:
+            breaks.append("%s: removed" % name)
+        elif getattr(actual, "code", None) != code:
+            breaks.append("%s: code %r → %r" % (name, code,
+                                                getattr(actual, "code", None)))
+    return breaks
+
+
+def database_breaks(module):
+    """Incompatibilities of a production-connection candidate against 1.6.
+
+    One list for the deliberate-break witness of #6573: a removed or newly
+    required parameter, a changed revision or error code is named here. The
+    surface module is passed, so a mutated copy proves the comparator detects
+    a break."""
+    spec = SURFACE["python"]["connect"]
+    breaks = []
+    for name, frozen in sorted(spec["signatures"].items()):
+        target = getattr(module, name, _MISSING)
+        if target is _MISSING:
+            breaks.append("%s: removed" % name)
+            continue
+        breaks += ["%s: %s" % (name, reason) for reason in signature_breaks(
+            frozen_signature(frozen), inspect.signature(target))]
+    expected = spec["contract_version"]
+    actual = getattr(module, "CONTRACT_VERSION", _MISSING)
+    if actual != expected:
+        breaks.append("CONTRACT_VERSION: %r → %r" % (expected, actual))
     for name, code in sorted(spec["errors"].items()):
         actual = getattr(module, name, _MISSING)
         if actual is _MISSING:
@@ -781,6 +811,32 @@ class PythonMailContractTest(unittest.TestCase):
         self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
 
 
+class PythonDatabaseContractTest(unittest.TestCase):
+    """The 1.6 production connection: signature, revision and error codes."""
+
+    spec = SURFACE["python"]["connect"]
+
+    def test_the_public_connect_signature_is_frozen(self):
+        for name, frozen in sorted(self.spec["signatures"].items()):
+            with self.subTest(name):
+                self.assertEqual(signature_breaks(
+                    frozen_signature(frozen),
+                    inspect.signature(getattr(database, name))), [])
+        self.assertIs(public.connect, database.connect)
+        self.assertIs(public.database, database)
+
+    def test_the_published_error_codes_are_frozen(self):
+        for name, code in sorted(self.spec["errors"].items()):
+            with self.subTest(name):
+                self.assertEqual(getattr(database, name).code, code)
+
+    def test_the_served_contract_version_is_frozen(self):
+        self.assertEqual(database.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.database.CONTRACT_VERSION, database.CONTRACT_VERSION)
+        self.assertEqual(public.CONTRACT_VERSION, self.spec["contract_version"])
+        self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
+
+
 class PythonFixtureContractTest(unittest.TestCase):
     """The 1.5 fixture surface: signatures, constants, error codes."""
 
@@ -797,8 +853,10 @@ class PythonFixtureContractTest(unittest.TestCase):
     def test_the_served_contract_version_is_frozen(self):
         self.assertEqual(fixture.CONTRACT_VERSION, self.spec["contract_version"])
         self.assertEqual(public.fixture.CONTRACT_VERSION, fixture.CONTRACT_VERSION)
-        self.assertEqual(public.CONTRACT_VERSION, self.spec["contract_version"])
         self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
+        self.assertGreaterEqual(
+            tuple(int(part) for part in public.CONTRACT_VERSION.split(".")),
+            tuple(int(part) for part in fixture.CONTRACT_VERSION.split(".")))
 
     def test_the_external_fixture_witness_is_its_own_distribution(self):
         self.assertNotIn(ROOT / "src", FIXTURE.parents)
@@ -807,7 +865,7 @@ class PythonFixtureContractTest(unittest.TestCase):
         parser.read(FIXTURE / "pyproject.toml")
         project = {key: json.loads(value) for key, value in parser["project"].items()}
         self.assertEqual(project["name"], "ameesh-public-fixture-witness")
-        self.assertEqual(project["version"], "1.5.0")
+        self.assertEqual(project["version"], "1.6.0")
 
 
 class HttpContractTest(unittest.TestCase):

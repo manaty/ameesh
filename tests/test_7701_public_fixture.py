@@ -53,8 +53,9 @@ CORE_TABLES = ("work_items", "agent_mailbox", "agent_registry", "spend_pending",
                "canon_state", "project_modules")
 #: the witness may import these standard-library modules and these surfaces.
 ALLOWED_IMPORTS = {"json", "os", "sys", "threading", "typing"}
-ALLOWED_FROM = {("__future__", "annotations"), ("ameesh.public", "fixture"),
-                ("ameesh.public", "mail"), ("typing", "Any"), ("typing", "Mapping")}
+ALLOWED_FROM = {("__future__", "annotations"), ("ameesh.public", "database"),
+                ("ameesh.public", "fixture"), ("ameesh.public", "mail"),
+                ("typing", "Any"), ("typing", "Mapping")}
 
 
 def psql(statement: str) -> str:
@@ -353,7 +354,7 @@ class FixtureDatabaseTest(unittest.TestCase):
         self.assertTrue(report.get("ok"), report.get("error"))
         self.assertEqual(report["schema"], "ameesh-public-fixture-witness/1")
         self.assertEqual(report["checks"], ["fixture", "canon", "process", "usage",
-                                            "mail", "views", "teardown"])
+                                            "mail", "connect", "views", "teardown"])
         self.assertTrue(DATABASE_NAME.match(database), database)
         self.assertNotEqual(database, admin_database)
         self.assertEqual(report["teardown"], {"database": database, "closed": True})
@@ -382,6 +383,22 @@ class FixtureDatabaseTest(unittest.TestCase):
         self.assertEqual(sum(1 for row in conflicting if "id" in row), 1)
         self.assertEqual(sum(1 for row in conflicting
                              if row.get("code") == "conflict"), 1)
+
+        # The production connection of contract 1.6: a clean child process
+        # connects with no argument, uses public mail, closes, and observes the
+        # three documented refusals without exposing the DSN.
+        connect = report["connect"]
+        self.assertEqual(connect["package_contract"], "1.6")
+        self.assertEqual(connect["mail_contract"], "1.4")
+        self.assertIn("public connect hello", connect["bodies"])
+        self.assertFalse(connect["repr_shows_dsn"])
+        self.assertEqual({name: outcome["code"] for name, outcome
+                          in connect["refusals"].items()},
+                         {"schema": "schema", "storage": "unsupported",
+                          "unavailable": "unavailable"})
+        for name, outcome in connect["refusals"].items():
+            with self.subTest(name):
+                self.assertFalse(outcome["shows_dsn"], outcome)
 
 
 class DeliberateBreakTest(unittest.TestCase):
