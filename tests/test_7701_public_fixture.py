@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#7701 (#5902): the public fixture kit, contract revision 1.5.
+"""#7701 (#5902): the public fixture kit, contract revision 1.5 (agent states: 1.7, #8341).
 
 The kit is ``ameesh.public.fixture``: an installed consumer creates its own
 disposable PostgreSQL database, applies the released schema through
@@ -354,7 +354,8 @@ class FixtureDatabaseTest(unittest.TestCase):
         self.assertTrue(report.get("ok"), report.get("error"))
         self.assertEqual(report["schema"], "ameesh-public-fixture-witness/1")
         self.assertEqual(report["checks"], ["fixture", "canon", "process", "usage",
-                                            "mail", "connect", "views", "teardown"])
+                                            "mail", "connect", "states", "views",
+                                            "teardown"])
         self.assertTrue(DATABASE_NAME.match(database), database)
         self.assertNotEqual(database, admin_database)
         self.assertEqual(report["teardown"], {"database": database, "closed": True})
@@ -399,6 +400,17 @@ class FixtureDatabaseTest(unittest.TestCase):
         for name, outcome in connect["refusals"].items():
             with self.subTest(name):
                 self.assertFalse(outcome["shows_dsn"], outcome)
+
+        # The agent qualification states of contract 1.7 (#8341): two states
+        # and their reverse through the fixture, an unknown one refused.
+        states = report["states"]
+        self.assertEqual(states["contract"], "1.7")
+        self.assertEqual(states["lease_expired"], {"owner": "fixture-runner", "live": False})
+        self.assertEqual(states["lease_free"], {"owner": None})
+        self.assertFalse(states["canon_stale"]["fresh"])
+        self.assertIn("canon_stale", states["canon_stale"]["reasons"])
+        self.assertTrue(states["canon_fresh"]["fresh"])
+        self.assertEqual(states["unknown"], {"error": "FixtureRefused", "code": "refused"})
 
 
 class DeliberateBreakTest(unittest.TestCase):
