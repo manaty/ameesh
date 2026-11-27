@@ -355,16 +355,22 @@ class PasseAuReposReelle(PgTestCase):
 
     def test_debit_regle_tenu_par_la_boucle_reelle(self):
         """B impl-11 : bail de 3 s renouvelé par le vrai battement, pas réglé à
-        100 s : une seule passe en 8 s (avant : une passe par bail au moins)."""
+        100 s : une seule passe en 8 s (avant : une passe par bail au moins).
+
+        #8346 : le bail suit `scaled` ; le fil du worker renouvelle au tiers
+        restant, et 1 s ne couvrait pas un renouvellement sous la charge de la
+        nocturne psql (bail perdu, « None != runner »). L'attente reste bien
+        en deçà du pas réglé (100 s) : une seule passe."""
         name = "debit8152"
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
         self.register(name, "claude", cwd=cwd)
-        cfg = dataclasses.replace(self.cfg, idle_passes_per_s=0.01, lease_ttl=3.0)
+        ttl = scaled(3.0)
+        cfg = dataclasses.replace(self.cfg, idle_passes_per_s=0.01, lease_ttl=ttl)
         runner = Runner(cfg, self.db)
         runner.poll = 1.0
         runner.listener = object()  # écoute établie : le pas réglé s'applique
-        lease = registry.claim(self.db, name, runner.runner_id, 3)
+        lease = registry.claim(self.db, name, runner.runner_id, int(ttl))
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
         runner.workers[name] = worker
         passes = []
@@ -379,10 +385,10 @@ class PasseAuReposReelle(PgTestCase):
         with mock.patch.object(AgentWorker, "_pick_for_turn", pick):
             worker.start()
             try:
-                self.assertTrue(premiere.wait(60), "first idle pass expected")
+                self.assertTrue(premiere.wait(scaled(60)), "first idle pass expected")
                 # plus de deux baux après la première passe : avant le
                 # correctif, au moins une passe de plus
-                time.sleep(8)
+                time.sleep(2 * ttl + 2)
                 vivant = registry.get(self.db, name)
             finally:
                 runner.stop.set()
