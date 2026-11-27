@@ -5298,6 +5298,13 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pa_list.add_argument("--json", action="store_true")
     pa_list.add_argument("--last", type=int, default=5, help="latest switches shown")
     pa_list.set_defaults(func=cmd_accounts)
+    # #8337 (manaty/ameesh#6577) : lecture publique, sans base ni secret
+    pa_profiles = acc_sub.add_parser(
+        "profiles", help="declared account profiles, redacted: names, kind, variable "
+                         "names, reserve, billing account; never a key or a path (#8337)")
+    pa_profiles.add_argument("--json", action="store_true",
+                             help="ameesh-account-profiles/1 document")
+    pa_profiles.set_defaults(func=cmd_accounts)
     pa_use = acc_sub.add_parser("use", help="force an account (no more automatic choice)")
     pa_use.add_argument("harness")
     pa_use.add_argument("account")
@@ -5620,6 +5627,25 @@ def cmd_accounts(cfg: Config, args) -> int:
                   " (not re-armed)" % who)
         else:
             print("one-turn exception #%d registered for %s on %s/%s" % who)
+        return 0
+    if what == "profiles":
+        document = accounts_mod.public_profiles(cfg.accounts)
+        if args.json:
+            print(json.dumps(document, ensure_ascii=False, indent=2))
+            return 0
+        if not document["valid"]:
+            print("configuration refused by the runner (valid=false)", file=sys.stderr)
+        for row in document["profiles"]:
+            print("%s/%s  %s  env=%s key_env=%s  reserve %.2f USD  billing %s" % (
+                row["harness"], row["name"], row["kind"], row["env"] or "—",
+                row["key_env"] or ("(file)" if row["key_source"] == "file" else "—"),
+                row["reserve_usd"], row["billing_account"] or "—"))
+        for item in document["refused"]:
+            print("refused: %s/%s #%s: %s" % (
+                item["harness"] or "?", item["name"] or "?",
+                "-" if item["index"] is None else item["index"], item["reason"]))
+        if not document["profiles"] and not document["refused"]:
+            print("no account declared (key `accounts` of the host configuration)")
         return 0
     declares = accounts_mod.parse(cfg.accounts)  # AccountError -> code 1, message
     qui = "human:%s" % (os.environ.get("USER") or getpass.getuser())

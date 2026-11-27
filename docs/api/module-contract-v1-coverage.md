@@ -15,9 +15,9 @@ distribution (copied outside the checkout, imports only
 `tests.test_7665_module_contract.CoverageTableTest` checks that every element
 has exactly one row and that every cited test exists.
 
-The surface freezes revision 1.8; its baseline commit stays the revision 1.0
-comparison point, and the elements that revisions 1.1, 1.2, 1.3, 1.5, 1.6, 1.7
-and 1.8 add are now listed (revision 1.4 adds no name). The comparison is
+The surface freezes revision 1.9; its baseline commit stays the revision 1.0
+comparison point, and the elements that revisions 1.1, 1.2, 1.3, 1.5, 1.6, 1.7,
+1.8 and 1.9 add are now listed (revision 1.4 adds no name). The comparison is
 additive-compatible, as the contract's compatibility rule states:
 
 - HTTP: every schema is flattened per field (type, `const`, `enum`, bounds,
@@ -46,6 +46,7 @@ additive-compatible, as the contract's compatibility rule states:
 | `cli:ameesh turn current` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_l2894_turn_context` |
 | `cli:ameesh turn observe` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_l2894_turn_observe` |
 | `cli:ameesh agent observe` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7670_agent_observation.AgentObservationTest.test_cli_and_http_use_the_builder` |
+| `cli:ameesh accounts profiles` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_8337_account_profiles.PublicProfilesTest.test_cli_json_needs_no_database_and_carries_no_secret`, `tests.test_8337_account_profiles.PublicProfilesTest.test_every_declared_profile_is_listed_sorted_and_redacted`, `tests.test_8337_account_profiles.PublicProfilesTest.test_an_unreadable_profile_is_reported_without_breaking_the_list` |
 | `cli:ameesh list` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7675_deferral.PublicViewsTest.test_list_json_carries_the_same_block` |
 | `cli:ameesh show` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7675_deferral.PublicViewsTest.test_show_json_carries_the_block` |
 | `cli:ameesh migrate` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_migrations_additives` |
@@ -105,4 +106,6 @@ their refusals join the `python:fixture` row, and the database test of every
 state and the external witness's two states join the `fixture` row. Revision
 1.8 (#8342) adds the public action-connector surface; its frozen protocol,
 declaration and invalid-refusal witnesses join the `python:connectors` row,
-together with the public-only module-connector bench.
+together with the public-only module-connector bench. Revision 1.9 (#8337)
+adds `ameesh accounts profiles`; its redaction and refusal witnesses join the
+`cli:ameesh accounts profiles` row.

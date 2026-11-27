@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.8",
+  "contract": "1.9",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -32,6 +32,7 @@
     "ameesh turn current": ["--expect-turn", "--help", "--json", "--local"],
     "ameesh turn observe": ["--help", "--json", "--request", "--turn"],
     "ameesh agent observe": ["--account-profile", "--help", "--json"],
+    "ameesh accounts profiles": ["--help", "--json"],
     "ameesh list": ["--help", "--json"],
     "ameesh show": ["--help", "--json"],
     "ameesh migrate": ["--additive-only", "--allow-live-executors", "--dry-run", "--help"],
