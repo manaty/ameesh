@@ -22,14 +22,18 @@ configuration with an immediate schema check (#6573); it is additive to 1.5.
 Contract 1.7 adds the fixture's agent qualification states
 (``Fixture.agent``/``Fixture.agent_state``, #8341): a module test puts an agent
 in a lease, canon, placement, spend or budget state without writing a core
-table; it is additive to 1.6.
+table; it is additive to 1.6. Contract 1.8 adds :mod:`ameesh.public.connectors`
+(#8342): an installed module declares its action connectors under
+``ACTION_CONNECTORS`` and imports ``Action``, ``Outcome`` and ``NotSentError``
+from the public surface instead of ``ameesh.connectors``; it is additive to
+1.7 and changes no connector protocol behavior.
 """
 from __future__ import annotations
 
 #: revision of the written contract served by this package
-CONTRACT_VERSION = "1.7"
+CONTRACT_VERSION = "1.8"
 
-from . import database, fixture, mail  # noqa: E402  (the version is defined before the surface)
+from . import connectors, database, fixture, mail  # noqa: E402  (the version is defined before the surface)
 from .database import connect  # noqa: E402
 
-__all__ = ["CONTRACT_VERSION", "connect", "database", "fixture", "mail"]
+__all__ = ["CONTRACT_VERSION", "connect", "connectors", "database", "fixture", "mail"]

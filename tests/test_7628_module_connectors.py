@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Installed action modules: real entry-point discovery, canon policy and gate."""
+import ast
 import importlib
 import json
 import os
@@ -13,6 +14,7 @@ from unittest import mock
 from ameesh import actions, connectors, module_actions, modules
 from ameesh.modules import registry
 from ameesh.modules.storage import ModuleStore
+from ameesh.public import connectors as public_connectors
 from tests.test_actions import ActionsBase, ALICE, POLICY
 from tests.test_l98_modules_activation import canon_with, federation, external_points, FakeEntryPoint, sample
 from tests.webauthn_soft import ORIGIN, RP_ID
@@ -77,6 +79,55 @@ class ConnectorDeclarationTest(unittest.TestCase):
         classes = {'example': {'message:publish/path': 'irreversible'}}
         compiled = module_actions.compile_policy('sample', module, module.descriptor(), classes)
         self.assertEqual(compiled['rules'][-1]['connectors'], classes)
+
+
+class PublicConnectorDeclarationTest(unittest.TestCase):
+    """#8342: a module declares connectors through the public surface only."""
+
+    def test_the_public_constant_names_the_registry_attribute(self):
+        self.assertEqual(public_connectors.ACTION_CONNECTORS, 'ACTION_CONNECTORS')
+        self.assertIs(public_connectors.Outcome, connectors.Outcome)
+        self.assertIs(public_connectors.NotSentError, connectors.NotSentError)
+
+    def test_a_public_declaration_is_discovered(self):
+        module = sample(name='public-extension')
+        setattr(module, public_connectors.ACTION_CONNECTORS,
+                {'public-publish': lambda: None})
+        with external_points(FakeEntryPoint(module, name='public-extension')):
+            discovered = registry.discover()
+            self.assertFalse(discovered.refused, discovered.refused)
+            self.assertEqual(discovered.get('public-extension').action_connectors,
+                             ('public-publish',))
+            self.assertIn('public-publish', registry.action_connectors())
+
+    def test_an_invalid_public_declaration_is_refused(self):
+        cases = (
+            (['public-publish'], 'must be a mapping'),
+            ({'Bad Name': lambda: None}, 'invalid action connector'),
+            ({'public-publish': None}, 'invalid action connector'),
+            ({'shell-noop': lambda: None}, 'duplicate action connector'),
+        )
+        for declarations, reason in cases:
+            with self.subTest(declarations=declarations):
+                module = sample(name='public-extension')
+                setattr(module, public_connectors.ACTION_CONNECTORS, declarations)
+                with external_points(FakeEntryPoint(module, name='public-extension')):
+                    discovered = registry.discover()
+                    self.assertEqual(len(discovered.refused), 1, discovered.refused)
+                    self.assertIn(reason, discovered.refused[0]['error'])
+                    self.assertIsNone(discovered.get('public-extension'))
+
+    def test_the_bench_distribution_imports_only_the_public_surface(self):
+        tree = ast.parse((FIXTURE / 'bench_actions.py').read_text(encoding='utf-8'))
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0)
+                names.add(node.module)
+        self.assertLessEqual(names, {'pathlib', 'ameesh.public.connectors'})
+        self.assertNotIn('ameesh.connectors', names)
 
 
 class InstalledActionTest(ActionsBase):

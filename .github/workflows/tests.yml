@@ -705,6 +705,15 @@ jobs:
           POSTGRES_USER: ameesh
           POSTGRES_PASSWORD: ameesh-ci
           POSTGRES_DB: ameesh
+          # #8355 : une passe `migrate` sur un schéma neuf est UNE transaction
+          # (#7649) qui garde ~1 100 verrous de relation jusqu'au COMMIT ; le
+          # clone du gabarit et DROP SCHEMA CASCADE autant. La table partagée
+          # par défaut (64 × ~120 processus ≈ 7 800) cède à 4 workers d'une
+          # part (« out of shared memory », psycopg 11/12 du run 45976721349).
+          # 256 ≈ 31 000 verrous, ~11 Mo de mémoire partagée en plus. Le
+          # réglage exige un redémarrage, et un service ne prend pas
+          # d'arguments : initdb -c (PG 16+) l'écrit dans postgresql.conf.
+          POSTGRES_INITDB_ARGS: "-c max_locks_per_transaction=256"
         ports: ["5432"]  # host port chosen by docker: several runners share the host
         # base jetable : données en mémoire
         options: >-
@@ -1007,6 +1016,7 @@ jobs:
           POSTGRES_USER: ameesh
           POSTGRES_PASSWORD: ameesh-ci
           POSTGRES_DB: ameesh
+          POSTGRES_INITDB_ARGS: "-c max_locks_per_transaction=256"  # #8355
         ports: ["5432"]  # host port chosen by docker: several runners share the host
         options: >-
           --tmpfs /var/lib/postgresql/data
@@ -1107,6 +1117,7 @@ jobs:
           POSTGRES_USER: ameesh
           POSTGRES_PASSWORD: ameesh-ci
           POSTGRES_DB: ameesh
+          POSTGRES_INITDB_ARGS: "-c max_locks_per_transaction=256"  # #8355
         ports: ["5432"]
         options: >-
           --tmpfs /var/lib/postgresql/data

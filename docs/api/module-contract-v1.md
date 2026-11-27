@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.7, 27 November 2026** (additive agent qualification
-states of the public fixture). Scope: an
+Contract revision: **1.8, 27 November 2026** (additive public action-connector
+surface). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -32,6 +32,11 @@ Revision 1.7 adds the fixture's agent qualification states
 test puts an agent in a lease, canon, placement, spend-marker, reservation or
 cost state through the core's own code, without writing a core table; it is
 additive to revision 1.6.
+Revision 1.8 adds `ameesh.public.connectors` (#8342, manaty/ameesh#6582): an
+installed module declares its action connectors under `ACTION_CONNECTORS` and
+imports the protocol objects (`Action`, `Outcome`, `NotSentError`) from the
+public surface instead of `ameesh.connectors`; the governed gate, its policy
+and the connector protocol are unchanged, so the revision is additive to 1.7.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -71,13 +76,14 @@ In particular, the baseline here is ameesh commit
 The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
 (#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b), the
 revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2), the
-revision 1.6 element (#6573) and the revision 1.7 element (#8341) are available only in a released version that
+revision 1.6 element (#6573), the revision 1.7 element (#8341) and the
+revision 1.8 element (#8342) are available only in a released version that
 carries those lots; at the 1.0 baseline they are absent, and a consumer must
 still treat their absence as "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
 [coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5,
-1.6 and 1.7 elements from the release that implements them, and freeze revision
-1.7; the surface keeps the 1.0 commit as its comparison point.
+1.6, 1.7 and 1.8 elements from the release that implements them, and freeze
+revision 1.8; the surface keeps the 1.0 commit as its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -108,7 +114,7 @@ release's `--help`. These entry points cover the module integration:
 | `ameesh list --json`, `ameesh show --json` | `ameesh-agents/1`: the same bounded `deferral` block (revision 1.2, #7675), closed reasons; its absence or `null` is not permission to run. |
 | `agent-mail send`, `agent-mail show` | Ordinary governed mail. The help documents flags and stdin. These commands alone do not provide IMA's atomic request/reply/deduplication protocol (E2). |
 | `ameesh migrate --dry-run --additive-only` | Core migration classification; the module does not import or invoke the migration implementation. Actual application retains its operator and staging gates. |
-| `ameesh action propose\|approve\|execute\|reconcile` | Governed action lifecycle; external connector availability is conditional on #7628, below. |
+| `ameesh action propose\|approve\|execute\|reconcile` | Governed action lifecycle. From revision 1.8 an installed module supplies external action connectors through `ACTION_CONNECTORS` and `ameesh.public.connectors`, below. |
 
 Use JSON only where the command offers it. Human tables, log text, Python
 tracebacks and private exit details are not machine schemas. A successful exit
@@ -218,13 +224,96 @@ before relying on the built-in development module's implementation.
 Likewise, `OWNS_CONNECTION` is used internally by development tooling, not a
 public escape hatch for external modules.
 
-External action connectors are tracked by
-[#7628 / #5818](https://github.com/manaty/ameesh/issues/5818):
+External action connectors from an installed module are part of this contract
+from revision 1.8: a module declares them under `ACTION_CONNECTORS` and imports
+the protocol objects from `ameesh.public.connectors`; see [action
+connectors](#action-connectors-declared-by-an-installed-module-18-8342) below.
+At the 1.0 baseline they were absent, and the historical design note
 [`ACTION_CONNECTORS`, operation classes and test bench](https://github.com/manaty/ameesh/blob/9755b4f3265a19afe6105e687be88edaab4ab459/docs/design/module-action-connectors.md)
-are specified in [PR #5836](https://github.com/manaty/ameesh/pull/5836), not present
-at this document's baseline. Connector-only modules and `action_classes`
-become available when that implementation is released. A consumer must not
-infer their availability from this contract's revision alone.
+remains the protocol rationale, not a second surface.
+
+## Action connectors declared by an installed module (1.8, #8342)
+
+Revision 1.8 adds `ameesh.public.connectors`, the supported Python surface for
+a module that supplies action connectors (#7628 / #5818, consumer IMA#1803,
+manaty/ameesh#6582). It is additive: the connector protocol, the governed gate
+(`ameesh.actions`), the canon `action_classes` policy and the database schema
+do not change.
+
+A module declares the connectors it offers in a module-level mapping named
+`ACTION_CONNECTORS`, from connector name to constructor. The module is
+installed through its own `ameesh.modules` entry point like any other module;
+a connector-only module returns an empty `types` list in its descriptor.
+
+```python
+from ameesh.public.connectors import Outcome
+
+class PublishConnector:
+    name = "example-publish"
+    dedupe = "guaranteed"
+
+    def classify(self, operation, args):
+        return "reversible"
+
+    def execute(self, action, idempotency_key):
+        ...  # perform the effect; the key is always action.action_id
+        return Outcome.confirmed("external-id")
+
+    def reconcile(self, action):
+        ...  # read the external system; None when it cannot tell
+        return Outcome.unknown("external read timed out")
+
+ACTION_CONNECTORS = {"example-publish": PublishConnector}
+```
+
+The core registry reads `ACTION_CONNECTORS` on discovery and validates it
+before the module becomes an action provider: the declaration is a mapping;
+each name is a unique module-style identifier; each value is a callable
+constructor; and a name owned by the core (`shell-noop`, `git-merge`) or
+already declared by another module is a collision. A refused module is reported
+with its error in `ameesh modules --json` (`refused`) and never serves a
+connector. Instantiation checks the returned object's `name`, `dedupe`, and
+callable `classify`/`execute`/`reconcile`, and requires its `name` to equal the
+registry key. The core imports only the module entry point it discovered; no
+path named by the canon is imported.
+
+| Element | Contract |
+| --- | --- |
+| `ACTION_CONNECTORS` | Module-level `{name: constructor}` mapping. `ameesh.public.connectors.ACTION_CONNECTORS` freezes the attribute spelling; the mapping is code, never permission. |
+| `name`, `dedupe`, `timeout` | `name` is the registry key and the value of `actions.connector`. `dedupe` is `guaranteed` only when the external system really deduplicates on the idempotency key, `none` otherwise (`DEDUPE`). `timeout` is an optional positive number of seconds (default 60) after which the gate treats the attempt as `unknown`. |
+| `classify(operation, args) -> str` | The default class of an operation, one of `ACTION_CLASSES` (`read`, `reversible`, `irreversible`, `costly`). The class declared in the trusted canon's `action_classes` is authoritative; the gate may skip this call. |
+| `execute(action, idempotency_key) -> Outcome` | The effect. The gate calls it only after writing `launched`; the key is always `action.action_id`. A `dedupe="guaranteed"` connector actually deduplicates that key. |
+| `reconcile(action) -> Outcome \| None` | A read-only observation: `None` when the external record cannot be found, `Outcome.confirmed` on proof, `Outcome.failed` on certain failure. It never grants authorization. |
+| `Action` | Frozen record: `action_id`, `project`, `connector`, `operation`, `target`, `args`, `action_class`, `amount`, `currency`, `policy_version`, `attempt`, `work_item`, `recurrence`, `spend_provider`, `spend_purpose`. |
+| `Outcome` | Frozen record: `state` (`confirmed`, `failed` or `unknown`), `external_ref`, `detail`, `extra`. Construct with `Outcome.confirmed(external_ref=None, detail="")`, `Outcome.failed(detail, external_ref=None)` or `Outcome.unknown(detail, external_ref=None)`; another state is refused. |
+| `NotSentError` (code `not-sent`) | Raised only for a certain failure before the first byte of the request was written (name resolution, refused or timed-out connection, TLS handshake). The gate settles the attempt `failed` (`not sent`) and permits a retry under the same `action_id`; never raise it after sending. |
+
+`unknown` is the safe answer whenever an effect may have happened: a read
+timeout after the request was sent, a lost response, or any other exception.
+Only a certain no-effect failure is `failed`; in doubt, return `unknown`.
+
+Activation and the gate remain the only path to an effect. A connector is
+usable in a project only when the trusted canon selects its module and declares
+the operation under `action_classes`; the gate rechecks activation and class
+before approval and execution. Declaration is not permission, and a
+connector's `classify` never overrides the canon.
+
+Accordingly, a module never writes the core's action log, approval,
+reservation or ledger tables; never calls `ameesh.connectors.get`, the internal
+registry or its own `execute` outside the gate; never treats its database
+credential, `ACTION_CONNECTORS` or a previous approval as authorization; and
+never imports `ameesh.connectors`, `ameesh.actions`, `ameesh.modules.registry`
+or another private path. A direct write or a bypassed gate is an unreviewed
+action, not an extension point.
+
+`ameesh.public.connectors` exports `CONTRACT_VERSION` (`"1.8"`),
+`ACTION_CONNECTORS`, `OUTCOMES`, `ACTION_CLASSES`, `DEDUPE`, `DEFAULT_TIMEOUT`,
+`Action`, `Outcome` and `NotSentError`. It re-exports the exact objects the
+gate uses, so an outcome is not translated between two vocabularies. Enable the
+surface only when its `CONTRACT_VERSION` is `"1.8"` or a compatible later
+minor; the package revision `ameesh.public.CONTRACT_VERSION` is then at least
+`"1.8"`. `ameesh.public.mail` stays at `"1.4"` and `ameesh.public.fixture` at
+`"1.7"`.
 
 ## Runner extension boundary
 
@@ -636,8 +725,13 @@ frozen as revision 1.5; [#8341](https://github.com/manaty/ameesh/issues/6581)
 adds its agent qualification states as revision 1.7, with the same witness.
 [#6573](https://github.com/manaty/ameesh/issues/6573) supplies the Python
 production connection, frozen as revision 1.6; its witness runs in the same
-external distribution and in `tests/test_8333_public_connect.py`. Existing
-evidence is
+external distribution and in `tests/test_8333_public_connect.py`. [#8342 /
+#6582](https://github.com/manaty/ameesh/issues/6582) adds the public
+action-connector surface as revision 1.8; the offline
+[module-connector bench](../../tests/fixtures/module_connector_bench) is a real
+external distribution that imports only `ameesh.public.connectors`, and
+`tests/test_7628_module_connectors.py` discovers it and refuses invalid
+declarations. Existing evidence is
 in `test_l84_serve`, `test_l98_modules_registry`, `test_l104_bare_canon`,
 `test_l2894_turn_observe`, and `test_l2894_turn_context`; the fixture witness
 covers the process, usage, refusal, mail and production-connection paths that
