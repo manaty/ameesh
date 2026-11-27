@@ -86,7 +86,7 @@ SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "migrations_width", "migrations_companions", "target",
                 "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
-                "required_statuses", "required_checks", "production_branch")
+                "required_statuses", "required_checks", "production_branch", "packets")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
 #: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
 CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
@@ -231,6 +231,10 @@ class Project:
     required_checks_declared: bool = False
     #: #3533: published ancestry excluded from packet author attribution.
     production_branch: str = ""
+    #: #8323 : `false` déclare que la cible `target` de `github` n'est portée
+    #: par aucun paquet (§11 bis) : la garde du paquet la laisse aux gardes du
+    #: §2. Absente : la cible est portée par les paquets (le doute refuse).
+    packets: bool = True
 
 
 @dataclass
@@ -387,6 +391,12 @@ def parse_settings(raw) -> Settings:
             plan_git.check_ref(texts["production_branch"], "production_branch")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
             raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
+        packets = value.get("packets", True)
+        if not isinstance(packets, bool):
+            raise SettingsError("%s.packets: true or false expected" % where)
+        if not packets and not (texts["github"] and texts["target"]):
+            raise SettingsError("%s.packets: false names a target without packet: github "
+                                "and target are required" % where)
         land = value.get("land") or "off"
         if land not in LAND_MODES:
             raise SettingsError("%s.land: %s expected" % (where, " | ".join(LAND_MODES)))
@@ -544,6 +554,7 @@ def parse_settings(raw) -> Settings:
                                  target=texts["target"],
                                  github=texts["github"], land=land,
                                  production_branch=texts["production_branch"],
+                                 packets=packets,
                                  gates=tuple(gates), merge_method=method,
                                  lease_ref=lease_ref,
                                  generated=tuple(generated), path_gates=tuple(by_path),
