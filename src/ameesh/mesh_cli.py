@@ -44,6 +44,8 @@
   agent-mesh canon check|show|sync [--json] [--host H]   OKF canon (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions and admissible hosts (C4)
   agent-mesh hosts [--json] [HOST] [--history N]         host resources (L31)
+  agent-mesh reservations [--json] [--limit N] [--account A] [--agent A] [--state S]
+                                                open account reservations, fleet-wide (#8343)
   agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between {works} (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
@@ -66,6 +68,7 @@ from __future__ import annotations
 from ameesh import work_lifecycle as lifecycle
 
 import argparse
+import dataclasses
 import getpass
 import json
 import os
@@ -112,6 +115,51 @@ def _doc(vocabulary=None) -> str:
 def _open(cfg: Config) -> Db:
     # L61 : la vérification de schéma part avec la première requête
     return db_mod.open_db(cfg)
+
+
+def _reservation_limit(text: str) -> int:
+    """#8343 : la borne de `ameesh reservations --limit` (1..MAX_LIMIT)."""
+    from . import account_reservations
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("a whole number") from exc
+    if not 1 <= value <= account_reservations.MAX_LIMIT:
+        raise argparse.ArgumentTypeError(
+            "between 1 and %d" % account_reservations.MAX_LIMIT)
+    return value
+
+
+def cmd_reservations(cfg: Config, args: argparse.Namespace) -> int:
+    """#8343 : réservations de comptes encore comptées, pour toute la flotte."""
+    from . import account_reservations
+    db = _open(dataclasses.replace(cfg, read_only=True))
+    try:
+        document = account_reservations.open_reservations(
+            db, limit=args.limit, account=args.account, agent=args.agent,
+            state=args.state)
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False))
+        return 0
+    if not document["reservations"] and not document["unreadable"]:
+        print("no open account reservation")
+        return 0
+    print("RESERVATIONS  %d listed  limit %d%s" % (
+        len(document["reservations"]), document["limit"],
+        "  (truncated: older ones not shown)" if document["truncated"] else ""))
+    print("  id  agent              account            usd     age     state  period")
+    for row in document["reservations"]:
+        print("  %-3d %-18s %-18s %7.2f %-7s %-5s %s%s" % (
+            row["id"], row["agent"][:18], row["billing_account"][:18],
+            row["usd"], _fmt_age(row["age_s"]), row["state"], row["period"],
+            "" if row["agent_known"] else "  (unknown agent)"))
+    for bad in document["unreadable"]:
+        print("  unreadable id %s agent %s account %s state %s: %s" % (
+            bad["id"], bad["agent"], bad["billing_account"], bad["state"],
+            bad["reason"]))
+    return 0
 
 
 def _fmt_age(seconds: float) -> str:
@@ -5354,6 +5402,27 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
     from . import budget as budget_mod
     budget_mod.add_parsers(sub)
+    # #8343 (manaty/ameesh#6583) : réservations de comptes encore comptées,
+    # pour toute la flotte — lecture seule et bornée.
+    from . import account_reservations as reservations_mod
+    p_reservations = sub.add_parser(
+        "reservations",
+        help="open account reservations per agent, fleet-wide (read-only, "
+             "bounded; #8343)")
+    p_reservations.add_argument(
+        "--limit", type=_reservation_limit, default=reservations_mod.DEFAULT_LIMIT,
+        metavar="N", help="reservations at most (1..%d, default %d)"
+                          % (reservations_mod.MAX_LIMIT, reservations_mod.DEFAULT_LIMIT))
+    p_reservations.add_argument("--account", default=None, metavar="ACCOUNT",
+                                help="exact billing account")
+    p_reservations.add_argument("--agent", default=None, metavar="AGENT",
+                                help="exact agent name")
+    p_reservations.add_argument(
+        "--state", choices=reservations_mod.STATE_FILTERS, default="all",
+        help="open, kept, or all (default: all = open and kept)")
+    p_reservations.add_argument("--json", action="store_true",
+                                help="ameesh-reservations/1 document")
+    p_reservations.set_defaults(func=cmd_reservations)
     # L131 : suites lourdes plafonnées par hôte
     from . import heavy as heavy_mod
     heavy_mod.add_parser(sub)

@@ -2327,6 +2327,186 @@
         ],
         "type": "object"
       },
+      "ameesh-reservations-1": {
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "filter": {
+            "properties": {
+              "account": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "agent": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "states": {
+                "items": {
+                  "enum": [
+                    "open",
+                    "kept"
+                  ]
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "account",
+              "agent",
+              "states"
+            ],
+            "type": "object"
+          },
+          "limit": {
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "observed_ts": {
+            "type": "number"
+          },
+          "reservations": {
+            "items": {
+              "properties": {
+                "account_envelope": {
+                  "type": "boolean"
+                },
+                "account_profile": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "age_s": {
+                  "type": "number"
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "agent_known": {
+                  "type": "boolean"
+                },
+                "billing_account": {
+                  "type": "string"
+                },
+                "created_ts": {
+                  "type": "number"
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "period": {
+                  "type": "string"
+                },
+                "period_reset_ts": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "enum": [
+                    "open",
+                    "kept"
+                  ]
+                },
+                "usd": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "id",
+                "agent",
+                "agent_known",
+                "account_profile",
+                "billing_account",
+                "usd",
+                "state",
+                "period",
+                "created_ts",
+                "age_s",
+                "account_envelope",
+                "period_reset_ts"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "schema": {
+            "const": "ameesh-reservations/1",
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "unreadable": {
+            "items": {
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "billing_account": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "enum": [
+                    "invalid_id",
+                    "invalid_identity",
+                    "invalid_state",
+                    "invalid_amount",
+                    "invalid_timestamp",
+                    "invalid_period"
+                  ]
+                },
+                "state": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "agent",
+                "billing_account",
+                "state",
+                "reason"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema",
+          "observed_ts",
+          "limit",
+          "truncated",
+          "filter",
+          "count",
+          "reservations",
+          "unreadable"
+        ],
+        "type": "object"
+      },
       "ameesh-sandbox-turn-1": {
         "properties": {
           "agent": {
@@ -6583,6 +6763,99 @@
           }
         },
         "summary": "One mailbox request's observation: delivery state and turn (#2167)"
+      }
+    },
+    "/api/v1/reservations": {
+      "get": {
+        "operationId": "reservations",
+        "parameters": [
+          {
+            "description": "at most 500 (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "exact billing account",
+            "in": "query",
+            "name": "account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "exact agent name",
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "open, kept, or all (default all)",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "enum": [
+                "all",
+                "open",
+                "kept"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-reservations-1"
+                }
+              }
+            },
+            "description": "Open account reservations per agent, fleet-wide (`ameesh reservations --json`; read-only, bounded, #8343)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Open account reservations per agent, fleet-wide (`ameesh reservations --json`; read-only, bounded, #8343)"
       }
     },
     "/api/v1/sandbox/turns": {
