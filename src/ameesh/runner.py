@@ -1600,9 +1600,9 @@ class AgentWorker(threading.Thread):
             # de connexion ; l'échec du retour doit survivre au worker, sinon
             # la passe suivante verrait zéro worker et publierait `login`
             # sans bail rendu.
-            self._seat_login_release_failed()
+            AgentWorker._seat_login_release_failed(self)
             return False
-        self._seat_login_release_confirmed()
+        AgentWorker._seat_login_release_confirmed(self)
         return True
 
     def _seat_login_release_failed(self) -> None:
