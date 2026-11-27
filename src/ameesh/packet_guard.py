@@ -35,6 +35,14 @@ geste à faire. Il n'écrit rien : aucun commit, aucune étiquette.
 (manaty/home), que le bureau fusionne (#2511), en est exclu : il se lit dans
 la configuration (les canons approuvés, `canon_repositories`), jamais en dur
 (§7). Un dépôt inconnu ou illisible reste refusé (le doute refuse).
+
+#8323 : le §11 bis ne nomme que les cibles des projets portés par les paquets.
+Une PR dont le dépôt réel (marque du gel, `ameesh-freeze-repo`) n'est aucun des
+dépôts de projet déclarés (`github.projects`, `radar.projects`) n'a pas de
+paquet : manaty-its/main pour un lot nexlink (#8095). Elle passe ici, et le
+feu lui applique les gardes du §2 (gel, avis, CI verte sur la tête gelée,
+`--match-head-commit`). Sans déclaration lisible, le doute refuse toujours ;
+un dépôt déclaré garde le refus sur toutes ses cibles d'intégration.
 """
 from __future__ import annotations
 
@@ -149,6 +157,43 @@ def outside_packets(repo, cfg) -> str:
     return ident if ident and ident in canon_repositories(cfg) else ""
 
 
+def packet_repositories(cfg) -> frozenset:
+    """#8323 : les dépôts des projets portés par les paquets, lus dans la
+    configuration (§7) : `github.projects` et `radar.projects`. Une section
+    illisible n'ajoute rien ; un ensemble vide ne dispense personne."""
+    if cfg is None:
+        return frozenset()
+    found = set()
+    try:
+        from .modules.dev import plan_github
+        for slug in plan_github.settings_of(cfg).projects.values():
+            ident = repository(slug)
+            if ident:
+                found.add(ident)
+    except Exception:  # noqa: BLE001 - section illisible : aucun dépôt
+        pass
+    try:
+        from . import radar
+        for project in radar.settings_of(cfg).projects.values():
+            ident = repository(getattr(project, "github", "") or "")
+            if ident:
+                found.add(ident)
+    except Exception:  # noqa: BLE001 - section illisible : aucun dépôt
+        pass
+    return frozenset(found)
+
+
+def without_packet(repo, cfg) -> str:
+    """#8323 : l'identité du dépôt quand des projets sont déclarés et qu'il
+    n'en est aucun (aucun paquet ne le porte), sinon "". Un dépôt illisible,
+    ou une configuration sans projet déclaré, rend "" : le doute refuse."""
+    ident = repository(repo)
+    if not ident:
+        return ""
+    declared = packet_repositories(cfg)
+    return ident if declared and ident not in declared else ""
+
+
 def exception_of(exception: str, reason: str) -> tuple[str, str]:
     """Valide la nature et le motif d'une exception, sans tête.
 
@@ -260,6 +305,12 @@ def _outside_why(ident: str) -> str:
             "outside the packets of canon §11 bis" % ident)
 
 
+def _without_packet_why(ident: str, target: str) -> str:
+    return ("repository %s carries no packet (no declared project): the target %s is "
+            "outside canon §11 bis, the §2 gates apply (freeze, reviews, green CI "
+            "on the frozen head, --match-head-commit)" % (ident, target or "?"))
+
+
 def _merge_refusal(source: str, target: str) -> str:
     return (
         "direct merge of %s into %s refused: canon §11 bis (owner decision of "
@@ -290,7 +341,8 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
     de travail ne déplace pas `main`/`develop`. La cible vide est traitée
     comme une cible d'intégration (le doute refuse). #5497 : la cible d'un
     dépôt hors paquets (`repo` est celui du canon, `outside_packets`) passe ;
-    sans `repo` ni `cfg`, le refus reste celui d'avant. Une exception explicite
+    sans `repo` ni `cfg`, le refus reste celui d'avant. #8323 : un dépôt qu'aucun
+    projet déclaré ne porte (`without_packet`) passe aussi. Une exception explicite
     est journalisée ici, sur la tête `sha` ; une exception déjà déclarée est
     relue. Rend la déclaration retenue, ou lève `PacketGuardError`."""
     source_name, target_name = branch_of(source), branch_of(target)
@@ -311,6 +363,10 @@ def check_merge(db, lot, source, target, sha, *, exception: str = "", reason: st
     if outside:
         return {"allowed": True, "why": _outside_why(outside), "exception": "",
                 "journaled": False}
+    alone = without_packet(repo, cfg)
+    if alone:
+        return {"allowed": True, "why": _without_packet_why(alone, target_name),
+                "exception": "", "journaled": False}
     if exception:
         return {"allowed": True, **declare(db, lot, exception, reason, sha, actor=actor)}
     found = declared(db, lot, sha)

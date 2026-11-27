@@ -260,12 +260,15 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
         except plan_git.MergeProbeError:
             target = ""
     full = merge_queue.pinned(repo, wanted) if repo else None
+    # #8323 : la garde lit le dépôt réel de la PR (marque du gel), pas le
+    # clone de l'assigné, qui peut être celui du projet du lot.
+    pr_repo = frozen_repository(marks) or repo or ""
 
     def check(database):
         try:
             packet_guard.check_merge(database, lot, item.get("branch") or "", target,
                                      frozen, exception=exception, reason=reason,
-                                     actor=actor, repo=repo or "", cfg=cfg)
+                                     actor=actor, repo=pr_repo, cfg=cfg)
         except packet_guard.PacketGuardError as exc:
             # #4306 : le lot d'un canon reçoit son feu depuis le clone du canon.
             hint = (" — a lot of the canon repository: pass --repo <its clone>"
@@ -441,9 +444,14 @@ def review_checkout(cfg, db, row: dict, *, repo: str | None = None,
     return None
 
 
-def _slug(cfg, item: dict, repo: str | None) -> str | None:
+def _slug(cfg, item: dict, repo: str | None, marks=None) -> str | None:
     """`owner/repo` du lot : son issue, le projet déclaré, sinon l'`origin` du
     dossier de travail.
+
+    #8323 : le dépôt que la marque machine du gel courant nomme
+    (`ameesh-freeze-repo`, #6735) est celui de la PR ; il l'emporte sur
+    l'issue. Un lot nexlink dont la PR vit dans manaty-its (#8095) est lu,
+    gardé et fusionné là, jamais dans manaty/nexlink.
 
     #4306 : un lot du canon porte souvent une issue manaty/ameesh, mais sa
     branche et sa PR vivent dans le dépôt du canon. Quand le dossier de
@@ -454,11 +462,21 @@ def _slug(cfg, item: dict, repo: str | None) -> str | None:
     origin = migrations.origin_repo(repo) if repo else None
     if origin and packet_guard.outside_packets(repo, cfg):
         return migrations.repo_key(origin)
+    named = frozen_repository(marks)
+    if named:
+        return migrations.repo_key(named)
     try:
         return work.lot_repository(item, cfg)
     except work.WorkError:
         pass
     return migrations.repo_key(origin) if origin else None
+
+
+def frozen_repository(marks) -> str:
+    """#8323 : le dépôt `owner/repo` de la PR que le gel courant nomme (marque
+    machine `ameesh-freeze-repo`), ou "" sans gel ni marque."""
+    from . import review_authors
+    return review_authors.freeze_repository(freeze_of(marks))
 
 
 def _project(cfg, repo: str | None, slug: str | None):
@@ -2372,7 +2390,7 @@ def ready(cfg, db, row: dict, marks: list, status: dict, *, repo: str | None,
         return ok, why, klass
     frozen = _norm((freeze_of(marks) or {}).get("sha"))
     ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
-                       slug=_slug(cfg, row, repo), gh=gh or land._gh, cfg=cfg)
+                       slug=_slug(cfg, row, repo, marks), gh=gh or land._gh, cfg=cfg)
     return ok, why, klass
 
 
@@ -2827,7 +2845,7 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
             "--repo %s is not a git checkout: pass a path inside the lot's repository "
             "(#2535: refusing to read the project's declared clone instead)" % repo))
         return out
-    slug = _slug(cfg, row, work_repo)
+    slug = _slug(cfg, row, work_repo, marks)
     if not slug:
         out.update(result="no-repository", detail="no GitHub repository known for this lot")
         return out
@@ -2898,8 +2916,12 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     # pour un feu donné avant la garde ou avec une auto-fusion déjà armée. La
     # déclaration d'exception est relue au journal du lot ; un refus désarme
     # une auto-fusion résiduelle (`_not_ready`) avant toute PR ou file.
+    # #8323 : la garde lit le dépôt (`slug`, marque du gel) et la base réels
+    # de la PR ; sans PR lue, la cible du lot.
     try:
-        packet_guard.check_merge(db, lot, branch, target, _norm(fire.get("sha")),
+        packet_guard.check_merge(db, lot, branch,
+                                 str((status or {}).get("base") or "") or target,
+                                 _norm(fire.get("sha")),
                                  repo=slug or work_repo or "", cfg=cfg)
     except packet_guard.PacketGuardError as exc:
         return _not_ready(db, row, status, out, str(exc), gh=gh, slug=slug,
