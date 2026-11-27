@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.5, 18 November 2026** (additive public fixture for a
-consumer-owned disposable database). Scope: an
+Contract revision: **1.6, 27 November 2026** (additive public production
+connection for an installed module). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -23,6 +23,10 @@ additive to revision 1.3.
 Revision 1.5 adds `ameesh.public.fixture` (tranche F2, #7701): an installed
 consumer creates, migrates, observes and drops its own disposable database
 without `tests.support` or a private path; it is additive to revision 1.4.
+Revision 1.6 adds `ameesh.public.database` (#6573): the production connection
+for the same public Python surfaces, opened from the usual configuration with
+an immediate schema check and no internal import; it is additive to revision
+1.5.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -61,14 +65,14 @@ In particular, the baseline here is ameesh commit
 `aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`; an open PR is not an installed feature.
 The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
 (#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b), the
-revision 1.4 element (#7673 E2c) and the revision 1.5 element (#7701 F2) are
-available only in a released version that carries those lots; at the 1.0
-baseline they are absent, and a consumer must still treat their absence as
-"unknown", never as permission. The frozen
+revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2) and the
+revision 1.6 element (#6573) are available only in a released version that
+carries those lots; at the 1.0 baseline they are absent, and a consumer must
+still treat their absence as "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
-[coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3 and
-1.5 elements from the release that implements them, and freeze revision 1.5;
-the surface keeps the 1.0 commit as its comparison point.
+[coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5
+and 1.6 elements from the release that implements them, and freeze revision
+1.6; the surface keeps the 1.0 commit as its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -473,8 +477,9 @@ Revision 1.5 adds `ameesh.public.fixture`, the qualification fixture for an
 installed module. A consumer uses it to run its own Process, usage, refusal and
 mail witnesses on a **consumer-owned disposable database**, without importing
 `tests.support`, a private ameesh path or a core table. Enable the surface when
-`ameesh.public.CONTRACT_VERSION` is `"1.5"` or a compatible later minor;
-`ameesh.public.fixture.CONTRACT_VERSION` is `"1.5"`.
+`ameesh.public.fixture.CONTRACT_VERSION` is `"1.5"` or a compatible later
+minor; the package revision `ameesh.public.CONTRACT_VERSION` is then at least
+`"1.5"` (`"1.6"` once the production connection is present).
 
 | Element | Contract |
 | --- | --- |
@@ -510,6 +515,42 @@ own DSN; no host default is read. The witness that exercises this surface is
 `tests/test_7701_public_fixture.py` runs it on `AMEESH_TEST_DSN` and proves that
 the reported `ameesh_fixture_*` database is gone afterwards.
 
+## Public production connection (1.6, #6573)
+
+Revision 1.6 adds :mod:`ameesh.public.database` and its re-export
+`ameesh.public.connect`: the production counterpart of the fixture's
+`connect()`. A module that already holds the deployment's database identity
+opens its connection from the same environment and configuration as an
+installed core command (`AMEESH_DSN` or the configured DSN, `AMEESH_SCHEMA`,
+driver and backend) instead of importing `ameesh.config`, `ameesh.db` and
+`require_schema()`. Enable the surface when `ameesh.public.CONTRACT_VERSION` is
+`"1.6"` or a compatible later minor; `ameesh.public.mail` stays at `"1.4"` and
+`ameesh.public.fixture` at `"1.5"`.
+
+| Element | Contract |
+| --- | --- |
+| `connect() -> Db` | Open one connection from the process's usual configuration, with no DSN, credential or connection argument. The agent-mesh schema is checked immediately with the core's probe, never deferred: a missing or incompatible schema refuses before the caller can write. Return the core connection object, opaque for this contract: pass it to `ameesh.public.mail` and close it with `db.close()`, never use it as an SQL escape hatch on the core's tables (their names, columns and views other than the admitted named views are internal). One connection per process or racing thread; the caller closes it. |
+| `DatabaseUnavailable` (code `unavailable`) | The configuration cannot be read, the database cannot be opened, or the connection is lost while the schema is checked. |
+| `SchemaRefused` (code `schema`) | The connection opened but the agent-mesh schema is absent, incompatible or cannot be verified. Nothing is written by this surface before the refusal. |
+| `UnsupportedStorage` (code `unsupported`) | A mediated or remote executor connection is outside this surface; it is refused before any mail operation. `DatabaseError` is the common base of the three. |
+| Redaction and opacity | `connect()` adds no attribute returning the DSN or a password. No published error message carries the DSN, a password or its encoded form, and `repr()` of the returned connection does not expose them. |
+| Configuration and identity | The surface reads the usual configuration exactly like an installed core command and does not authenticate a remote client: the database credential remains the trust boundary. A process running under a mesh runner still submits under the identity that runner verified; `connect()` mints, widens or verifies no identity. |
+
+The surface is additive: `Fixture.connect()` keeps its 1.5 behavior and
+isolation, and `public.mail` keeps its 1.4 behavior. Where the fixture
+constructs a disposable database for qualification, `public.connect()` opens
+the deployment's configured database; a consumer chooses the appropriate one,
+it is not inferred from the other.
+
+The external witness
+[public-fixture-witness](../../examples/fixtures/public-fixture-witness) runs
+this surface in a clean child process of the fixture environment: it connects
+with no argument, submits and reads through `ameesh.public.mail`, closes, and
+observes the documented schema, storage and unavailable refusals without
+importing an internal module. `tests/test_8333_public_connect.py` covers the
+same elements in-process and in a subprocess; the
+[coverage table](module-contract-v1-coverage.md) cites both.
+
 ## Consumer qualification and delivery
 
 [#7665](https://github.com/manaty/ameesh/issues/5857) supplies the external
@@ -519,12 +560,17 @@ element → test table is [module-contract-v1-coverage.md](module-contract-v1-co
 [#7701](https://github.com/manaty/ameesh/issues/5902) supplies the Python
 fixture surface and its external witness
 ([public-fixture-witness](../../examples/fixtures/public-fixture-witness)),
-frozen as revision 1.5. Existing evidence is
+frozen as revision 1.5.
+[#6573](https://github.com/manaty/ameesh/issues/6573) supplies the Python
+production connection, frozen as revision 1.6; its witness runs in the same
+external distribution and in `tests/test_8333_public_connect.py`. Existing
+evidence is
 in `test_l84_serve`, `test_l98_modules_registry`, `test_l104_bare_canon`,
 `test_l2894_turn_observe`, and `test_l2894_turn_context`; the fixture witness
-covers the process, usage, refusal and mail paths that previously required
-`tests.support`. No test imports `tests.support` across the package boundary:
-a consumer-owned process/database fixture replaces that dependency.
+covers the process, usage, refusal, mail and production-connection paths that
+previously required `tests.support` or internal imports. No test imports
+`tests.support` across the package boundary: a consumer-owned process/database
+fixture replaces that dependency.
 
 Validate the same consumer unchanged against two consecutive stable versions.
 A contract failure belongs in upstream CI before release. Delivery of an
