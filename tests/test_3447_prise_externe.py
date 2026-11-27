@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import (alert_briefs, debit, exploitation, stagnation,
+from ameesh import (alert_briefs, backlog, debit, exploitation, stagnation,
                     sous_utilisation, storage, work)
 
 from .test_l119_backlog import HEURE, _Base, _seuils
@@ -55,11 +55,20 @@ class PriseExterneTest(_Base):
         self.assertIn("reserved to bureau", str(raised.exception))
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
 
-        # Levée : le lot retourne à la file ordinaire et L165 le prend.
+        # Levée : le lot quitte la réservation, mais L165 ne le reprend pas
+        # dans la minute (#8375) — la levée est un passage de main, pas une
+        # nouvelle demande. Sans preuve de livraison, il revient à la file
+        # après la fenêtre de clôture.
         cleared = work.set_external_executor(self.db, lot["id"], None,
                                              actor="human:proprio", cfg=self.cfg,
                                              clear=True)
         self.assertIsNone(cleared["item"]["external_executor"])
+        self.assertEqual(self.take(), [])
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = created_at"
+            " - make_interval(secs => %s) WHERE work_item_id = %s",
+            (backlog.EXTERNAL_RELEASE_GRACE_S + 60, lot["id"]))
         self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "claude1")
 

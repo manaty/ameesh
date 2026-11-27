@@ -8,7 +8,7 @@ import json
 import threading
 from unittest import mock
 
-from ameesh import registry, storage, work
+from ameesh import backlog, registry, storage, work
 
 from .test_l119_backlog import HEURE, _Base
 
@@ -51,13 +51,21 @@ class ExecutantNonAgentTest(_Base):
             work.delegate(self.db, lot["id"], "system:ima", within="30m",
                           actor="human:proprio", cfg=self.cfg)
         self.assertIn("reserved to system:ima", str(raised.exception))
-        # L165 ne le prend pas, et la levée le rend à la file ordinaire.
+        # L165 ne le prend pas ; la levée ne le rend pas prenable dans la
+        # minute (#8375) : elle est un passage de main, pas une nouvelle
+        # demande. Sans preuve de livraison, il revient à la file après la
+        # fenêtre de clôture.
         self.agent("claude1", team="nexlink")
         self.assertNotIn(lot["id"],
                          [i["id"] for i in storage.of(self.db).work.unassigned_lots(10)])
         self.assertEqual(self.take(), [])
         work.set_external_executor(self.db, lot["id"], None, actor="human:proprio",
                                    cfg=self.cfg, clear=True)
+        self.assertEqual(self.take(), [])
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = created_at"
+            " - make_interval(secs => %s) WHERE work_item_id = %s",
+            (backlog.EXTERNAL_RELEASE_GRACE_S + 60, lot["id"]))
         self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
 
     def test_un_systeme_non_declare_est_refuse_et_dit_comment_faire(self):
