@@ -1630,8 +1630,17 @@ def incompatible_migrations(db, directory: str = MIGRATIONS_DIR) -> list[dict]:
 #: Les passes longues gardent leur contrôle explicite et frais (writer_tick).
 #: Une minuterie ouvrant seulement des connexions relit au plus tard après 5 s.
 WRITER_ADMISSION_TTL_S = 5.0
+#: #8335 : attente maximale d'un contrôle d'admission déjà en vol pour la
+#: même cible ; au-delà, la connexion fait son propre contrôle (jamais admise
+#: sans lecture).
+WRITER_ADMISSION_WAIT_S = 30.0
 _WRITER_ADMISSIONS = {}
-_WRITER_ADMISSION_LOCK = threading.RLock()
+#: #8335 : ne protège que les dictionnaires ci-dessous, jamais une lecture de
+#: base : les contrôles de cibles et de fils différents vont en parallèle.
+_WRITER_ADMISSION_LOCK = threading.Lock()
+_WRITER_ADMISSION_FLIGHTS = {}
+#: Augmente à chaque refus : un succès lu avant ne réarme plus le cache.
+_writer_revocations = 0
 
 
 def _writer_admission_key(db, directory):
@@ -1642,36 +1651,53 @@ def _writer_admission_key(db, directory):
     return (os.getpid(), cfg.dsn, cfg.schema, os.path.abspath(directory))
 
 
+def _revoke_writer_admission(key):
+    global _writer_revocations
+    with _WRITER_ADMISSION_LOCK:
+        _WRITER_ADMISSIONS.pop(key, None)
+        _writer_revocations += 1
+
+
 def _check_compatible_writer(db, directory, key):
-    # Refus et erreur de transport ne laissent jamais un succès antérieur.
-    _WRITER_ADMISSIONS.pop(key, None)
+    with _WRITER_ADMISSION_LOCK:
+        revocations = _writer_revocations
     started = time.monotonic()
-    incompatible = incompatible_migrations(db, directory)
-    if incompatible:
-        labels = ", ".join("%04d_%s" % (int(r["version"]), r["name"]) for r in incompatible)
-        raise IncompatibleSchema(
-            "writes refused: database has non-additive migration(s) unknown to this code: "
-            + labels + "; upgrade this executor/CLI before writing")
-    if key is not None:
-        if len(_WRITER_ADMISSIONS) >= 128:
+    try:
+        incompatible = incompatible_migrations(db, directory)
+        if incompatible:
+            labels = ", ".join("%04d_%s" % (int(r["version"]), r["name"]) for r in incompatible)
+            raise IncompatibleSchema(
+                "writes refused: database has non-additive migration(s) unknown to this code: "
+                + labels + "; upgrade this executor/CLI before writing")
+    except BaseException:
+        # Refus et erreur de transport ne laissent jamais un succès antérieur ;
+        # ScopedDb peut ouvrir une connexion admise pendant cette lecture :
+        # son succès imbriqué ne survit pas au refus extérieur.
+        _revoke_writer_admission(key)
+        raise
+    if key is None:
+        return
+    with _WRITER_ADMISSION_LOCK:
+        if revocations != _writer_revocations:
+            return  # un refus est tombé pendant la lecture : rien à partager
+        if key not in _WRITER_ADMISSIONS and len(_WRITER_ADMISSIONS) >= 128:
             _WRITER_ADMISSIONS.pop(next(iter(_WRITER_ADMISSIONS)))
         # Le temps de lecture compte dans les 5 s, pas seulement l'attente.
         _WRITER_ADMISSIONS[key] = started + WRITER_ADMISSION_TTL_S
 
 
 def require_compatible_writer(db, directory: str = MIGRATIONS_DIR) -> None:
-    """Contrôle explicite toujours frais ; renouvelle l'admission de la cible."""
+    """Contrôle explicite toujours frais ; renouvelle l'admission de la cible.
+
+    #8335 : la lecture se fait hors de tout verrou partagé ; des contrôles
+    concurrents (un par worker) ne s'attendent pas les uns les autres."""
     if getattr(getattr(db, 'cfg', None), 'backend', '') == 'mediated':
         return  # requests are admitted by the server running its own code
-    with _WRITER_ADMISSION_LOCK:
-        key = _writer_admission_key(db, directory)
-        try:
-            _check_compatible_writer(db, directory, key)
-        except BaseException:
-            # ScopedDb peut ouvrir une connexion admise pendant cette lecture.
-            # Son succès imbriqué ne doit pas survivre au refus extérieur.
-            _WRITER_ADMISSIONS.pop(key, None)
-            raise
+    _check_compatible_writer(db, directory, _writer_admission_key(db, directory))
+
+
+def _admitted(key) -> bool:
+    return key is not None and time.monotonic() < _WRITER_ADMISSIONS.get(key, 0)
 
 
 def admit_writer_connection(db, directory: str = MIGRATIONS_DIR) -> None:
@@ -1680,8 +1706,15 @@ def admit_writer_connection(db, directory: str = MIGRATIONS_DIR) -> None:
     Portée : processus, DSN exact (identité comprise), schéma et inventaire
     du code. Aucun cache interprocessus. Les contrôles explicites des passes
     (`writer_tick`, tours) ne sont jamais sautés ; seule la tête de passe au
-    repos d'un worker partage ce succès (#8152). Le verrou empêche qu'un succès concurrent ancien
-    réarme le cache après un refus détecté par un autre fil.
+    repos d'un worker partage ce succès (#8152). Un refus incrémente un
+    compteur : un succès concurrent lu avant ne réarme pas le cache.
+
+    #8335 : sans succès valide, une seule connexion par cible lit la base ;
+    les autres attendent son résultat (au plus `WRITER_ADMISSION_WAIT_S`)
+    puis reprennent le succès partagé, ou contrôlent elles-mêmes s'il manque
+    (refus, panne, attente dépassée). Aucune connexion n'est admise sans un
+    succès lu dans les 5 s. Une admission imbriquée dans le contrôle du même
+    fil (ScopedDb) contrôle directement, sans s'attendre elle-même.
 
     N = 5 s borne la fenêtre d'admission d'une nouvelle connexion écrivaine
     après l'apparition d'une migration non additive inconnue. Les processus
@@ -1691,14 +1724,33 @@ def admit_writer_connection(db, directory: str = MIGRATIONS_DIR) -> None:
     """
     if getattr(getattr(db, 'cfg', None), 'backend', '') == 'mediated':
         return
-    with _WRITER_ADMISSION_LOCK:
-        key = _writer_admission_key(db, directory)
-        if key is not None and time.monotonic() < _WRITER_ADMISSIONS.get(key, 0):
-            return
+    key = _writer_admission_key(db, directory)
+    flight = None
+    if key is not None:
+        me = threading.get_ident()
+        with _WRITER_ADMISSION_LOCK:
+            if _admitted(key):
+                return
+            other = _WRITER_ADMISSION_FLIGHTS.get(key)
+            if other is None:
+                flight = (me, threading.Event())
+                _WRITER_ADMISSION_FLIGHTS[key] = flight
+        if other is not None and other[0] != me:
+            other[1].wait(WRITER_ADMISSION_WAIT_S)
+            with _WRITER_ADMISSION_LOCK:
+                if _admitted(key):
+                    return
+    try:
         if directory == MIGRATIONS_DIR:
             require_compatible_writer(db)
         else:
             require_compatible_writer(db, directory)
+    finally:
+        if flight is not None:
+            with _WRITER_ADMISSION_LOCK:
+                if _WRITER_ADMISSION_FLIGHTS.get(key) is flight:
+                    del _WRITER_ADMISSION_FLIGHTS[key]
+            flight[1].set()
 
 
 @functools.lru_cache(maxsize=16)
