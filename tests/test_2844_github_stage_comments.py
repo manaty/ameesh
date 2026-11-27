@@ -36,11 +36,12 @@ class LimitedGh(FakeGh):
     the JSON body. The refused attempt is counted but not applied.
     """
 
-    def __init__(self, at: int = 3, *, body: str | None = None,
+    def __init__(self, at: int = 3, *, body: str | None = None, status: int = 403,
                  headers: tuple = ("Retry-After: 120",
                                    "X-Ratelimit-Remaining: 4999")):
         super().__init__()
         self.at = int(at)
+        self.status = int(status)
         self.body = body or '{"message":"You have exceeded a secondary rate limit."}'
         self.headers = tuple(headers)
         self.comment_posts = 0
@@ -50,7 +51,9 @@ class LimitedGh(FakeGh):
                 and argv[3].endswith("/comments")):
             self.comment_posts += 1
             if self.comment_posts == self.at:
-                head = "\r\n".join(("HTTP/2.0 403 Forbidden", *self.headers))
+                reason = "Too Many Requests" if self.status == 429 else "Forbidden"
+                head = "\r\n".join(("HTTP/2.0 %d %s" % (self.status, reason),
+                                    *self.headers))
                 return 1, head + "\r\n\r\n" + self.body, ""
         return super().run(argv, stdin, timeout)
 
@@ -101,7 +104,7 @@ class StageCommentsTest(unittest.TestCase):
         return report
 
     def make_writes(self, *, comments_per_pass=pg.MAX_COMMENTS_PER_PASS,
-                    clock=None):
+                    comments_per_hour=pg.MAX_COMMENTS_PER_HOUR, clock=None):
         """The production write client: shared quota, paced by a fake clock."""
         self.clock = clock or Clock()
         self.sleeps = []
@@ -112,7 +115,8 @@ class StageCommentsTest(unittest.TestCase):
 
         reads = pg.SharedReads(self.folder.name, clock=self.clock)
         return pg._Writes(self.gh, reads=reads, clock=self.clock, sleep=sleep,
-                          comments_per_pass=comments_per_pass)
+                          comments_per_pass=comments_per_pass,
+                          comments_per_hour=comments_per_hour)
 
     def use_limited_gh(self, **kwargs):
         """Replace the fake with one refusing the Nth comment POST."""
@@ -387,6 +391,42 @@ class StageCommentsTest(unittest.TestCase):
         self.assertEqual(len(report["errors"]), 1)
         self.assertIn("rate limit", report["errors"][0]["detail"].lower())
         self.assertIsNotNone(pg.SharedReads(self.folder.name, clock=self.clock).blocked())
+
+    def test_generic_429_without_a_marker_stops_and_is_remembered(self):
+        # #8357: GitHub sometimes answers 429 "Too Many Requests" without a
+        # body marker or Retry-After. It is still a limit: stop, remember a
+        # default window, and do not send the next lot.
+        gh = self.use_limited_gh(at=2, status=429,
+                                 body='{"message":"Too Many Requests"}', headers=())
+        self.enroll()
+        self.events = [dict(id=n, state="blocked" if n % 2 else "build", created_ts=n)
+                       for n in range(1, 5)]
+        report = self.project(writes=self.make_writes())
+        self.assertEqual(gh.comment_posts, 2)
+        self.assertEqual(len(self.bodies()), 2)      # accepted + event-1
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("rate limit", report["errors"][0]["detail"].lower())
+        self.assertIsNotNone(pg.SharedReads(self.folder.name, clock=self.clock).blocked())
+
+    def test_hourly_credit_stops_then_resumes_at_the_next_window(self):
+        # #8357: 20 per pass at a 90 s cadence would still allow 800/h. A
+        # persistent hourly credit keeps the projection well below GitHub's
+        # ~500/h and leaves room for merges, CI and other token writers.
+        self.enroll()
+        self.events = [dict(id=n, state="blocked" if n % 2 else "build", created_ts=n)
+                       for n in range(1, 21)]
+        first = self.project(writes=self.make_writes(comments_per_hour=2))
+        self.assertEqual(len(first["comments"]), 2)
+        self.assertEqual(len(self.bodies()), 3)      # accepted + two
+        self.gh.reset_calls()
+        second = self.project(writes=self.make_writes(comments_per_hour=2))
+        self.assertEqual(second["comments"], [])     # credit spent, no POST
+        self.assertEqual(self.gh.calls(), [])        # nor a thread read
+        self.assertEqual(len(self.bodies()), 3)
+        window = Clock(1000.0 + pg.COMMENT_CREDIT_WINDOW_S + 1)
+        third = self.project(writes=self.make_writes(comments_per_hour=2, clock=window))
+        self.assertEqual(len(third["comments"]), 2)
+        self.assertEqual(len(self.bodies()), 5)
 
     def test_comment_budget_is_paced_and_resumes_without_duplicates(self):
         # #8357: a catch-up is spread over passes. The mirror is enrolled

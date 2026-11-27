@@ -243,6 +243,10 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
     if not gh_repo.dry_run and "_since" not in checkpoint:
         checkpoint["_since"] = since
         save()      # the cutoff must survive a pass that posts nothing
+    if not gh_repo.dry_run and not gh_repo.comments_available():
+        # #8357 : crédit horaire épuisé. Ne pas relire les fils ni poster :
+        # la fenêtre suivante reprendra les marqueurs restants.
+        return
 
     receipts = {lot: kept for lot, rows in raw_receipts.items()
                 if (kept := _current_receipts(rows, since))}

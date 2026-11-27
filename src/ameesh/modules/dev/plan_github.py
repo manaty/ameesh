@@ -840,7 +840,13 @@ class SharedReads:
         retry = _int_or_none(header_of(headers, "Retry-After"))
         resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
             or str(resource or "").strip().lower() or DEFAULT_RESOURCE
-        secondary = status in (403, 429) and SECONDARY_LIMIT_MARK in str(body or "").lower()
+        # #8357 : un 429 est une limite, même sans « secondary rate limit »
+        # dans le corps ni Retry-After (GitHub renvoie parfois « Too Many
+        # Requests » seul). Sans cette règle, le refus n'était pas mémorisé et
+        # le passage suivant le répétait. Un 403 ne bloque que sur un marqueur
+        # explicite : un 403 de droits reste une erreur de droits.
+        secondary = status == 429 or (
+            status == 403 and SECONDARY_LIMIT_MARK in str(body or "").lower())
         primary = status in (403, 429) and "api rate limit exceeded" in str(body or "").lower()
         self._ensure_dirs()
         taken = _take_pending(self._pending, self._pending_lock)
@@ -931,6 +937,64 @@ class SharedReads:
         now = float(self.clock() if now is None else now)
         return (self.blocked(now, resource) is not None
                 and float(self.quota(resource).get("blocked_until") or 0.0) <= now)
+
+    def content_credit_available(self, *, limit: int, window: float = 3600.0,
+                                 now=None, name: str = "comments") -> bool:
+        """#8357 : reste-t-il un crédit de contenu dans la fenêtre courante ?
+
+        Lecture seule : une passe qui sait déjà le crédit épuisé n'a pas
+        besoin d'interroger GitHub pour le constater."""
+        if int(limit) <= 0:
+            return True
+        now = float(self.clock() if now is None else now)
+        path = os.path.join(self.root, "content-credit-%s.json" % str(name))
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return True
+        try:
+            start = float(data.get("window") or 0.0)
+            count = int(data.get("count") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return True
+        return start <= 0 or now - start >= float(window) or count < int(limit)
+
+    def take_content_credit(self, *, limit: int, window: float = 3600.0,
+                            now=None, name: str = "comments") -> bool:
+        """#8357 : prend un crédit de création de contenu dans l'heure.
+
+        Le crédit vit sur disque, sous le verrou du cache : les passes d'un
+        même hôte (et leurs processus) ne peuvent pas transformer le plafond
+        par passage en 800 créations/h. La fenêtre est fixe à partir du
+        premier crédit ; `limit <= 0` désactive le crédit. Un fichier de
+        crédit illisible ne bloque jamais la projection : il rend un crédit.
+        """
+        if int(limit) <= 0:
+            return True
+        now = float(self.clock() if now is None else now)
+        path = os.path.join(self.root, "content-credit-%s.json" % str(name))
+        self._ensure_dirs()
+        try:
+            with self._locked():
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                except (OSError, ValueError):
+                    data = {}
+                try:
+                    start = float(data.get("window") or 0.0)
+                    count = int(data.get("count") or 0)
+                except (AttributeError, TypeError, ValueError):
+                    start, count = 0.0, 0
+                if start <= 0 or now - start >= float(window):
+                    start, count = now, 0
+                if count >= int(limit):
+                    return False
+                _atomic_write(path, {"window": start, "count": count + 1})
+                return True
+        except OSError:
+            return True            # le crédit est une précaution, jamais une panne
 
 
 def _resource_header(headers) -> str | None:
@@ -1712,15 +1776,21 @@ ISSUES_PAGE_TIMEOUT = 120.0
 #: qu'au plus `MAX_COMMENTS_PER_PASS`, espacés, et le suivant reprend le reste.
 MAX_COMMENTS_PER_PASS = 20
 COMMENT_INTERVAL_S = 1.0
+#: #8357 : crédit horaire persistant. La cadence de 90 s ferait 800
+#: commentaires/h avec le seul plafond par passage, au-dessus des ~500/h de
+#: GitHub et sans marge pour les fusions, la CI et les autres écrivains du
+#: jeton partagé. 200/h laisse 300 créations à ces autres gestes.
+MAX_COMMENTS_PER_HOUR = 200
+COMMENT_CREDIT_WINDOW_S = 3600.0
 
 
 class ContentLimitReached(Exception):
-    """#8357 : le quota de commentaires du passage est dépensé.
+    """#8357 : le quota de commentaires du passage ou de l'heure est dépensé.
 
-    Ce n'est pas une panne GitHub : aucune requête n'est partie, et le
-    passage suivant reprend les marqueurs restants. Distinct de
-    `GithubError` pour que les boucles s'arrêtent proprement au lieu de
-    compter chaque lot comme une erreur."""
+    Ce n'est pas une panne GitHub : aucune requête n'est partie, et la passe
+    suivante (ou la fenêtre horaire suivante) reprend les marqueurs restants.
+    Distinct de `GithubError` pour que les boucles s'arrêtent proprement au
+    lieu de compter chaque lot comme une erreur."""
 
 
 class _Writes:
@@ -1737,17 +1807,21 @@ class _Writes:
       limite primaire ou secondaire arrête le passage, et son `Retry-After`
       est respecté au passage suivant ;
     * borne les commentaires à `comments_per_pass`, espacés d'au moins
-      `comment_interval` : un rattrapage s'étale sur plusieurs passages.
+      `comment_interval`, et à `comments_per_hour` par fenêtre fixe sur
+      disque : un rattrapage s'étale sur plusieurs passages sans dépasser
+      le budget horaire du jeton partagé.
     """
 
     def __init__(self, gh, reads: "SharedReads | None" = None, *, clock=time.time,
                  sleep=time.sleep, comments_per_pass: int = MAX_COMMENTS_PER_PASS,
+                 comments_per_hour: int = MAX_COMMENTS_PER_HOUR,
                  comment_interval: float = COMMENT_INTERVAL_S):
         self.gh = gh
         self.reads = reads
         self.clock = clock
         self.sleep = sleep
         self.comments_per_pass = int(comments_per_pass)
+        self.comments_per_hour = int(comments_per_hour)
         self.comment_interval = float(comment_interval)
         #: commentaires tentés dans ce passage (le plafond se vérifie avant).
         self.comments = 0
@@ -1781,9 +1855,11 @@ class _Writes:
             # une limite ; `SharedReads` retient alors la fenêtre par défaut,
             # et le passage s'arrête au lieu de répéter sur chaque lot.
             text = "%s %s" % (exc, getattr(exc, "body", "") or "")
-            if (SECONDARY_LIMIT_MARK in text.lower()
-                    or "api rate limit exceeded" in text.lower()):
-                until = self.reads.note({}, status=403, now=float(self.clock()),
+            lowered = text.lower()
+            if ("http 429" in lowered or "too many requests" in lowered
+                    or SECONDARY_LIMIT_MARK in lowered
+                    or "api rate limit exceeded" in lowered):
+                until = self.reads.note({}, status=429, now=float(self.clock()),
                                         body=text) if self.reads is not None else None
                 raise GithubRateLimited(path, until) from exc
             raise
@@ -1793,9 +1869,13 @@ class _Writes:
             resource = _resource_header(headers) or resource_of(path)
             until = self.reads.note(headers, status=status, now=now,
                                     resource=resource, body=body)
-        limited = (status in (403, 429)
-                   and (until or SECONDARY_LIMIT_MARK in body.lower()
-                        or "api rate limit exceeded" in body.lower()))
+        # #8357 : tout 429 est une limite ; un 403 n'en est une que sur un
+        # marqueur ou une fenêtre déjà mémorisée (un 403 de droits reste une
+        # erreur de droits).
+        limited = status == 429 or (
+            status == 403
+            and (until or SECONDARY_LIMIT_MARK in body.lower()
+                 or "api rate limit exceeded" in body.lower()))
         if limited:
             raise GithubRateLimited(path, until)
         if status >= 400:
@@ -1806,14 +1886,27 @@ class _Writes:
         except ValueError as exc:
             raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
 
+    def comments_available(self) -> bool:
+        """#8357 : le crédit horaire permet-il encore une écriture ?"""
+        if self.reads is None:
+            return True
+        return self.reads.content_credit_available(
+            limit=self.comments_per_hour, window=COMMENT_CREDIT_WINDOW_S,
+            name="comments")
+
     def comment(self, path: str, body: str) -> dict:
-        """Un commentaire, borné et espacé par passage (#8357)."""
+        """Un commentaire, borné par passage et par heure, et espacé (#8357)."""
         if self.comments >= self.comments_per_pass:
             raise ContentLimitReached(
                 "GitHub comments: %d per pass reached; the next pass resumes"
                 % self.comments_per_pass)
         now = float(self.clock())
         self._refuse_while_blocked(path, now)
+        if self.reads is not None and not self.reads.take_content_credit(
+                limit=self.comments_per_hour, window=COMMENT_CREDIT_WINDOW_S,
+                now=now, name="comments"):
+            raise ContentLimitReached(
+                "GitHub comments: hourly credit spent; the next window resumes")
         if self._last_comment is not None:
             wait = self.comment_interval - (now - self._last_comment)
             if wait > 0:
@@ -1874,6 +1967,10 @@ class _Repo:
             return self.writes.comment(path, body) or {}
         return _json(self.gh, ["api", "-X", "POST", path, "--input", "-"],
                      json.dumps({"body": body})) or {}
+
+    def comments_available(self) -> bool:
+        """#8357 : le crédit horaire des commentaires n'est pas dépensé."""
+        return self.writes is None or self.writes.comments_available()
 
     def comments(self, number: int) -> list[dict]:
         return _lines(self.gh, ["api", "--paginate",
