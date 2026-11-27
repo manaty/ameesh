@@ -1,6 +1,6 @@
 # IMA → public module contract: inventory and replacement plan
 
-Document revision 4, 27 November 2026. This is the consumer mapping for
+Document revision 5, 27 November 2026. This is the consumer mapping for
 [contract v1](../api/module-contract-v1.md), requested by
 [#7664 / #5856](https://github.com/manaty/ameesh/issues/5856), under
 [#7636 / #5827](https://github.com/manaty/ameesh/issues/5827).
@@ -63,7 +63,7 @@ private helper: the gap column preserves the remaining requirement.
 | # | IMA script and internal dependency | Public/native replacement and remaining work |
 | --- | --- | --- |
 | 1 | [`scripts/ameesh-directory-snapshot.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-directory-snapshot.py): `canon.load_yaml/load/validate/errors`, member objects, `ameesh.__file__` | `ameesh canon check` for validation; **E1a** for a public immutable canon/directory snapshot with member metadata, source SHA and freshness. `GET /projects` alone does not return members or their directory metadata. Source-pin validation → S. |
-| 2 | [`scripts/ameesh-mailbox-bridge.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-mailbox-bridge.py): `config`, `db`, `accounts`, `storage`, `mail`, `registry`; raw mailbox/registry/spend queries | Ordinary mail → `agent-mail send`; request observation → `ameesh turn observe --request ID --json` / HTTP `/requests/{request}`. **E2a/E2b** preserve request key dedupe, typed payload, lease-bound pending/reply and reply correlation; **E2d** replaces the production `config`/`db.connect`/`require_schema` imports with `ameesh.public.connect()`; **E1b** replaces account/capacity introspection. These guarantees are not provided by generic message send alone. |
+| 2 | [`scripts/ameesh-mailbox-bridge.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-mailbox-bridge.py): `config`, `db`, `accounts`, `storage`, `mail`, `registry`; raw mailbox/registry/spend queries | Ordinary mail → `agent-mail send`; request observation → `ameesh turn observe --request ID --json` / HTTP `/requests/{request}`. **E2a/E2b** preserve request key dedupe, typed payload, lease-bound pending/reply and reply correlation; **E2d** replaces the production `config`/`db.connect`/`require_schema` imports with `ameesh.public.connect()`; **E1b** replaces account/capacity introspection, and **R** (`ameesh reservations`, #6583) replaces the `credit_snapshot` read of `account_reservations`. These guarantees are not provided by generic message send alone. |
 | 3 | [`scripts/ameesh-process-qualification.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-process-qualification.py): `process_workflow`, `process_registry`, `process_verifiers`, `DbError`, `PgTestCase`; synthetic registry rows | Native Process cards through `ameesh canon check/sync`; **F** supplies an external fixture and CLI/API qualification path for acceptance, refusal and verifier outcomes without private workflow imports or synthetic core SQL. Pin checks → S. |
 | 4 | [`scripts/ameesh-reviewer-observation.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-reviewer-observation.py): `registry.get/lease_matches/pending_spend_get/canon_claim_predicate_sql`, raw canon state | `turn current`, `turn observe`, `/agents/{agent}`, `/turns/{turn}`, `/sandbox/turns/{turn}` provide native references; **E1b** supplies the atomic admitted-profile/lease observation and freshness it additionally needs. Missing sandbox or tranche evidence remains unavailable, never invented or treated as admitted. |
 | 5 | [`scripts/ameesh-reviewer-preparation.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-reviewer-preparation.py): `accounts`, `account_budget`, `exploitation`, `registry`, `storage`, private profile digest | Native Kubernetes sandbox turns and turn observation replace a parallel execution/accounting path. **E1b** for read-only prepared admission/capacity evidence (responsible, canon/placement references, lease epoch, bounded budget and limits). It must not reserve spend or launch a Job. Source checks → S. |
@@ -136,6 +136,40 @@ migration application.
 - upstream: [#6579](https://github.com/manaty/ameesh/issues/6579);
   implementation lot #8339.
 
+### Account reservations still counted (post-inventory, #6583)
+
+The `credit_snapshot` operation of `scripts/ameesh-mailbox-bridge.py` reads
+`account_reservations` directly (lines 124–168 at the inventory SHA): it groups
+`kept` rows by `billing_account` and `agent`, counts them, counts those created
+in the last 15 minutes, and keeps the smallest reservation id, restricted to the
+account's current calendar period or the last 15 minutes. From contract
+revision 1.11 the supported read is
+`ameesh reservations --json` (`ameesh-reservations/1`, also
+`GET /api/v1/reservations`): every `open` reservation and every `kept`
+reservation of the envelope's current calendar day, oldest first,
+bounded by `limit` (default 100, maximum 500), with `id`, `agent`,
+`agent_known`, `account_profile`, `billing_account`, `usd`, `state`, `period`,
+`created_ts`, `age_s`, `account_envelope` and `period_reset_ts`; `observed_ts`
+is the single instant of the age. The core applies the same current-period
+filter as the admission (`_USAGE`), so an expired `kept` never saturates the
+bound. The consumer keeps its own grouping, 15-minute window and capacity
+decision; the core supplies no IMA-specific grouping or window. An agent that no longer
+exists is still listed (`agent_known: false`), and a row that cannot be rendered
+faithfully is under `unreadable` with a closed reason instead of disappearing.
+`/budget` already publishes the per-account envelope and period used to apply
+the same calendar-day restriction; `/agents` publishes the blocked state and
+status text used by the adjacent `blocked` query. IMA removes the
+`account_reservations` SQL and the private `storage.budgets` join, not its own
+aggregation or the final capacity decision.
+
+- [CLI boundary](../api/module-contract-v1.md#cli-boundary), frozen as
+  `cli:ameesh reservations` in
+  [module-contract-v1.surface.json](../api/module-contract-v1.surface.json);
+  [HTTP boundary](../api/module-contract-v1.md#http-boundary) for
+  `GET /api/v1/reservations`
+- upstream: [#6583](https://github.com/manaty/ameesh/issues/6583);
+  implementation lot #8343.
+
 ## Indirect runner and connection dependencies
 
 These rows complete the dependency inventory even though they are not additional
@@ -155,6 +189,7 @@ direct package imports. All adoption/removal remains in IMA#1803.
 | `agent_mailbox`: pending delivery, request/reply lookup, payload filtering, request key reuse and Memoria relay history | **E2a/E2b**. Typed payload is module-owned data; request identity, visibility, idempotency and transactionality belong to the core. Public ordinary mail and turn/request observations remain usable immediately. |
 | `agent_registry`: checking owner/epoch/lease expiry, `FOR UPDATE`, changing `pending_prompt` and status during shutdown | **E1b** read-only admitted-profile observation, **E2b** fenced reply, **E2c** core-owned replay. `agent_mesh_overview` can replace fleet display, not authorization under a mutable lease. |
 | `spend_pending` and ledger joins: match mailbox delivery to native turn/reservation and determine whether a request is still current | Native `turn current` and `turn observe`; **E1b/E2b** for atomic protocol checks. Never publish a writable reservation capability. |
+| `account_reservations`: the `credit_snapshot` grouping of `kept` rows per agent and billing account (count, 15-minute count, smallest id, current calendar period) | **R** (#6583): `ameesh reservations --json` / `GET /api/v1/reservations` publishes every `open` row and every `kept` row of the envelope's current calendar day, oldest first and bounded, with `state`, `period`, `created_ts`, `age_s`, `account_envelope` and `period_reset_ts`. The consumer keeps its grouping, 15-minute window and capacity decision; the core publishes no IMA-specific shape and no writable reservation path. |
 | `canon_state`, account/budget/binding tables: freshness, provider limits and admission preparation | **E1a/E1b** and native canon/budget APIs; return redacted facts and opaque references instead of raw credentials or core tables. |
 | Core SQL in synthetic tests (`INSERT`, `UPDATE`, `DELETE` on registry/mail/budget/ledger) | **F**: consumer-owned isolated fixtures using public setup/operations; no test-only production bypass. |
 
@@ -247,10 +282,11 @@ Each row is at most one working day. The pilot created lots #7669–#7675
 [public snapshot CLI](../api/canon-snapshot-v1.md); the other rows remain
 delivery work, not available APIs. Later consumer requests add E2d (#6573,
 implemented by #8333), E3c (#6574, proposal only, implementation lot #8334)
-A (#6582, implemented by #8342), P (#6577, implemented by #8337) and the
-migration dry-run report (#6579, implemented by #8339). F/S are the existing
-qualification/stable lots. Each upstream delivery needs a corresponding removal
-commit referenced in IMA#1803 before the external request closes.
+A (#6582, implemented by #8342), P (#6577, implemented by #8337), the
+migration dry-run report (#6579, implemented by #8339) and R (#6583,
+implemented by #8343). F/S are the existing qualification/stable lots. Each
+upstream delivery needs a corresponding removal commit referenced in IMA#1803
+before the external request closes.
 
 | Key | Estimate | Deliverable and acceptance | Dependencies / owner of next step |
 | --- | --- | --- | --- |
@@ -263,6 +299,7 @@ commit referenced in IMA#1803 before the external request closes.
 | E2d (#6573) | 3 h | Production connection for the E2 Python surfaces: `ameesh.public.connect()` opens the deployment's usual configuration (no DSN argument), checks the schema immediately, returns an opaque `Db` for `ameesh.public.mail`, and refuses with `DatabaseUnavailable`/`SchemaRefused`/`UnsupportedStorage` without exposing the DSN or a password. **Implemented by #8333** as contract revision 1.6 ([public connection](../api/module-contract-v1.md#public-production-connection-16-6573)); external witness in the [public fixture witness](../../examples/fixtures/public-fixture-witness) and `tests/test_8333_public_connect.py`. | IMA#1803 replaces its `config`/`db.connect`/`require_schema` imports; no new IMA migration. |
 | A (#6582) | 4 h | Public action-connector surface: `ameesh.public.connectors` exports the frozen `Action`, `Outcome` and `NotSentError` protocol objects, the closed states/classes/dedupe vocabularies and `ACTION_CONNECTORS`; an installed module declares its connector mapping and the registry discovers it, refusing invalid declarations without any internal import. No protocol, gate or schema change. **Implemented by #8342** as contract revision 1.8 ([action connectors](../api/module-contract-v1.md#action-connectors-declared-by-an-installed-module-18-8342)); the public-only module-connector bench and `tests/test_7665_module_contract.PythonConnectorsContractTest` are the witnesses. | IMA#1803 replaces `from ameesh.connectors import Outcome` with the public import; no connector code change. |
 | P (#6577) | 4 h | Public redacted read of the declared account profiles: `ameesh accounts profiles --json` lists every profile (name, kind, harness, `env`/`key_env` names, reserve, billing account), sorted; no key value, key file path or content; an unreadable profile is refused with a closed reason without hiding the list. **Implemented by #8337** as contract revision 1.9; witnesses in `tests/test_8337_account_profiles.py`. | IMA#1803 replaces `accounts.parse(cfg.accounts)` in its runtime-admission and reviewer-preparation checks. |
+| R (#6583) | 4 h | Bounded read-only fleet view of the account reservations still counted: `ameesh reservations --json` / `GET /api/v1/reservations` lists every `open` row and every `kept` row of the envelope's current calendar day, oldest first, with agent, billing account, profile name, amount, state, period, creation instant, age, envelope flag and period reset; no `spend_key`, key, path or DSN; an unreadable row is reported with a closed reason without hiding the others; one repeatable-read read-only snapshot, no reservation opened, settled or released. **Implemented by #8343** as contract revision 1.11; witnesses in `tests/test_8343_account_reservations.py`. | IMA#1803 removes the `credit_snapshot` query on `account_reservations`; `/budget` and `/agents` already cover the adjacent account and blocked-agent reads. |
 | E3b (#7675) | 6 h | Native pressure/admission qualification and structured bounded deferral observation. Native `own_cgroup`, budget/ledger and lock stay authoritative; fairness/latency witness for awakened document vs role/background, ambiguous accounting retained. Add missing declarative policy only if witness proves a gap; no arbitrary runner callback or lock replacement. **Implemented by [#7675 / #5868](https://github.com/manaty/ameesh/issues/5868)**: `ameesh-deferral/1` (closed reasons, bounded, no free text) on list/show/turn observations; opt-in `max_cgroup_cpu_used` and `max_cgroup_throttled_periods` for IMA's CPU/period gates (no defaults); the native admission lock qualified as-is, no document class. See the [qualification note](7675-native-pressure-admission-qualification.md). | Implementation lot under #5827; IMA#1803 removes pressure/scheduling subclasses after adopting revision 1.2. |
 | F | 8 h | External module witness and public fixture/setup/observation protocol; contract element → test matrix, deliberate break witness. Include fixture use for Process, usage, refusal and mail races without importing upstream tests. **Implemented by [#7701 / #5902](https://github.com/manaty/ameesh/issues/5902)**: `ameesh.public.fixture` in contract revision 1.5 ([public fixture](../api/module-contract-v1.md#public-fixture-for-a-consumer-owned-database-15-7701)); the external [witness](../../examples/fixtures/public-fixture-witness) creates/migrates/drops its own database and covers Process admission/refusal, Pipeline adoption, usage, mail refusals and races, and the deliberate-break comparator. | Existing #7665 / #5857 and #7701 / #5902; IMA#1803 adopts the fixture and removes its `PgTestCase`/synthetic-SQL dependencies. [#8341 / #6581](https://github.com/manaty/ameesh/issues/6581) adds the agent qualification states (`Fixture.agent`/`agent_state`, revision 1.7: lease, canon, placement, spend marker, reservation, cost), so the qualification scripts and integration tests drop their synthetic core SQL. |
 | E3c (#6574) | 3 h | Documented per-worker preview publisher setting (`peek: false` Host policy or runner configuration), read at worker startup, default unchanged (publisher active), a non-boolean value refused, no `AgentWorker` subclass; `Runner.peek()` and the `/peek` read API unchanged. **Proposition, non disponible** at 1.72.0: no documented setting exists and IMA subclasses `AgentWorker` to cut the publisher. | Implementation lot #8334 (upstream [#6574](https://github.com/manaty/ameesh/issues/6574)); next step mesh-design. |

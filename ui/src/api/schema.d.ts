@@ -513,6 +513,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/reservations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Open account reservations per agent, fleet-wide (`ameesh reservations --json`; read-only, bounded, #8343) */
+        get: operations["reservations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sandbox/turns": {
         parameters: {
             query?: never;
@@ -1086,6 +1103,42 @@ export interface components {
             projects: Record<string, never>[];
             /** @constant */
             schema: "ameesh-projects/1";
+        };
+        "ameesh-reservations-1": {
+            count: number;
+            filter: {
+                account: string | null;
+                agent: string | null;
+                states: ("open" | "kept")[];
+            };
+            limit: number;
+            observed_ts: number;
+            reservations: {
+                account_envelope: boolean;
+                account_profile: string | null;
+                age_s: number;
+                agent: string;
+                agent_known: boolean;
+                billing_account: string;
+                created_ts: number;
+                id: number;
+                period: string;
+                period_reset_ts: number | null;
+                /** @enum {unknown} */
+                state: "open" | "kept";
+                usd: number;
+            }[];
+            /** @constant */
+            schema: "ameesh-reservations/1";
+            truncated: boolean;
+            unreadable: {
+                agent: string | null;
+                billing_account: string | null;
+                id: number | null;
+                /** @enum {unknown} */
+                reason: "invalid_id" | "invalid_identity" | "invalid_state" | "invalid_amount" | "invalid_timestamp" | "invalid_period";
+                state: string | null;
+            }[];
         };
         "ameesh-sandbox-turn-1": {
             agent: string;
@@ -3626,6 +3679,62 @@ export interface operations {
             };
             /** @description not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    reservations: {
+        parameters: {
+            query?: {
+                /** @description exact billing account */
+                account?: string;
+                /** @description exact agent name */
+                agent?: string;
+                /** @description at most 500 (default 100) */
+                limit?: number;
+                /** @description open, kept, or all (default all) */
+                state?: "all" | "open" | "kept";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Open account reservations per agent, fleet-wide (`ameesh reservations --json`; read-only, bounded, #8343) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-reservations-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };

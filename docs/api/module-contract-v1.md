@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.10, 27 November 2026** (machine-readable migration
-dry-run report). Scope: an
+Contract revision: **1.11, 27 November 2026** (bounded public read of the
+account reservations still counted). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -47,6 +47,11 @@ standard output with the pending core and module migrations (checksum and
 non-additive reasons), the applied migrations modified since application, and
 the database versions unknown to this code. It is additive to 1.9: the text
 dry-run, the application path and the 0/3/1 exit codes are unchanged.
+Revision 1.11 adds `ameesh reservations --json` and
+`GET /api/v1/reservations` (#8343, manaty/ameesh#6583): the bounded,
+read-only fleet view of the account reservations still counted (`open` and
+`kept`), so a consumer stops querying `account_reservations` directly; it is
+additive to 1.10 and changes no reservation, envelope or admission path.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -87,14 +92,16 @@ The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
 (#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b), the
 revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2), the
 revision 1.6 element (#6573), the revision 1.7 element (#8341), the
-revision 1.8 element (#8342), the revision 1.9 element (#8337) and the
-revision 1.10 element (#8339) are available only in a released version that
+revision 1.8 element (#8342), the revision 1.9 element (#8337), the
+revision 1.10 element (#8339) and the revision 1.11 element (#8343) are
+available only in a released version that
 carries those lots; at the 1.0 baseline they are absent, and a consumer must
 still treat their absence as "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
 [coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5,
-1.6, 1.7, 1.8, 1.9 and 1.10 elements from the release that implements them, and
-freeze revision 1.10; the surface keeps the 1.0 commit as its comparison point.
+1.6, 1.7, 1.8, 1.9, 1.10 and 1.11 elements from the release that implements
+them, and freeze revision 1.11; the surface keeps the 1.0 commit as its
+comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -123,6 +130,7 @@ release's `--help`. These entry points cover the module integration:
 | `ameesh turn observe (--turn ID \| --request ID) --json` | Read-only `ameesh-turn-observation/1`: request, turn, accounting, bounded deferral and quiescence. Absence of a known cost is not zero cost. |
 | `ameesh agent observe AGENT [--account-profile NAME] [--json]` | Read-only `ameesh-agent-observation/1`: admitted canon/placement references, responsible, live lease owner/epoch, declared and effective bounds, redacted provider budget and native turn/sandbox references. One repeatable-read snapshot; no claim, reservation, settlement, dispatch or canon synchronization. A missing fact is `null` plus a code in `missing`, never permission or zero cost. |
 | `ameesh accounts profiles [--json]` | Read-only `ameesh-account-profiles/1` (revision 1.9, #8337): every profile declared in this host's configuration, sorted by `harness` then `name`, with `kind` (`api_key_env`/`config_dir`), `env` and `key_env` (variable **names**), `key_source` (`env`, `file` or `null`), `reserve_usd` and `billing_account`. Never a key value, a key file's path or content, nor a configuration directory; no database read and no credential read (a key's value is never read from the environment or a file). `valid` combines the runner's admission of the whole `accounts` configuration with the completeness of this read: it is false as soon as any profile is refused (a non-empty `refused` implies `valid` false). An unreadable profile does not hide the others: it is listed under `refused` with `harness`/`index`/`name` (`null` unless a valid identifier) and a closed `reason` (`invalid_accounts`, `unknown_harness`, `invalid_profile_list`, `not_an_object`, `invalid_name`, `duplicate_name`, `invalid_profile`, `shared_configuration_dir`, `unpublishable_variable_name`), never the error text. A synthetic `(default)` profile is never declared, so never listed. Exit 0 whenever the document is printed. |
+| `ameesh reservations [--json] [--limit N] [--account A] [--agent A] [--state S]` | Read-only `ameesh-reservations/1` (revision 1.11, #8343): the fleet's account reservations still counted against a billing envelope — `open` (a turn is in flight, returned whatever its period) and `kept` (a turn never settled; still counted until a human release or the end of its calendar day, so only a `kept` whose period is the envelope's current calendar day is returned, with the same timezone and instant as the envelope usage) — oldest first, at most `--limit` rows (default 100, maximum 500; `truncated` says older ones were not returned). Each row carries `id`, `agent`, `agent_known` (`false` when the agent no longer exists; the row is still listed because it occupies the envelope), `account_profile` (the profile name recorded for the agent, or `null`; never a key), `billing_account`, `usd`, `state`, `period`, `created_ts`, `age_s`, `account_envelope` and `period_reset_ts` (the end of the envelope's calendar day, `null` without an envelope). `observed_ts` is one instant and every age derives from it. The read opens one `REPEATABLE READ, READ ONLY` transaction and never opens, settles or releases a reservation. A row that cannot be rendered faithfully (non-finite amount, unreadable timestamp, unknown state or period) is listed under `unreadable` with `id`, `agent`, `billing_account`, `state` and a closed `reason` (`invalid_id`, `invalid_identity`, `invalid_state`, `invalid_amount`, `invalid_timestamp`, `invalid_period`); it never hides the other rows and never becomes a zero reservation. No `spend_key`, credential, path or DSN is selected. `--state` is `all` (default), `open` or `kept`; `--account` and `--agent` are exact filters. The same document is `GET /api/v1/reservations`. |
 | `ameesh list --json`, `ameesh show --json` | `ameesh-agents/1`: the same bounded `deferral` block (revision 1.2, #7675), closed reasons; its absence or `null` is not permission to run. |
 | `agent-mail send`, `agent-mail show` | Ordinary governed mail. The help documents flags and stdin. These commands alone do not provide IMA's atomic request/reply/deduplication protocol (E2). |
 | `ameesh migrate --dry-run [--additive-only] [--json]` | Core and module migration classification; `--json` returns the read-only `ameesh-migrate-dry-run/1` report, the text forms stay diagnostic. The module does not import or invoke the migration implementation; actual application retains its operator and staging gates. |
@@ -166,10 +174,11 @@ and `label` together.
 
 The normative method, path, input and response schemas are the checked-in
 [OpenAPI v1 document](openapi-v1.json), also served at
-`GET /api/v1/openapi.json`. At this revision there are 35 paths, including the
+`GET /api/v1/openapi.json`. At this revision there are 36 paths, including the
 discovery document `/.well-known/ameesh`. Revision 1.0 had 34; revision 1.1
-adds `/api/v1/agents/{agent}/observation`. The path count is an observation, not
-a limit. Only the methods described there are public.
+adds `/api/v1/agents/{agent}/observation`; revision 1.11 adds
+`/api/v1/reservations`. The path count is an observation, not a limit. Only the
+methods described there are public.
 
 | Area | Public paths (prefix `/api/v1`) |
 | --- | --- |
@@ -177,7 +186,7 @@ a limit. Only the methods described there are public.
 | Work and progress | `/lots`, `/lots/{id}`, `/lots/{id}/assign`, `/projects/{project}/progress`, `/projects/{project}/timeline` |
 | Agent interaction | `/agents/{agent}/chat`, `/agents/{agent}/messages`, `/agents/{agent}/peek`, and the documented interrupt/pause/resume/stop methods |
 | Observation | `/agents/{agent}/observation`, `/requests/{request}`, `/turns/{turn}`, `/sandbox/turns`, `/sandbox/turns/{turn}`, `/events`; `/agents` and `/agents/{agent}` also carry the bounded `deferral` block |
-| Governance | `/budget`, `/budget/caps`, `/decisions`, `/alerts`, `/alerts/{key}/ack`, `/actions/{action}/approval-request` |
+| Governance | `/budget`, `/budget/caps`, `/reservations`, `/decisions`, `/alerts`, `/alerts/{key}/ack`, `/actions/{action}/approval-request` |
 | Threads | `/threads/{project}`, `/threads/{project}/{lot}` |
 
 `/agents/{agent}/observation` is built inside one `REPEATABLE READ, READ ONLY`
@@ -198,6 +207,15 @@ Off-host the budget is refused (`foreign_host`) and `admission.admitted` is
 remote admission into `true`. `null` is unknown, never permission. Any other
 fact this observation cannot supply is `null` with a stable code in `missing`;
 it is never permission, admission or zero cost.
+
+`/reservations` is built inside one `REPEATABLE READ, READ ONLY` transaction
+and answers the same `ameesh-reservations/1` document as `ameesh reservations
+--json`; `observed_ts` is the transaction's single instant. It never opens,
+keeps, settles or releases a reservation, and it is not an admission: a missing
+or truncated list is never permission to spend. Its closed projection and the
+meaning of `open`/`kept`, `truncated` and `unreadable` are the ones documented
+for the CLI entry above. The same bounds apply (`limit` 1..500, default 100);
+`account`, `agent` and `state` filter exactly.
 
 Use the server's configured authentication and visibility rules. The client's
 actor, project and lease scope are not elevated by using HTTP. Retry a write

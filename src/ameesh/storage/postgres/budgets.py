@@ -290,3 +290,52 @@ class Budgets(CycleBudgets, interface.Budgets):
             " and created_at >= to_timestamp(%s)"
             " group by agent, billing_account order by agent, billing_account",
             (float(since_ts),))
+
+    # -- #8343 (manaty/ameesh#6583): réservations ouvertes de la flotte ------
+    def account_open_reservations(self, *, limit=100, account=None, agent=None,
+                                  states=("open", "kept"), at=None) -> list:
+        """Les réservations encore comptées (`open`, `kept`), la plus ancienne
+        d'abord, bornées à `limit` lignes (+1 pour que l'appelant dise la
+        troncature). Une seule instruction, donc un seul instantané ; `at`
+        (epoch) fixe l'âge affiché et le jour courant.
+
+        Une `open` est toujours comptée, quel que soit son jour : le tour est
+        en vol. Une `kept` ne l'est que si sa période est le jour calendaire
+        courant de son enveloppe, avec le même `at` et le même fuseau que
+        `_USAGE` (lignes 136-138) ; hors enveloppe, rien ne la compte. C'est
+        la même règle que l'admission, pour qu'une vieille `kept` ne sature
+        jamais la borne et ne masque pas les `open` récentes.
+
+        `agent_known` et `session_account` viennent de `agent_registry` (le
+        profil enregistré pour l'agent, jamais une clé) ;
+        `account_envelope` dit si un plafond de compte existe, et
+        `period_reset_ts` est la fin du jour calendaire de ce plafond (NULL
+        sans plafond : la zone du compte est alors inconnue). Lecture seule.
+        """
+        conditions = ["r.state = ANY(%s::text[])"]
+        params: list = [float(at), [str(state) for state in states]]
+        if account is not None:
+            conditions.append("r.billing_account = %s")
+            params.append(account)
+        if agent is not None:
+            conditions.append("r.agent = %s")
+            params.append(agent)
+        conditions.append(
+            "(r.state = 'open' or (b.billing_account is not null"
+            " and r.period = (p.at at time zone b.tz)::date))")
+        params.append(int(limit))
+        return self.db.query(
+            "with p as (select to_timestamp(%s) as at)"
+            " select r.id, r.agent, (a.name is not null) as agent_known,"
+            " a.session_account, r.billing_account, r.usd::float8 as usd,"
+            " r.state, r.period::text as period,"
+            " extract(epoch from r.created_at)::float8 as created_ts,"
+            " extract(epoch from (p.at - r.created_at))::float8 as age_s,"
+            " (b.billing_account is not null) as account_envelope,"
+            " extract(epoch from ((r.period + 1)::timestamp"
+            "   at time zone b.tz))::float8 as period_reset_ts"
+            " from account_reservations r cross join p"
+            " left join agent_registry a on a.name = r.agent"
+            " left join account_budgets b on b.billing_account = r.billing_account"
+            " where " + " and ".join(conditions) +
+            " order by r.created_at, r.id limit %s", tuple(params))

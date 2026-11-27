@@ -71,9 +71,9 @@ import time
 import urllib.parse
 from typing import Callable
 
-from . import (agent_observation, deferral_observation, events, httpkit,
-               serve_actions, server_faults, storage, turn_observation,
-               sandbox_observation, version)
+from . import (account_reservations, agent_observation, deferral_observation,
+               events, httpkit, serve_actions, server_faults, storage,
+               turn_observation, sandbox_observation, version)
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -103,6 +103,8 @@ _MAIL_RE = re.compile(r"^[0-9]{1,19}$")
 _SEQ_RE = re.compile(r"^(0|[1-9][0-9]{0,15})$")
 _ENTRY_RE = re.compile(r"^[A-Za-z0-9._/#:-]{1,256}$")
 _SINCE_RE = re.compile(r"^[0-9]{1,6}[mhdj]$|^[0-9]{4}-[0-9]{2}-[0-9]{2}[0-9T:+.Z-]{0,20}$")
+#: #8343 : le filtre d'état de `/reservations`
+_RESERVATION_STATE_RE = re.compile(r"^(open|kept|all)$")
 _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/@:+-]{0,200})")
 CSP = "default-src 'none'; frame-ancestors 'none'"
 #: `Idempotency-Key` of an action (L87), and how long its response is kept
@@ -384,6 +386,28 @@ def _budget(ctx: Context, db, params, query) -> dict:
     return budget.status(ctx.cfg, db)
 
 
+def _reservations(ctx: Context, db, params, query) -> dict:
+    """#8343 : réservations de comptes encore comptées, lecture seule et bornée.
+
+    Le builder ouvre sa propre transaction `REPEATABLE READ, READ ONLY` ; la
+    route ne fait que valider les paramètres, jamais écrire une réservation."""
+    limit = _checked(_one(query, "limit"), _SEQ_RE, "limit")
+    if limit is not None:
+        limit = int(limit)
+        if not 1 <= limit <= account_reservations.MAX_LIMIT:
+            raise ApiError(400, "bad_query", "limit refused")
+    state = _checked(_one(query, "state"), _RESERVATION_STATE_RE, "state")
+    try:
+        return account_reservations.open_reservations(
+            db,
+            limit=limit if limit is not None else account_reservations.DEFAULT_LIMIT,
+            account=_checked(_one(query, "account"), _NAME_RE, "account"),
+            agent=_checked(_one(query, "agent"), _NAME_RE, "agent"),
+            state=state or "all")
+    except ValueError as exc:
+        raise ApiError(400, "bad_query", str(exc)) from exc
+
+
 def _thread(ctx: Context, db, params, query) -> dict:
     from . import fil
     transport = fil.transport_for(ctx.cfg)
@@ -523,6 +547,19 @@ ROUTES = (
     Route(API + "/hosts/{host}", "ameesh-host/1", "One host (`ameesh hosts --json HOST`)",
           _host),
     Route(API + "/budget", "ameesh-budget/1", "Budget (`ameesh budget --json`)", _budget),
+    Route(API + "/reservations", "ameesh-reservations/1",
+          "Open account reservations per agent, fleet-wide (`ameesh reservations "
+          "--json`; read-only, bounded, #8343)", _reservations,
+          query=(("limit", {"type": "integer", "minimum": 1,
+                            "maximum": account_reservations.MAX_LIMIT},
+                  "at most %d (default %d)" % (account_reservations.MAX_LIMIT,
+                                               account_reservations.DEFAULT_LIMIT)),
+                 ("account", {"type": "string"},
+                  "exact billing account"),
+                 ("agent", {"type": "string"}, "exact agent name"),
+                 ("state", {"type": "string",
+                            "enum": list(account_reservations.STATE_FILTERS)},
+                  "open, kept, or all (default all)"))),
     Route(API + "/threads/{project}", "ameesh-thread/1",
           "Project thread (`ameesh fil show PROJECT`)", _thread, db=False,
           query=(("since", {"type": "string"}, "entries after this entry id"),)),
@@ -724,6 +761,39 @@ _DEFERRAL = _nullable_obj(
     state={"enum": list(deferral_observation.STATES)},
     reason={"enum": list(deferral_observation.REASONS)},
     since_ts=_NUM_NULL, age_s=_INT_NULL, queue=_QUEUE)
+
+#: #8343: the fleet-wide read of the account reservations still counted.
+#: Closed enums come from the builder, so a new state or unreadable reason
+#: cannot be served without the document and the tests seeing it.
+_RESERVATION = _obj(
+    None,
+    ["id", "agent", "agent_known", "account_profile", "billing_account", "usd",
+     "state", "period", "created_ts", "age_s", "account_envelope",
+     "period_reset_ts"],
+    id={"type": "integer"}, agent=_STR, agent_known={"type": "boolean"},
+    account_profile=_STR_NULL, billing_account=_STR, usd=_NUM,
+    state={"enum": list(account_reservations.STATES)},
+    period=_STR, created_ts=_NUM, age_s=_NUM,
+    account_envelope={"type": "boolean"}, period_reset_ts=_NUM_NULL)
+_RESERVATIONS = _obj(
+    "ameesh-reservations/1",
+    ["observed_ts", "limit", "truncated", "filter", "count", "reservations",
+     "unreadable"],
+    observed_ts=_NUM,
+    limit={"type": "integer", "minimum": 1,
+           "maximum": account_reservations.MAX_LIMIT},
+    truncated={"type": "boolean"},
+    filter=_obj(None, ["account", "agent", "states"],
+                account=_STR_NULL, agent=_STR_NULL,
+                states={"type": "array",
+                        "items": {"enum": list(account_reservations.STATES)}}),
+    count={"type": "integer"},
+    reservations={"type": "array", "items": _RESERVATION},
+    unreadable={"type": "array", "items": _obj(
+        None, ["id", "agent", "billing_account", "state", "reason"],
+        id=_INT_NULL, agent=_STR_NULL, billing_account=_STR_NULL,
+        state=_STR_NULL,
+        reason={"enum": list(account_reservations.UNREADABLE_REASONS)})})
 
 #: #2167 B1: the observation of one turn or one request (study l2894, §3).
 #: The enums are the domain constants, so a new state cannot be documented
@@ -951,6 +1021,7 @@ SCHEMAS = {
         "type": "array", "items": _HOST}),
     "ameesh-host/1": _HOST,
     "ameesh-budget/1": _obj("ameesh-budget/1", ["limits"], limits=_OBJ),
+    "ameesh-reservations/1": _RESERVATIONS,
     "ameesh-thread/1": _obj("ameesh-thread/1", ["project", "lot", "entries"], project=_STR,
                             lot=_STR_NULL, entries={"type": "array", "items": _obj(
                                 None, ["id", "author", "recipient", "text", "ts"],

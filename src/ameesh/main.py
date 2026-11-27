@@ -239,6 +239,9 @@
   ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
         trois {works} {delivered} sur leur base gelée, version installée et version
         évaluée, relecture croisée à l'aveugle ;
+  ameesh reservations [--json] [--limit N] [--account A] [--agent A] [--state S]
+        #8343 : réservations de comptes `open`/`kept` encore comptées, par
+        agent et compte de facturation, âge et montant (lecture seule bornée) ;
   ameesh responder <application> --severity S [--json] [--now ISO]
         #7866 : route un incident vers le premier humain disponible déclaré
         par la fiche Application du canon (schéma ameesh-responder/1) ; les
@@ -368,6 +371,8 @@ MESH_COMMANDS = (
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
     "budget",
+    # #8343 : réservations de comptes encore comptées (`ameesh reservations`)
+    "reservations",
     # L131 : suites lourdes plafonnées par hôte (`ameesh heavy -- <commande>`)
     "heavy",
     # L161c (#744) : la CI lue par `ameesh ci status <lot>` — le parseur existait
