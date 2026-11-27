@@ -28,12 +28,15 @@ table; it is additive to 1.6. Contract 1.8 adds :mod:`ameesh.public.connectors`
 from the public surface instead of ``ameesh.connectors``; it is additive to
 1.7 and changes no connector protocol behavior. Contract 1.9 adds the CLI
 ``ameesh accounts profiles --json`` (#8337), the redacted read of the declared
-account profiles; it is additive to 1.8 and adds no Python name.
+account profiles; it is additive to 1.8 and adds no Python name. Contract 1.10
+adds the machine-readable migration dry-run report `ameesh migrate --dry-run
+--json` (#8339, manaty/ameesh#6579), schema ``ameesh-migrate-dry-run/1``; it is
+additive to 1.9 and changes no migration application path.
 """
 from __future__ import annotations
 
 #: revision of the written contract served by this package
-CONTRACT_VERSION = "1.9"
+CONTRACT_VERSION = "1.10"
 
 from . import connectors, database, fixture, mail  # noqa: E402  (the version is defined before the surface)
 from .database import connect  # noqa: E402

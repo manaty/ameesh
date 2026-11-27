@@ -1,6 +1,6 @@
 # IMA → public module contract: inventory and replacement plan
 
-Document revision 3, 27 November 2026. This is the consumer mapping for
+Document revision 4, 27 November 2026. This is the consumer mapping for
 [contract v1](../api/module-contract-v1.md), requested by
 [#7664 / #5856](https://github.com/manaty/ameesh/issues/5856), under
 [#7636 / #5827](https://github.com/manaty/ameesh/issues/5827).
@@ -71,7 +71,7 @@ private helper: the gap column preserves the remaining requirement.
 | 7 | [`scripts/ameesh-role-bridge.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-role-bridge.py): mail/registry imports, raw role mailbox and lease transactions | Generic mail/turn observation plus **E2a/E2b** for atomic `submit_many`, request scope, lease-bound reply and dedupe. Reuse the same generic protocol as document requests; no role-specific core schema. |
 | 8 | [`scripts/ameesh-role-runner.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-role-runner.py): config/db import, dynamically installed Runner replacement, direct `runner.main` | Installed `agent-runner`, governed harness adapters and `--agents-file`; native `own_cgroup` pressure. Account admission qualification → **E1b**; remaining policy/diagnostics → **E3a/E3b**. Remove the placeholder role harness only with real role execution correlated to the native turn/sandbox, tracked in IMA#1803. |
 | 9 | [`scripts/ameesh-runtime-admission.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-runtime-admission.py): `accounts.parse`, direct `account_budgets` SQL | Native governed account admission/budget caps; HTTP `/budget` for observation. **E1b** supplies the admitted profile/capacity check required before runtime startup without exposing credentials. Keep IMA's own provider/endpoint allowlist in IMA. |
-| 10 | [`scripts/ameesh-upgrade-runtime.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-upgrade-runtime.py): `config`, `db`, `migrations`, `cli.main` | Execute `ameesh migrate --dry-run --additive-only` and documented migrate/doctor CLI under existing operator gates. **F** for disposable upgrade fixtures; **S** for pin and qualification across stable versions. This mapping authorizes no migration application. |
+| 10 | [`scripts/ameesh-upgrade-runtime.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-upgrade-runtime.py): `config`, `db`, `migrations`, `cli.main` | Execute `ameesh migrate --dry-run --json` (revision 1.10, `ameesh-migrate-dry-run/1`: pending core/module migrations with checksum and non-additive reasons, applied migrations modified after the fact, unknown versions) and the documented upgrade/doctor CLI under existing operator gates. IMA replaces `cli.cmd_migrate`, `migrations.check` and `migrations.non_additive` with that object once adopted. **F** for disposable upgrade fixtures; **S** for pin and qualification across stable versions. This mapping authorizes no migration application. |
 | 11 | [`scripts/document-ameesh-preflight-smoke.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-preflight-smoke.py): `PgTestCase`, canon sync, registry/storage, accounts/budgets, `CostBook/load_prices` | **F** replaces fixture/seed/ledger test internals with public setup and observations. Native canon, `/budget` and `turn observe` for assertions; **E1b** for admission capacity evidence. IMA owns its expected cost examples. |
 | 12 | [`scripts/document-ameesh-preflight.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-preflight.py): config/db/registry, private registry binding reads and package location | `ameesh --version`, public agents/hosts observations and **E1b** for complete admitted binding evidence. Immutable source identity comes from **S**, not `ameesh.__file__`. |
 | 13 | [`scripts/document-ameesh-runner.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-runner.py): canon/config/db imports, `cost.load_prices/max_price_of`, direct bindings, installed monkey patches | Installed `agent-runner --agents-file`; native admission priority and `own_cgroup`; governed canon and budget admission. **E1b** for preflight bindings/capacity; **E3a/E3b** for policy/diagnostics; **E2c** for interrupted request replay. IMA's business binding restrictions stay in its module. |
@@ -118,6 +118,23 @@ drops the `accounts` import for this check.
   [module-contract-v1.surface.json](../api/module-contract-v1.surface.json)
 - upstream: [#6577](https://github.com/manaty/ameesh/issues/6577);
   implementation lot #8337.
+
+### Migration dry-run report (post-inventory, #6579)
+
+IMA's upgrade rehearsal (`scripts/ameesh-upgrade-runtime.py`) reads missing,
+modified and non-additive migrations by calling `cli.cmd_migrate`,
+`migrations.check` and `migrations.non_additive`. From contract revision 1.10
+the supported replacement is the documented `ameesh migrate --dry-run --json`
+command (schema `ameesh-migrate-dry-run/1`), which returns the same facts as
+data and keeps the operator gates on the applying path. IMA#1803 removes the
+three private calls once it adopts the report; this mapping authorizes no
+migration application.
+
+- [migration dry-run report](../api/module-contract-v1.md#migration-dry-run-report-revision-110-8339)
+- frozen surface: `cli:ameesh migrate` in
+  [module-contract-v1.surface.json](../api/module-contract-v1.surface.json)
+- upstream: [#6579](https://github.com/manaty/ameesh/issues/6579);
+  implementation lot #8339.
 
 ## Indirect runner and connection dependencies
 
@@ -230,7 +247,8 @@ Each row is at most one working day. The pilot created lots #7669–#7675
 [public snapshot CLI](../api/canon-snapshot-v1.md); the other rows remain
 delivery work, not available APIs. Later consumer requests add E2d (#6573,
 implemented by #8333), E3c (#6574, proposal only, implementation lot #8334)
-A (#6582, implemented by #8342) and P (#6577, implemented by #8337). F/S are the existing
+A (#6582, implemented by #8342), P (#6577, implemented by #8337) and the
+migration dry-run report (#6579, implemented by #8339). F/S are the existing
 qualification/stable lots. Each upstream delivery needs a corresponding removal
 commit referenced in IMA#1803 before the external request closes.
 
