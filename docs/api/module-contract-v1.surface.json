@@ -4978,7 +4978,7 @@
         "path": "(self, relative)",
         "read": "(self, relative)",
         "git": "(self, *args)",
-        "agent": "(self, name, *, host='fixture-host', harness='claude', model='fixture-model', team='fixture', responsible='human:fixture', governed=True)",
+        "agent": "(self, name, *, host=None, harness='claude', model='fixture-model', team='fixture', responsible='human:fixture', governed=True)",
         "agent_state": "(self, name, state, **options)"
       },
       "errors": {

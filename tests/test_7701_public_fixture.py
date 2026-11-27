@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#7701 (#5902): the public fixture kit, contract revision 1.5.
+"""#7701 (#5902): the public fixture kit, contract revision 1.5 (agent states: 1.7, #8341).
 
 The kit is ``ameesh.public.fixture``: an installed consumer creates its own
 disposable PostgreSQL database, applies the released schema through

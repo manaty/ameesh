@@ -49,8 +49,13 @@ class StateBoundaryTest(unittest.TestCase):
         for name in ("", "a b", "x;drop", "../agent", None):
             with self.subTest(name=name), self.assertRaises(fixture_mod.FixtureRefused):
                 self.fixture.agent_state(name, "lease_live")
+        for options in ({"usd": {"sql": "1"}}, {"usd": None}, {"usd": True},
+                        {"spendkey": "typo"}, {"owner": "x"}):
+            with self.subTest(options=options), \
+                    self.assertRaises(fixture_mod.FixtureRefused):
+                self.fixture.agent_state("ima-agent", "cost", **options)
         with self.assertRaises(fixture_mod.FixtureRefused):
-            self.fixture.agent_state("ima-agent", "cost", usd={"sql": "1"})
+            self.fixture.agent("ima-agent", host="bad host")
 
     def test_a_core_failure_is_a_state_error_without_the_dsn(self):
         self.fixture._created = True
@@ -76,9 +81,10 @@ class StateBoundaryTest(unittest.TestCase):
                 self.fixture.agent_state("ima-agent", "lease_live")
         self.assertEqual(str(caught.exception), "not here")
 
-    def test_every_state_has_a_handler_and_a_check(self):
+    def test_every_state_has_a_handler_a_check_and_its_options(self):
         self.assertEqual(set(states_mod._HANDLERS), set(states_mod.AGENT_STATES))
         self.assertEqual(set(states_mod._CHECKS), set(states_mod.AGENT_STATES))
+        self.assertEqual(set(states_mod.STATE_OPTIONS), set(states_mod.AGENT_STATES))
 
 
 @unittest.skipUnless(support.REQUIRE_DB, "banc Postgres requis (AMEESH_REQUIRE_DB=0)")
@@ -149,6 +155,42 @@ class FixtureStatesDatabaseTest(unittest.TestCase):
         fresh = self.state("canon_fresh")
         self.assertTrue(fresh["canon"]["fresh"])
         self.assertNotIn("canon_stale", fresh["reasons"])
+
+    def test_a_stale_canon_does_not_refuse_the_claim(self):
+        # The core's claim checks the canon status, not its age (the age
+        # gates a new turn): the lease is taken, canon_stale stays a reason.
+        self.state("canon_stale")
+        live = self.state("lease_live")
+        self.assertTrue(live["lease"]["live"])
+        self.assertIn("canon_stale", live["reasons"])
+        self.state("lease_free")
+        self.state("canon_fresh")
+
+    def test_a_canon_state_stays_on_its_agents_own_host(self):
+        other = "ima-state-8341-b"
+        self.fixture.agent(other)
+        self.state("canon_stale")
+        self.assertTrue(self.fixture.agent_state(other, "canon_fresh")["canon"]["fresh"])
+        self.assertTrue(self.fixture.agent(other)["canon"]["fresh"])
+        self.assertEqual(self.registered["placement"]["ref"],
+                         "hosts/fixture-host-%s.md" % self.agent)
+        # Agents registered on one explicit host share its canon state.
+        first = self.fixture.agent("ima-shared-a", host="ima-shared-host")
+        self.fixture.agent("ima-shared-b", host="ima-shared-host")
+        self.assertTrue(first["canon"]["fresh"])
+        self.fixture.agent_state("ima-shared-a", "canon_stale")
+        self.assertIn("canon_stale",
+                      self.fixture.agent_state("ima-shared-b", "spend_clear")["reasons"])
+        self.state("canon_fresh")
+
+    def test_registering_again_releases_an_expired_lease_only(self):
+        self.state("lease_expired")
+        again = self.fixture.agent(self.agent)
+        self.assertIsNone(again["lease"]["owner"])
+        self.state("lease_live")
+        with self.assertRaises(fixture_mod.FixtureStateError):
+            self.fixture.agent(self.agent)
+        self.state("lease_free")
 
     def test_the_placement_states_compose_with_the_claim(self):
         refused = self.state("placement_refused", diagnostic="host refuses deepseek")

@@ -535,10 +535,10 @@ minor; `ameesh.public.CONTRACT_VERSION` is then at least `"1.7"`.
 
 | Element | Contract |
 | --- | --- |
-| `agent(name, *, host="fixture-host", harness="claude", model="fixture-model", team="fixture", responsible="human:fixture", governed=True) -> dict` | Register `name` in the fixture registry and return its state report. A governed agent pins the fixture canon commit (the one `canon()` returned, else a fixed placeholder), has a fresh canon state on `host`, an admitted placement and no lease: it is claimable. `governed=False` registers a row with no canon reference and no placement verdict. Calling it again rewrites the declared profile; it refuses while the agent holds a lease. |
-| `agent_state(name, state, **options) -> dict` | Put the registered agent into `state`, one of `AGENT_STATES`, then read it back. Options are strings or numbers. The report is described below. |
+| `agent(name, *, host=None, harness="claude", model="fixture-model", team="fixture", responsible="human:fixture", governed=True) -> dict` | Register `name` in the fixture registry and return its state report. A governed agent pins the fixture canon commit (the one `canon()` returned, else a fixed placeholder), has a fresh canon state on `host`, an admitted placement and no lease: it is claimable. `host` defaults to the agent's own `fixture-host-<name>`; agents given the same explicit host share its canon state. `governed=False` registers a row with no canon reference and no placement verdict. Calling it again rewrites the declared profile; it refuses while the agent holds a live lease and releases an expired one. |
+| `agent_state(name, state, **options) -> dict` | Put the registered agent into `state`, one of `AGENT_STATES`, then read it back. Options are strings or numbers, and only the options listed for that state are accepted. The report is described below. |
 | `AGENT_STATES` | The closed list of states, below. A later minor may add a state; it never changes what an existing one means. |
-| `FixtureStateError` (code `state`) | The state was not reached or not observed: agent not registered, claim refused (the report's reasons explain why, e.g. a refused placement), reservation over its envelope. Its message carries no DSN or password. An unknown state, a non-plain agent name or an option that is neither a string nor a number is `FixtureRefused` (code `refused`). |
+| `FixtureStateError` (code `state`) | The state was not reached or not observed: agent not registered, claim refused (the report's reasons explain why, e.g. a refused placement), reservation over its envelope. Its message carries no DSN or password. An unknown state, a non-plain agent name or an option that is neither a string nor a number is `FixtureRefused` (code `refused`), as is an option the state does not take. |
 
 | State | Reached by | Observed as | Options |
 | --- | --- | --- | --- |
@@ -567,12 +567,21 @@ observation's admission reasons) and `spend` (`marker`, `spend_key`,
 environment's host, not the agent's, so `responsible_policy_unavailable` may
 appear among the reasons; it never means a state was missed.
 
-States are isolated and reversible: a state touches only the named agent's
-rows and the named billing account, on the fixture's own database, and the
-four reverse states (`lease_free`, `canon_fresh`, `placement_admitted`,
-`spend_clear`) undo the others. A lease state releases the previous lease
-first. States compose with the core's rules: a refused placement or a stale
-canon makes the next lease state refuse, exactly as a runner's claim would.
+States are isolated and reversible, on the fixture's own database only. A
+state touches the named agent's rows and the named billing account. The
+exception is the canon states: the core keeps one canon state per host, so
+`canon_stale` and `canon_fresh` change the canon state of the agent's host.
+That is why each agent gets its own host by default. Agents registered on one
+explicit host share its canon state. Four reverse states undo the
+others: `lease_free` undoes the lease states, `canon_fresh` undoes
+`canon_stale`, `placement_admitted` undoes `placement_refused`, and
+`spend_clear` undoes the spend marker and the open or kept reservations. A
+cost row stays in the ledger, as it would in production. A lease state
+releases the previous lease first. States compose with the core's claim
+rules: a refused placement makes the next lease state refuse, exactly as a
+runner's claim would. The claim checks the canon state's status, not its age:
+after `canon_stale`, a lease state still succeeds and `canon_stale` stays in
+`reasons`. The age gates a new turn, not the lease.
 `canon_stale` and `spend_ambiguous` have no production write path, since time
 and a lost key produce them; the fixture writes those two facts itself, inside
 the core package and only on its disposable database. The consumer still

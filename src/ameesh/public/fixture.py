@@ -390,7 +390,7 @@ class Fixture:
             raise FixtureError("read_view(%s): %s" % (view, exc)) from exc
 
     # -- agent qualification states (1.7, #8341) --------------------------
-    def agent(self, name: str, *, host: str = states_mod.DEFAULT_HOST,
+    def agent(self, name: str, *, host: Optional[str] = None,
               harness: str = states_mod.DEFAULT_HARNESS,
               model: str = states_mod.DEFAULT_MODEL, team: str = states_mod.DEFAULT_TEAM,
               responsible: str = states_mod.DEFAULT_RESPONSIBLE,
@@ -400,11 +400,17 @@ class Fixture:
         A governed agent (the default) pins the fixture canon commit (the
         one returned by :meth:`canon`, else a placeholder), has a fresh canon
         state on ``host`` and an admitted placement, and holds no lease: it
-        is claimable.  ``governed=False`` registers a row with no canon
-        reference and no placement verdict.  Calling it again rewrites the
-        declared profile; it refuses while the agent holds a lease.
+        is claimable.  ``host`` defaults to the agent's own
+        ``fixture-host-<name>``: the canon state belongs to a host, so agents
+        given the same explicit host share their canon states.
+        ``governed=False`` registers a row with no canon reference and no
+        placement verdict.  Calling it again rewrites the declared profile; it
+        refuses while the agent holds a live lease and releases an expired one.
         """
         name = _agent_name(name)
+        host = states_mod.default_host(name) if host is None else host
+        if not isinstance(host, str) or not config_mod.NAME_RE.match(host):
+            raise FixtureRefused("host must be a plain host name: %r" % (host,))
         return self._state_call(lambda db: states_mod.register(
             self, db, name, host=host, harness=harness, model=model,
             team=team, responsible=responsible, governed=bool(governed)))
@@ -420,15 +426,21 @@ class Fixture:
         admission reasons) and ``spend``; the budget states add ``account``,
         ``spend_key``, ``reservation`` and ``budget``, and ``cost`` adds
         ``cost``.  Each state has its reverse (``lease_free``, ``canon_fresh``,
-        ``placement_admitted``, ``spend_clear``) and touches only this agent's
-        rows and the named billing account.
+        ``placement_admitted``, ``spend_clear``).  A state touches only this
+        agent's rows and the named billing account, except the canon states,
+        which touch the canon state of the agent's host.  An option the state
+        does not take is refused.
         """
         name = _agent_name(name)
         if state not in AGENT_STATES:
             raise FixtureRefused("unknown agent state %r: one of %s"
                                  % (state, ", ".join(AGENT_STATES)))
+        allowed = states_mod.STATE_OPTIONS[state]
         for key, value in options.items():
-            if value is not None and not isinstance(value, (str, int, float)):
+            if key not in allowed:
+                raise FixtureRefused("state %s takes no option %r (options: %s)"
+                                     % (state, key, ", ".join(allowed) or "none"))
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
                 raise FixtureRefused("state option %s must be a string or a number"
                                      % key)
         return self._state_call(lambda db: states_mod.reach(

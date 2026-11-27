@@ -53,8 +53,10 @@ FOREIGN_OWNER = "fixture-foreign"
 FIXTURE_ACCOUNT = "fixture-account"
 #: daily envelope given to a billing account that has none
 DEFAULT_LIMIT_USD = 100.0
-#: default fixture agent profile
-DEFAULT_HOST = "fixture-host"
+#: default fixture agent profile; the default host is the agent's own
+#: (``fixture-host-<name>``): the canon state is per host, so a canon state
+#: of one agent never reaches another agent unless they share a host
+DEFAULT_HOST_PREFIX = "fixture-host-"
 DEFAULT_HARNESS = "claude"
 DEFAULT_MODEL = "fixture-model"
 DEFAULT_TEAM = "fixture"
@@ -63,6 +65,28 @@ DEFAULT_RESPONSIBLE = "human:fixture"
 PLACEHOLDER_COMMIT = "f1" * 20
 
 _STATE_ACTOR = "fixture"
+
+#: the options each state accepts; any other key is refused
+STATE_OPTIONS = {
+    "lease_live": ("owner", "ttl"),
+    "lease_foreign": ("owner", "ttl"),
+    "lease_expired": ("owner", "ttl"),
+    "lease_free": (),
+    "canon_fresh": (),
+    "canon_stale": ("age_s",),
+    "placement_admitted": (),
+    "placement_refused": ("diagnostic",),
+    "spend_ambiguous": ("start_index", "account"),
+    "spend_clear": (),
+    "reservation_open": ("account", "usd", "spend_key", "limit_usd"),
+    "reservation_settled": ("account", "usd", "spend_key", "cost_usd", "limit_usd"),
+    "cost": ("usd", "input_tokens", "output_tokens", "spend_key", "account"),
+}
+
+
+def default_host(name: str) -> str:
+    """The agent's own fixture host."""
+    return DEFAULT_HOST_PREFIX + name
 
 
 class StateNotReached(Exception):
@@ -86,8 +110,13 @@ def register(fixture, db, name: str, *, host: str, harness: str, model: str,
         "_expected_lease_epoch": int(row["lease_epoch"] or 0) if row else -1,
     }
     if row and row.get("lease_owner"):
-        raise StateNotReached("agent %s holds a lease (%s): put it in lease_free first"
-                              % (name, row["lease_owner"]))
+        if observe(fixture, db, name)["lease"]["live"]:
+            raise StateNotReached("agent %s holds a live lease (%s): put it in "
+                                  "lease_free first" % (name, row["lease_owner"]))
+        # An expired lease is released, as the next claim would take it over.
+        _free(db, name)
+        row = registry.get(db, name)
+        values["_expected_lease_epoch"] = int(row["lease_epoch"] or 0)
     if not canon_sync._write_declared(db, name, values):
         raise StateNotReached("the registry refused to write agent %s" % name)
     if governed:
@@ -439,4 +468,4 @@ _CHECKS: Dict[str, Callable] = {
     "cost": _check_cost,
 }
 
-assert set(_HANDLERS) == set(AGENT_STATES) == set(_CHECKS)
+assert set(_HANDLERS) == set(AGENT_STATES) == set(_CHECKS) == set(STATE_OPTIONS)
