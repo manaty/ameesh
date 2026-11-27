@@ -37,9 +37,11 @@ with tempfile.TemporaryDirectory() as cwd:
     assert str(pathlib.Path(result.stdout.strip()).resolve()) == SOURCE
     paths = os.environ['PYTHONPATH'].split(os.pathsep)
     root = pathlib.Path(__file__).resolve().parent.parent
-    assert paths[:2] == [str(root / 'src'), str(root)], paths
+    assert str(root) not in paths, paths
     if os.environ.get('INHERITED_8366'):
         assert paths[-1] == os.environ['INHERITED_8366'], paths
+        paths = paths[:-1]
+    assert paths and all(path == str(root / 'src') for path in paths), paths
 class Probe(unittest.TestCase):
     def test_child(self):
         self.assertEqual(result.returncode, 0)

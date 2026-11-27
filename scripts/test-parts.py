@@ -1145,7 +1145,7 @@ def prepare_python_path() -> None:
     sys.path[:0] = paths
     inherited = os.environ.get("PYTHONPATH")
     os.environ["PYTHONPATH"] = os.pathsep.join(
-        paths + ([inherited] if inherited else []))
+        paths[:1] + ([inherited] if inherited else []))
 
 
 def run_parallel(args) -> int | None:
