@@ -5541,6 +5541,9 @@ class AgentWorker(threading.Thread):
         book = cost_mod.CostBook(
             state_dir=self.cfg.state_dir, db=self.db,
             tools={self.name: self.agent.get("harness") or ""},
+            # #8347 : la lignée suit le même cache court et le même réveil
+            # `ameesh_budget` que les plafonds
+            lineage_cache=self.runner.budget_cache,
             **limites.book_kwargs())
         critique = account_turn.is_critical(self)
         if not critique:

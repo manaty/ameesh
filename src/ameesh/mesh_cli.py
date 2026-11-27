@@ -5257,6 +5257,17 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     pc_attr.add_argument("--agent", default=None)
     pc_attr.add_argument("--json", action="store_true")
     pc_attr.set_defaults(func=cmd_cost)
+    # #8347 : coût regroupé par racine de lignée (avatar et ses clones)
+    pc_lin = cost_sub.add_parser(
+        "lineage",
+        help="cost grouped by root agent of the created_by lineage (#8347)")
+    pc_lin.add_argument("--since", default="24h", help="duration (16h, 2d) or ISO date")
+    pc_lin.add_argument("--until", default=None,
+                        help="end of the period (duration or ISO date; default: now)")
+    pc_lin.add_argument("--agent", default=None,
+                        help="only the lineage of this agent (root or one of its clones)")
+    pc_lin.add_argument("--json", action="store_true")
+    pc_lin.set_defaults(func=cmd_cost)
     pc_gauges = cost_sub.add_parser("gauges", help="plan gauge history")
     pc_gauges.add_argument("--harness", default=None)
     pc_gauges.add_argument("--since", default="7d")
@@ -5449,6 +5460,8 @@ def cmd_cost(cfg: Config, args) -> int:
             return _cost_l26(cfg, db, what, args)
         if what == "attribution":
             return _cost_attribution(db, args)
+        if what == "lineage":
+            return _cost_lineage(db, args)
         if what == "report":
             # L61 : le rapport lisait la dépense agent par agent (deux
             # requêtes chacun, ~67 s vers une base distante) : ses lectures
@@ -5764,6 +5777,68 @@ def cmd_accounts(cfg: Config, args) -> int:
 def _since_seconds(text: str) -> float:
     now = time.time()
     return max(0.0, now - progress.parse_since(text, now))
+
+
+def _cost_lineage(db, args) -> int:
+    """#8347 : `cost lineage` — coût par racine de lignée `created_by`.
+
+    Deux lectures seulement : `turn_costs.by_agent` sur la période, puis
+    `agents.lineages()` pour la carte racine → membres ; le regroupement se
+    fait en Python, sans une requête par agent. Un agent sans lignée (racine
+    sans enfant) compte pour lui-même."""
+    now = time.time()
+    try:
+        since = progress.parse_since(args.since, now)
+        until = progress.parse_since(args.until, now) if args.until else now
+        if until < since:
+            raise progress.ProgressError("--until is before --since")
+        rows = storage.of(db).turn_costs.by_agent(since, until)
+        groups = storage.of(db).agents.lineages()
+    except (progress.ProgressError, NotImplementedError, db_mod.DbError) as exc:
+        print("cost lineage: %s" % exc, file=sys.stderr)
+        return 2
+    root_of = {}
+    for group in groups:
+        for member in group.get("members") or ():
+            if member.get("agent"):
+                root_of[member["agent"]] = group["root"]
+    wanted = args.agent or None
+    if wanted:
+        wanted = root_of.get(wanted, wanted)
+    grouped: dict = {}
+    for row in rows:
+        agent = str(row.get("agent") or "")
+        root = root_of.get(agent, agent)
+        if wanted and root != wanted:
+            continue
+        entry = grouped.setdefault(root, {"root": root, "usd": 0.0, "turns": 0,
+                                          "agents": []})
+        usd = float(row.get("usd") or 0.0)
+        turns = int(row.get("turns") or 0)
+        entry["usd"] += usd
+        entry["turns"] += turns
+        entry["agents"].append({"agent": agent, "usd": round(usd, 6), "turns": turns})
+    lineages = sorted(grouped.values(), key=lambda e: (-e["usd"], e["root"]))
+    for entry in lineages:
+        entry["usd"] = round(entry["usd"], 6)
+        entry["agents"].sort(key=lambda a: (-a["usd"], a["agent"]))
+    data = {"schema": "ameesh-cost-lineage/1", "period": args.since,
+            "since_ts": since, "until_ts": until, "agent": args.agent,
+            "lineages": lineages}
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print("cost by lineage — period %s (until %s)" % (
+        args.since, time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(until))))
+    print("%-24s %12s %8s  %s" % ("ROOT", "SPEND", "TURNS", "AGENTS"))
+    for entry in lineages:
+        agents = ", ".join("%s %.4f (%d)" % (a["agent"], a["usd"], a["turns"])
+                           for a in entry["agents"])
+        print("%-24s %12.4f %8d  %s" % (entry["root"], entry["usd"],
+                                        entry["turns"], agents))
+    if not lineages:
+        print("no turn cost in the period")
+    return 0
 
 
 def _cost_attribution(db, args) -> int:

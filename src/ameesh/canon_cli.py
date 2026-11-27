@@ -992,6 +992,15 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db)
+        # #8347 (option 3) : avertir, sans refuser, quand la lignée du
+        # créateur est déjà au-dessus d'un plafond — l'enfant sera mis en
+        # pause à son premier tour, comme le reste de la lignée.
+        from . import budget as budget_mod
+        alerte = budget_mod.lineage_warning(cfg, db, args.by)
+        if alerte:
+            print("warning: lineage budget already reached (%s); the child will be "
+                  "paused at its first turn until the root cap allows it" % alerte,
+                  file=sys.stderr)
         name = args.name or _generated_name(
             canon[0].naming if canon else None, args.role, args.project, canon, db,
             for_spawn=True)
