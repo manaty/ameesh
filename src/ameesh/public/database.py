@@ -64,26 +64,35 @@ class UnsupportedStorage(DatabaseError, NotImplementedError):
 
 #: userinfo password of a PostgreSQL URI (``postgresql://user:pw@host``)
 _URI_PASSWORD = re.compile(r"(postgres(?:ql)?://[^:/@\s]+:)[^@\s]+@")
-#: libpq key/value password, quoted or bare
-_PASSWORD_PAIR = re.compile(r"(?i)\bpassword\s*=\s*(?:'[^']*'|[^\s;]+)")
+#: libpq key/value password: single- or double-quoted with backslash escapes,
+#: or bare with escaped whitespace (``password='a\'b'``, ``password=a\ b``)
+_PASSWORD_PAIR = re.compile(
+    r"(?i)\bpassword\s*=\s*(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|"
+    r"(?:[^\s;\\]|\\.)+)")
 #: URI query password (``?password=…``)
 _QUERY_PASSWORD = re.compile(r"(?i)([?&]password=)[^&\s]+")
+
+
+def _libpq_escaped(password: str) -> str:
+    """The password in the backslash-escaped form a key/value DSN may echo."""
+    return password.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def _redact(value: Any, cfg: Any = None) -> str:
     """One-line diagnostic that never carries the DSN or a password.
 
-    The core already avoids printing a password in most errors, but this
-    surface is public: a driver message might echo a connection string, so the
-    known DSN and every of its encoded password forms are replaced.  Unknown
-    URI userinfo and ``password=`` pairs are redacted too.
+    Masking happens on the complete text, before collapsing and truncation: a
+    secret crossing the 300-character cut would otherwise keep an unredacted
+    prefix.  The configured DSN is parsed by the core's libpq reader (escaped
+    quotes included), then its password is replaced in every form a driver can
+    echo (raw, URI-encoded, libpq-escaped).  Unknown URI userinfo and
+    ``password=`` pairs are redacted too.
     """
-    message = " ".join(str(value).split())[:300]
-    message = _QUERY_PASSWORD.sub(r"\1***", message)
-    message = _PASSWORD_PAIR.sub("password=***", message)
-    message = _URI_PASSWORD.sub(r"\1***@", message)
+    message = str(value)
     dsn = str(getattr(cfg, "dsn", "") or "")
     if dsn:
+        # Whole DSN first: the core parser knows libpq escapes, so its mask
+        # replaces the pair exactly instead of stopping at an escaped quote.
         if dsn in message:
             message = message.replace(dsn, config_mod.mask_dsn(dsn))
         try:
@@ -91,11 +100,15 @@ def _redact(value: Any, cfg: Any = None) -> str:
         except dsn_mod.DsnError:
             password = ""
         if password:
-            for variant in (password, quote(password, safe=""),
-                            quote_plus(password)):
+            variants = {password, quote(password, safe=""),
+                        quote_plus(password), _libpq_escaped(password)}
+            for variant in sorted(variants, key=len, reverse=True):
                 if variant:
                     message = message.replace(variant, "***")
-    return message
+    message = _QUERY_PASSWORD.sub(r"\1***", message)
+    message = _PASSWORD_PAIR.sub("password=***", message)
+    message = _URI_PASSWORD.sub(r"\1***@", message)
+    return " ".join(message.split())[:300]
 
 
 def _admit(connection: Any, cfg: Any) -> None:

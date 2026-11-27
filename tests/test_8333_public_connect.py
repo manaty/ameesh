@@ -287,6 +287,45 @@ class PublicConnectBoundaryTest(unittest.TestCase):
         self.assertNotIn("postgresql://agent:%s" % secret, message)
         self.assertIn("***", message)
 
+    def test_a_libpq_escaped_password_is_redacted(self):
+        # Reader report (#235087): the pair regex used to stop at the escaped
+        # quote and leave the tail of the password in the public message.
+        dsn = "password='first\\'TAIL_SECRET' host=localhost dbname=mesh"
+        cfg = self.config(dsn=dsn)
+        with mock.patch.object(database_mod.config_mod, "load", return_value=cfg), \
+                mock.patch.object(database_mod.db_mod, "connect",
+                                  side_effect=db_mod.Unavailable(
+                                      "connection rejected: %s" % dsn)):
+            with self.assertRaises(database_mod.DatabaseUnavailable) as caught:
+                database_mod.connect()
+        message = str(caught.exception)
+        self.assertNotIn("TAIL_SECRET", message)
+        self.assertNotIn("first", message)
+        self.assertIn("password=***", message)
+        self.assertIn("localhost", message)
+
+    def test_a_secret_crossing_the_truncation_is_redacted(self):
+        # Reader report (#235087): masking after the 300-character cut kept
+        # the prefix of a password sitting at the cut.
+        secret = "LONG_SECRET_TOKEN"
+        cfg = self.config(dsn="postgresql://agent:%s@localhost/mesh" % secret)
+        with mock.patch.object(database_mod.config_mod, "load", return_value=cfg), \
+                mock.patch.object(database_mod.db_mod, "connect",
+                                  side_effect=db_mod.Unavailable(
+                                      "x" * 292 + secret)):
+            with self.assertRaises(database_mod.DatabaseUnavailable) as caught:
+                database_mod.connect()
+        message = str(caught.exception)
+        self.assertNotIn("LONG_SEC", message)
+        self.assertNotIn(secret, message)
+        self.assertIn("***", message)
+
+    def test_an_unknown_escaped_password_pair_is_redacted(self):
+        message = database_mod._redact(
+            "driver: password='first\\'TAIL_SECRET' host=db")
+        self.assertNotIn("TAIL_SECRET", message)
+        self.assertIn("password=***", message)
+
     def test_a_configuration_failure_is_unavailable(self):
         with mock.patch.object(database_mod.config_mod, "load",
                                side_effect=SystemExit(
