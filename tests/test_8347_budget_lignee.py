@@ -172,8 +172,8 @@ class LigneeBudgetTest(PgTestCase):
         self._depense("r", 0.6)
         self._cap("r", 1.0)
         self.assertEqual(
-            budget.reserve_lineage(self.cfg, self.db, "c1", "k1", reserve_usd=2.0), "")
-        refus = budget.reserve_lineage(self.cfg, self.db, "c2", "k2", reserve_usd=2.0)
+            budget.reserve_lineage(self.cfg, self.db, "c1", "k1", reserve_usd=0.4), "")
+        refus = budget.reserve_lineage(self.cfg, self.db, "c2", "k2", reserve_usd=0.4)
         self.assertIn("lineage r", refus)
         self.assertIn("reserved by in-flight turns", refus)
         # la garde lue compte la réservation : 0.60 + 0.40 = 1.00
@@ -182,7 +182,7 @@ class LigneeBudgetTest(PgTestCase):
                       book.over("c2", paid_harnesses=PAID, pace=False))
         # rejeu de la même clé : idempotent, une seule ligne
         self.assertEqual(
-            budget.reserve_lineage(self.cfg, self.db, "c1", "k1", reserve_usd=2.0), "")
+            budget.reserve_lineage(self.cfg, self.db, "c1", "k1", reserve_usd=0.4), "")
         rows = self.db.query(
             "select spend_key, hour_usd::float8 as hour_usd"
             " from budget_lineage_reservations order by spend_key")
@@ -191,7 +191,36 @@ class LigneeBudgetTest(PgTestCase):
         # la place rendue au règlement, le frère est admis
         self.assertTrue(budget.release_lineage(self.db, "k1"))
         self.assertEqual(
-            budget.reserve_lineage(self.cfg, self.db, "c2", "k2", reserve_usd=2.0), "")
+            budget.reserve_lineage(self.cfg, self.db, "c2", "k2", reserve_usd=0.4), "")
+
+    def test_borne_du_tour_qui_ne_tient_pas_refusee(self):
+        # B/P2 #46864 : réserver min(borne, reste) laissait deux tours de
+        # 0.30 $ admis sur des restes de 0.40 $ puis 0.10 $ porter la lignée
+        # à 1.20 $ sous un plafond de 1 $. Une borne qui ne tient pas refuse.
+        self._agent("r")
+        self._agent("c1", creator="r")
+        self._agent("c2", creator="r")
+        self._depense("r", 0.6)
+        self._cap("r", 1.0)
+        self.assertEqual(
+            budget.reserve_lineage(self.cfg, self.db, "c1", "k1", reserve_usd=0.3), "")
+        refus = budget.reserve_lineage(self.cfg, self.db, "c2", "k2", reserve_usd=0.3)
+        self.assertIn("lineage r", refus)
+        self.assertIn("turn bound 0.30 $", refus)
+        self.assertIn("remaining 0.10 $", refus)
+        # le premier tour règle sa borne : 0.60 + 0.30 = 0.90 $, et la place
+        # restante (0.10 $) ne porte toujours pas la borne d'un tour
+        self.assertTrue(budget.release_lineage(self.db, "k1"))
+        self._depense("c1", 0.3)
+        self.assertIn(
+            "remaining 0.10 $",
+            budget.reserve_lineage(self.cfg, self.db, "c2", "k2", reserve_usd=0.3))
+        total = self.db.query(
+            "select coalesce(sum(usd), 0)::float8 as usd from turn_costs")[0]["usd"]
+        self.assertEqual(total, 0.9, "la lignée a dépassé son plafond")
+        self.assertEqual(
+            self.db.query("select count(*)::int as n from budget_lineage_reservations")[0]["n"],
+            0, "un refus ne doit rien laisser réservé")
 
     def test_admission_concurrente_une_seule_gagne(self):
         self._agent("r")
@@ -207,7 +236,7 @@ class LigneeBudgetTest(PgTestCase):
             try:
                 barriere.wait(5)
                 resultats[agent] = budget.reserve_lineage(
-                    self.cfg, db, agent, "k-" + agent, reserve_usd=2.0)
+                    self.cfg, db, agent, "k-" + agent, reserve_usd=0.4)
             except Exception as exc:  # noqa: BLE001 - le fil doit rendre la main
                 resultats[agent] = "EXCEPTION: %s" % exc
             finally:
@@ -411,6 +440,28 @@ class LigneeBudgetTest(PgTestCase):
                          "pas %d" % apres)
         self.assertLessEqual(apres_status, 20,
                              "trop de lectures turn_costs pour la vue : %d" % apres_status)
+        # plusieurs racines : le coût de la vue ne dépend pas non plus du
+        # nombre de racines (banc 1 racine / 12 enfants → 17 racines).
+        for index in range(16):
+            root = "mr%d" % index
+            self._agent(root)
+            self._cap(root, 100.0)
+            self._depense(root, 0.01)
+            self._agent(root + "-c", creator=root)
+            self._depense(root + "-c", 0.01)
+        limites = budget.current(self.cfg, self.db)
+        avant_racines = measure(lambda: budget._lineage_view(self.db, limites, book, PAID))
+        statut_avant = measure(lambda: budget.status(self.cfg, self.db))
+        self.assertEqual(avant_racines, 2,
+                         "la vue de lignée relit le grand livre par racine : %d"
+                         % avant_racines)
+        self.assertLessEqual(statut_avant, 12,
+                             "trop de lectures turn_costs avec plusieurs racines : %d"
+                             % statut_avant)
+        sortie = budget._lineage_view(self.db, limites, book, PAID)
+        par_racine = {entry["root"]: entry for entry in sortie}
+        self.assertEqual(par_racine["mr0"]["total"]["1h_usd"], 0.02)
+        self.assertEqual(par_racine["r"]["total"]["1h_usd"], 13.0)
 
     # -- spawn -------------------------------------------------------------
     def test_avertissement_de_spawn(self):

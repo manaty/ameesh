@@ -29,7 +29,8 @@ l'agent et plafond de lignée s'appliquent ensemble, le plus strict gagne. Une
 lignée rompue (créateur absent, cycle) refuse le tour : on ne somme jamais une
 lignée partielle. L'admission d'un tour réserve atomiquement sa part du
 plafond de la racine (migration 0611) : deux clones ne lisent pas le même
-reste, la réservation est rendue au règlement ou expire. La vue `ameesh
+reste, et un tour dont la borne ne tient pas dans ce reste est refusé plutôt
+que tronqué. La réservation est rendue au règlement ou expire. La vue `ameesh
 budget --json` publie `lineages` (racine, enfants vivants/échus, totaux
 1 h/24 h).
 
@@ -341,10 +342,17 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
         spend["24h_usd"] = round(book.spent("all", 86400, harnesses=paid), 6)
         # #513 : idem contre le plafond par jour glissant
         spend["24h_counted_usd"] = round(book.paid_spent(paid, 86400), 6)
-        for agent in sorted(limits.agents):
+        # #8347 : deux lectures pour tous les agents à plafond, pas une par
+        # agent (même agrégat que `book.spent`, une requête par fenêtre).
+        capped = sorted(limits.agents)
+        capped_one = (book.spent_by_agent(capped, 3600, harnesses=paid)
+                      if capped else {})
+        capped_day = (book.spent_by_agent(capped, 86400, harnesses=paid)
+                      if capped else {})
+        for agent in capped:
             spend["agents"][agent] = {
-                "1h_usd": round(book.spent(agent, 3600, harnesses=paid), 6),
-                "24h_usd": round(book.spent(agent, 86400, harnesses=paid), 6)}
+                "1h_usd": round(capped_one.get(agent, 0.0), 6),
+                "24h_usd": round(capped_day.get(agent, 0.0), 6)}
         # #8347 : vue de lignée, une lecture de lignées et deux sommes pour
         # tous les enfants — jamais une requête par enfant.
         lineages = _lineage_view(db, limits, book, paid)
@@ -382,19 +390,22 @@ def _lineage_view(db, limits: Limits, book, paid) -> list:
     """#8347 : la dépense d'une lignée, racine et enfants, 1 h / 24 h.
 
     Les racines rendues sont celles à plafond, plus celles qui ont au moins un
-    éphémère descendant. `spent_by_agent` lit les deux fenêtres en une requête
-    chacune : le coût ne dépend pas du nombre d'enfants."""
+    éphémère descendant. Tous les membres de toutes les racines sont
+    dédupliqués avant le rendu : `spent_by_agent` lit les deux fenêtres en une
+    requête chacune, donc le coût ne dépend ni du nombre d'enfants ni du
+    nombre de racines (l'ancien rendu relisait le grand livre par racine)."""
     roots = tuple(sorted(limits.agents))
     groups = storage.of(db).agents.lineages(roots)
     now = time.time()
+    names = sorted({str(m["agent"]) for group in groups
+                    for m in group.get("members") or () if m.get("agent")})
+    one = book.spent_by_agent(names, 3600, harnesses=paid) if names else {}
+    day = book.spent_by_agent(names, 86400, harnesses=paid) if names else {}
     out = []
     for group in groups:
         members = group.get("members") or []
-        names = [str(m["agent"]) for m in members if m.get("agent")]
-        if not names:
+        if not any(m.get("agent") for m in members):
             continue
-        one = book.spent_by_agent(names, 3600, harnesses=paid)
-        day = book.spent_by_agent(names, 86400, harnesses=paid)
         children = []
         total_one = total_day = 0.0
         own = {"1h_usd": 0.0, "24h_usd": 0.0}
@@ -459,10 +470,13 @@ def reserve_lineage(cfg: Config, db, agent: str, spend_key: str | None, *,
     La garde lue seule (`CostBook.over`) laissait deux clones lire le même
     reste avant que l'un des deux ne règle son tour. L'admission d'un tour
     prend ici le verrou de la racine, relit la dépense payée et les
-    réservations des tours en vol, et réserve `reserve_usd` (borné au reste)
-    sous la clé comptable du tour : un second clone ne peut plus être admis
-    sur le même reste. Le règlement (`release_lineage`) ou l'expiration rend
-    la place ; le rejeu de la même clé est idempotent.
+    réservations des tours en vol, et réserve `reserve_usd` — la borne d'un
+    tour — sous la clé comptable du tour. Un second clone ne peut plus être
+    admis sur le même reste. Une borne qui ne tient pas entièrement dans le
+    reste **refuse le tour** : la tronquer laisserait le tour dépenser sa
+    borne pleine et dépasser le plafond (B de cx2, #46864). Le règlement
+    (`release_lineage`) ou l'expiration rend la place ; le rejeu de la même
+    clé est idempotent.
 
     Rend '' quand le tour est admis (ou qu'aucun plafond de lignée ne
     s'applique), sinon la raison du refus. Une base ou une lignée illisible
@@ -519,16 +533,26 @@ def reserve_lineage(cfg: Config, db, agent: str, spend_key: str | None, *,
                                      **limits.book_kwargs())
             reserved = store.budgets.lineage_reserved(root)
             parts: dict = {}
+            borne = float(reserve_usd) if reserve_usd and reserve_usd > 0 else 0.0
             for window, cap in sorted(caps.items()):
                 spent = book.paid_spent(paid, window, tuple(members))
                 garde = float(reserved.get(window, 0.0))
                 reste = cap - spent - garde
+                label = "hourly" if window == 3600 else "daily"
                 if reste <= 0:
                     return ("%s budget of lineage %s (pay-per-token): %.2f $ "
                             "spent + %.2f $ reserved by in-flight turns, cap %.2f $"
-                            % ("hourly" if window == 3600 else "daily", root,
-                               spent, garde, cap))
-                part = float(reserve_usd) if reserve_usd and reserve_usd > 0 else reste
+                            % (label, root, spent, garde, cap))
+                part = borne if borne > 0 else reste
+                if part > reste + 1e-9:
+                    # une réservation tronquée ne borne pas la dépense du tour
+                    # (il peut dépenser sa borne pleine) : on refuse plutôt que
+                    # de laisser la lignée dépasser le plafond.
+                    return ("%s budget of lineage %s (pay-per-token): %.2f $ "
+                            "spent + %.2f $ reserved by in-flight turns, cap "
+                            "%.2f $; the turn bound %.2f $ exceeds the remaining "
+                            "%.2f $" % (label, root, spent, garde, cap, part,
+                                        reste))
                 parts[window] = min(part, reste)
             ecrit = store.budgets.lineage_reserve_put(
                 root=root, agent=agent, spend_key=spend_key,
