@@ -10,7 +10,9 @@ moyen, un hôte qui veut rester dans la fenêtre réapplique tout le canon
 La confirmation ne charge ni ne valide aucune fiche. Elle prouve, à coût
 constant (une lecture, un `git rev-parse` local, une écriture), que :
 
-* l'état enregistré de ce canon sur l'hôte est `ok` au commit `SHA` donné ;
+* l'état enregistré de ce canon sur l'hôte est `ok` au commit `SHA` donné,
+  appliqué depuis une SEULE source (une fédération dont une sœur peut avancer
+  sous une racine inchangée passe toujours par `canon sync`) ;
 * sa racine est encore un canon configuré de l'hôte, approuvé, et la
   révision appliquée (enregistrée dans `source`) — ou la révision configurée —
   désigne toujours ce commit dans le dépôt local (aucun fetch : l'appelant
@@ -125,7 +127,14 @@ def confirm(db, cfg, host: str, commit: str, *, canon: str | None = None,
                       "recorded root %s is not the configured canon of this key" % (root or "?"))
     if entry.untrusted:
         return refuse("untrusted", "an untrusted canon is never confirmed")
-    first = str(row.get("source") or "").split("; ")[0]
+    sources = str(row.get("source") or "").split("; ")
+    if len(sources) != 1:
+        # Une source sœur peut avancer (et révoquer une consigne) sous une
+        # racine inchangée ; ce chemin ne la revoit pas : synchro complète.
+        return refuse("multi-source",
+                      "a canon applied from %d sources is only refreshed by "
+                      "`ameesh canon sync`" % len(sources))
+    first = sources[0]
     match = _GIT_SOURCE.fullmatch(first)
     if match is None or not commit.startswith(match["short"]):
         return refuse("source-unknown",

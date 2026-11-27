@@ -110,6 +110,14 @@ class ConfirmTest(PgTestCase):
         self.hcfg.canon_untrusted = True
         self._refused("untrusted")
 
+    def test_multi_source_state_is_refused(self):
+        """Racine inchangée, sœur avancée B1 -> B2 : refus, checked_at inchangé."""
+        self.db.execute(
+            "UPDATE canon_state SET source = %s",
+            ("root @ %s (main); sister @ %s (main)" % (self.sha[:12], "b1" * 6),))
+        self._refused("multi-source")
+        self.assertFalse(placement.canon_fresh(self._state())[0])
+
     def test_named_canon_uses_its_own_row(self):
         other = os.path.join(self.tmp, "second")
         _git(self.tmp, "clone", "-q", self.repo, other)
