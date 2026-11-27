@@ -407,7 +407,8 @@ class DebitCauseTest(_SloBase):
     def test_qa_merge_nomme_la_cause_de_l_auteur(self):
         self.db.execute(
             "UPDATE work_item_milestones SET at = to_timestamp(%s)"
-            " WHERE work_item_id = %s AND kind = 'frozen'",
+            # #8320 : l'attente du paquet court du verdict `ok`, pas du gel
+            " WHERE work_item_id = %s AND kind IN ('frozen', 'verdict')",
             (self.now - 3 * HEURE, self.lot["id"]))
         cause = {"code": "freeze-not-head", "owner": "author",
                  "detail": "freeze 1dd33c0e17c3 is not the published head 949e195be64c",

@@ -116,7 +116,8 @@ class PausedAuthorTest(_SloBase):
     def _report(self):
         self.db.execute(
             "UPDATE work_item_milestones SET at = to_timestamp(%s)"
-            " WHERE work_item_id = %s AND kind = 'frozen'",
+            # #8320 : l'attente du paquet court du verdict `ok`, pas du gel
+            " WHERE work_item_id = %s AND kind IN ('frozen', 'verdict')",
             (self.now - 3 * H, self.lot["id"]))
         with mock.patch.object(packet_candidates, "candidate_refusal",
                                return_value=dict(self.CAUSE)):
