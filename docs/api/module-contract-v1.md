@@ -1,7 +1,7 @@
 # External module public contract, version 1
 
-Contract revision: **1.8, 27 November 2026** (additive public action-connector
-surface). Scope: an
+Contract revision: **1.9, 27 November 2026** (additive public read of the
+declared account profiles). Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
@@ -37,6 +37,10 @@ installed module declares its action connectors under `ACTION_CONNECTORS` and
 imports the protocol objects (`Action`, `Outcome`, `NotSentError`) from the
 public surface instead of `ameesh.connectors`; the governed gate, its policy
 and the connector protocol are unchanged, so the revision is additive to 1.7.
+Revision 1.9 adds `ameesh accounts profiles --json` (#8337,
+manaty/ameesh#6577): the redacted list of the host's declared account
+profiles, so a consumer checks its account layout without importing
+`accounts.parse`; it is additive to 1.8.
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -76,14 +80,14 @@ In particular, the baseline here is ameesh commit
 The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
 (#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b), the
 revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2), the
-revision 1.6 element (#6573), the revision 1.7 element (#8341) and the
-revision 1.8 element (#8342) are available only in a released version that
+revision 1.6 element (#6573), the revision 1.7 element (#8341), the
+revision 1.8 element (#8342) and the revision 1.9 element (#8337) are available only in a released version that
 carries those lots; at the 1.0 baseline they are absent, and a consumer must
 still treat their absence as "unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
 [coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5,
-1.6, 1.7 and 1.8 elements from the release that implements them, and freeze
-revision 1.8; the surface keeps the 1.0 commit as its comparison point.
+1.6, 1.7, 1.8 and 1.9 elements from the release that implements them, and freeze
+revision 1.9; the surface keeps the 1.0 commit as its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
 ([#7666 / #5858](https://github.com/manaty/ameesh/issues/5858)) through one
@@ -111,6 +115,7 @@ release's `--help`. These entry points cover the module integration:
 | `ameesh turn current --json [--expect-turn ID]` | Current turn's versioned authorization document, with identity and database recheck. `--local` omits the database recheck and must not be treated as proof of a live lease. |
 | `ameesh turn observe (--turn ID \| --request ID) --json` | Read-only `ameesh-turn-observation/1`: request, turn, accounting, bounded deferral and quiescence. Absence of a known cost is not zero cost. |
 | `ameesh agent observe AGENT [--account-profile NAME] [--json]` | Read-only `ameesh-agent-observation/1`: admitted canon/placement references, responsible, live lease owner/epoch, declared and effective bounds, redacted provider budget and native turn/sandbox references. One repeatable-read snapshot; no claim, reservation, settlement, dispatch or canon synchronization. A missing fact is `null` plus a code in `missing`, never permission or zero cost. |
+| `ameesh accounts profiles [--json]` | Read-only `ameesh-account-profiles/1` (revision 1.9, #8337): every profile declared in this host's configuration, sorted by `harness` then `name`, with `kind` (`api_key_env`/`config_dir`), `env` and `key_env` (variable **names**), `key_source` (`env`, `file` or `null`), `reserve_usd` and `billing_account`. Never a key value, a key file's path or content, nor a configuration directory; no database read and no credential read (a key's value is never read from the environment or a file). `valid` combines the runner's admission of the whole `accounts` configuration with the completeness of this read: it is false as soon as any profile is refused (a non-empty `refused` implies `valid` false). An unreadable profile does not hide the others: it is listed under `refused` with `harness`/`index`/`name` (`null` unless a valid identifier) and a closed `reason` (`invalid_accounts`, `unknown_harness`, `invalid_profile_list`, `not_an_object`, `invalid_name`, `duplicate_name`, `invalid_profile`, `shared_configuration_dir`, `unpublishable_variable_name`), never the error text. A synthetic `(default)` profile is never declared, so never listed. Exit 0 whenever the document is printed. |
 | `ameesh list --json`, `ameesh show --json` | `ameesh-agents/1`: the same bounded `deferral` block (revision 1.2, #7675), closed reasons; its absence or `null` is not permission to run. |
 | `agent-mail send`, `agent-mail show` | Ordinary governed mail. The help documents flags and stdin. These commands alone do not provide IMA's atomic request/reply/deduplication protocol (E2). |
 | `ameesh migrate --dry-run --additive-only` | Core migration classification; the module does not import or invoke the migration implementation. Actual application retains its operator and staging gates. |

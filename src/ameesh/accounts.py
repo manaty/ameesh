@@ -769,6 +769,120 @@ def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
 
 
 # --------------------------------------------------------------------------
+# #8337 (manaty/ameesh#6577) : lecture publique des profils déclarés
+# --------------------------------------------------------------------------
+
+#: schéma du document `ameesh accounts profiles --json`
+PUBLIC_PROFILES_SCHEMA = "ameesh-account-profiles/1"
+#: un nom de variable publiable ; toute autre valeur dans `env`/`key_env`
+#: (une clé collée par erreur à la place du nom) n'est jamais recopiée
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+#: raisons fermées d'un profil écarté : jamais le texte de `AccountError`,
+#: qui cite des valeurs et des chemins
+PUBLIC_REFUSALS = ("invalid_accounts", "unknown_harness", "invalid_profile_list",
+                   "not_an_object", "invalid_name", "duplicate_name",
+                   "invalid_profile", "shared_configuration_dir",
+                   "unpublishable_variable_name")
+
+
+def _public_row(profile: Profile) -> dict:
+    return {
+        "harness": profile.harness,
+        "name": profile.name,
+        "kind": profile.kind,
+        "env": profile.env or None,
+        "key_env": profile.key_env or None,
+        # la présence d'un fichier de clé, jamais son chemin
+        "key_source": ("file" if profile.key_file else "env" if profile.key_env
+                       else None) if profile.kind == "api_key_env" else None,
+        "reserve_usd": profile.reserve_usd,
+        "billing_account": profile.billing_account or None,
+    }
+
+
+def public_profiles(raw) -> dict:
+    """#8337 : tous les profils déclarés, expurgés, triés par (harnais, nom).
+
+    Ni valeur de clé, ni contenu ou chemin de fichier, ni dossier de
+    configuration : le nom, le type, le harnais, les **noms** des variables
+    (`env`, `key_env`), la réserve et le compte de facturation. Aucune valeur
+    de clé n'est lue, ni dans l'environnement ni dans un fichier : seule la
+    configuration déjà chargée est analysée.
+
+    Un profil illisible ne fait pas tomber la liste : il est rangé dans
+    `refused` avec une raison fermée (`PUBLIC_REFUSALS`), son harnais et son
+    nom seulement s'ils sont des identifiants valides. `valid` dit si la
+    configuration entière passe `parse` — l'exécuteur l'admet (une erreur
+    suspend les tours, fail-closed) — et il est faux dès qu'un profil est
+    refusé (`refused` non vide). Un profil synthétique (`(default)`) n'est
+    jamais déclaré, donc jamais listé.
+    """
+    rows: list[dict] = []
+    refused: list[dict] = []
+    try:
+        parse(raw)
+        valid = True
+    except AccountError:
+        valid = False
+
+    def refuse(harness, index, name, reason):
+        refused.append({
+            "harness": harness if isinstance(harness, str) and NAME_RE.match(harness) else None,
+            "index": index,
+            "name": name if isinstance(name, str) and NAME_RE.match(name) else None,
+            "reason": reason})
+
+    if raw in (None, "", {}):
+        raw = {}
+    if not isinstance(raw, dict):
+        refuse(None, None, None, "invalid_accounts")
+        raw = {}
+    known = harnesses.known_ids()
+    for harness in sorted(raw, key=str):
+        items = raw[harness]
+        if harness not in known:
+            refuse(harness, None, None, "unknown_harness")
+            continue
+        if not isinstance(items, list) or not items:
+            refuse(harness, None, None, "invalid_profile_list")
+            continue
+        kept: list[Profile] = []
+        seen: set[str] = set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                refuse(harness, index, None, "not_an_object")
+                continue
+            name = item.get("name")
+            if not (isinstance(name, str) and NAME_RE.match(name)):
+                refuse(harness, index, None, "invalid_name")
+                continue
+            if name in seen:
+                refuse(harness, index, name, "duplicate_name")
+                continue
+            seen.add(name)
+            try:
+                (profile,) = parse({harness: [item]})[harness]
+            except AccountError:
+                refuse(harness, index, name, "invalid_profile")
+                continue
+            if any(value and not ENV_NAME_RE.match(value)
+                   for value in (profile.env, profile.key_env)):
+                refuse(harness, index, name, "unpublishable_variable_name")
+                continue
+            kept.append(profile)
+        try:
+            _refuse_shared_homes(harness, kept)
+        except AccountError:
+            # le refus vaut pour le harnais entier : les profils restent
+            # listés (leurs noms ne sont pas secrets), le motif est signalé
+            refuse(harness, None, None, "shared_configuration_dir")
+        rows.extend(_public_row(profile) for profile in kept)
+    rows.sort(key=lambda row: (row["harness"], row["name"]))
+    return {"schema": PUBLIC_PROFILES_SCHEMA, "valid": valid and not refused,
+            "profiles": rows, "refused": refused}
+
+
+# --------------------------------------------------------------------------
 # #3647 : rythme compilé du canon (§11, décision owner #141793 a)
 # --------------------------------------------------------------------------
 

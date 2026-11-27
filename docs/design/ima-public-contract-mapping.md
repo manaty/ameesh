@@ -1,6 +1,6 @@
 # IMA → public module contract: inventory and replacement plan
 
-Document revision 2, 27 November 2026. This is the consumer mapping for
+Document revision 3, 27 November 2026. This is the consumer mapping for
 [contract v1](../api/module-contract-v1.md), requested by
 [#7664 / #5856](https://github.com/manaty/ameesh/issues/5856), under
 [#7636 / #5827](https://github.com/manaty/ameesh/issues/5827).
@@ -99,6 +99,25 @@ connector code.
   [module-contract-v1.surface.json](../api/module-contract-v1.surface.json)
 - upstream: [#6582](https://github.com/manaty/ameesh/issues/6582);
   implementation lot #8342.
+
+### Account profile layout (post-inventory, #6577)
+
+`ameesh-runtime-admission.py` (row 9) and `ameesh-reviewer-preparation.py`
+(row 5) call `accounts.parse(cfg.accounts)` to check that exactly one API
+account exists per provider. From contract revision 1.9 the supported read is
+`ameesh accounts profiles --json` (`ameesh-account-profiles/1`): every declared
+profile with `name`, `kind`, `harness`, the variable names `env`/`key_env`,
+`key_source`, `reserve_usd` and `billing_account`, never a key value or a key
+file's path; an unreadable profile is listed under `refused` with a closed
+reason instead of hiding the others, and `valid` says whether the runner admits
+the configuration. IMA keeps its own "one API account per provider" rule and
+drops the `accounts` import for this check.
+
+- [CLI boundary](../api/module-contract-v1.md#cli-boundary), frozen as
+  `cli:ameesh accounts profiles` in
+  [module-contract-v1.surface.json](../api/module-contract-v1.surface.json)
+- upstream: [#6577](https://github.com/manaty/ameesh/issues/6577);
+  implementation lot #8337.
 
 ## Indirect runner and connection dependencies
 
@@ -211,7 +230,7 @@ Each row is at most one working day. The pilot created lots #7669–#7675
 [public snapshot CLI](../api/canon-snapshot-v1.md); the other rows remain
 delivery work, not available APIs. Later consumer requests add E2d (#6573,
 implemented by #8333), E3c (#6574, proposal only, implementation lot #8334)
-and A (#6582, implemented by #8342). F/S are the existing
+A (#6582, implemented by #8342) and P (#6577, implemented by #8337). F/S are the existing
 qualification/stable lots. Each upstream delivery needs a corresponding removal
 commit referenced in IMA#1803 before the external request closes.
 
@@ -225,6 +244,7 @@ commit referenced in IMA#1803 before the external request closes.
 | E3a (#7674) | 6 h | Declarative per-agent fresh-session/context and bounded refusal-retry policy consumed by the runner; no AgentWorker subclass. Test document and ordinary agent side by side, optional harness handling, failure delay and graceful shutdown. **Implemented by #7674** as the Agent/Persona session fields in the [public contract](../api/module-contract-v1.md#declarative-per-agent-session-policy-e3a-7674); IMA#1803 removes the session monkey patch. | Implementation lot under #5827; IMA#1803 adopts the card fields and removes the monkey patch. |
 | E2d (#6573) | 3 h | Production connection for the E2 Python surfaces: `ameesh.public.connect()` opens the deployment's usual configuration (no DSN argument), checks the schema immediately, returns an opaque `Db` for `ameesh.public.mail`, and refuses with `DatabaseUnavailable`/`SchemaRefused`/`UnsupportedStorage` without exposing the DSN or a password. **Implemented by #8333** as contract revision 1.6 ([public connection](../api/module-contract-v1.md#public-production-connection-16-6573)); external witness in the [public fixture witness](../../examples/fixtures/public-fixture-witness) and `tests/test_8333_public_connect.py`. | IMA#1803 replaces its `config`/`db.connect`/`require_schema` imports; no new IMA migration. |
 | A (#6582) | 4 h | Public action-connector surface: `ameesh.public.connectors` exports the frozen `Action`, `Outcome` and `NotSentError` protocol objects, the closed states/classes/dedupe vocabularies and `ACTION_CONNECTORS`; an installed module declares its connector mapping and the registry discovers it, refusing invalid declarations without any internal import. No protocol, gate or schema change. **Implemented by #8342** as contract revision 1.8 ([action connectors](../api/module-contract-v1.md#action-connectors-declared-by-an-installed-module-18-8342)); the public-only module-connector bench and `tests/test_7665_module_contract.PythonConnectorsContractTest` are the witnesses. | IMA#1803 replaces `from ameesh.connectors import Outcome` with the public import; no connector code change. |
+| P (#6577) | 4 h | Public redacted read of the declared account profiles: `ameesh accounts profiles --json` lists every profile (name, kind, harness, `env`/`key_env` names, reserve, billing account), sorted; no key value, key file path or content; an unreadable profile is refused with a closed reason without hiding the list. **Implemented by #8337** as contract revision 1.9; witnesses in `tests/test_8337_account_profiles.py`. | IMA#1803 replaces `accounts.parse(cfg.accounts)` in its runtime-admission and reviewer-preparation checks. |
 | E3b (#7675) | 6 h | Native pressure/admission qualification and structured bounded deferral observation. Native `own_cgroup`, budget/ledger and lock stay authoritative; fairness/latency witness for awakened document vs role/background, ambiguous accounting retained. Add missing declarative policy only if witness proves a gap; no arbitrary runner callback or lock replacement. **Implemented by [#7675 / #5868](https://github.com/manaty/ameesh/issues/5868)**: `ameesh-deferral/1` (closed reasons, bounded, no free text) on list/show/turn observations; opt-in `max_cgroup_cpu_used` and `max_cgroup_throttled_periods` for IMA's CPU/period gates (no defaults); the native admission lock qualified as-is, no document class. See the [qualification note](7675-native-pressure-admission-qualification.md). | Implementation lot under #5827; IMA#1803 removes pressure/scheduling subclasses after adopting revision 1.2. |
 | F | 8 h | External module witness and public fixture/setup/observation protocol; contract element → test matrix, deliberate break witness. Include fixture use for Process, usage, refusal and mail races without importing upstream tests. **Implemented by [#7701 / #5902](https://github.com/manaty/ameesh/issues/5902)**: `ameesh.public.fixture` in contract revision 1.5 ([public fixture](../api/module-contract-v1.md#public-fixture-for-a-consumer-owned-database-15-7701)); the external [witness](../../examples/fixtures/public-fixture-witness) creates/migrates/drops its own database and covers Process admission/refusal, Pipeline adoption, usage, mail refusals and races, and the deliberate-break comparator. | Existing #7665 / #5857 and #7701 / #5902; IMA#1803 adopts the fixture and removes its `PgTestCase`/synthetic-SQL dependencies. [#8341 / #6581](https://github.com/manaty/ameesh/issues/6581) adds the agent qualification states (`Fixture.agent`/`agent_state`, revision 1.7: lease, canon, placement, spend marker, reservation, cost), so the qualification scripts and integration tests drop their synthetic core SQL. |
 | E3c (#6574) | 3 h | Documented per-worker preview publisher setting (`peek: false` Host policy or runner configuration), read at worker startup, default unchanged (publisher active), a non-boolean value refused, no `AgentWorker` subclass; `Runner.peek()` and the `/peek` read API unchanged. **Proposition, non disponible** at 1.72.0: no documented setting exists and IMA subclasses `AgentWorker` to cut the publisher. | Implementation lot #8334 (upstream [#6574](https://github.com/manaty/ameesh/issues/6574)); next step mesh-design. |
