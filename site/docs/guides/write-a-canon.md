@@ -78,12 +78,17 @@ title: alice
 description: "Responsable du projet acme-web (fictive)."
 roles: [project-lead, reviewer]
 authenticators: []
+timezone: Europe/Paris          # optional: IANA zone for local hours
+quiet_hours: "22:00-07:00"      # optional: hold non-urgent pushes, one summary at the end
 ---
 ```
 
 `authenticators` stays empty until the human enrols a passkey through
 ameesh-approve; the enrolment produces an entry that is added here by pull
-request.
+request. `quiet_hours` is local time and needs `timezone`: without a
+readable IANA zone the window is ignored (fail-open) and `canon check`
+names the defect. See “Alertes poussées — ameesh notify” in the operations
+guide.
 
 ## 3. Hosts and their policies
 

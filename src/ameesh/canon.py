@@ -961,6 +961,10 @@ class Member:
     #: fallback; missing `incident_eligible` = never a responder.
     timezone: str | None = None
     incident_eligible: bool = False
+    #: #8345 : local quiet window (`22:00-07:00`) during which `ameesh notify`
+    #: holds non-urgent pushes.  Stored in canonical text form; a window
+    #: without a readable `timezone` is refused (fail-open at delivery).
+    quiet_hours: str | None = None
 
 
 @dataclass
@@ -1839,6 +1843,7 @@ class Canon:
                              local_accounts=m.local_accounts,
                              timezone=m.timezone,
                              incident_eligible=m.incident_eligible,
+                             quiet_hours=m.quiet_hours,
                              **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
@@ -4656,6 +4661,25 @@ class _Loader:
                 timezone = None
         else:
             timezone = None
+        # #8345 : une fenêtre calme est de l'heure locale : sans fuseau lisible
+        # elle ne s'applique jamais, et la carte le dit (erreur nommée) plutôt
+        # que de laisser croire qu'elle retiendra quelque chose.
+        quiet_raw = fiche.data.get("quiet_hours")
+        quiet_hours = None
+        if quiet_raw not in (None, ""):
+            from . import quiet_hours as quiet_mod
+            try:
+                window = quiet_mod.parse_value(quiet_raw, where="`quiet_hours`",
+                                               allow_timezone=False)
+            except quiet_mod.QuietHoursError as exc:
+                self.add("member-quiet-hours-invalid", ERROR, str(exc), **where)
+            else:
+                if not timezone:
+                    self.add("member-quiet-hours-invalid", ERROR,
+                             "`quiet_hours`: a readable `timezone` is required "
+                             "(the window is local time)", **where)
+                else:
+                    quiet_hours = window.text
         eligible = fiche.data.get("incident_eligible")
         if eligible is None:
             incident_eligible = False
@@ -4675,7 +4699,8 @@ class _Loader:
             local_accounts=self._list(fiche, "local_accounts", where,
                                       "member-local-accounts-invalid"),
             timezone=timezone,
-            incident_eligible=incident_eligible))
+            incident_eligible=incident_eligible,
+            quiet_hours=quiet_hours))
 
     def _roles(self, fiche: Fiche, where: dict, subject: dict) -> list[str] | None:
         """L244 (#420) : les rôles déclarés d'une fiche Agent/Persona.
