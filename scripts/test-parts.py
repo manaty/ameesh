@@ -1139,6 +1139,15 @@ def attendre(procs: list[subprocess.Popen], echeance: float | None,
     return False
 
 
+def prepare_python_path() -> None:
+    """#8366 : charger les sources ici et dans tous les processus enfants."""
+    paths = [str(REPO / "src"), str(REPO)]
+    sys.path[:0] = paths
+    inherited = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        paths[:1] + ([inherited] if inherited else []))
+
+
 def run_parallel(args) -> int | None:
     """#3754 — exécute la part en N processus `run`, chacun sur son schéma.
 
@@ -1161,7 +1170,7 @@ def run_parallel(args) -> int | None:
     classes = {m: tuple(c) for m, c in plan.get("classes", {}).items()}
     etiquette = args.label or entree.get("label") or f"{args.driver} {args.part}/{args.parts}"
     os.chdir(REPO)
-    sys.path[:0] = [str(REPO), str(REPO / "src")]
+    prepare_python_path()
     try:
         unites = _unites_de(part)
     except Exception as exc:  # un module qui n'importe pas : découpage par module
@@ -1391,7 +1400,7 @@ def run(args) -> int:
                     estimee_s=round(estimee, 1))
     os.chdir(REPO)
     measure = _Measure(args.measure) if args.measure else None
-    sys.path[:0] = [str(REPO), str(REPO / "src")]
+    prepare_python_path()
     suite = _load(part, measure, tests_du_plan)
     impactes = None if entree is None else tuple(
         m for m in part if classes.get(m, ("P3", ""))[0] in ("P0", "P1"))
