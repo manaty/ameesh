@@ -260,20 +260,51 @@ class DeliveryTest(_PgCase):
         self.pass_(self.make_notifier(state))
         self.assertEqual(len(self.sender.sent), 1)
 
-    def test_nouvel_episode_apres_resolution(self):
+    def test_nouvel_episode_dans_la_meme_seconde_sans_passe_intermediaire(self):
+        """B1 (cx2) : l'épisode durable, pas l'heure arrondie, fait la clé."""
         self.raise_()
         self.pass_()
         self.resolve()
-        self.now += 60
-        self.pass_()
-        time.sleep(1.1)            # `raised_at` neuf, à la seconde de la clé
-        self.raise_()
+        self.assertEqual(self.raise_()["episode"], 2)   # même seconde, sans passe
         self.now += 60
         self.pass_()
         self.assertEqual([title for _, title in self.sent()],
                          ["ima: triage stalled (q1)",
                           "ima: resolved — triage stalled (q1)",
                           "ima: triage stalled (q1)"])
+        self.assertEqual(len(self.notifier.state["notified"]), 2)
+
+    def test_nouvel_episode_dans_la_meme_seconde_avec_passe_intermediaire(self):
+        self.raise_()
+        self.pass_()
+        self.resolve()
+        self.pass_()
+        self.raise_()
+        self.pass_()
+        self.assertEqual([title for _, title in self.sent()],
+                         ["ima: triage stalled (q1)",
+                          "ima: resolved — triage stalled (q1)",
+                          "ima: triage stalled (q1)"])
+
+    def test_plus_de_500_alertes_ouvertes_toutes_collectees(self):
+        """B2 (cx2) : aucune page ne cache les alertes les plus récentes."""
+        self.db.execute(
+            "INSERT INTO app_alerts (app, type, key, recipient, text)"
+            " SELECT %s, 'triage_stalled', 'k' || g, %s, 'stalled'"
+            " FROM generate_series(1, 520) g", (APP, ALICE))
+        self.raise_(key="last", kind="intake_down")
+        collected = app_alerts.alerts(self.db)
+        self.assertEqual(len(collected), 521)
+        notifier = self.make_notifier(ncfg=self.notify_config(rate_per_minute=0))
+        self.pass_(notifier)
+        self.assertIn("ima: intake down (last)",
+                      [title for _, title in self.sent()])
+        self.db.execute("UPDATE app_alerts SET resolved_at = clock_timestamp()"
+                        " WHERE key LIKE 'k%%'")
+        self.now += 60
+        self.pass_(notifier)
+        self.assertEqual(list(e["alert"]["app_key"]
+                              for e in notifier.state["active"].values()), ["last"])
 
     def test_urgence_portee_par_le_message(self):
         self.raise_(key="n")

@@ -2403,7 +2403,7 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          # lisible à la résolution (`_deliverable`)
          "human_due", "wake_ts",
          # #8344 : l'identité d'une alerte d'application et sa route
-         "app", "app_type", "app_key", "route")
+         "app", "app_type", "app_key", "app_episode", "route")
 
 
 # --------------------------------------------------------------------------

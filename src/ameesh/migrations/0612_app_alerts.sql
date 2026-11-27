@@ -7,7 +7,9 @@
 -- déduplication). Une condition durable lève une seule fois ; une levée
 -- répétée sur une ligne ouverte ne change rien. `resolve` ferme la ligne
 -- une seule fois ; une nouvelle levée après résolution ouvre un nouvel
--- épisode (`raised_at` neuf). La passe `alerts` du notificateur lit les
+-- épisode (`episode` + 1, `raised_at` neuf). `episode` est l'identité
+-- durable de l'épisode pour le notificateur : deux épisodes levés dans la
+-- même seconde restent distincts. La passe `alerts` du notificateur lit les
 -- lignes ouvertes comme des alertes `app_alert` : routes, avatar, limite
 -- par humain, reprises et registre `notified` sont ceux du mesh.
 --
@@ -25,6 +27,7 @@ create table if not exists app_alerts (
     recipient   text,
     route       text,
     urgent      boolean not null default false,
+    episode     bigint not null default 1,
     text        text not null,
     raised_by   text,
     raised_at   timestamptz not null default clock_timestamp(),

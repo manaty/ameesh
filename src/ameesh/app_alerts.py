@@ -267,6 +267,7 @@ def raise_alert(db, cfg, *, app: str, type: str, key: str, text: str,
         " recipient = excluded.recipient, route = excluded.route,"
         " urgent = excluded.urgent, text = excluded.text,"
         " raised_by = excluded.raised_by, raised_at = clock_timestamp(),"
+        " episode = app_alerts.episode + 1,"
         " resolved_at = null, resolved_by = null"
         " where app_alerts.resolved_at is not null"
         " returning app",
@@ -295,7 +296,7 @@ def resolve_alert(db, *, app: str, type: str, key: str,
     return row
 
 
-_COLUMNS = ("select app, type, key, recipient, route, urgent, text, raised_by,"
+_COLUMNS = ("select app, type, key, recipient, route, urgent, episode, text, raised_by,"
             " extract(epoch from raised_at)::float8 as raised_ts,"
             " extract(epoch from resolved_at)::float8 as resolved_ts, resolved_by"
             " from app_alerts")
@@ -308,7 +309,9 @@ def get(db, app: str, kind: str, key: str) -> dict | None:
 
 
 def listing(db, *, app: str | None = None, open_only: bool = True,
-            limit: int = 500) -> list:
+            limit: int | None = 500) -> list:
+    """The rows, oldest first; `limit=None` reads them all (the notifier's
+    collection: a capped page would hide the newest alerts, #8344 B2)."""
     where, params = [], []
     if open_only:
         where.append("resolved_at is null")
@@ -316,26 +319,32 @@ def listing(db, *, app: str | None = None, open_only: bool = True,
         where.append("app = %s")
         params.append(app)
     sql = _COLUMNS + (" where " + " and ".join(where) if where else "")
-    sql += " order by raised_at, app, type, key limit %s"
-    params.append(int(limit))
+    sql += " order by raised_at, app, type, key"
+    if limit is not None:
+        sql += " limit %s"
+        params.append(int(limit))
     return [dict(row) for row in db.query(sql, tuple(params))]
 
 
 def alerts(db) -> list:
     """The open application alerts, in the shape of `exploitation.alerts`.
 
-    `since` is the episode start (`raised_at`): it enters the alert key, so a
-    raise after a resolution is a new alert and the `notified` ledger keeps
-    one notification per episode. The canon is not read here: a type removed
-    from the card after its raise still resolves normally."""
+    `episode` (a counter bumped by every reopening) enters the alert key, so
+    a raise after a resolution is a new alert and the `notified` ledger keeps
+    one notification per episode — even for two episodes within the same
+    second, which `since` (`raised_at`, for display) would not tell apart.
+    Every open row is read, without a page cap: an alert beyond a page would
+    never be delivered. The canon is not read here: a type removed from the
+    card after its raise still resolves normally."""
     from . import exploitation
     out = []
-    for row in listing(db, open_only=True):
+    for row in listing(db, open_only=True, limit=None):
         out.append({
             "schema": exploitation.ALERT_SCHEMA, "type": ALERT_TYPE, "agent": None,
             "since": round(float(row["raised_ts"]), 3), "value": None,
             "threshold": None, "detail": row["text"], "app": row["app"],
             "app_type": row["type"], "app_key": row["key"],
+            "app_episode": int(row["episode"]),
             "responsible": row.get("recipient"), "route": row.get("route"),
             "urgent": bool(row.get("urgent"))})
     return out
