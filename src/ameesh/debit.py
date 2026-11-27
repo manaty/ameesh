@@ -191,8 +191,13 @@ GESTURES = {
         "pause de famille couverte par la décision owner {decisions} jusqu'au "
         "{until} : aucun geste avant l'échéance ; à cette date, l'attente "
         "redevient ordinaire (canon §9)",
+    #: #8320 : le créneau vient de `packets.cutoffs` (mechanics) ; sans
+    #: cadence déclarée, le paquet suit la fusion du paquet en cours.
     "qa_merge": "lot relu, en attente du paquet : rappeler au pilote de le ranger "
-                "dans le prochain paquet horaire (canon §11 bis)",
+                "dans le paquet de {slot} (canon §11 bis)",
+    "qa_merge_no_slot": "lot relu, en attente du paquet : rappeler au pilote de "
+                        "le ranger dans le paquet suivant, dès la fusion du "
+                        "paquet en cours (canon §11 bis)",
     "qa_designation": "désignation en attente : {cause} — traiter la cause puis "
                       "relancer la désignation (`ameesh work reviewers {lot} "
                       "--apply`)",
@@ -1265,6 +1270,16 @@ def _verdict_on_head(verdict: dict, freeze: dict, freeze_sha: str,
     return float(verdict.get("at_ts") or 0.0) >= freeze_at
 
 
+def _last_ok_on_head(milestones: list[dict], freeze: dict) -> float | None:
+    """#8320 : la date du dernier verdict `ok` porté sur la tête gelée."""
+    freeze_at = float(freeze.get("at_ts") or 0.0)
+    freeze_sha = str(freeze.get("sha") or "").strip()
+    stamps = [float(m.get("at_ts") or 0.0) for m in milestones
+              if m.get("kind") == "verdict" and m.get("verdict") == "ok"
+              and _verdict_on_head(m, freeze, freeze_sha, freeze_at)]
+    return max(stamps) if stamps else None
+
+
 def blocking_review(milestones: list[dict], freeze: dict | None) -> dict | None:
     """L'avis `blocked` encore valable du dernier gel (repli sans base).
 
@@ -1382,7 +1397,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
           human_routes: Iterable[str] = (),
           review_pilots: Mapping[str, str] | None = None,
           closed_hosts: Iterable[str] = (),
-          zone: str = "UTC") -> dict:
+          zone: str = "UTC",
+          next_packet: float | None = None) -> dict:
     """Le rapport de débit, calculé sans I/O (témoins et tests).
 
     `closure_allowed` est l'autorité de levée (#3219) partagée par `read`
@@ -1724,6 +1740,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 "assignee": item.get("assignee") or None,
                 "frozen_ts": float(freeze.get("at_ts") or 0.0),
                 "frozen": _iso(freeze.get("at_ts")),
+                "verdict_ok_ts": _last_ok_on_head(lot_milestones, freeze),
                 "sha": str(freeze.get("sha") or "")[:12] or None,
                 #: #7435 : la tête gelée complète, pour comparer au
                 #: `frozen_sha` enregistré par la composition du paquet.
@@ -1929,6 +1946,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
                            "age_s": age, "who": who, "gesture": gesture,
                            "level": level, "human": bool(human)}, **extra))
 
+    if next_packet is not None:
+        from zoneinfo import ZoneInfo
+        merge_gesture = GESTURES["qa_merge"].format(
+            slot=datetime.datetime.fromtimestamp(
+                float(next_packet), ZoneInfo(zone)).strftime("%H:%M"))
+    else:
+        merge_gesture = GESTURES["qa_merge_no_slot"]
     for row in qa:
         state = state_by_lot.get(int(row["lot"]))
         wait = row.get("designation_wait") or {}
@@ -2072,8 +2096,11 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 who = "paquet #%d" % packet["package_id"]
                 extra.update({"packet": packet["package_id"],
                               "packet_state": packet["state"]})
-            add_wait("qa_merge", row, row["frozen_ts"], who,
-                     GESTURES["qa_merge"], level=2,
+            # #8320 : l'attente du paquet court du dernier verdict `ok` de la
+            # tête gelée (comme `packet_parallel.daily_waits`), jamais avant le
+            # gel : un lot validé à 16:10 n'attend pas le paquet depuis 12:35.
+            since = max(row["frozen_ts"], row.get("verdict_ok_ts") or 0.0)
+            add_wait("qa_merge", row, since, who, merge_gesture, level=2,
                      human=(_human_wait(state)
                             or (packet is not None
                                 and packet["state"] == lifecycle.WAITING_HUMAN)),
@@ -2913,6 +2940,7 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     # lisent sur un champ à part, `idle_agent_hours_footprint`, sans rouvrir
     # `idle_agent_hours`. Sans date connue, aucune heure n'est inventée.
     footprint_since: dict[str, float] = {}
+    footprint_count: dict[str, int] = {}
     for project, held_lots in footprint_by.items():
         if project not in exhausted or project in available_since:
             continue
@@ -2922,6 +2950,7 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
                 continue
             since = max(start, float(at))
             footprint_since[project] = min(footprint_since.get(project, now), since)
+            footprint_count[project] = footprint_count.get(project, 0) + 1
 
     # #8283 : l'exclusion se calcule par plage. Les plages d'épuisement viennent
     # des transitions notées sur le lot de découpage ; le verdict de l'instant
@@ -2984,9 +3013,19 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         # ni famille exclue) : les trous d'un agent occupé ne sont pas de la
         # capacité disponible (#5043)
         seconds = sum(project_idle(name) for name in idle)
-        held_seconds = sum(_idle_gaps(
-            spans.get(name, []), footprint_since[primary.get(name)], now, min_gap)
-            for name in idle if primary.get(name) in footprint_since)
+        # #8320 : un lot retenu n'occupe qu'un agent ; par projet, seuls les
+        # min(lots retenus, agents au repos) plus longs repos comptent, sinon
+        # un seul lot se facturait N fois (38,7 h-agent pour #8312).
+        held_gaps: dict[str, list[float]] = {}
+        for name in idle:
+            project_name = primary.get(name)
+            if project_name in footprint_since:
+                held_gaps.setdefault(project_name, []).append(_idle_gaps(
+                    spans.get(name, []), footprint_since[project_name], now,
+                    min_gap))
+        held_seconds = sum(
+            sum(sorted(gaps, reverse=True)[:footprint_count[project_name]])
+            for project_name, gaps in held_gaps.items())
         share = (len(idle) / len(names)) if names else 0.0
         row = {"wakeable": len(names), "idle": len(idle), "idle_agents": idle,
                "idle_share": round(share, 4),
@@ -3478,6 +3517,7 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
     # ajouter une lecture illisible au rapport des lots.
     zone = "UTC"
     families: tuple[str, ...] = ()
+    next_packet: float | None = None
     try:
         from . import mechanics
         document = mechanics.configured(cfg)
@@ -3486,6 +3526,9 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
         # d'un verdict (registre `harness` → famille), donc le nombre de
         # familles distinctes qui ont relu la tête.
         families = tuple(document.families or ())
+        # #8320 : le geste qa_merge nomme le créneau déclaré (`packets.cutoffs`).
+        if document.packet_cutoffs:
+            next_packet = document.next_packet(now)
     except Exception:  # noqa: BLE001 - zone de repli explicite, jamais devinée
         pass
     agents = _rows(db, _AGENTS_SQL)
@@ -3635,7 +3678,8 @@ def _read(db, *, cfg, now, hours, wait_s, ci_hours, ci_slow_s, canons,
                    external_executors=external_executors,
                    human_routes=human_routes,
                    review_pilots=review_pilots,
-                   closed_hosts=closed_hosts, zone=zone)
+                   closed_hosts=closed_hosts, zone=zone,
+                   next_packet=next_packet)
     annotate_candidate_causes(db, cfg, report, milestones, unreadable)
     report["capacity"] = read_capacity(db, cfg=cfg, now=now, hours=hours, turns=turns,
                                        canons=canons, unreadable=unreadable,
