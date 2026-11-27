@@ -1,7 +1,8 @@
 # Public fixture witness
 
 An installed external consumer of `ameesh.public.fixture` (contract revision
-1.5, [#7701](https://github.com/manaty/ameesh/issues/5902)) and
+1.5, [#7701](https://github.com/manaty/ameesh/issues/5902), with its agent
+states of revision 1.7, [#8341](https://github.com/manaty/ameesh/issues/6581)) and
 `ameesh.public.database` (revision 1.6,
 [#6573](https://github.com/manaty/ameesh/issues/6573)). This directory is its
 own distribution, outside `src/`: it imports only `ameesh.public.fixture`,
@@ -29,7 +30,11 @@ and then, on that database only:
 - runs a clean child process of the fixture environment that calls
   `ameesh.public.database.connect()` with no argument, submits and reads through
   `ameesh.public.mail`, closes, and observes the documented schema, storage and
-  unavailable refusals without exposing the DSN.
+  unavailable refusals without exposing the DSN;
+- registers an agent with `Fixture.agent()` and puts it into two qualification
+  states and back with `Fixture.agent_state()` (`lease_expired` then
+  `lease_free`, `canon_stale` then `canon_fresh`), and sees an unknown state
+  refused with code `refused`. It writes no core table to get there.
 
 It prints one JSON report and exits 0 only if every check passed. The fixture
 drops its database and its private root before the report is printed, so the

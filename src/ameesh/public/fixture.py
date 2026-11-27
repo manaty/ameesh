@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Public fixture surface, contract v1.5 (tranche F2, #7701/#5902).
+"""Public fixture surface, contract v1.7 (tranche F2, #7701/#5902; states #8341).
 
 An installed external module qualifies against a **consumer-owned** disposable
 database: this module creates a fresh database on the consumer's PostgreSQL
@@ -20,7 +20,11 @@ hands back:
 * ``connect()`` — an opaque core-owned connection for the public Python
   surfaces (:mod:`ameesh.public.mail`); do not query core tables with it;
 * ``read_view()`` — the named SQL read views admitted by the contract, with
-  explicit columns only.
+  explicit columns only;
+* ``agent()`` / ``agent_state()`` (1.7, #8341) — a registered agent put into a
+  named qualification state (lease, canon, placement, spend marker,
+  reservation, cost) through the core's own code, so a module test never
+  writes a core table itself.
 
 The database name is always ``ameesh_fixture_<random>``.  Only the instance
 that created a database drops it; ``close()`` is idempotent and ``keep=True``
@@ -41,9 +45,13 @@ from typing import Mapping, Optional, Sequence
 from .. import config as config_mod
 from .. import db as db_mod
 from .. import dsn as dsn_mod
+from . import _fixture_states as states_mod
+
+#: the qualification states :meth:`Fixture.agent_state` reaches (1.7, #8341)
+AGENT_STATES = states_mod.AGENT_STATES
 
 #: revision of the written contract served by this module
-CONTRACT_VERSION = "1.5"
+CONTRACT_VERSION = "1.7"
 
 #: every database this surface creates starts with this prefix
 DATABASE_PREFIX = "ameesh_fixture_"
@@ -83,6 +91,12 @@ class FixtureRefused(FixtureError):
     code = "refused"
 
 
+class FixtureStateError(FixtureError):
+    """An agent state helper could not reach, or could not prove, its state."""
+
+    code = "state"
+
+
 class Fixture:
     """A consumer-owned disposable database and its isolated process state.
 
@@ -120,6 +134,7 @@ class Fixture:
         self._closed = False
         self._canon_root = ""
         self._canon_ref = ""
+        self._canon_commit = ""
         self._connections = []
         self._db = None
 
@@ -354,6 +369,7 @@ class Fixture:
                   "commit", "-q", "-m", message)
         commit = self._git("rev-parse", "HEAD")
         self._git("update-ref", "refs/remotes/origin/%s" % ref, commit)
+        self._canon_commit = commit
         return commit
 
     # -- named read views --------------------------------------------------
@@ -372,6 +388,79 @@ class Fixture:
             raise
         except Exception as exc:  # noqa: BLE001 — one stable public error
             raise FixtureError("read_view(%s): %s" % (view, exc)) from exc
+
+    # -- agent qualification states (1.7, #8341) --------------------------
+    def agent(self, name: str, *, host: str = states_mod.DEFAULT_HOST,
+              harness: str = states_mod.DEFAULT_HARNESS,
+              model: str = states_mod.DEFAULT_MODEL, team: str = states_mod.DEFAULT_TEAM,
+              responsible: str = states_mod.DEFAULT_RESPONSIBLE,
+              governed: bool = True) -> dict:
+        """Register ``name`` in the fixture registry and return its state report.
+
+        A governed agent (the default) pins the fixture canon commit (the
+        one returned by :meth:`canon`, else a placeholder), has a fresh canon
+        state on ``host`` and an admitted placement, and holds no lease: it
+        is claimable.  ``governed=False`` registers a row with no canon
+        reference and no placement verdict.  Calling it again rewrites the
+        declared profile; it refuses while the agent holds a lease.
+        """
+        name = _agent_name(name)
+        return self._state_call(lambda db: states_mod.register(
+            self, db, name, host=host, harness=harness, model=model,
+            team=team, responsible=responsible, governed=bool(governed)))
+
+    def agent_state(self, name: str, state: str, **options) -> dict:
+        """Put the registered agent ``name`` into ``state``; return the report.
+
+        ``state`` is one of :data:`AGENT_STATES`.  The state is reached by the
+        core's own code on this fixture's database only, then read back with
+        the read-only agent observation; a state that is not observed raises
+        :class:`FixtureStateError`.  The report carries ``agent``, ``state``,
+        ``lease``, ``canon``, ``placement``, ``reasons`` (the observation's
+        admission reasons) and ``spend``; the budget states add ``account``,
+        ``spend_key``, ``reservation`` and ``budget``, and ``cost`` adds
+        ``cost``.  Each state has its reverse (``lease_free``, ``canon_fresh``,
+        ``placement_admitted``, ``spend_clear``) and touches only this agent's
+        rows and the named billing account.
+        """
+        name = _agent_name(name)
+        if state not in AGENT_STATES:
+            raise FixtureRefused("unknown agent state %r: one of %s"
+                                 % (state, ", ".join(AGENT_STATES)))
+        for key, value in options.items():
+            if value is not None and not isinstance(value, (str, int, float)):
+                raise FixtureRefused("state option %s must be a string or a number"
+                                     % key)
+        return self._state_call(lambda db: states_mod.reach(
+            self, db, name, state, options))
+
+    def _state_call(self, call):
+        if not self._created:
+            raise FixtureRefused("fixture not created")
+        if self._db is None:
+            self._db = self.connect()
+        try:
+            return call(self._db)
+        except FixtureError:
+            raise
+        except states_mod.StateNotReached as exc:
+            raise FixtureStateError(self._redact(str(exc))) from None
+        except Exception as exc:  # noqa: BLE001 — one stable public error
+            raise FixtureStateError(self._redact("%s: %s" % (type(exc).__name__, exc))) \
+                from None
+
+    def _redact(self, text: str) -> str:
+        """Remove the DSNs and their password from a message."""
+        secrets_found = [self._dsn, self.admin_dsn]
+        try:
+            password, _dsn = dsn_mod.split_password(self.admin_dsn)
+        except dsn_mod.DsnError:
+            password = ""
+        if password:
+            secrets_found.append(password)
+        for secret in sorted(filter(None, secrets_found), key=len, reverse=True):
+            text = text.replace(secret, "<redacted>")
+        return text
 
     # -- internals ---------------------------------------------------------
     @property
@@ -457,6 +546,13 @@ def _command(executable: Sequence[str]) -> tuple:
     if isinstance(executable, str):
         return (executable,)
     return tuple(executable)
+
+
+def _agent_name(name: str) -> str:
+    """An agent name for the state helpers (a plain registry name)."""
+    if not isinstance(name, str) or not config_mod.NAME_RE.match(name):
+        raise FixtureRefused("agent name must be a plain registry name: %r" % (name,))
+    return name
 
 
 def _relative(relative: str) -> str:

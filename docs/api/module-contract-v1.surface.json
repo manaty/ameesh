@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.6",
+  "contract": "1.7",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -4929,9 +4929,9 @@
   "python": {
     "fixture": {
       "module": "ameesh.public.fixture",
-      "contract_version": "1.5",
+      "contract_version": "1.7",
       "constants": {
-        "CONTRACT_VERSION": "1.5",
+        "CONTRACT_VERSION": "1.7",
         "DATABASE_PREFIX": "ameesh_fixture_",
         "ADMITTED_VIEWS": [
           "agent_mesh_overview",
@@ -4946,7 +4946,22 @@
           "AGENT_MAIL_CONFIG",
           "AMEESH_SCHEMA"
         ],
-        "DEFAULT_TIMEOUT": 120
+        "DEFAULT_TIMEOUT": 120,
+        "AGENT_STATES": [
+          "lease_live",
+          "lease_foreign",
+          "lease_expired",
+          "lease_free",
+          "canon_fresh",
+          "canon_stale",
+          "placement_admitted",
+          "placement_refused",
+          "spend_ambiguous",
+          "spend_clear",
+          "reservation_open",
+          "reservation_settled",
+          "cost"
+        ]
       },
       "signatures": {
         "Fixture": "(admin_dsn, *, executable=None, mail_executable=None, root=None, prefix='ameesh_fixture_', keep=False)",
@@ -4962,11 +4977,14 @@
         "write": "(self, relative, text)",
         "path": "(self, relative)",
         "read": "(self, relative)",
-        "git": "(self, *args)"
+        "git": "(self, *args)",
+        "agent": "(self, name, *, host='fixture-host', harness='claude', model='fixture-model', team='fixture', responsible='human:fixture', governed=True)",
+        "agent_state": "(self, name, state, **options)"
       },
       "errors": {
         "FixtureError": "fixture",
-        "FixtureRefused": "refused"
+        "FixtureRefused": "refused",
+        "FixtureStateError": "state"
       }
     },
     "mail": {

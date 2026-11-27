@@ -833,7 +833,10 @@ class PythonDatabaseContractTest(unittest.TestCase):
     def test_the_served_contract_version_is_frozen(self):
         self.assertEqual(database.CONTRACT_VERSION, self.spec["contract_version"])
         self.assertEqual(public.database.CONTRACT_VERSION, database.CONTRACT_VERSION)
-        self.assertEqual(public.CONTRACT_VERSION, self.spec["contract_version"])
+        # #8341: a later revision (1.7) may raise the package above 1.6.
+        self.assertGreaterEqual(
+            tuple(int(part) for part in public.CONTRACT_VERSION.split(".")),
+            tuple(int(part) for part in self.spec["contract_version"].split(".")))
         self.assertEqual(public.CONTRACT_VERSION, SURFACE["contract"])
 
 
@@ -865,7 +868,7 @@ class PythonFixtureContractTest(unittest.TestCase):
         parser.read(FIXTURE / "pyproject.toml")
         project = {key: json.loads(value) for key, value in parser["project"].items()}
         self.assertEqual(project["name"], "ameesh-public-fixture-witness")
-        self.assertEqual(project["version"], "1.6.0")
+        self.assertEqual(project["version"], "1.7.0")
 
 
 class HttpContractTest(unittest.TestCase):

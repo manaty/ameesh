@@ -401,12 +401,12 @@ class ContractVersionTest(unittest.TestCase):
         from ameesh import public
 
         # The package revision moves with the whole contract (#7701 adds the
-        # fixture in 1.5, #8333 the production connection in 1.6); the mail
-        # surface keeps the revision that last changed it, so a caller's 1.4
-        # gate stays true.
-        self.assertEqual(public.CONTRACT_VERSION, "1.6")
+        # fixture in 1.5, #8333 the production connection in 1.6, #8341 the
+        # fixture's agent states in 1.7); the mail surface keeps the revision
+        # that last changed it, so a caller's 1.4 gate stays true.
+        self.assertEqual(public.CONTRACT_VERSION, "1.7")
         self.assertEqual(public_mail.CONTRACT_VERSION, "1.4")
-        self.assertEqual(public.fixture.CONTRACT_VERSION, "1.5")
+        self.assertEqual(public.fixture.CONTRACT_VERSION, "1.7")
         self.assertEqual(public.database.CONTRACT_VERSION, "1.6")
         self.assertEqual(public_mail.ADMITTED_PAYLOAD_KEYS,
                          frozenset(("module", "attribution")))
