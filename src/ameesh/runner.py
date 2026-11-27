@@ -963,6 +963,21 @@ class AgentWorker(threading.Thread):
         #: génération de son empreinte au début de la dernière passe
         self._idle_gated = False
         self._idle_mark: int | None = None
+        #: #8326 : le sommeil précédent s'est terminé seul (aucun NOTIFY,
+        #: aucune échéance connue) : le choix du tour suivant peut être borné
+        #: à l'empreinte de la passe groupée, sans passer par la sélection
+        #: complète. `_quiet_full_at` date la dernière sélection complète
+        #: (filet `IDLE_SAFETY_S`), `_quiet_gen` son empreinte et `_quiet_sig`
+        #: la lecture bornée de repli quand la passe groupée n'est pas là.
+        self._quiet_eligible = False
+        self._idle_nominal = 0.0
+        self._quiet_gated_sleep = 0.0
+        self._quiet_full_at: float | None = None
+        self._quiet_gen: int | None = None
+        self._quiet_sig: str | None = None
+        self._quiet_probe_unsupported = False
+        self._quiet_skips = 0
+        self._quiet_logged = False
         #: #5826 : harnais lancés ; une phase qui en contient un repart à zéro
         self._launches = 0
         #: r3 : les appels de renouvellement détachés (sans réponse dans
@@ -7098,7 +7113,141 @@ class AgentWorker(threading.Thread):
                    "priority": item.get("priority")}
         return fits(self.name, self.agent or {}, row)
 
+    # -- #8326 : choix du tour borné au repos -------------------------------
+    def _lot_wake_due(self, now: float) -> bool:
+        """#8326 : une échéance de réveil de lot inactif est-elle atteinte ?
+
+        Même calcul que `_lot_wake_spec` (règle 1, #408), sans requête : une
+        échéance atteinte demande la sélection complète, jamais le saut."""
+        try:
+            if not self.lot_wake_enabled():
+                return False
+            base = self.mail_batch() + float(
+                getattr(self.cfg, "lot_wake_margin", 60.0))
+        except Exception:  # noqa: BLE001 - doublure sans réglage : pas d'échéance
+            return False
+        repos = now - self.last_activity
+        dernier = (self.agent or {}).get("last_turn_ts")
+        if dernier:
+            try:
+                repos = min(repos, time.time() - float(dernier))
+            except (TypeError, ValueError):
+                pass
+        return repos >= base
+
+    def _quiet_row(self) -> dict | None:
+        """#8326 : l'empreinte de ce worker, sans requête quand la passe
+        groupée est vivante, sinon par **une** lecture bornée.
+
+        La passe groupée couvre déjà registre, courrier actif, réveils
+        programmés et cycle de vie des hôtes (#8166) : quand elle a lu, sa
+        ligne est la référence et le choix ne touche pas la base. Sans elle
+        (exécuteur médié, passe en panne, premier passage), une seule requête
+        rend la même empreinte ; un stockage qui ne la sert pas garde la
+        sélection complète. Aucune exception ne remonte : un doute vaut passe
+        complète."""
+        runner = self.runner
+        alive = getattr(runner, "idle_sweep_alive", None)
+        if callable(alive) and alive():
+            return runner.idle_row(self.name)
+        if getattr(self, "_quiet_probe_unsupported", False):
+            return None
+        try:
+            lu = storage.of(self.db).leases.idle_signatures([self.name])
+        except Exception as exc:  # noqa: BLE001 - un doute vaut passe complète
+            from .mediated_executor.contract import NotSupportedRemotely
+            if isinstance(exc, (NotSupportedRemotely, AttributeError,
+                                NotImplementedError)):
+                # Contrat sans empreinte (exécuteur médié) : inutile de
+                # redemander à chaque passage, la sélection complète reste.
+                self._quiet_probe_unsupported = True
+                return None
+            if not isinstance(exc, db_mod.DbError):
+                log_async("[%s] idle signature unreadable (%s): full turn choice"
+                          % (self.name, type(exc).__name__))
+                self._quiet_probe_unsupported = True
+            return None
+        if not isinstance(lu, dict):
+            return None
+        row = (lu.get("agents") or {}).get(self.name)
+        return row if isinstance(row, dict) else None
+
+    def _turn_selection_quiet(self) -> bool:
+        """#8326 : le choix du tour de ce passage peut-il être sauté ?
+
+        Vrai seulement si le sommeil précédent s'est terminé de lui-même
+        (aucun NOTIFY, aucune échéance connue), que l'empreinte du worker n'a
+        pas changé depuis la dernière sélection complète, qu'aucun travail
+        local n'attend et qu'une sélection complète a eu lieu depuis moins de
+        `IDLE_SAFETY_S` (filet). Une passe groupée en panne, une empreinte
+        illisible, un réveil dû ou un doute : sélection complète, comme avant.
+
+        Le saut ne consomme rien et n'écrit rien : la passe groupée réveille
+        sur tout changement qu'elle voit (courrier actif, consigne, réveil
+        programmé, cycle de vie des hôtes) et NOTIFY reste devant (`wake`)."""
+        if not getattr(self, "_quiet_eligible", False):
+            return False
+        self._quiet_eligible = False
+        wake = getattr(self, "wake", None)
+        if callable(getattr(wake, "is_set", None)) and wake.is_set():
+            return False
+        stopping = getattr(self, "stopping", None)
+        if stopping is not None and stopping.is_set():
+            return False
+        if self._local_work_pending():
+            return False
+        if self._attach_pending():
+            return False
+        if self.retry_due():
+            return False
+        now = time.monotonic()
+        runner = self.runner
+        last = getattr(self, "_quiet_full_at", None)
+        if last is None or now - last >= float(
+                getattr(runner, "IDLE_SAFETY_S", 900.0)):
+            return False
+        if self.idle_due():
+            return False
+        if self._lot_wake_due(now):
+            return False
+        row = self._quiet_row()
+        if row is None or row.get("pending"):
+            return False
+        wake_ts = row.get("wake_ts")
+        if wake_ts is not None and float(wake_ts) <= time.time() + 0.05:
+            return False
+        if (self.agent or {}).get("releve") == "election":
+            return False
+        alive = getattr(runner, "idle_sweep_alive", None)
+        if callable(alive) and alive():
+            generation = self._idle_generation()
+            if generation is None or generation != self._quiet_gen:
+                return False
+        else:
+            sig = row.get("sig")
+            if sig is None:
+                return False
+            if self._quiet_sig is None:
+                self._quiet_sig = sig  # première lecture : base de comparaison
+            elif sig != self._quiet_sig:
+                self._quiet_sig = None  # la sélection complète repose la base
+                return False
+        self._quiet_skips += 1
+        if not self._quiet_logged:
+            self._quiet_logged = True
+            log_async("[%s] nothing due: turn choice skipped (no admission%s)"
+                      % (self.name, "" if callable(alive) and alive()
+                         else ", one bounded read"))
+        return True
+
     def _pick(self) -> dict | None:
+        if self._turn_selection_quiet():
+            return None
+        #: #8326 : une sélection complète a eu lieu — borne du filet et base
+        #: de l'empreinte pour les sauts suivants.
+        self._quiet_full_at = time.monotonic()
+        self._quiet_gen = self._idle_generation()
+        self._quiet_sig = None
         agent = registry.get(self.db, self.name)
         if agent is None or agent.get("status") == "stopped":
             if agent is not None:
@@ -8320,7 +8469,13 @@ class AgentWorker(threading.Thread):
         due, self._due_at = getattr(self, "_due_at", None), None
         if due is None:
             return cap
-        return max(0.05, min(cap, due - time.time() + 0.05))
+        reste = max(0.05, due - time.time() + 0.05)
+        #: #8326 : un sommeil raccourci par une échéance (fenêtre de
+        #: regroupement du courrier) ne peut pas autoriser le saut du choix,
+        #: même quand l'écart au pas nominal est sous la tolérance d'horloge.
+        if reste < cap:
+            self._idle_due_shortened = True
+        return min(cap, reste)
 
     def _marque_vu(self, messages) -> None:
         """L'instant (horloge de l'hôte) où cet exécuteur a lu chaque message
@@ -12227,7 +12382,11 @@ class AgentWorker(threading.Thread):
         échéances connues sans requête : réveil programmé, relance au repos,
         premier réveil de lot inactif. Sinon : `_idle_wait`, comme avant."""
         self._idle_gated = False
+        self._quiet_gated_sleep = 0.0
         pas = self._idle_wait()
+        #: #8326 : pas nominal, avant toute échéance : le sommeil qui suit ne
+        #: pourra autoriser un saut du choix que s'il n'a pas été raccourci.
+        self._idle_nominal = pas
         runner = self.runner
         alive = getattr(runner, "idle_sweep_alive", None)
         if not callable(alive) or not alive():
@@ -12248,7 +12407,9 @@ class AgentWorker(threading.Thread):
         if row is None or row.get("pending") or mark is None or self._idle_generation() != mark:
             self._idle_gated = False
             return pas
-        return min(max(pas, float(runner.IDLE_SAFETY_S)), self._idle_deadlines(row))
+        gated = min(max(pas, float(runner.IDLE_SAFETY_S)), self._idle_deadlines(row))
+        self._quiet_gated_sleep = gated
+        return gated
 
     #: #8166 (B P2 dev3) : états locaux d'un travail en attente, absents de
     #: la base donc de l'empreinte — suite après plafond, tour retenu (budget,
@@ -12322,30 +12483,55 @@ class AgentWorker(threading.Thread):
         tranche = max(1.0, self.lease_ttl / 3.0)
         runner = self.runner
         couvert = getattr(self, "_idle_gated", False)
+        nominal = float(getattr(self, "_idle_nominal", pas))
         if couvert:
             # #8166 (B P2 cx2) : couvert par la passe groupée, le sommeil long
             # relit sa santé (sans requête) : passe groupée en panne ou bloquée,
             # la passe suivante repart au pas ordinaire
             tranche = min(tranche, 3 * float(getattr(runner, "IDLE_SWEEP_S", 10.0)))
+            # #8326 : le pas couvert peut être le filet ou une échéance connue ;
+            # seul l'écoulement du pas nominal (filet compris) autorise le saut
+            # du choix suivant.
+            nominal = max(nominal, float(getattr(self, "_quiet_gated_sleep", 0.0)))
         # #8166 : au repos, le battement groupé renouvelle ce bail
         self._resting = True
+        raccourci = bool(getattr(self, "_idle_due_shortened", False))
+        self._idle_due_shortened = False
+        reveil = False
+        propre = True
         try:
             while True:
                 reste = fin - horloge.monotonic()
                 if reste <= 0:
-                    return False
+                    break
                 if self.wake.wait(timeout=self.wait_timeout(min(reste, tranche))):
-                    return True
+                    reveil = True
+                    break
                 if (self.stopping.is_set() or self.lease_lost.is_set()
                         or self.deadline_passed()
                         or getattr(runner, "stop", _NEVER).is_set()
                         or getattr(runner, "draining", _NEVER).is_set()):
-                    return False
+                    propre = False
+                    break
                 if couvert and not self._sweep_covers():
-                    return False
+                    propre = False
+                    break
+            return reveil
         finally:
             self._resting = False
             self._idle_gated = False
+            self._quiet_gated_sleep = 0.0
+            # #8326 : seul un sommeil allé au bout, sans réveil ni sortie
+            # anticipée, et non raccourci par une échéance connue, autorise le
+            # saut du choix du tour suivant. Un NOTIFY posé à la dernière
+            # limite reste un réveil (l'événement est relu, pas seulement la
+            # valeur de retour de `wait`).
+            wake = getattr(self, "wake", None)
+            wake_set = (callable(getattr(wake, "is_set", None)) and wake.is_set())
+            self._quiet_eligible = bool(
+                propre and not reveil and not raccourci
+                and not self.stopping.is_set()
+                and not wake_set and pas >= nominal - 0.05)
 
     def _admission_priority(self) -> None:
         """#4602 : applique au fil la classe de la passe qui commence.
