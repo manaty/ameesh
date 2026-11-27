@@ -743,6 +743,31 @@ class ToolingTest(unittest.TestCase):
         self.assertEqual(got["cause"], "tooling-missing")
         map_for.assert_not_called()
 
+    def test_a_freeze_in_a_repo_without_tooling_is_skipped(self):
+        # #8321 : le canon manaty/home ne porte ni plan ni lanceur ; le gel
+        # dit « sautée : projet non outillé », jamais « non concluante ».
+        git(self.repo.root, "rm", "-q", "scripts/test-plan.py", "scripts/test-parts.py")
+        head = self.repo.commit("canon sans plan")
+        item = {"id": 8321, "app": "ameesh", "assignee": "dev",
+                "branch": "canon/8321-x", "branch_target": "main"}
+        notes = []
+        with mock.patch("ameesh.work.get", return_value=item), \
+                mock.patch("ameesh.work.events_noted", return_value=[]), \
+                mock.patch("ameesh.work.note",
+                           side_effect=lambda db, lot, text, **kw: notes.append(text)), \
+                mock.patch.object(calls, "parameters", return_value=self.parameters()), \
+                mock.patch.object(calls, "repository", return_value=self.repo.root):
+            outcome = calls.after_freeze(None, object(), 8321, head)
+        self.assertEqual(outcome["state"], "skipped")
+        self.assertEqual(outcome["cause"], "tooling-missing")
+        line = calls.freeze_line(outcome)
+        self.assertIn("sautée", line)
+        self.assertIn("projet non outillé", line)
+        self.assertNotIn("NON CONCLUANTE", line)
+        self.assertNotIn("ameesh work prevalidate", line)
+        self.assertTrue(notes[0].startswith(
+            "prevalidation skipped: tooling-missing"))
+
 
 class FreezeTest(unittest.TestCase):
     def setUp(self):
@@ -791,6 +816,22 @@ class FreezeTest(unittest.TestCase):
         outcome = self.freeze(raises=pv.PrevalidationError("no-vm", "vm absente"))
         self.assertEqual(outcome["state"], "unavailable")
         self.assertTrue(any("unavailable" in n and "no-vm" in n for n in self.notes))
+
+    def test_tooling_missing_is_skipped_not_non_conclusive(self):
+        # #8321 : un dépôt sans plan ni lanceur n'a rien à jouer ; le gel le
+        # dit « sautée » et ne renvoie pas vers `ameesh work prevalidate`.
+        outcome = self.freeze(raises=pv.PrevalidationError(
+            "tooling-missing",
+            "scripts/test-plan.py, scripts/test-parts.py absent de /repo au SHA "
+            "aaaaaaaaaaaa : le projet ameesh n'outille pas la prévalidation"))
+        self.assertEqual(outcome["state"], "skipped")
+        line = calls.freeze_line(outcome)
+        self.assertIn("prevalidation: sautée", line)
+        self.assertIn("projet non outillé", line)
+        self.assertNotIn("NON CONCLUANTE", line)
+        self.assertNotIn("ameesh work prevalidate", line)
+        self.assertTrue(self.notes[0].startswith(
+            "prevalidation skipped: tooling-missing"))
 
     def test_a_no_vm_report_is_unavailable_not_red(self):
         # Le run d'offload peut rendre no-vm sans lever : ce n'est pas un rouge.
@@ -865,7 +906,7 @@ class FreezeJournalTest(unittest.TestCase):
         self.freeze(raises=pv.PrevalidationError("no-vm", "vm absente"), sha="b" * 40)
         self.assertEqual(len(self.notes), 2, self.notes)
         self.assertTrue(self.notes[0].startswith(
-            "prevalidation unavailable: tooling-missing"))
+            "prevalidation skipped: tooling-missing"))
         self.assertTrue(self.notes[1].startswith("prevalidation unavailable: no-vm"))
 
     def test_unavailable_reports_are_deduplicated_by_cause(self):

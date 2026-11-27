@@ -1932,9 +1932,10 @@ def after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
     """La prévalidation du gel, après que le jalon ``frozen`` est écrit.
 
     Le résultat est attaché à la tête gelée dans ``prevalidation_reports`` et
-    résumé au journal. Un rouge, une sélection non prouvée ou une
-    indisponibilité ne défont pas le gel : il est déjà écrit, et ce geste ne
-    lève pas. Rend ``{"state": "green"|"red"|"unavailable", ...}``.
+    résumé au journal. Un rouge, une sélection non prouvée, une indisponibilité
+    ou un dépôt sans outillage (#8321) ne défont pas le gel : il est déjà
+    écrit, et ce geste ne lève pas. Rend
+    ``{"state": "green"|"red"|"unavailable"|"skipped", ...}``.
 
     #4067 : borné par ``deadline`` (par défaut ``CALLER_BUDGET_S``), pour que
     ``work milestone frozen`` rende la main sous le délai du compositeur.
@@ -2025,6 +2026,16 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
             key = "%s en file" % JOURNAL_PREFIX
             _journal(db, lot, "%s: %s" % (key, exc.why), key=key)
             return {"state": "queued", "cause": "queued", "why": exc.why}
+        if exc.cause == "tooling-missing":
+            #: #8321 : un dépôt qui ne porte ni plan ni lanceur n'a rien à
+            #: jouer : le gel le dit « sautée », jamais « non concluante », et
+            #: ne renvoie pas vers `ameesh work prevalidate` pour un test qui
+            #: n'existe pas.
+            key = "%s skipped: %s" % (JOURNAL_PREFIX, exc.cause)
+            _journal(db, lot, "%s — project not tooled: %s" % (key, exc.why),
+                     key=key)
+            return {"state": "skipped", "cause": exc.cause,
+                    "why": "projet non outillé : %s" % exc.why}
         why = _timed_out(deadline, exc.why)
         key = "%s unavailable: %s" % (JOURNAL_PREFIX, exc.cause)
         text = "%s%s" % (key, (" — " + why) if why else "")
