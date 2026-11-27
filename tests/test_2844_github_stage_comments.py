@@ -15,6 +15,68 @@ from .fake_github import FakeGh
 REPO = "acme/app"
 
 
+class Clock:
+    """#8357: an adjustable clock; no test waits on the real one."""
+
+    def __init__(self, now: float = 1000.0):
+        self.now = float(now)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
+class LimitedGh(FakeGh):
+    """Fake GitHub refusing the Nth comment POST (#8357).
+
+    The refused call returns the HTTP response `gh api -i` would print: the
+    status, the quota headers (a secondary limit's `Retry-After` included) and
+    the JSON body. The refused attempt is counted but not applied.
+    """
+
+    def __init__(self, at: int = 3, *, body: str | None = None, status: int = 403,
+                 headers: tuple = ("Retry-After: 120",
+                                   "X-Ratelimit-Remaining: 4999")):
+        super().__init__()
+        self.at = int(at)
+        self.status = int(status)
+        self.body = body or '{"message":"You have exceeded a secondary rate limit."}'
+        self.headers = tuple(headers)
+        self.comment_posts = 0
+
+    def run(self, argv, stdin=None, timeout=None):
+        if (argv[:3] == ["api", "-X", "POST"] and len(argv) > 3
+                and argv[3].endswith("/comments")):
+            self.comment_posts += 1
+            if self.comment_posts == self.at:
+                reason = "Too Many Requests" if self.status == 429 else "Forbidden"
+                head = "\r\n".join(("HTTP/2.0 %d %s" % (self.status, reason),
+                                    *self.headers))
+                return 1, head + "\r\n\r\n" + self.body, ""
+        return super().run(argv, stdin, timeout)
+
+
+class RefusingWritesGh(FakeGh):
+    """Refuses the first non-comment write with a secondary limit (#8357)."""
+
+    def __init__(self):
+        super().__init__()
+        self.write_attempts = 0
+
+    def run(self, argv, stdin=None, timeout=None):
+        if (len(argv) > 3 and argv[:2] == ["api", "-X"]
+                and argv[2] in ("POST", "PATCH", "DELETE", "PUT")
+                and not argv[3].endswith("/comments")):
+            self.write_attempts += 1
+            return 1, ("HTTP/2.0 403 Forbidden\r\n"
+                       "Retry-After: 120\r\n"
+                       "X-Ratelimit-Remaining: 4999\r\n\r\n"
+                       '{"message":"You have exceeded a secondary rate limit."}'), ""
+        return super().run(argv, stdin, timeout)
+
+
 class StageCommentsTest(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
@@ -33,13 +95,46 @@ class StageCommentsTest(unittest.TestCase):
             "body": "human text", "state": "open", "labels": [], "state_reason": None})
         self.guard = pg.Guard(host_names=("worker-7",))
 
-    def project(self, dry_run=False):
+    def project(self, dry_run=False, writes=None):
         report = {"issues": [{"work_item": 12, "number": 7, "action": "unchanged"}],
                   "comments": [], "withheld": [], "errors": []}
-        comments.project(self.db, self.st, pg._Repo(self.gh, REPO, dry_run), report,
-                         [(self.item, self.gh.repo(REPO)["issues"][0])], guard=self.guard,
-                         refused=set(), project="app", closings={})
+        comments.project(self.db, self.st, pg._Repo(self.gh, REPO, dry_run, writes=writes),
+                         report, [(self.item, self.gh.repo(REPO)["issues"][0])],
+                         guard=self.guard, refused=set(), project="app", closings={})
         return report
+
+    def make_writes(self, *, comments_per_pass=pg.MAX_COMMENTS_PER_PASS,
+                    comments_per_hour=pg.MAX_COMMENTS_PER_HOUR, clock=None):
+        """The production write client: shared quota, paced by a fake clock."""
+        self.clock = clock or Clock()
+        self.sleeps = []
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            self.clock.advance(seconds)
+
+        reads = pg.SharedReads(self.folder.name, clock=self.clock)
+        return pg._Writes(self.gh, reads=reads, clock=self.clock, sleep=sleep,
+                          comments_per_pass=comments_per_pass,
+                          comments_per_hour=comments_per_hour)
+
+    def use_limited_gh(self, **kwargs):
+        """Replace the fake with one refusing the Nth comment POST."""
+        gh = LimitedGh(**kwargs)
+        gh.repo(REPO)["visibility"] = "private"
+        gh.repo(REPO)["issues"].append(dict(self.gh.repo(REPO)["issues"][0]))
+        self.gh = gh
+        return gh
+
+    def enroll(self):
+        """#2861: an existing open mirror starts from its current stage.
+
+        Post that stage with the legacy client (no writes) so the following
+        passes, on the same mirror, replay all new candidates."""
+        self.project()
+        self.gh.reset_calls()
+        if hasattr(self.gh, "comment_posts"):
+            self.gh.comment_posts = 0
 
     def bodies(self):
         return self.gh.repo(REPO)["comments"].get("7", [])
@@ -223,6 +318,169 @@ class StageCommentsTest(unittest.TestCase):
         self.assertEqual(self.project()["errors"], [])
         self.assertEqual(self.gh.writes(), [])
 
+    def test_secondary_limit_stops_the_pass_and_is_remembered(self):
+        # #8357: the 3rd comment is refused; the pass stops, the first two
+        # stay, the fourth is never attempted. The window and its Retry-After
+        # are remembered, so the next pass sends nothing until it expires.
+        gh = self.use_limited_gh(at=3)
+        self.enroll()                                # accepted, once
+        self.events = [dict(id=n, state="blocked" if n % 2 else "build", created_ts=n)
+                       for n in range(1, 6)]
+        report = self.project(writes=self.make_writes())
+        self.assertEqual(gh.comment_posts, 3)
+        self.assertEqual([r["event"] for r in report["comments"]],
+                         ["event-1", "event-3"])
+        self.assertEqual(len(self.bodies()), 3)      # accepted + two events
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(report["errors"][0]["action"], "stage-comment")
+        self.assertIn("rate limit", report["errors"][0]["detail"].lower())
+        self.assertIsNotNone(pg.SharedReads(self.folder.name, clock=self.clock).blocked())
+
+        gh.comment_posts = 0
+        gh.reset_calls()
+        blocked = self.project(writes=self.make_writes())
+        self.assertEqual(gh.comment_posts, 0)       # refused without a POST
+        self.assertEqual(len(blocked["errors"]), 1)
+        self.assertEqual(len(self.bodies()), 3)     # no duplicate
+
+        # After Retry-After, the remaining marker replays, with no duplicate.
+        resumed = self.project(writes=self.make_writes(clock=Clock(1200.0)))
+        self.assertEqual([r["event"] for r in resumed["comments"]], ["event-5"])
+        self.assertEqual(len(self.bodies()), 4)
+        self.assertEqual(len(set(self.bodies())), 4)
+        self.gh.reset_calls()
+        self.assertEqual(self.project(writes=self.make_writes(clock=Clock(1300.0)))["comments"], [])
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_limit_stops_before_the_next_lot(self):
+        # #8357: the quota ends the PASS, not just the current ticket. The
+        # next lot is not attempted in the same burst.
+        gh = self.use_limited_gh(at=2)
+        self.enroll()
+        issue8 = {"id": 9008, "number": 8, "title": "Second", "body": "human",
+                  "state": "open", "labels": [], "state_reason": None}
+        self.gh.repo(REPO)["issues"].append(issue8)
+        other = dict(self.item, id=13, title="Second", issue_ref=REPO + "#8")
+        self.events = [dict(id=n, state="blocked" if n % 2 else "build", created_ts=n)
+                       for n in (1, 2, 3)]
+        report = {"issues": [{"work_item": 12, "number": 7, "action": "unchanged"},
+                             {"work_item": 13, "number": 8, "action": "unchanged"}],
+                  "comments": [], "withheld": [], "errors": []}
+        comments.project(
+            self.db, self.st, pg._Repo(self.gh, REPO, False, writes=self.make_writes()),
+            report, [(self.item, self.gh.repo(REPO)["issues"][0]), (other, issue8)],
+            guard=self.guard, refused=set(), project="app", closings={})
+        self.assertEqual(gh.comment_posts, 2)        # event-1, then lot 13's accepted
+        self.assertEqual([(r["work_item"], r["event"]) for r in report["comments"]],
+                         [(12, "event-1")])
+        self.assertEqual(self.gh.repo(REPO)["comments"].get("8", []), [])
+        self.assertEqual(len(report["errors"]), 1)
+
+    def test_primary_limit_also_stops_the_pass(self):
+        # #8357: a primary refusal (remaining 0, reset) stops like a secondary
+        # one; the pass does not try the following lots.
+        gh = self.use_limited_gh(
+            at=2, body='{"message":"API rate limit exceeded"}',
+            headers=("X-Ratelimit-Remaining: 0", "X-Ratelimit-Reset: 1060"))
+        self.enroll()
+        self.events = [dict(id=n, state="blocked" if n % 2 else "build", created_ts=n)
+                       for n in range(1, 5)]
+        report = self.project(writes=self.make_writes())
+        self.assertEqual(gh.comment_posts, 2)
+        self.assertEqual(len(self.bodies()), 2)      # accepted + event-1
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("rate limit", report["errors"][0]["detail"].lower())
+        self.assertIsNotNone(pg.SharedReads(self.folder.name, clock=self.clock).blocked())
+
+    def test_generic_429_without_a_marker_stops_and_is_remembered(self):
+        # #8357: GitHub sometimes answers 429 "Too Many Requests" without a
+        # body marker or Retry-After. It is still a limit: stop, remember a
+        # default window, and do not send the next lot.
+        gh = self.use_limited_gh(at=2, status=429,
+                                 body='{"message":"Too Many Requests"}', headers=())
+        self.enroll()
+        self.events = [dict(id=n, state="blocked" if n % 2 else "build", created_ts=n)
+                       for n in range(1, 5)]
+        report = self.project(writes=self.make_writes())
+        self.assertEqual(gh.comment_posts, 2)
+        self.assertEqual(len(self.bodies()), 2)      # accepted + event-1
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("rate limit", report["errors"][0]["detail"].lower())
+        self.assertIsNotNone(pg.SharedReads(self.folder.name, clock=self.clock).blocked())
+
+    def test_hourly_credit_stops_then_resumes_at_the_next_window(self):
+        # #8357: 20 per pass at a 90 s cadence would still allow 800/h. A
+        # persistent hourly credit keeps the projection well below GitHub's
+        # ~500/h and leaves room for merges, CI and other token writers.
+        self.enroll()
+        self.events = [dict(id=n, state="blocked" if n % 2 else "build", created_ts=n)
+                       for n in range(1, 21)]
+        first = self.project(writes=self.make_writes(comments_per_hour=2))
+        self.assertEqual(len(first["comments"]), 2)
+        self.assertEqual(len(self.bodies()), 3)      # accepted + two
+        self.gh.reset_calls()
+        second = self.project(writes=self.make_writes(comments_per_hour=2))
+        self.assertEqual(second["comments"], [])     # credit spent, no POST
+        self.assertEqual(self.gh.calls(), [])        # nor a thread read
+        self.assertEqual(len(self.bodies()), 3)
+        window = Clock(1000.0 + pg.COMMENT_CREDIT_WINDOW_S + 1)
+        third = self.project(writes=self.make_writes(comments_per_hour=2, clock=window))
+        self.assertEqual(len(third["comments"]), 2)
+        self.assertEqual(len(self.bodies()), 5)
+
+    def test_comment_budget_is_paced_and_resumes_without_duplicates(self):
+        # #8357: a catch-up is spread over passes. The mirror is enrolled
+        # first (accepted); 25 blocked events follow and this pass posts 20,
+        # spaced one second. The five others wait for the next pass.
+        self.enroll()
+        self.events = [dict(id=n, state="blocked" if n % 2 else "build", created_ts=n)
+                       for n in range(1, 51)]
+        first = self.project(writes=self.make_writes())
+        self.assertEqual(len(first["comments"]), 20)
+        self.assertEqual(self.sleeps, [pg.COMMENT_INTERVAL_S] * 19)
+        self.assertEqual(self.clock.now, 1000.0 + 19 * pg.COMMENT_INTERVAL_S)
+        self.assertEqual(len(self.bodies()), 21)
+        second = self.project(writes=self.make_writes())
+        self.assertEqual(len(second["comments"]), 5)
+        self.assertEqual(self.sleeps, [pg.COMMENT_INTERVAL_S] * 4)
+        self.assertEqual(len(self.bodies()), 26)
+        self.assertEqual(len(set(self.bodies())), 26)
+        third = self.project(writes=self.make_writes())
+        self.assertEqual(third["comments"], [])
+        self.assertEqual(len(self.bodies()), 26)
+
+    def test_patch_uses_the_shared_window_and_is_refused_immediately(self):
+        # #8357: PATCH writes go through the same quota memory as reads; once
+        # a secondary limit is known, no further request leaves the process.
+        gh = RefusingWritesGh()
+        self.gh = gh
+        writes = self.make_writes()
+        with self.assertRaises(pg.GithubRateLimited):
+            writes.write("PATCH", "repos/acme/app/issues/7", {"title": "x"})
+        self.assertEqual(gh.write_attempts, 1)
+        self.assertIsNotNone(pg.SharedReads(self.folder.name, clock=self.clock).blocked())
+        with self.assertRaises(pg.GithubRateLimited):
+            writes.write("PATCH", "repos/acme/app/issues/7", {"title": "x"})
+        self.assertEqual(gh.write_attempts, 1)
+
+    def test_headerless_secondary_refusal_still_stops_and_is_remembered(self):
+        # #8357: some `gh` versions report the refusal on stderr without an
+        # HTTP status line. The text still stops the pass, and the default
+        # window is remembered so the next pass sends nothing.
+        gh = self.gh
+        original = gh.run
+
+        def run(argv, stdin=None, timeout=None):
+            if argv[:2] == ["api", "-X"]:
+                return 1, "", "gh: You have exceeded a secondary rate limit. (HTTP 403)"
+            return original(argv, stdin, timeout)
+
+        with mock.patch.object(gh, "run", side_effect=run):
+            writes = self.make_writes()
+            with self.assertRaises(pg.GithubRateLimited):
+                writes.write("POST", "repos/acme/app/issues", {"title": "x"})
+        self.assertIsNotNone(pg.SharedReads(self.folder.name, clock=self.clock).blocked())
+
     def test_paginated_read_failure_never_posts_and_dry_run_is_read_only(self):
         self.assertEqual(len(self.project(dry_run=True)["comments"]), 1)
         self.assertEqual(self.gh.writes(), [])
@@ -375,6 +633,18 @@ class StageCommentsTest(unittest.TestCase):
         self.gh.reset_calls()
         self.assertEqual(self.project()["comments"], [])
         self.assertEqual(self.gh.calls(), [])
+
+    def test_project_lots_routes_comment_posts_through_the_quota_client(self):
+        # #8357: the production path (Projector.tick -> project_lots) must
+        # hand its writes to the quota client, not call `gh api` directly.
+        self.st.hosts = SimpleNamespace(current=lambda *_: [])
+        self.st.work.issue_feed = lambda *_: [self.item]
+        with mock.patch.object(pg.storage, "of", return_value=self.st):
+            result = pg.project_lots(self.db, self.gh, "app", REPO)
+        self.assertEqual([r["event"] for r in result["comments"]], ["accepted"])
+        posts = [c for c in self.gh.writes() if "/comments" in " ".join(c)]
+        self.assertEqual(len(posts), 1)
+        self.assertIn("-i", posts[0])
 
     def test_real_projection_calls_comments_when_issue_is_unchanged(self):
         self.st.hosts = SimpleNamespace(current=lambda *_: [])
