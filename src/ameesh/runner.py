@@ -14109,20 +14109,43 @@ class Runner:
 
         Le runner arrête les tours, rend les baux de ses workers et cesse de
         réclamer, pour que le pod de connexion dédié monte le PVC sans
-        écriture concurrente du harnais (design 7633 §7.3). Une fois les baux
-        rendus, il pose `_tenant_login_drained` : le battement suivant publie
-        `login` dans `runner_presence` (`login_ack`), et le bureau attend cet
-        acquittement avant de créer le pod de connexion. Le drapeau est retiré
-        à la fermeture de la fenêtre, et le battement republie `running`. Rend
-        True si la passe doit s'arrêter là : aucune prise, aucun déplacement
-        pendant la connexion. Une lecture impossible ne retient pas la passe —
-        la garde SQL `ameesh_tenant_claim_ok` refuse de toute façon la
-        réclamation pendant la fenêtre."""
+        écriture concurrente du harnais (design 7633 §7.3). Une fois l'arrêt
+        **et** le retour des baux confirmés pour tous les workers, il pose
+        `_tenant_login_drained` : le battement suivant publie `login` dans
+        `runner_presence` (`login_ack`), et le bureau attend cet acquittement
+        avant de créer le pod. Un arrêt non confirmé (processus pas encore
+        publié, annulation sandbox seulement demandée) ou un retour de bail en
+        échec laisse le drapeau faux et sera réessayé.
+
+        La reprise ne dépend pas de la seule échéance SQL : le pod de
+        connexion écrit un battement sur le volume partagé, et le runner
+        n'enregistre sa fin (`login_pod_ended`) qu'après verrou libre et
+        silence de `tenancy.LOGIN_BEAT_STALE_S`. Tant que cette fin n'est pas
+        observée, la garde `ameesh_tenant_login_active` reste fermée, même
+        fenêtre expirée (B/P2 #46731) ; un pod jamais démarré laisse la
+        fenêtre fermée et se ferme par `logout`, après suppression constatée.
+        Rend True si la passe doit s'arrêter là : aucune prise, aucun
+        déplacement pendant la connexion. Une lecture impossible ne retient
+        pas la passe — la garde SQL `ameesh_tenant_claim_ok` refuse de toute
+        façon la réclamation pendant la fenêtre."""
         from . import tenancy
         tenant = tenancy.runner_tenant(getattr(self, "cfg", None))
         if not tenant:
             return False
         try:
+            window = tenancy.login_window(self.db, self.host, tenant)
+            if window is not None:
+                pod = str(window.get("pod_name") or "")
+                if pod and window.get("pod_ended_ts") is None \
+                        and tenancy.login_pod_beat_stale(
+                            getattr(self, "cfg", None), pod):
+                    if tenancy.login_pod_ended(
+                            self.db, self.host, tenant, pod_name=pod,
+                            by=self.runner_id):
+                        log_async("tenant %s: connection pod %s ended "
+                                  "(silent volume beat), claims may resume"
+                                  % (tenant, pod))
+                    window = tenancy.login_window(self.db, self.host, tenant)
             active = tenancy.login_active(self.db, self.host, tenant)
         except db_mod.DbError as exc:
             log_async("tenant %s: seat-login state unreadable (%s)"
@@ -14140,6 +14163,10 @@ class Runner:
                       "pausing claims" % tenant)
         with self.lock:
             workers = list(self.workers.values())
+        # L'état d'arrêt/retour est rattaché à la fenêtre (`id`) : une nouvelle
+        # fenêtre ne réutilise pas les confirmations de la précédente.
+        token = window.get("id") if window else None
+        drained = True
         for worker in workers:
             stopping = getattr(worker, "stopping", None)
             if stopping is not None:
@@ -14147,16 +14174,42 @@ class Runner:
             wake = getattr(worker, "wake", None)
             if wake is not None:
                 wake.set()
-            stop_group = getattr(worker, "stop_group_now", None)
-            if callable(stop_group):
-                stop_group("tenant seat login", grace=3.0)
-        for worker in workers:
-            release = getattr(worker, "release_lease", None)
-            if callable(release):
-                release()
-        # Le harnais est arrêté (SIGTERM puis SIGKILL dans la grâce) et les
-        # baux sont rendus : le battement peut maintenant annoncer `login`.
-        self._tenant_login_drained = True
+            state = getattr(worker, "_seat_login_drain", None)
+            if not (isinstance(state, tuple) and len(state) == 3
+                    and state[0] == token):
+                state = (token, False, False)
+            stopped, released = bool(state[1]), bool(state[2])
+            alive = getattr(worker, "is_alive", None)
+            still_alive = bool(callable(alive) and alive())
+            if not still_alive:
+                # Un fil terminé a rendu son harnais : l'arrêt est acquis.
+                stopped = True
+            elif not stopped:
+                stop_group = getattr(worker, "stop_group_now", None)
+                if callable(stop_group):
+                    # False = latch seulement (processus pas encore publié) :
+                    # rien n'est arrêté, on réessaie à la passe suivante.
+                    if stop_group("tenant seat login", grace=3.0) is True:
+                        stopped = True
+                    else:
+                        drained = False
+            if not released:
+                release = getattr(worker, "release_lease", None)
+                if callable(release):
+                    if release() is True:
+                        released = True
+                    else:
+                        drained = False
+            # Recontrôle après l'arrêt : un arrêt local confirmé termine le
+            # fil ; le chemin sandbox ne fait que demander l'annulation du Job
+            # distant, donc `login` attend que le fil ait réellement fini —
+            # c'est l'observation que l'arrêt du Job a eu lieu.
+            if callable(alive) and alive():
+                drained = False
+            worker._seat_login_drain = (token, stopped, released)
+        # `login` n'est publié que si l'arrêt et le retour des baux sont
+        # confirmés pour tous les workers ; sinon le bureau continue d'attendre.
+        self._tenant_login_drained = drained
         return True
 
     @migrations.writer_tick

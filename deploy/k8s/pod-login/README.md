@@ -17,8 +17,17 @@ jamais.
 - un **Pod d'un seul conteneur** qui monte **seulement** le PVC de la
   personne, sous son UID/GID, sans superviseur, sans jeton de compte de
   service, `readOnlyRootFilesystem: true`, `/tmp` en `emptyDir`, TTL ≤ 30 min
-  (`activeDeadlineSeconds`), épinglé au **même nœud** que le pod partagé ;
-- un **Role** `pods/exec` borné par `resourceNames` à **ce seul pod** ;
+  (`activeDeadlineSeconds`, filet de sécurité du manifeste), épinglé au
+  **même nœud** que le pod partagé ;
+- un **processus principal** qui tient un verrou et écrit un **battement**
+  toutes les secondes dans `.ameesh/seat-login/` sur le PVC, et qui **sort de
+  lui-même** à `expires_at - 30 s` : cette borne est absolue (horloge de la
+  fenêtre), donc un pod créé tard après le rendu ne survit pas à l'échéance.
+  Le runner du tenant, qui monte le même volume, n'enregistre la fin du pod
+  qu'après verrou libre et 30 s de silence. C'est la **fin observée** qui
+  rouvre la réclamation, jamais la seule échéance SQL (B/P2 #46731) ;
+- un **Role** `get pods` + `create pods/exec` borné par `resourceNames` à
+  **ce seul pod** (`kubectl exec` lit d'abord le pod) ;
 - si `--subject` est donné, le **RoleBinding** de la personne
   (`User:<nom>` ou `Group:<nom>`) ; sans sujet, le bureau crée le binding
   avec l'identité Kubernetes réelle de la personne ;
@@ -50,7 +59,8 @@ ameesh host tenant login human:alice --host pod-alice \
 
 Le geste est humain ou avatar (`operator`), **jamais un agent** ni le runner
 du tenant. Il exige `policy.runtime.kind: pod` dans le canon et une liaison
-`host_tenants` existante.
+`host_tenants` existante. La sortie JSON donne `pod_name` et `expires_ts` :
+ce sont eux qui pilotent le rendu (étape 4), pas un nom ou un TTL inventés.
 
 ### 2. Attendre que le runner ait rendu ses baux
 
@@ -78,20 +88,32 @@ nœud** pour que les deux pods le montent sans détachement.
 
 ### 4. Rendre et appliquer le pod de connexion
 
-`IMAGE` est l'image du harnais, **épinglée par digest**. `UID` est celui du
-chart (`ameesh host tenant list` le montre ; le battement le vérifie).
+`IMAGE` est l'image du harnais, **épinglée par digest** et contenant
+`python3` (le processus principal du pod est le gardien du battement). `UID`
+est celui du chart (`ameesh host tenant list` le montre ; le battement le
+vérifie). `POD` et `EXPIRES` sont les valeurs rendues par l'étape 1 :
+
+```sh
+LOGIN=$(ameesh host tenant login human:alice --host pod-alice \
+        --terms '#233251' --ttl 1800)
+POD=$(printf '%s' "$LOGIN" | python3 -c \
+      'import json,sys; print(json.load(sys.stdin)["pod_name"])')
+EXPIRES=$(printf '%s' "$LOGIN" | python3 -c \
+      'import json,sys; print(int(json.load(sys.stdin)["expires_ts"]))')
+```
 
 ```sh
 python3 deploy/k8s/pod-login/render.py \
     --namespace ameesh --host pod-alice --tenant human:alice \
-    --uid "$UID" --pvc pvc-alice --pod ameesh-login-alice \
+    --uid "$UID" --pvc pvc-alice --pod "$POD" \
     --node "$NODE" \
     --image "$IMAGE" \
+    --expires-at "$EXPIRES" \
     --subject User:alice \
   | kubectl apply -f -
 
 kubectl -n ameesh wait --for=condition=Ready \
-    pod/ameesh-login-alice --timeout=120s
+    "pod/$POD" --timeout=120s
 ```
 
 ### 5. La personne se connecte
@@ -99,7 +121,7 @@ kubectl -n ameesh wait --for=condition=Ready \
 Avec **son** identité Kubernetes (celle du RoleBinding) :
 
 ```sh
-kubectl -n ameesh exec -it ameesh-login-alice -- sh
+kubectl -n ameesh exec -it "$POD" -- sh
 # dans le shell, sous l'UID du tenant :
 claude      # puis /login ; l'URL s'ouvre sur le poste de la personne
 # ou
@@ -116,15 +138,36 @@ Supprimer le pod **d'abord**, puis le Role et le RoleBinding, puis fermer la
 fenêtre :
 
 ```sh
-kubectl -n ameesh delete pod ameesh-login-alice
-kubectl -n ameesh delete role ameesh-login-alice
-kubectl -n ameesh delete rolebinding ameesh-login-alice
+kubectl -n ameesh delete pod "$POD" --wait=true
+kubectl -n ameesh delete role "$POD"
+kubectl -n ameesh delete rolebinding "$POD"
 ameesh host tenant logout human:alice --host pod-alice
 ```
 
-`logout` est idempotent (`closed: false` s'il n'y a rien à fermer). Le
-battement suivant republie `state=running` et les profils de compte ; le
-runner reprend les tours.
+`kubectl delete --wait=true` attend la disparition de l'objet : c'est la
+suppression **constatée**. `logout` est idempotent (`closed: false` s'il n'y
+a rien à fermer). Le battement suivant republie `state=running` et les profils
+de compte ; le runner reprend les tours.
+
+## Fin observée du pod (B/P2 #46731)
+
+La fenêtre SQL et le `activeDeadlineSeconds` du pod ne suffisent pas : le pod
+peut démarrer après l'ouverture, survivre à l'échéance ou être détruit plus
+tard que prévu. Le pod de connexion écrit donc un **battement** et tient un
+**verrou** sur le volume de la personne ; le runner du tenant, seul autre
+processus qui monte ce volume, applique cette règle :
+
+- verrou tenu par le pod, ou battement frais : la fin n'est pas observée, la
+  fenêtre reste fermée, le runner ne réclame pas ;
+- verrou libre **et** battement silencieux depuis 30 s (plus que
+  `terminationGracePeriodSeconds: 5`) : le runner enregistre `pod_ended_at`,
+  la garde `ameesh_tenant_login_active` s'ouvre et les prises reprennent ;
+- pod jamais démarré (aucun battement) : la fenêtre reste fermée après
+  l'échéance. Le bureau supprime le pod, constate sa disparition, puis
+  `logout` — jamais l'inverse, et jamais de réouverture par simple attente.
+
+Une nouvelle fenêtre pour la même personne prend un **nouveau** `pod_name` :
+le battement d'une session précédente ne peut pas libérer la suivante.
 
 ### 7. Vérifier
 

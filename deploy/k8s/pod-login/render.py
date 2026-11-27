@@ -10,28 +10,40 @@ Ce rendu produit, pour **une** personne et **une** session :
 
 * un pod d'un seul conteneur qui monte **seulement** le PVC de la personne,
   sous son UID/GID, sans superviseur, sans jeton de compte de service,
-  `readOnlyRootFilesystem: true`, `/tmp` en `emptyDir`, TTL <= 30 min, épinglé
-  au même nœud que le pod partagé (le PVC `ReadWriteOnce` est monté par les
-  deux pods) ;
-* un Role `pods/exec` borné par `resourceNames` à **ce seul pod** ;
+  `readOnlyRootFilesystem: true`, `/tmp` en `emptyDir`, épinglé au même nœud
+  que le pod partagé (le PVC `ReadWriteOnce` est monté par les deux pods).
+  Son `activeDeadlineSeconds` est dérivé de l'échéance de la fenêtre `login` :
+  le pod meurt 30 s **avant** que la base ne rende la main aux prises du
+  tenant, jamais après (design §7.3) ;
+* le processus principal du conteneur tient un **verrou** et écrit un
+  **battement** dans `.ameesh/seat-login/` sur le PVC, une fois par seconde.
+  Le runner du tenant, qui monte le même volume, n'enregistre la fin du pod
+  qu'après verrou libre **et** battement silencieux depuis 30 s : la reprise
+  est conditionnée à la fin **observée** du pod, pas à la seule échéance SQL
+  (B/P2 #46731). Fichier absent ou verrou tenu = pas de fin observée ;
+* un Role `get` + `pods/exec` borné par `resourceNames` à **ce seul pod**
+  (`kubectl exec` lit d'abord le pod, puis demande l'exec) ;
 * si `--subject` est donné, le RoleBinding de la personne (`User:<nom>` ou
   `Group:<nom>`). Sans sujet, le Role est rendu seul : le bureau crée le
   binding avec l'identité Kubernetes réelle de la personne.
 
 Aucun secret, aucune clé, aucun identifiant n'est rendu ni lu : la personne
 lance `claude /login` ou `codex login` elle-même dans le pod. La fenêtre
-`login` (preuve D2, TTL) est ouverte en base par `ameesh host tenant login`.
+`login` (preuve D2, TTL) est ouverte en base par `ameesh host tenant login`,
+qui rend aussi le `pod_name` à passer ici.
 
     python3 deploy/k8s/pod-login/render.py --namespace ameesh \\
       --host pod-alice --tenant human:alice --uid 2519 --pvc pvc-alice \\
-      --pod ameesh-login-alice --node node-1 \\
-      --image registry.example/ameesh-runner@sha256:... --subject User:alice
+      --pod ameesh-login-alice-1a2b3c4d --node node-1 \\
+      --image registry.example/ameesh-runner@sha256:... \\
+      --expires-at 1795742400 --subject User:alice
 """
 from __future__ import annotations
 
 import argparse
 import re
 import sys
+import time
 
 try:
     import yaml
@@ -41,17 +53,88 @@ except ImportError:  # pragma: no cover - dépend de l'environnement
 #: borne du design §7.3 : `activeDeadlineSeconds` <= 30 min.
 TTL_MAX_S = 1800
 TTL_MIN_S = 30
+#: #7911 : le pod de connexion doit mourir **avant** la fenêtre `login` de la
+#: base, qui rend la main aux prises du tenant à `expires_at`. La marge couvre
+#: la terminaison du pod (grâce 5 s) et la reprise du runner : le pod est
+#: éteint au plus tard à `expires_at - 30 s`, jamais après la garde SQL.
+TERMINATION_MARGIN_S = 30
 #: fsGroup neutre du chart pod-shared (jamais un fsGroup par tenant).
 DEFAULT_FS_GROUP = 10000
 #: préfixe du pod de connexion ; un nom de pod partagé est refusé.
 LOGIN_PREFIX = "ameesh-login-"
 SHARED_PREFIX = "ameesh-pod-"
+#: #7911 : répertoire du verrou et du battement, à la racine du PVC du tenant.
+#: `tenancy.LOGIN_BEAT_DIR` porte la même valeur (le runner lit ce chemin).
+BEAT_DIR = ".ameesh/seat-login"
 DNS_1123 = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 TENANT_RE = re.compile(r"^human:[A-Za-z0-9][A-Za-z0-9._@-]*$")
 
 
+def beat_command(pod: str, expires_at: float) -> list[str]:
+    """PID 1 du pod de connexion : verrou + battement, sortie à l'échéance.
+
+    Le verrou est tenu jusqu'à la mort du processus (le noyau le rend, même
+    après SIGKILL) et le battement est réécrit chaque seconde. Le runner du
+    tenant, qui monte le même PVC sous le même UID, ne reprend qu'après verrou
+    libre **et** battement silencieux depuis `LOGIN_BEAT_STALE_S` : la fin du
+    pod est observée là où l'écriture concurrente aurait lieu, sans jeton
+    Kubernetes dans le pod (B/P2 #46731).
+
+    Le processus sort de lui-même à `expires_at - TERMINATION_MARGIN_S` : la
+    borne est **absolue**, calculée sur l'horloge de la fenêtre, pas sur celle
+    du démarrage du conteneur. Un pod créé tard après le rendu ne peut donc
+    pas survivre à l'échéance SQL ; `activeDeadlineSeconds` n'est que le
+    filet de sécurité du manifeste.
+    """
+    deadline = float(expires_at) - TERMINATION_MARGIN_S
+    script = (
+        "import fcntl, os, time\n"
+        + "deadline = %.0f\n" % deadline
+        + "base = os.path.join(os.environ['HOME'], %r)\n" % BEAT_DIR
+        + "os.makedirs(base, mode=0o700, exist_ok=True)\n"
+        "lock = open(os.path.join(base, %r), 'w')\n" % (pod + ".lock")
+        + "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+        "beat = os.path.join(base, %r)\n" % (pod + ".beat")
+        + "while time.time() < deadline:\n"
+        "    with open(beat, 'w') as stream:\n"
+        "        stream.write('%.0f' % time.time())\n"
+        "    time.sleep(1)\n"
+    )
+    return ["python3", "-c", script]
+
+
 class RenderError(ValueError):
-    """Entrée refusée (nom hors chart, TTL hors borne, image non épinglée)."""
+    """Entrée refusée (nom hors chart, échéance hors borne, image non épinglée)."""
+
+
+def deadline_ttl(expires_at: float, *, now: float | None = None) -> int:
+    """`activeDeadlineSeconds` d'un pod de connexion, dérivé de la fenêtre.
+
+    `expires_at` est l'échéance de la fenêtre `tenant_logins` (epoch, le
+    `expires_ts` rendu par `host tenant login`) ; le pod meurt
+    `TERMINATION_MARGIN_S` avant, pour que la garde `ameesh_tenant_login_active`
+    ne rende pas la main aux prises du tenant pendant que le pod monte encore
+    le PVC. Refuse une échéance déjà trop proche ou hors de la borne de 30 min.
+    """
+    now = time.time() if now is None else float(now)
+    try:
+        expires = float(expires_at)
+    except (TypeError, ValueError):
+        raise RenderError("expires-at must be an epoch number, got %r"
+                          % (expires_at,)) from None
+    remaining = expires - now
+    if remaining > TTL_MAX_S + TERMINATION_MARGIN_S:
+        raise RenderError(
+            "expires-at is more than 30 min away (%ss): not a seat-login "
+            "window (design 7633 §7.3)" % int(remaining))
+    ttl = int(remaining - TERMINATION_MARGIN_S)
+    if ttl < TTL_MIN_S:
+        raise RenderError(
+            "the seat-login window ends in %ss, less than the %ss margin plus "
+            "the %ss minimum pod TTL: reopen the window"
+            % (int(remaining), TERMINATION_MARGIN_S, TTL_MIN_S))
+    return min(ttl, TTL_MAX_S)
+
 
 
 def slug(tenant: str) -> str:
@@ -80,7 +163,8 @@ def _pinned_image(image: str) -> str:
 
 
 def build(*, namespace: str, host: str, tenant: str, uid: int, pvc: str,
-          pod: str, node: str, image: str, ttl_s: int = TTL_MAX_S,
+          pod: str, node: str, image: str, expires_at: float,
+          now: float | None = None,
           fs_group: int = DEFAULT_FS_GROUP,
           subject: str | None = None) -> list[dict]:
     """Les objets Kubernetes du pod de connexion (Pod, Role, RoleBinding)."""
@@ -109,13 +193,7 @@ def build(*, namespace: str, host: str, tenant: str, uid: int, pvc: str,
         raise RenderError("fs-group must be a positive integer") from None
     if fs_group <= 0:
         raise RenderError("fs-group must be a positive integer")
-    try:
-        ttl_s = int(ttl_s)
-    except (TypeError, ValueError):
-        raise RenderError("ttl must be an integer number of seconds") from None
-    if not (TTL_MIN_S <= ttl_s <= TTL_MAX_S):
-        raise RenderError("ttl must be between %d and %d seconds (design 7633 "
-                          "§7.3), got %s" % (TTL_MIN_S, TTL_MAX_S, ttl_s))
+    ttl_s = deadline_ttl(expires_at, now=now)
     ident = slug(tenant)
     user = "ameesh-" + ident
     home = "/home/" + user
@@ -155,7 +233,9 @@ def build(*, namespace: str, host: str, tenant: str, uid: int, pvc: str,
             "containers": [{
                 "name": "login",
                 "image": image,
-                "command": ["sleep", "infinity"],
+                # #7911 : verrou + battement sur le PVC, pour que le runner
+                # observe la fin du pod avant de reprendre (B/P2 #46731).
+                "command": beat_command(pod, expires_at),
                 "workingDir": home,
                 "env": [
                     {"name": "HOME", "value": home},
@@ -223,14 +303,25 @@ def build(*, namespace: str, host: str, tenant: str, uid: int, pvc: str,
             "namespace": namespace,
             "labels": dict(labels),
         },
-        "rules": [{
-            "apiGroups": [""],
-            "resources": ["pods/exec"],
-            # Le pod de connexion n'a qu'un conteneur : la limite par pod
-            # suffit. Le pod partagé n'est jamais nommé ici.
-            "resourceNames": [pod],
-            "verbs": ["create"],
-        }],
+        "rules": [
+            {
+                # `kubectl exec` lit d'abord le pod (`Pods.Get`) pour résoudre
+                # la phase et le conteneur : sans ce `get`, l'exec échoue avant
+                # la sous-ressource. Borné au même pod, jamais au partagé.
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "resourceNames": [pod],
+                "verbs": ["get"],
+            },
+            {
+                "apiGroups": [""],
+                "resources": ["pods/exec"],
+                # Le pod de connexion n'a qu'un conteneur : la limite par pod
+                # suffit. Le pod partagé n'est jamais nommé ici.
+                "resourceNames": [pod],
+                "verbs": ["create"],
+            },
+        ],
     }
     docs = [service_account, pod_doc, role]
     if subject:
@@ -271,8 +362,10 @@ def main(argv=None) -> int:
                         help="spec.nodeName of the shared pod (same node)")
     parser.add_argument("--image", required=True,
                         help="harness image pinned by digest")
-    parser.add_argument("--ttl", type=int, default=TTL_MAX_S,
-                        help="activeDeadlineSeconds (30..1800, default 1800)")
+    parser.add_argument(
+        "--expires-at", required=True, type=float,
+        help="epoch seconds of the login window expiry (`expires_ts` from "
+             "`ameesh host tenant login`); the pod dies 30 s before it")
     parser.add_argument("--fs-group", type=int, default=DEFAULT_FS_GROUP)
     parser.add_argument("--subject",
                         help="RoleBinding subject: User:<name> or Group:<name>")
@@ -284,7 +377,7 @@ def main(argv=None) -> int:
         docs = build(namespace=args.namespace, host=args.host,
                      tenant=args.tenant, uid=args.uid, pvc=args.pvc,
                      pod=args.pod, node=args.node, image=args.image,
-                     ttl_s=args.ttl, fs_group=args.fs_group,
+                     expires_at=args.expires_at, fs_group=args.fs_group,
                      subject=args.subject)
     except RenderError as exc:
         print("pod-login-render: %s" % exc, file=sys.stderr)

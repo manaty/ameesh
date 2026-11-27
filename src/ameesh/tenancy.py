@@ -35,6 +35,7 @@ import pwd
 import re
 import shlex
 import time
+import uuid
 from typing import Any, Mapping
 
 from . import canon as canon_mod
@@ -73,6 +74,19 @@ POD_CHILD_TEMPLATE = "ameesh-child"
 #: connexion porte `activeDeadlineSeconds` sous cette borne.
 LOGIN_TTL_MAX_S = 1800.0
 LOGIN_TTL_DEFAULT_S = 1800.0
+#: #7911 : préfixe du pod de connexion dédié (le pod partagé n'est jamais une
+#: cible `pods/exec`). Le nom est rendu par `host tenant login` AVANT la
+#: création : le runner sait quel battement observer.
+LOGIN_POD_PREFIX = "ameesh-login-"
+LOGIN_POD_RE = re.compile(r"^ameesh-login-[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+#: #7911 : répertoire du battement, à la RACINE du PVC du tenant (le pod de
+#: connexion et le runner le montent au même endroit logique). Le pod y écrit
+#: un battement par seconde ; le runner n'enregistre la fin qu'après silence.
+LOGIN_BEAT_DIR = ".ameesh/seat-login"
+#: #7911 : silence du battement au-delà duquel le pod est tenu pour terminé.
+#: Plus long que `terminationGracePeriodSeconds` (5 s) : les processus d'un
+#: conteneur qui s'arrête ont le temps de disparaître avant la reprise.
+LOGIN_BEAT_STALE_S = 30.0
 #: Une preuve D2 citable : décision/mail/lot (`#233251`), référence
 #: `owner/repo#123`, ou `card@commit`. Une phrase libre va dans la note du
 #: lot, jamais dans la colonne : la preuve est une référence, pas un récit.
@@ -702,21 +716,99 @@ def beat(cfg, db, *, version: str | None = None,
 
 
 def login_active(db, host: str, tenant: str) -> bool:
-    """#7911 : une fenêtre de connexion du siège est ouverte et non expirée
-    pour ce tenant (la garde SQL `ameesh_tenant_login_active`, 0610)."""
+    """#7911 : la garde de connexion du siège est active pour ce tenant (la
+    fonction SQL `ameesh_tenant_login_active`, 0610) : fenêtre ouverte tant
+    que la fin du pod de connexion désigné n'a pas été observée. Une fenêtre
+    sans pod reste bornée par son échéance ; une fenêtre avec pod ne se
+    rouvre pas à l'expiration seule (B/P2 #46731)."""
     return storage.of(db).tenancy.login_active(host, check_tenant(tenant))
 
 
+def login_window(db, host: str, tenant: str) -> dict | None:
+    """#7911 : la fenêtre `login` ouverte du tenant, ou None. Le runner lit
+    `pod_name` et `pod_ended_ts` pour observer la fin du pod sur le volume
+    partagé avant de reprendre ses tours."""
+    return storage.of(db).tenancy.login_window(host, check_tenant(tenant))
+
+
+def login_pod_ended(db, host: str, tenant: str, *, pod_name: str,
+                    by: str) -> bool:
+    """#7911 : enregistre la fin observée du pod de connexion (battement
+    silencieux du volume, ou suppression constatée). Idempotent."""
+    return storage.of(db).tenancy.login_pod_ended(
+        host, check_tenant(tenant), pod_name=pod_name, by=by)
+
+
+def login_pod_name(tenant: str) -> str:
+    """#7911 : nom unique du pod de connexion d'une fenêtre.
+
+    Rendu par `host tenant login` : le bureau le passe à `render.py --pod` et
+    le runner observe le battement de CE pod. Le suffixe aléatoire interdit
+    qu'une fenêtre précédente (ou une autre personne) partage le même
+    battement sur le volume."""
+    ident = re.sub(r"[^a-z0-9-]", "-",
+                   check_tenant(tenant)[len("human:"):].lower()).strip("-")
+    ident = (ident or "tenant")[:24].strip("-") or "tenant"
+    return LOGIN_POD_PREFIX + ident + "-" + uuid.uuid4().hex[:8]
+
+
+def login_pod_beat_stale(cfg, pod_name: str, *, now: float | None = None) -> bool:
+    """#7911 : la fin du pod de connexion est-elle **observée** sur le volume ?
+
+    Le pod de connexion tient un verrou et écrit un battement par seconde dans
+    `LOGIN_BEAT_DIR`, à la racine du PVC du tenant (design 7633 §7.3). Le
+    runner est le seul autre processus qui monte ce volume : il considère la
+    fin acquise quand le verrou est libre **et** que le battement est
+    silencieux depuis `LOGIN_BEAT_STALE_S`. Le verrou prouve que le porteur
+    n'est plus vivant (le noyau le rend à sa mort, même SIGKILL), le silence
+    couvre la grâce de terminaison : aucun processus du pod ne peut plus
+    écrire quand la reprise a lieu. Fichier absent, verrou tenu ou lecture
+    impossible : pas de fin observée (fail closed), la fenêtre reste fermée et
+    `logout` est le seul chemin après suppression constatée."""
+    tenant = runner_tenant(cfg)
+    name = str(pod_name or "").strip()
+    if not tenant or not name:
+        return False
+    base = os.path.join(tenant_home(tenant), LOGIN_BEAT_DIR)
+    beat = os.path.join(base, name + ".beat")
+    lock = os.path.join(base, name + ".lock")
+    try:
+        fd = os.open(lock, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        import fcntl
+        try:
+            # Verrou exclusif non bloquant : il n'est libre que si le porteur
+            # du pod est mort (le noyau le libère à la disparition du process).
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    try:
+        beat_mtime = os.stat(beat).st_mtime
+    except OSError:
+        return False
+    moment = time.time() if now is None else float(now)
+    return (moment - beat_mtime) >= LOGIN_BEAT_STALE_S
+
+
 def login_open(db, host: str, tenant: str, *, terms_ref: str, actor: str,
-               ttl_s: float = LOGIN_TTL_DEFAULT_S) -> dict:
+               ttl_s: float = LOGIN_TTL_DEFAULT_S,
+               pod_name: str | None = None) -> dict:
     """Ouvre la fenêtre `login` d'un tenant pod (geste humain/avatar).
 
     `terms_ref` est la preuve citable de la vérification D2 (conditions du
     fournisseur avec la personne, décision owner #233251) : sans elle, aucune
-    connexion de siège. Le runner du tenant rend ses baux et son battement
-    publie `login` ; le bureau attend cet acquittement (`host tenant list`)
-    avant de créer le pod de connexion dédié. Refuse un tenant non lié et une
-    fenêtre déjà ouverte ; la durée est bornée à 30 min (design §7.3)."""
+    connexion de siège. Le nom du pod de connexion est rendu ici, AVANT sa
+    création : le runner observe son battement sur le volume pour ne reprendre
+    qu'après sa fin observée (B/P2 #46731). Le runner du tenant rend ses baux
+    et son battement publie `login` ; le bureau attend cet acquittement
+    (`host tenant list`) avant de créer le pod. Refuse un tenant non lié, un
+    nom de pod invalide et une fenêtre encore ouverte ; la durée est bornée à
+    30 min (design §7.3)."""
     tenant = check_tenant(tenant)
     ref = str(terms_ref or "").strip()
     if not ref or len(ref) > 300 or not LOGIN_TERMS_RE.match(ref):
@@ -734,6 +826,12 @@ def login_open(db, host: str, tenant: str, *, terms_ref: str, actor: str,
             "tenant-login-ttl-invalid",
             "a seat-login window lasts between 30 s and %d s (design 7633 §7.3)"
             % int(LOGIN_TTL_MAX_S))
+    pod = str(pod_name or "").strip() or login_pod_name(tenant)
+    if len(pod) > 63 or not LOGIN_POD_RE.match(pod):
+        raise TenancyError(
+            "tenant-login-pod-invalid",
+            "the connection pod must be a DNS-1123 name starting with `%s`, "
+            "got %r" % (LOGIN_POD_PREFIX, pod))
     bound = {row.get("tenant") for row in
              storage.of(db).tenancy.bindings(host)}
     if tenant not in bound:
@@ -742,15 +840,17 @@ def login_open(db, host: str, tenant: str, *, terms_ref: str, actor: str,
             "host %s: %s has no binding (run `host tenant add --pod "
             "--register` first)" % (host, tenant))
     result = storage.of(db).tenancy.login_open(
-        host, tenant, terms_ref=ref, actor=actor, ttl_s=ttl)
+        host, tenant, terms_ref=ref, actor=actor, ttl_s=ttl, pod_name=pod)
     if not result.get("opened"):
         current = result.get("current") or {}
         raise TenancyError(
             "tenant-login-already-open",
-            "host %s: %s already has a seat-login window (until %s, by %s); "
-            "run `host tenant logout` first"
+            "host %s: %s already has a seat-login window (until %s, by %s, "
+            "pod %s); delete that pod, observe its deletion, then run "
+            "`host tenant logout`"
             % (host, tenant, _iso(current.get("expires_ts")),
-               current.get("opened_by") or "?"))
+               current.get("opened_by") or "?",
+               current.get("pod_name") or "?"))
     return result
 
 
@@ -988,9 +1088,12 @@ def describe(rows: list[Mapping[str, Any]]) -> list[str]:
             if row.get("profiles") else ""
         login = ""
         if row.get("login_until_ts") is not None:
-            login = "  login until %s terms=%s by=%s" % (
+            login = "  login until %s terms=%s by=%s pod=%s" % (
                 _iso(row.get("login_until_ts")), row.get("login_terms") or "?",
-                row.get("login_opened_by") or "?")
+                row.get("login_opened_by") or "?",
+                row.get("login_pod") or "?")
+            if row.get("login_pod_ended_ts") is not None:
+                login += " ended=%s" % _iso(row.get("login_pod_ended_ts"))
         state = "  state=%s" % row["state"] if row.get("state") else ""
         out.append("%s  %s  user=%s uid=%s runner=%s  seen %s%s%s%s%s" % (
             row["host"], row["tenant"], row["unix_user"], row["uid"], row["runner_id"],
@@ -1106,7 +1209,8 @@ def main(argv=None) -> int:
                        help="citable proof of the supplier-terms verification "
                             "(D2): e.g. `#233251`, `owner/repo#123`, `mail:234666`")
     login.add_argument("--ttl", type=int, default=int(LOGIN_TTL_DEFAULT_S),
-                       help="window in seconds (30..%d, default %d)"
+                       help="window in seconds (30..%d, default %d); the "
+                            "returned pod_name and expires_ts drive render.py"
                             % (int(LOGIN_TTL_MAX_S), int(LOGIN_TTL_DEFAULT_S)))
     login.add_argument("--actor",
                        help="who opens (human:<id> or avatar) from an unbound terminal")

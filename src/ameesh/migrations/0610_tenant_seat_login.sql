@@ -18,9 +18,15 @@
 -- `tenant_logins` porte la fenêtre ouverte : `terms_ref` est la référence
 -- citable de la vérification D2 (mail, décision, note de lot — jamais un
 -- secret), `opened_by` l'auteur du geste, l'échéance et la fermeture.
--- `ameesh_tenant_login_active` ignore une fenêtre expirée : une ligne restée
--- ouverte ne bloque pas indéfiniment la réclamation. L'index partiel
--- `tenant_logins_one_open` garantit une seule fenêtre ouverte par tenant.
+-- `pod_name` est le pod de connexion désigné à l'ouverture (nom unique, rendu
+-- par `host tenant login`) : la fenêtre ne rend pas la main à l'expiration
+-- tant que la fin de CE pod n'a pas été observée (`pod_ended_at`, B/P2 du
+-- 27/11 : le pod pouvait survivre à la fenêtre SQL et écrire le PVC pendant
+-- que le runner reprenait). Le runner observe la fin sur le volume partagé
+-- (battement du pod) ; sans observation, la fenêtre reste fermée (fail
+-- closed) et se ferme par `logout`, après suppression du pod constatée.
+-- L'index partiel `tenant_logins_one_open` garantit une seule fenêtre
+-- ouverte par tenant.
 --
 -- Additive seulement : table neuve, colonne à défaut, fonction de garde
 -- remplacée à l'identique pour les hôtes non pod (aucune ligne `tenant_logins`
@@ -35,6 +41,15 @@ create table if not exists tenant_logins (
     opened_by  text not null,
     opened_at  timestamptz not null default now(),
     expires_at timestamptz not null,
+    -- pod de connexion désigné par `host tenant login` : son nom est rendu au
+    -- bureau AVANT la création, pour que le runner sache quel battement
+    -- observer ; NULL = fenêtre d'avant ce delta, bornée par l'échéance.
+    pod_name   text,
+    -- fin observée du pod (battement silencieux du volume) ou constat de sa
+    -- suppression par le bureau ; NULL = rien n'a encore prouvé que le PVC
+    -- n'est plus monté par le pod de connexion.
+    pod_ended_at timestamptz,
+    pod_ended_by text,
     closed_at  timestamptz,
     closed_by  text,
     constraint tenant_logins_state_valid
@@ -46,6 +61,15 @@ create table if not exists tenant_logins (
     constraint tenant_logins_window_valid
         check (expires_at > opened_at
                and expires_at <= opened_at + interval '30 minutes'),
+    constraint tenant_logins_pod_name_valid
+        check (pod_name is null
+               or (length(pod_name) <= 63
+                   and pod_name ~ '^ameesh-login-[a-z0-9-]+$')),
+    constraint tenant_logins_pod_end_valid
+        check ((pod_ended_at is null and pod_ended_by is null)
+               or (pod_ended_at is not null and pod_ended_at >= opened_at
+                   and btrim(pod_ended_by) <> ''
+                   and length(pod_ended_by) <= 120)),
     constraint tenant_logins_closed_valid
         check ((state = 'open' and closed_at is null and closed_by is null)
                or (state = 'closed' and closed_at is not null
@@ -63,18 +87,30 @@ comment on column tenant_logins.terms_ref is
 comment on column tenant_logins.opened_by is
     '#7911: human or avatar who opened the window (never an agent nor the tenant runner); the CLI operator() gate enforces it.';
 
+comment on column tenant_logins.pod_name is
+    '#7911: dedicated connection pod designated at open (returned to the bureau before creation); the window stays closed to claims until this pod''s end is observed.';
+
+comment on column tenant_logins.pod_ended_at is
+    '#7911: observed end of the connection pod (silent liveness beat on the tenant volume, or the bureau''s observed deletion); only then does the window stop blocking claims, expiry alone does not.';
+
 create unique index if not exists tenant_logins_one_open
     on tenant_logins (host, tenant)
     where state = 'open';
+
+create unique index if not exists tenant_logins_pod_name
+    on tenant_logins (host, pod_name)
+    where pod_name is not null;
 
 create index if not exists tenant_logins_expiry
     on tenant_logins (expires_at)
     where state = 'open';
 
--- Vrai pendant la fenêtre ouverte et non expirée. Le battement du runner et
--- la garde de réclamation s'appuient dessus ; une fenêtre expirée ne bloque
--- rien (elle est fermée par `host tenant login`/`logout` ou par le prochain
--- battement de la liste).
+-- Vrai pendant la fenêtre ouverte, tant que la fin du pod désigné n'a pas été
+-- observée. Une fenêtre SANS pod (`pod_name` null, ligne d'avant ce delta)
+-- reste bornée par son échéance ; une fenêtre AVEC pod ne rend pas la main à
+-- `expires_at` : le pod peut survivre à la fenêtre SQL (B/P2 #46731) et le
+-- runner reprendrait pendant qu'il écrit le PVC. La fin observée est la seule
+-- sortie automatique ; `logout` (après suppression constatée) est l'autre.
 create or replace function ameesh_tenant_login_active(h text, t text)
 returns boolean language sql stable as $$
     select exists (
@@ -82,11 +118,13 @@ returns boolean language sql stable as $$
          where l.host = h
            and l.tenant = t
            and l.state = 'open'
-           and l.expires_at > now())
+           and (case when l.pod_name is null then l.expires_at > now()
+                     else l.pod_ended_at is null end)
+    )
 $$;
 
 comment on function ameesh_tenant_login_active(text, text) is
-    '#7911: a tenant seat-connection window is open and not expired; the claim guard and the runner heartbeat use it.';
+    '#7911: a tenant seat-connection window is open and its designated connection pod has not been observed ended; the claim guard and the runner heartbeat use it.';
 
 -- `runner_presence.state` publie ce que le runner a vu : `running` (il sert
 -- les tours) ou `login` (il a rendu ses baux et ne réclame plus). L'état fait

@@ -5601,23 +5601,44 @@ class Tenancy(Domain):
     def bindings(self, host: str | None = None) -> list[dict]:
         """Liaisons (avec la présence de leur runner : `seen_ts`, `version`,
         `profiles`, `state`) et, #7911, la fenêtre `login` ouverte
-        (`login_until_ts`, `login_terms`, `login_opened_by`)."""
+        (`login_until_ts`, `login_terms`, `login_opened_by`, `login_pod`,
+        `login_pod_ended_ts`)."""
 
     @abc.abstractmethod
     def login_active(self, host: str, tenant: str) -> bool:
-        """#7911 : une fenêtre de connexion du siège est ouverte et non
-        expirée pour ce tenant (la garde SQL `ameesh_tenant_login_active`)."""
+        """#7911 : la garde de connexion du siège est active pour ce tenant
+        (la fonction SQL `ameesh_tenant_login_active`) : fenêtre ouverte et
+        fin du pod de connexion non observée. Une fenêtre sans pod reste
+        bornée par son échéance ; une fenêtre avec pod ne se rouvre pas à
+        l'expiration seule, la fin observée du pod est requise."""
+
+    @abc.abstractmethod
+    def login_window(self, host: str, tenant: str) -> dict | None:
+        """#7911 : la fenêtre `login` ouverte du tenant, ou None : `pod_name`,
+        `expires_ts`, `pod_ended_ts`, `pod_ended_by`, `opened_ts`, `opened_by`.
+        Le runner s'en sert pour observer la fin du pod sur le volume avant de
+        reprendre (B/P2 #46731)."""
 
     @abc.abstractmethod
     def login_open(self, host: str, tenant: str, *, terms_ref: str,
-                   actor: str, ttl_s: float) -> dict:
+                   actor: str, ttl_s: float, pod_name: str | None = None) -> dict:
         """#7911 : ouvre la fenêtre `login` d'un tenant (geste humain/avatar,
         `terms_ref` = preuve citable des conditions du fournisseur, D2).
 
-        Une fenêtre expirée du même tenant est fermée au passage ; une fenêtre
-        encore ouverte est refusée (`tenant-login-already-open`). Rend la
-        ligne (id, host, tenant, terms_ref, opened_by, opened_at, expires_at).
+        `pod_name` est le pod de connexion désigné, rendu au bureau AVANT sa
+        création (défaut : nom unique dérivé du tenant). Une fenêtre dont la
+        fin du pod a été observée, ou une fenêtre expirée sans pod, est fermée
+        au passage ; une fenêtre encore ouverte et non terminée est refusée
+        (`tenant-login-already-open`). Rend la ligne (id, host, tenant,
+        pod_name, terms_ref, opened_by, opened_at, expires_at).
         """
+
+    @abc.abstractmethod
+    def login_pod_ended(self, host: str, tenant: str, *, pod_name: str,
+                        by: str) -> bool:
+        """#7911 : enregistre la fin observée du pod de connexion de la
+        fenêtre ouverte (battement silencieux du volume, ou suppression
+        constatée). Idempotent ; vrai si cette passe a écrit la fin."""
 
     @abc.abstractmethod
     def login_close(self, host: str, tenant: str, *, actor: str) -> dict:

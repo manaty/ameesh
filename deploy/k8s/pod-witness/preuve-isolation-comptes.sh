@@ -120,6 +120,7 @@ if [ "$RENDER_ONLY" -eq 1 ]; then
             --uid "$UID_A" --pvc pvc-temoin-a --pod ameesh-login-alice \
             --node node-temoin \
             --image "ameesh/temoin@sha256:$(printf '0%.0s' {1..64})" \
+            --expires-at "$(python3 -c 'import time; print("%.0f" % (time.time() + 1800))')" \
             --subject User:temoin-alice
     else
         echo "# login: PyYAML absent, rendu non produit"
@@ -527,13 +528,15 @@ check_base() {
 # Le pod partagé ne reçoit JAMAIS `pods/exec` : `kubectl exec` choisit le
 # conteneur dans la requête, hors de l'objet RBAC. Ce contrôle rend le pod de
 # connexion dédié (#7911, design 7633 §7.3), l'applique, puis interroge l'API
-# d'autorisation : le sujet du RoleBinding peut exec dans SON pod de connexion,
-# jamais dans le pod partagé ni dans celui d'un pair. Aucun conteneur n'y
-# tourne : le pod reste Pending et l'image n'est pas tirée, seule
-# l'autorisation est prouvée.
+# d'autorisation : le sujet du RoleBinding peut lire (`get pods`) et exec dans
+# SON pod de connexion, jamais dans le pod partagé ni dans celui d'un pair.
+# `kubectl exec` fait d'abord un GET du pod (ExecOptions.Run) : sans le `get`,
+# la personne reçoit « cannot get resource pods » (B/P1 #46730). Aucun
+# conteneur ne tourne : le pod reste Pending et l'image n'est pas tirée, seule
+# l'autorisation et le rendu sont prouvés.
 check_login() {
     local pod=ameesh-login-alice peer=ameesh-login-bob partage=ameesh-pod-alice
-    local user=temoin-alice node image manifest allowed denied
+    local user=temoin-alice node image manifest expires allowed denied rules
     python3 -c 'import yaml' 2>/dev/null \
         || { echo "SKIP login: PyYAML absent — contrôle non exécuté (non-concluant)" >&2; return 77; }
     command -v python3 >/dev/null 2>&1 \
@@ -544,16 +547,19 @@ check_login() {
     # Image épinglée par digest (le rendu l'exige), volontairement absente :
     # ce contrôle porte sur le RBAC, pas sur l'exécution d'un harnais.
     image="ameesh/temoin@sha256:$(printf '0%.0s' {1..64})"
+    # Échéance de fenêtre `login` (epoch) : le pod meurt 30 s avant, jamais
+    # après la garde SQL ; le rendu refuse une échéance hors borne.
+    expires=$(python3 -c 'import time; print("%.0f" % (time.time() + 1800))')
     manifest=$(python3 "$REPO_ROOT/deploy/k8s/pod-login/render.py" \
         --namespace "$NS" --host pod-alice --tenant human:alice \
         --uid "$UID_A" --pvc pvc-temoin-a --pod "$pod" --node "$node" \
-        --image "$image" --subject "User:$user") \
+        --image "$image" --expires-at "$expires" --subject "User:$user") \
         || fail "login: le rendu du pod de connexion a échoué"
     # Un nom de pod partagé est refusé à la source : pas de pods/exec dessus.
     if python3 "$REPO_ROOT/deploy/k8s/pod-login/render.py" \
         --namespace "$NS" --host pod-alice --tenant human:alice \
         --uid "$UID_A" --pvc pvc-temoin-a --pod "$partage" --node "$node" \
-        --image "$image" >/dev/null 2>&1; then
+        --image "$image" --expires-at "$expires" >/dev/null 2>&1; then
         fail "login: le rendu accepte le pod partagé comme cible exec"
     fi
     grep -q 'resourceNames:' <<<"$manifest" \
@@ -564,34 +570,50 @@ check_login() {
     printf '%s\n' "$manifest" | kubectl -n "$NS" apply -f - >/dev/null \
         || fail "login: les objets du pod de connexion sont refusés par l'API"
     echo "trace: login: pod=$pod (Pending, image non tirée) role=$pod sujet=User:$user"
+    # `kubectl exec` = GET du pod, puis CREATE sur la sous-ressource exec.
     _sar_login() {
+        local subject=$1 verb=$2 resource=$3 sub=$4 name=$5 sub_line=""
+        [ -n "$sub" ] && sub_line="    subresource: $sub"
         kubectl create -f - -o jsonpath='{.status.allowed}' <<EOF
 apiVersion: authorization.k8s.io/v1
 kind: SubjectAccessReview
 spec:
-  user: $1
+  user: $subject
   resourceAttributes:
     namespace: $NS
-    verb: create
+    verb: $verb
     group: ""
-    resource: pods
-    subresource: exec
-    name: $2
+    resource: $resource
+$sub_line
+    name: $name
 EOF
     }
-    allowed=$(_sar_login "$user" "$pod") \
-        || fail "login: SubjectAccessReview impossible sur le pod de connexion"
+    allowed=$(_sar_login "$user" get pods "" "$pod") \
+        || fail "login: SubjectAccessReview get pods impossible sur le pod de connexion"
+    [ "$allowed" = "true" ] \
+        || fail "login: get pods refusé sur son propre pod de connexion ($allowed)"
+    allowed=$(_sar_login "$user" create pods exec "$pod") \
+        || fail "login: SubjectAccessReview exec impossible sur le pod de connexion"
     [ "$allowed" = "true" ] \
         || fail "login: exec refusé sur son propre pod de connexion ($allowed)"
     for denied in "$partage" "$peer"; do
-        allowed=$(_sar_login "$user" "$denied") \
-            || fail "login: SubjectAccessReview impossible sur $denied"
+        allowed=$(_sar_login "$user" get pods "" "$denied") \
+            || fail "login: SubjectAccessReview get pods impossible sur $denied"
+        [ "$allowed" = "false" ] \
+            || fail "login: get pods autorisé sur $denied (attendu: refusé)"
+        allowed=$(_sar_login "$user" create pods exec "$denied") \
+            || fail "login: SubjectAccessReview exec impossible sur $denied"
         [ "$allowed" = "false" ] \
             || fail "login: exec autorisé sur $denied (attendu: refusé)"
     done
-    [ "$(kubectl -n "$NS" get role "$pod" \
-        -o jsonpath='{.rules[0].resourceNames[0]}')" = "$pod" ] \
-        || fail "login: le Role ne nomme pas uniquement le pod de connexion"
+    rules=$(kubectl -n "$NS" get role "$pod" \
+        -o jsonpath='{range .rules[*]}{.verbs[0]}/{.resources[0]}/{.resourceNames[0]}{"\n"}{end}')
+    grep -qx "get/pods/$pod" <<<"$rules" \
+        || fail "login: le Role n'accorde pas get pods sur le seul pod de connexion"
+    grep -qx "create/pods/exec/$pod" <<<"$rules" \
+        || fail "login: le Role n'accorde pas create pods/exec sur le seul pod de connexion"
+    [ "$(printf '%s\n' "$rules" | sed '/^$/d' | wc -l)" -eq 2 ] \
+        || fail "login: le Role porte des règles hors du pod de connexion"
     [ "$(kubectl -n "$NS" get rolebinding "$pod" \
         -o jsonpath='{.subjects[0].kind}:{.subjects[0].name}')" = "User:$user" ] \
         || fail "login: le RoleBinding ne lie pas l'utilisateur attendu"
@@ -603,9 +625,8 @@ EOF
     kubectl -n "$NS" delete pod "$pod" --wait=true --timeout=120s >/dev/null
     kubectl -n "$NS" delete role "$pod" rolebinding "$pod" serviceaccount ameesh-login \
         --ignore-not-found --wait=true >/dev/null
-    pass "login: exec autorisé sur le seul pod de connexion ($pod) pour User:$user, refusé sur le pod partagé ($partage) et sur celui d'un pair ($peer), Role borné, aucun Role large ni compte de service"
+    pass "login: get pods et exec autorisés sur le seul pod de connexion ($pod) pour User:$user, refusés sur le pod partagé ($partage) et sur celui d'un pair ($peer), Role borné (get + exec), aucun Role large ni compte de service"
 }
-
 
 docker pull --quiet "$IMAGE" >/dev/null
 docker pull --quiet "$GIT_IMAGE" >/dev/null

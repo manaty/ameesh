@@ -5501,6 +5501,8 @@
     "login_active",
     "login_close",
     "login_open",
+    "login_pod_ended",
+    "login_window",
     "policy",
     "presence",
     "unbind",

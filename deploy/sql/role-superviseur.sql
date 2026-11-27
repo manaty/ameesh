@@ -507,6 +507,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- reste fermée, aucun secret mais une preuve de personne.
     ('tenant_logins', ARRAY[
         'host', 'tenant', 'state', 'opened_by', 'opened_at', 'expires_at',
+        'pod_name', 'pod_ended_at', 'pod_ended_by',
         'closed_at', 'closed_by'
     ]),
     -- #7695 (0599) : bail d'un seul superviseur par hôte pod — détenteur,
