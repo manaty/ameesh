@@ -10,6 +10,12 @@
   ameesh canon show [--json]             fiches lues, et d'où (commit)
   ameesh canon snapshot --expect-commit SHA [--json]
                                          public immutable directory; read-only, no DB
+  ameesh canon confirm --commit SHA [--canon ID] [--host H] [--json]
+                                         canon inchangé (#8354) : rafraîchit la seule
+                                         fraîcheur (checked_at) si l'état est ok à SHA,
+                                         la révision appliquée y pointe encore et la
+                                         dernière synchro complète a moins d'une heure ;
+                                         aucune fiche lue ; code 1 si refus
   ameesh canon sync [--host H] [--json] [--bootstrap-ref BRANCHE]
                      [--allow-rewind]
                                          canon → registre de l'hôte (§4.4) ; enregistre
@@ -1337,7 +1343,7 @@ def _add_agent_parsers(parent, *, move: bool = False,
 
 def add_parsers(sub) -> None:
     """Branche `canon …` (dont `canon agent …`), `placement …` et `agent …`."""
-    p_canon = sub.add_parser("canon", help="OKF canon: check, show, snapshot, sync")
+    p_canon = sub.add_parser("canon", help="OKF canon: check, show, snapshot, confirm, sync")
     canon_sub = p_canon.add_subparsers(dest="canon_command")
     p_check = canon_sub.add_parser("check", help="validate the canon (§4.3)")
     _canon_options(p_check)
@@ -1368,6 +1374,8 @@ def add_parsers(sub) -> None:
                                  "additional source with a readable scope, list "
                                  "unloaded siblings as omitted members")
     p_snapshot.set_defaults(func=cmd_snapshot)
+    from .canon_confirm import add_parser as add_confirm
+    add_confirm(canon_sub)
     p_sync = canon_sub.add_parser("sync", help="canon → host registry (§4.4)")
     _canon_options(p_sync)
     p_sync.add_argument("--host", default=None, help="host (otherwise AMEESH_HOST / this machine)")
