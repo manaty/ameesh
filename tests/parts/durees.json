@@ -4,7 +4,6 @@
  "_source_7951": "#7951 : `test_6298_vm_probe` n'était ni dans la liste « toujours » ni dans cette table, donc ordonné en dernier par `paquet-auto.contract_order` et jamais atteint avant l'épuisement du budget. Valeurs mesurées sur le banc local (PostgreSQL 17, 2026-11-20) : 65.2 s sous psql, 22.1 s sous psycopg, setUpClass non compris ; la prochaine mesure de carte les remplacera.",
  "_source_psql_full": "GitHub Actions, run 45738064364 (main c26984bd, 2026-11-26, nocturne psql 16/16) : secondes par module sous psql, somme des tests du flux. #8291 : la table du 08/11 (run 42460885729) annonçait 16 parts égales (~12 050 s) que ce run a mesurées de 2 799 à 12 113 s ; la part 10 a été coupée à 60 min. Pour les modules de cette part encore en cours dans les cinq dernières minutes, la mesure partielle est remplacée par la valeur du 08/11 quand celle-ci est plus haute ; ses deux modules jamais atteints gardent la valeur du 08/11, et les modules postérieurs au run restent pesés par `psql`, puis par le prorata des tests. `psql_full` sert au découpage du nocturne (#6437) ; depuis #7526, elle comble aussi les modules absents de la table psql ordinaire, sans remplacer ses mesures ni celles de la carte.",
  "psql": {
-  "runTest": 0.0,
   "test_1002_relance_perimee": 0.0,
   "test_1003_merge_pr": 16.9,
   "test_1021_tenue_attribution": 28.8,
