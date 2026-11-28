@@ -13,7 +13,7 @@ import subprocess
 from . import (land, merge_queue, plan_git, radar, resolutions, train_ci,
                train_migrations, train_transports)
 from .canon import FETCH_TIMEOUT, GitError
-from .train import MemberDeferred, TrainError, digest, identity
+from .train import MemberDeferred, TrainError, TrainObjectMissing, digest, identity
 
 
 class Repository:
@@ -303,6 +303,47 @@ class Repository:
         if proc.returncode:
             raise TrainError("cannot create deterministic train commit")
         return proc.stdout.strip()
+
+    def _present(self, sha):
+        try:
+            return plan_git._commit(self.clone.path, sha) == sha
+        except (GitError, OSError):
+            return False
+
+    def materialize(self, plan):
+        """#8480 : la tête gelée et la base du plan, lisibles dans ce clone.
+
+        Le clone est propre au propriétaire de la réservation : un plan composé
+        et publié par un autre runner (relève du bail, adoption #3142) n'y a
+        jamais été écrit. Avant toute lecture d'un commit du plan (preuve des
+        parts, contrat CI), un commit absent déclenche un fetch borné de la
+        branche d'intégration du plan et de la cible, puis une relecture.
+        Encore absent : `TrainObjectMissing`, l'incident nommé."""
+        branch = self._guard(plan["target"])
+        wanted = [sha for sha in (plan["head"], plan["base"]) if not self._present(sha)]
+        if not wanted:
+            return
+        train = plan.get("branch") or ""
+        if not train.startswith("integration/train-"):
+            raise TrainError("plan branch outside the train namespace")
+        plan_git.check_ref("refs/heads/" + train, "train branch")
+        self.clone.ensure()
+        source = land._origin(self.project) or self.project.repo
+        fetched = []
+        proc = resolutions._run(self.clone.path, "fetch", "--quiet", "--no-tags", source,
+                                "+refs/heads/%s:refs/ameesh/trains/%s" % (train, train),
+                                "+refs/heads/%s:%s" % (branch, land.FRESH_REF),
+                                timeout=FETCH_TIMEOUT)
+        if proc.returncode:
+            fetched.append(resolutions._err(proc)[-200:])
+        missing = [sha for sha in wanted if not self._present(sha)]
+        if missing:
+            raise TrainObjectMissing(plan.get("id"), missing[0],
+                "train object missing after fetch: %s of plan %s is not in %s even after "
+                "fetching %s and %s from %s%s" % (
+                    missing[0][:12], (plan.get("id") or "?")[:8], self.clone.path,
+                    train, branch, source,
+                    " (fetch failed: %s)" % fetched[0] if fetched else ""))
 
     def _validate(self, plan):
         branch = self._guard(plan["target"])

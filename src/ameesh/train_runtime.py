@@ -171,6 +171,7 @@ class Runtime:
         trace even while the rest of the packet is published.
         """
         self._belongs(plan)
+        self._materialize(plan)
         found = train_ci.deferred_source_member(
             self.repository.clone.path, plan, self.ci_adapter.workflows,
             plan.get("members") or ())
@@ -263,10 +264,17 @@ class Runtime:
                 return False
         return True
 
+    def _materialize(self, plan):
+        """#8480 : la tête et la base du plan dans le clone, avant de les lire."""
+        if hasattr(self.repository, "materialize"):
+            self.repository.materialize(plan)
+
     def start_ci(self, plan):
+        self._materialize(plan)
         self.ci_adapter.start(plan)
 
     def ci(self, plan):
+        self._materialize(plan)
         evidence = self.ci_adapter.read(plan)
         if evidence.get("status") == "red" and evidence.get("complete") is True:
             evidence = dict(evidence, diagnosis=train_diagnosis.unresolved(plan, evidence))
