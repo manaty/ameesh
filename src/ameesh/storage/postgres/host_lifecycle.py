@@ -36,6 +36,10 @@ _ROW = ("host, mode, generation, actor, "
         "hook_attempt_state, hook_attempt_generation, hook_attempt_epoch, "
         "extract(epoch from hook_wait_at)::float8 AS hook_wait_ts, "
         "hook_wait_state, hook_wait_generation, hook_wait_epoch, "
+        # #8459: the hub's standby debt (see 0615): entered but not exited,
+        # and the first failed `sortir` of the episode.
+        "extract(epoch from standby_entered_at)::float8 AS standby_entered_ts, "
+        "extract(epoch from standby_exit_failed_at)::float8 AS standby_exit_failed_ts, "
         "extract(epoch from updated_at)::float8 AS updated_ts")
 
 # #7913: a `busy` finishing on row `c` resyncs a `draining` acknowledged by an
