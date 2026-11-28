@@ -4056,13 +4056,8 @@ def attestation_execution_inputs(cfg):
 
 def contract_attestation_context(worktree: Path, *, base: str, modules: list,
                                  timeout: float, project: str = "", target: str | None = None,
-                                 carrier: int = 0,
-                                 executor: str = "") -> tuple[dict, Path, list, int | None]:
+                                 carrier: int = 0) -> tuple[dict, Path, list, int | None]:
     """Exact local execution inputs; unavailable context disables caching.
-
-    #8437 : `executor` (hôte dont le guest jouera les contrats) entre dans le
-    scope scellé (`profile` offload-…, `drivers.executor`) : un rapport déporté
-    et un rapport local ne se réutilisent jamais l'un pour l'autre.
 
     The Git tree covers runner code, migrations and repository fixtures. The
     external interpreter/dependencies, heavy launcher, declared execution
@@ -4119,11 +4114,8 @@ def contract_attestation_context(worktree: Path, *, base: str, modules: list,
              "registry_digest": evidence.digest({"tree": tree}),
              "runner_digest": evidence.digest({"runtime": runtime, "binary": binary,
                                                 "launcher": launcher}),
-             "profile": ("offload-" + (project or "ameesh")) if executor else "local-heavy",
-             "drivers": dict(
-                 attestation_execution_inputs(cfg), driver=test_driver(worktree),
-                 **({"executor": executor, "executor_driver": OFFLOAD_DRIVER}
-                    if executor else {})),
+             "profile": "local-heavy", "drivers": dict(
+                 attestation_execution_inputs(cfg), driver=test_driver(worktree)),
              "database_schema": tree, "fixtures": {"tree": tree}, "exclusions": {}}
     lots = []
     from ameesh import packet_snapshot
@@ -4232,16 +4224,22 @@ def prepublication_contracts(worktree: Path, *, base: str,
             raise PaquetAutoError("créneau heavy indisponible")
         modules = contract_modules(worktree, base=base,
                                    timeout=max(0.1, end - time.monotonic()))
-        # #8437 : l'hôte est décidé avant l'attestation, qui le scelle
+        # #8437 : l'hôte est décidé avant l'attestation : un run déporté n'en a pas
         executor = offload_host() if modules else ""
         from datetime import datetime, timezone
         from ameesh import db as ameesh_db, packet_snapshot, prevalidation
         try:
+            if executor:
+                # #8437 : le runtime et les dépendances du guest ne se scellent
+                # pas d'ici (runner_digest décrit le composeur) : un run déporté
+                # n'est ni attesté ni réutilisé
+                raise ValueError("contrats déportés sur %s : ni attestation ni "
+                                 "réutilisation" % executor)
             from ameesh.canon import GitDeadline
             try:
                 context = contract_attestation_context(
                     worktree, base=base, modules=modules, timeout=end - time.monotonic(), project=project,
-                    target=target, carrier=carrier, executor=executor)
+                    target=target, carrier=carrier)
             except GitDeadline as exc:
                 raise ValueError("attestation context budget exhausted") from exc
             scope, path, lots, max_age = context
@@ -4272,12 +4270,6 @@ def prepublication_contracts(worktree: Path, *, base: str,
         else:
             run = run_contract_modules(worktree, modules, end=end, parallel=parallel,
                                        host=executor)
-            if getattr(run, "executor", "") != executor:
-                # #8437 : repli local après un refus du guest : le scope scellé
-                # ne décrit plus le run, rien n'est attesté ni réutilisable
-                print("attestation contrats : non écrite, contrats joués %s au lieu de %s"
-                      % (getattr(run, "executor", "") or "ici", executor or "ici"), flush=True)
-                context = None
     except PaquetAutoError as exc:
         # #7950 : la passe n'a pas démarré (budget, créneau, arbre) : ses
         # modules sont « non lancés », jamais un « code de retour None ».
@@ -4322,11 +4314,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
                 "base": base, "card": "", "modules": [
                     module for module, result in results.items() if result != "inconclusive"],
                 "missing": [module for module, result in results.items() if result == "inconclusive"],
-                "selection": "contract",
-                # #8437 : le guest qui a joué les contrats, quand il y en a un
-                "profile": ("offload-" + (project or "ameesh")) if getattr(run, "executor", "")
-                else "local-heavy",
-                "host": getattr(run, "executor", "") or socket.gethostname(),
+                "selection": "contract", "profile": "local-heavy", "host": socket.gethostname(),
                 "planned": modules, "ok": state == "green",
                 "outcome": {"green": "green", "red": "run-red",
                             "inconclusive": "run-incomplete"}[state],

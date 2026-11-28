@@ -204,43 +204,48 @@ class OffloadedContractsTest(unittest.TestCase):
 
 
 class SealedExecutorTest(unittest.TestCase):
-    """L'hôte est décidé avant l'attestation ; un repli local n'atteste rien."""
+    """Le runtime du guest ne se scelle pas d'ici : un run déporté n'est ni
+    attesté ni réutilisé ; l'hôte est décidé avant toute réutilisation."""
 
-    def run_pass(self, executed_by):
-        seen = {}
+    def run_pass(self, host):
+        seen = {"context": 0}
 
         def context(*args, **kwargs):
-            seen["executor"] = kwargs.get("executor")
+            seen["context"] += 1
             raise ValueError("isolated test: no canon")
 
         def contracts(*args, **kwargs):
             seen["host"] = kwargs.get("host")
             return auto.merge_contract_runs(["tests.test_a"], [auto.TestRun(
                 "contrats tests.test_a", ["tests.test_a"], 0, "Ran 1 test\n\nOK\n", 0.1)],
-                executed_by)
+                kwargs.get("host") or "")
 
+        out = io.StringIO()
         with mock.patch.object(auto, "contract_scope", return_value=("a" * 40, "b" * 40)), \
                 mock.patch.object(auto, "verify_contract_scope"), \
                 mock.patch.object(auto.shutil, "which", return_value="/bin/ameesh"), \
                 mock.patch.object(auto, "contract_modules", return_value=["tests.test_a"]), \
-                mock.patch.object(auto, "offload_host", return_value="ameesh-agents-3"), \
+                mock.patch.object(auto, "offload_host", return_value=host), \
                 mock.patch.object(auto, "contract_attestation_context", side_effect=context), \
+                mock.patch.object(auto, "previous_contract_attestation") as previous, \
+                mock.patch.object(auto, "save_contract_attestation") as save, \
                 mock.patch.object(auto, "run_contract_modules", side_effect=contracts), \
-                mock.patch.object(auto, "save_test_log", side_effect=lambda run: run):
+                mock.patch.object(auto, "save_test_log", side_effect=lambda run: run), \
+                contextlib.redirect_stdout(out):
             report = auto.prepublication_contracts(Path("."), base="c" * 40, budget=600)
-        return seen, report
+        return seen, report, out.getvalue(), previous, save
 
-    def test_the_decided_host_is_sealed_and_played(self):
-        seen, report = self.run_pass("ameesh-agents-3")
-        self.assertEqual(seen, {"executor": "ameesh-agents-3", "host": "ameesh-agents-3"})
-        self.assertEqual(report.run.executor, "ameesh-agents-3")
-
-    def test_a_local_fallback_writes_no_attestation(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            _, report = self.run_pass("")
+    def test_an_offloaded_pass_is_neither_attested_nor_reused(self):
+        seen, report, out, previous, save = self.run_pass("ameesh-agents-3")
+        self.assertEqual(seen, {"context": 0, "host": "ameesh-agents-3"})
+        previous.assert_not_called()
+        save.assert_not_called()
         self.assertIsNone(report.evidence)
-        self.assertIn("attestation contrats : non écrite", out.getvalue())
+        self.assertIn("ni attestation ni réutilisation", out)
+
+    def test_a_local_pass_keeps_its_attestation_path(self):
+        seen, _, _, _, _ = self.run_pass("")
+        self.assertEqual(seen, {"context": 1, "host": ""})
 
 
 class OffloadedSeriesTest(unittest.TestCase):

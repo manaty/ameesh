@@ -332,37 +332,6 @@ class ContextTest(unittest.TestCase):
                     other_host, _, _, _ = auto.contract_attestation_context(
                         repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
                 self.assertNotEqual(scope['drivers']['host'], other_host['drivers']['host'])
-                # #8437 : un run déporté scelle son guest ; jamais réutilisé
-                # pour un run local, ni l'inverse
-                guest, _, _, _ = auto.contract_attestation_context(
-                    repo, base=base, modules=['tests.test_a'], timeout=10, project='demo',
-                    executor='ameesh-agents-3')
-                self.assertEqual(scope['profile'], 'local-heavy')
-                self.assertEqual(guest['profile'], 'offload-demo')
-                self.assertEqual(guest['drivers']['executor'], 'ameesh-agents-3')
-                self.assertNotIn('executor', scope['drivers'])
-                from ameesh import prevalidation
-                from datetime import datetime, timezone
-                now = datetime.now(timezone.utc)
-                for sealed, asked in ((guest, scope), (scope, guest)):
-                    report = prevalidation.attest_report({
-                        'schema': prevalidation.REPORT_SCHEMA, 'lot': 0, 'sha': base,
-                        'base': base, 'card': '', 'modules': ['tests.test_a'],
-                        'missing': [], 'selection': 'contract', 'profile': sealed['profile'],
-                        'host': 'h', 'planned': ['tests.test_a'], 'ok': True,
-                        'outcome': 'green', 'causes': [], 'seconds': 1.0, 'tests': 1,
-                        'tree': {'head': base, 'snapshot': base, 'plan': '',
-                                 'git_tree': git('rev-parse', 'HEAD^{tree}')}},
-                        tree=git('rev-parse', 'HEAD^{tree}'), scope=sealed, lots=lots,
-                        results={'tests.test_a': 'passed'}, timestamp=now.isoformat(), links=[])
-                    same, _ = prevalidation.reuse_report(
-                        report, head=base, tree=git('rev-parse', 'HEAD^{tree}'), scope=sealed,
-                        now=now, max_age_seconds=3600)
-                    reused, causes = prevalidation.reuse_report(
-                        report, head=base, tree=git('rev-parse', 'HEAD^{tree}'), scope=asked,
-                        now=now, max_age_seconds=3600)
-                    self.assertIsNotNone(same)
-                    self.assertIsNone(reused, causes)
                 with mock.patch('ameesh.canon.load_configured', return_value=[]):
                     with self.assertRaisesRegex(ValueError, 'no readable canon'):
                         auto.contract_attestation_context(repo, base=base, modules=['tests.test_a'], timeout=10, project='demo')
