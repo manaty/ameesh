@@ -6043,8 +6043,13 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = (), automatic: bool = False,
-              close_claims: bool = False, force_short_reason: str | None = None) -> dict:
+              close_claims: bool = False, force_short_reason: str | None = None,
+              force_reason: str | None = None) -> dict:
         """Close claims/enable atomically and retain agents' original host.
+
+        #8384: `force_reason` is the operator's explicit override of the
+        release-check guard, journaled with the drain (`host.drain_forced`);
+        `None` means the guard refused nothing.
 
         #3029: an elected role holding its lease on this host is returned in
         the same transaction, with its epoch bumped, so another candidate can
