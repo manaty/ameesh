@@ -38,6 +38,17 @@
       "replica": true,
       "standby_enter_argv": ["/usr/bin/sudo", "-n", "/usr/local/sbin/ameesh-mode-veille", "entrer"],
       "standby_exit_argv": ["/usr/bin/sudo", "-n", "/usr/local/sbin/ameesh-mode-veille", "sortir"]
+    },
+    "ci-host": {
+      "kind": "ci",
+      "zone": "fr-par-1",
+      "server_id": "44444444-4444-4444-8444-444444444444",
+      "project_id": "22222222-2222-4222-8222-222222222222",
+      "timezone": "Europe/Paris",
+      "release_windows": ["11:00", "23:00"],
+      "quiesce_argv": ["/opt/ameesh-vm-adapter/venv/bin/python", "-I", "/opt/ameesh-vm-adapter/commandes/vm-commande.py", "quiesce", "/etc/ameesh-vm-adapter/cibles/ci-host.json"],
+      "halt_argv": ["/opt/ameesh-vm-adapter/venv/bin/python", "-I", "/opt/ameesh-vm-adapter/commandes/vm-commande.py", "halt", "/etc/ameesh-vm-adapter/cibles/ci-host.json"],
+      "halted_argv": ["/opt/ameesh-vm-adapter/venv/bin/python", "-I", "/opt/ameesh-vm-adapter/commandes/vm-commande.py", "halted", "/etc/ameesh-vm-adapter/cibles/ci-host.json"]
     }
   }
 }

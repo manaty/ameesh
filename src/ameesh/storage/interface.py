@@ -6949,13 +6949,19 @@ class CiResults(Domain):
     @abc.abstractmethod
     def observe_runners(self, repo: str, runners: Sequence[dict]) -> None:
         """Enregistre l'état des runners du dépôt (relevé `ci.Watcher`) :
-        `[{id, name, busy, job, stuck, labels}]`. `stuck_since` garde le début
-        de l'épisode « busy sans job in_progress » et redevient NULL dès qu'il
-        finit ; `busy_since` suit l'état busy, pour le diagnostic. #8031 :
+        `[{id, name, busy, job, stuck, labels, online}]`. `stuck_since` garde le
+        début de l'épisode « busy sans job in_progress » et redevient NULL dès
+        qu'il finit ; `busy_since` suit l'état busy, pour le diagnostic. #8031 :
         `labels` porte les étiquettes du runner, en ligne ou hors ligne (NULL :
-        non relevé), pour la correspondance hôte → file servie. Les runners
-        absents du relevé (retirés du dépôt) sont supprimés : pas d'alerte
-        fantôme. Un relevé partiel n'est jamais écrit (l'appelant le saute)."""
+        non relevé), pour la correspondance hôte → file servie. #8422 :
+        `online` dit si le runner est connecté (un runner hors ligne n'est
+        jamais busy) ; `last_busy_at` garde le dernier relevé où il était
+        occupé, que la fin du job efface de `busy_since`. `state_seen_at` date
+        ces deux faits dans la même écriture que `seen_at` : un veilleur N-1
+        qui ne nomme pas ces colonnes laisse un écart, lu comme un doute. Les
+        runners absents du relevé (retirés du dépôt) sont supprimés : pas
+        d'alerte fantôme. Un relevé partiel n'est jamais écrit (l'appelant le
+        saute)."""
 
     @abc.abstractmethod
     def stuck_runners(self) -> list[dict]:
@@ -6967,7 +6973,11 @@ class CiResults(Domain):
     def all_runners(self) -> list[dict]:
         """#8031 : tous les runners relevés du dépôt, avec `labels` (liste ou
         NULL) et `seen_ts` : une VM CI arrêtée reste enregistrée hors ligne,
-        et ses étiquettes nomment la file qu'elle peut servir au réveil."""
+        et ses étiquettes nomment la file qu'elle peut servir au réveil.
+        #8422 : `online` (connecté ?) et `last_busy_ts` (dernier relevé busy,
+        NULL si jamais vu busy) fondent la preuve de retour et celle de repos
+        de l'adaptateur VM ; `state_seen_ts` date leur écriture et doit valoir
+        `seen_ts` (NULL ou différent : relevé N-1, donc doute)."""
 
     @abc.abstractmethod
     def observe_queue(self, repo: str, *, oldest_id: int | None, oldest_at: str | None,

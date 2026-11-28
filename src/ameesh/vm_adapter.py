@@ -218,22 +218,35 @@ def enrollment(value, *, local_host=None):
                 raise Refused('exact VM and project UUIDs required') from None
         if not re.fullmatch(r'[a-z]{2}-[a-z]{3}-[1-9]', target.get('zone', '')):
             raise Refused('invalid target zone')
+        # #8422: an agent target keeps its probe and health contract; a CI
+        # target is proved by its measured runners instead (README).
+        kind = target.get('kind', 'agent')
+        if kind not in ('agent', 'ci'):
+            raise Refused('invalid target kind')
+        replica = target.get('replica', False)
+        if not isinstance(replica, bool):
+            raise Refused('replica must be true or false')
+        if kind == 'ci' and replica:
+            raise Refused('a CI target cannot be a replica')
         # #6017: the one identity the health command runs on a closed return.
         probe = target.get('probe_agent')
-        if not isinstance(probe, str) or not config.NAME_RE.fullmatch(probe):
-            raise Refused('explicit probe agent required')
+        if kind == 'agent':
+            if not isinstance(probe, str) or not config.NAME_RE.fullmatch(probe):
+                raise Refused('explicit probe agent required')
+        elif probe is not None and (not isinstance(probe, str)
+                                    or not config.NAME_RE.fullmatch(probe)):
+            raise Refused('invalid probe agent')
         identity = (target['zone'], target['server_id'])
         if identity in seen:
             raise Refused('duplicate VM mapping')
         seen.add(identity)
-        replica = target.get('replica', False)
-        if not isinstance(replica, bool):
-            raise Refused('replica must be true or false')
         standby = ('standby_enter_argv', 'standby_exit_argv')
         if not replica and any(key in target for key in standby):
             raise Refused('standby commands require replica: true')
-        for key in ('health_argv', 'reconcile_argv', 'quiesce_argv', 'halt_argv', 'halted_argv') + (
-                standby if replica else ()):
+        commands = ('quiesce_argv', 'halt_argv', 'halted_argv')
+        if kind == 'agent':
+            commands = ('health_argv', 'reconcile_argv') + commands
+        for key in commands + (standby if replica else ()):
             argv = target.get(key)
             if (not isinstance(argv, list) or not argv or not all(
                     isinstance(a, str) and a and '\x00' not in a for a in argv)
@@ -531,8 +544,12 @@ def stalled_role_wakes(queue, targets, controls, *, now):
     return stalled
 
 
-def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
-    """Revalidate native release proof and elected leader/reserve at effect time."""
+def stop_evidence(cfg, db, host, control, *, now, quiet_s=None, on_ts=None):
+    """Revalidate native release proof and elected leader/reserve at effect time.
+
+    `on_ts` is accepted for the shared call site (#8422): an agent host proves
+    its rest from the host reading, a CI host from its measured runners.
+    """
     canons, unknown = host_release._canon_read(cfg)
     if unknown:
         raise Refused('canon unavailable')
@@ -583,6 +600,52 @@ def stop_evidence(cfg, db, host, control, *, now, quiet_s=None):
     if fp.get('state') != 'idle':
         raise Refused('host no longer idle')
     return fp
+
+
+def ci_stop_evidence(cfg, db, host, control, *, now, quiet_s=None, on_ts=None):
+    """#8422: rest proof of a `kind: ci` target, without a host reading.
+
+    A CI VM publishes no host reading, has no ameesh runner and no probe
+    agent. Its rest is measured on the same CI domain as its wake (#8031):
+    the wake queue must be readable and idle (a waiting job or an unreadable
+    measurement is doubt and forbids the stop), no registered runner may be
+    busy, and the last busy scan, bounded by the VM's own `on_since`, must be
+    older than `quiet_s` (the enrollment hysteresis, at least
+    `idle_after_s`). The returned footprint has the shape the tick's
+    hysteresis reads (`state`, `capacity`, `idle_since`).
+    """
+    canons, unknown = host_release._canon_read(cfg)
+    if unknown:
+        raise Refused('canon unavailable')
+    if not canons:
+        raise Refused('no canon configured')
+    activity = host_release.ci_runner_activity(db, host, now=now)
+    if activity.get('state') == 'inert':
+        raise Refused('CI runners not measured')
+    if activity.get('state') != 'ok':
+        raise Refused(activity.get('reason') or 'CI runners unreadable')
+    if activity.get('busy'):
+        raise Refused('CI runner busy: ' + ', '.join(activity['busy']))
+    ci = host_release.ci_wake_evidence(
+        db, host, now=now, released_ts=(control or {}).get('released_ts'))
+    if ci.get('state') == 'waiting':
+        raise Refused('CI job waiting for %s (%s)' % (
+            ', '.join(ci.get('labels') or ()), ci.get('repo') or '?'))
+    if ci.get('state') != 'idle':
+        raise Refused('CI queue unreadable: '
+                      + (ci.get('reason') or 'no measurement'))
+    idle_since = max((value for value in (activity.get('last_busy_ts'), on_ts)
+                      if isinstance(value, (int, float))), default=None)
+    if quiet_s is not None and idle_since is None:
+        # Neither a busy scan nor the VM's own start instant: the quiet
+        # bound cannot be proved. Doubt never opens a drain.
+        raise Refused('CI rest not measured')
+    if (quiet_s is not None and idle_since is not None
+            and now - idle_since < quiet_s):
+        raise Refused('CI runners not at rest for %d s'
+                      % math.ceil(quiet_s - (now - idle_since)))
+    return {'capacity': 'burst', 'unknown': [], 'state': 'idle',
+            'idle_since': idle_since}
 
 
 def current(control, request):
@@ -658,7 +721,7 @@ def prepare_elected_wake(db, policy, host, listing, lots, controls, holds):
                 return
 
 
-def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop_evidence):
+def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=None):
     """One bounded operator tick; never opens native claims itself.
 
     #8382: the successful provider read of a tick stays durable even when the
@@ -667,7 +730,14 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
     it is replayed in its own transaction before the failure leaves. Only a
     real observation gap (unreadable provider, stopped worker) then breaks the
     90 s continuity and resets `on_since`.
+
+    #8422: `evidence` defaults to the proof of the target's kind; a CI target
+    reads its runners instead of the host reading.
     """
+    if evidence is None:
+        evidence = (ci_stop_evidence
+                    if policy['targets'][host].get('kind') == 'ci'
+                    else stop_evidence)
     tick_state = []
     try:
         result = _tick_host(cfg, db, policy, host, provider, probe=probe,
@@ -702,6 +772,87 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
                      or control.get('standby_exit_failed_ts') is not None)):
             return standby_exit(db, policy, host, probe, prefix='inactive')
     return result
+
+
+def tick_target(cfg, db, policy, host, provider, *, probe=run_probe,
+                evidence=None):
+    """#8422: dispatch one enrolled target to its own controller.
+
+    An agent target keeps the historical tick. A CI target has no ameesh
+    runner and no Host-card lifecycle hook, so nobody on the VM asks for the
+    withdrawal: the operator worker is its controller. While the target is
+    free (`available` or known), `ci_start` decides whether the measured rest
+    opens the drain; once the control is draining/returning, the normal tick
+    carries the two phases and the wake.
+    """
+    target = policy['targets'][host]
+    if target.get('kind') != 'ci':
+        return tick_host(cfg, db, policy, host, provider, probe=probe,
+                         evidence=evidence)
+    control = Queue(db).control(host)
+    if control and control['mode'] in ('draining', 'returning'):
+        if control['claims_open']:
+            return 'returning'
+        return tick_host(cfg, db, policy, host, provider, probe=probe,
+                         evidence=evidence)
+    return ci_start(cfg, db, policy, host, provider)
+
+
+def ci_start(cfg, db, policy, host, provider):
+    """#8422: the controller opens a CI drain on a measured rest.
+
+    The stop proof is the same as the halt's (`ci_stop_evidence`): readable
+    idle wake queue, no busy runner, last busy older than the enrollment
+    hysteresis. The drain is written `automatic` and claims are closed, like
+    the scanner does for an agent host; the two adapter requests are queued
+    right after, so the existing two-phase stop carries it. A failure between
+    the two writes is repaired by the next tick (the control is draining and
+    its `draining` request is missing).
+
+    A returned CI host is `available` with claims **open**: `ci_ready`
+    reopens them (`undrain`) before `complete_return`, and no agent ever
+    claims on a CI VM. That state is the normal start of a new cycle, not a
+    concurrent wave. The generation/epoch read before the stop proof must
+    still be the live one when the proof is done; `drain` is then the atomic
+    decision (it closes claims in its own transaction), and a concurrent wave
+    that won it keeps its generation and requests.
+    """
+    try:
+        holds = {row['host']: row for row in storage.of(db).hosts.holds()}
+    except Exception:  # noqa: BLE001 - a hold is safety, not a tick crash
+        return 'holds unreadable'
+    if host in holds:
+        return 'held'
+    control = Queue(db).control(host)
+    now = Queue(db).now()
+    state = provider.state(policy['targets'][host])
+    observed = Queue(db).observe(host, state, policy['observation_gap_s'])
+    if state != 'running':
+        return 'provider ' + state
+    delay = observed['wake_delay_s'] or policy['wake_delay_s']
+    quiet_s = max(cfg.idle_after_s, policy['min_on_s'], 2 * delay)
+    try:
+        ci_stop_evidence(cfg, db, host, control or {}, now=now,
+                         quiet_s=quiet_s, on_ts=observed['on_ts'])
+    except Refused as exc:
+        return 'CI rest: ' + str(exc)
+    fresh = Queue(db).control(host)
+    if fresh and fresh['mode'] not in (None, 'available'):
+        return 'CI control changed'
+    if ((fresh or {}).get('generation') != (control or {}).get('generation')
+            or (fresh or {}).get('release_epoch')
+            != (control or {}).get('release_epoch')):
+        return 'CI control changed'
+    row = storage.of(db).host_lifecycle.drain(
+        host, actor='vm-adapter', automatic=True, close_claims=True)
+    if row is None:
+        return 'drain refused'
+    if row['mode'] != 'draining' or row['claims_open']:
+        return 'CI control changed'
+    q = Queue(db)
+    q.request(host, row['generation'], row['release_epoch'], 'draining')
+    q.request(host, row['generation'], row['release_epoch'], 'idle-drained')
+    return 'draining requested'
 
 
 def replicas_back(db, policy):
@@ -763,6 +914,38 @@ def standby_exit(db, policy, host, probe, *, prefix='ready'):
     return prefix + '; standby exit failed (synchronous list left empty)'
 
 
+def ci_ready(q, db, host, control, request, *, after, now):
+    """#8422: a CI VM is back once its measured runners are online.
+
+    No host reading and no probe agent exist on these VMs; the return proof is
+    the CI measurement itself, made **after** the power-on: every registered
+    runner of the host online, none busy (README). The `busy` request is
+    completed with that proof, then the control returns: `undrain` opens the
+    gate (there is no agent claim to reopen) and `complete_return` makes the
+    host `available`, so the controller can open a later drain.
+    """
+    activity = host_release.ci_runner_activity(db, host, now=now, after=after)
+    if activity.get('state') == 'inert':
+        return 'CI runners not measured'
+    if activity.get('state') != 'ok':
+        return activity.get('reason') or 'CI runners unreadable'
+    if not activity.get('online'):
+        return 'CI runners offline'
+    if activity.get('busy'):
+        return 'CI runner busy after return'
+    q.healthy(host)
+    q.complete(request, 'runners online')
+    api = storage.of(q.db).host_lifecycle
+    if control['mode'] != 'returning':
+        if api.undrain(host, actor='vm-adapter', claims_open=True,
+                       generation=control['generation'],
+                       release_epoch=control['release_epoch']) is None:
+            return 'return pending'
+    if not api.complete_return(host, control['generation']):
+        return 'return pending'
+    return 'ready'
+
+
 def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
     target = policy['targets'][host]
     store = storage.of(db)
@@ -791,7 +974,11 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
     # #6017: the probe runs only once the closed return admits its identity.
     if (prepared and prepared[0]['state'] == 'busy' and current(control, prepared[0])
             and control['mode'] == 'returning'
-            and Queue(db).return_probe(host) == target['probe_agent']
+            # #8422: a CI target has neither a probe nor health commands; it
+            # never enters this agent-only pre-probe.
+            and target.get('probe_agent') is not None
+            and target.get('health_argv') is not None
+            and Queue(db).return_probe(host) == target.get('probe_agent')
             and not any(h['host'] == host for h in store.hosts.holds())
             and provider.state(target) == 'running'
             and host_release._fresh_reading(cfg, db, host, now=Queue(db).now(),
@@ -844,6 +1031,16 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
                 deadline = control.get('return_ts')
                 if deadline is not None and deadline - now < required:
                     q.finish(row, 'pending', 'drain too short for halt: needs %d s' % math.ceil(required))
+        if (target.get('kind') == 'ci' and control['mode'] == 'draining'
+                and control['release_state'] == 'draining'
+                and control.get('hook_state') is None
+                and not control['claims_open']):
+            # #8422: the controller wrote the drain and died before queueing
+            # the two requests; the next tick repairs it (idempotent).
+            q.request(host, control['generation'], control['release_epoch'],
+                      'draining')
+            q.request(host, control['generation'], control['release_epoch'],
+                      'idle-drained')
         listing = store.operations.listing()
         lots = store.operations.open_lots_activity(None)
         holds = {h['host']: h for h in store.hosts.holds()}
@@ -927,7 +1124,13 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
                 return 'provider transition'
             quiet_s = max(cfg.idle_after_s, policy['min_on_s'], 2 * delay)
             try:
-                fp = evidence(cfg, tx, host, control, now=now, quiet_s=quiet_s)
+                if target.get('kind') == 'ci':
+                    fp = ci_stop_evidence(cfg, tx, host, control, now=now,
+                                          quiet_s=quiet_s,
+                                          on_ts=observed['on_ts'])
+                else:
+                    fp = evidence(cfg, tx, host, control, now=now,
+                                  quiet_s=quiet_s, on_ts=observed['on_ts'])
             except Refused as exc:
                 # #8126: each canon refusal keeps its own durable marker, so
                 # the alert names the right cause; any other refusal still
@@ -998,6 +1201,14 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
         if state != 'running':
             return 'provider transition'
         after = max(observed['on_ts'] or now, observed['poweron_ts'] or 0, control['requested_ts'])
+        if target.get('kind') == 'ci':
+            # #8422: runners online replace the host reading and the probe.
+            # The measurement must postdate the power-on, not the later tick
+            # that observed the VM running.
+            ci_after = (observed['poweron_ts'] or observed['on_ts']
+                        or control['requested_ts'])
+            return ci_ready(q, tx, host, control, request, after=ci_after,
+                            now=now)
         if not host_release._fresh_reading(cfg, tx, host, now=now, after=after):
             return 'fresh reading pending'
         if control['mode'] != 'returning' or control['return_probe'] != target['probe_agent']:
@@ -1125,7 +1336,7 @@ def main(argv=None):
         provider = Scaleway(credentials['secret_key'], timeout=policy['io_timeout_s'])
         for host in policy['targets']:
             try:
-                result = tick_host(cfg, db, policy, host, provider)
+                result = tick_target(cfg, db, policy, host, provider)
                 print(host + ': ' + result)
             except Exception as error:
                 print(host + ': adapter unavailable at tick: ' + failure_cause(error)
