@@ -19,7 +19,7 @@ from ameesh import (exploitation, alert_briefs, plan_git, resolutions, train,
                     train_git, train_runner, train_runtime)
 from .test_l160e2_land import _Land
 from .test_l160b_radar import _git
-from .test_7967_train_sommeil import TrainStuckHourTest
+from . import test_7967_train_sommeil
 
 BRANCH = "integration/train-20261128-1406-165f1938763407b2"
 
@@ -148,14 +148,15 @@ class PilotOnceTest(unittest.TestCase):
         send.assert_not_called()
 
 
-class DrainingCapTest(TrainStuckHourTest):
+class DrainingCapTest(unittest.TestCase):
     """Un `draining` alerte au plus tard à 2 h, même sous une cadence de 12 h."""
     rules = types.SimpleNamespace(next_packet=lambda at: (
         23 * 3600.0 if at < 23 * 3600.0 else 35 * 3600.0))
 
     def alerts(self, phase, age):
+        stuck = test_7967_train_sommeil.TrainStuckHourTest
         started = 11 * 3600.0
-        db = self.Db([self.row(phase=phase, started_ts=started)])
+        db = stuck.Db([stuck.row(None, phase=phase, started_ts=started)])
         with mock.patch.object(exploitation, "_packet_calendar", return_value=self.rules):
             return exploitation._train_stuck(db, started + age, cfg=object())
 
