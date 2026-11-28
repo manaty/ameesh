@@ -837,6 +837,11 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
     return None
 
 
+#: the bound of one `version-level.py level` run (#8455: a few dozen seconds
+#: once its runs are memoized, 300 s before)
+VERSION_LEVEL_TIMEOUT_S = 300.0
+
+
 def version_floor(repo: str, since: str, target: str) -> tuple[str, str]:
     """The `version-level.py` floor of the range, or `unknown`."""
     script = os.path.join(repo, "scripts", "version-level.py")
@@ -850,8 +855,12 @@ def version_floor(repo: str, since: str, target: str) -> tuple[str, str]:
                     "exec(compile(sys.stdin.read(), __file__, 'exec'))")
         proc = subprocess.run([sys.executable, "-c", launcher, script,
                                "level", since, target], input=source.stdout,
-                              capture_output=True, text=True, cwd=repo, timeout=300.0)
-    except (subprocess.TimeoutExpired, OSError) as exc:
+                              capture_output=True, text=True, cwd=repo,
+                              timeout=VERSION_LEVEL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        # #8455: said as such, not as a bare `unknown` level.
+        return "unknown", "version-level.py: %d s timeout exceeded" % VERSION_LEVEL_TIMEOUT_S
+    except OSError as exc:
         return "unknown", "version-level.py: %s" % exc
     if proc.returncode != 0:
         return "unknown", " ".join((proc.stderr or proc.stdout or "").split())[-300:]
@@ -1876,6 +1885,10 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
     floor, floor_reason = ("patch", "no previous tag")
     if previous:
         floor, floor_reason = version_floor(project.repo, previous["tag"], base)
+    if floor == "unknown":
+        # #8455: the report and the mail say why (a timeout, an error).
+        raise ReleaseError("the content's version level is unknown (%s): no release"
+                           % _clean(floor_reason, 300))
     if version is None:
         if previous and version_tuple(current) > version_tuple(previous["version"]):
             # An untagged version bump left by a crashed run: keep it only if
