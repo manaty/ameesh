@@ -37,6 +37,16 @@
 # #3042 : PostgreSQL n'est pas un `service:` — macOS n'a pas de conteneurs —
 # et les outils GNU (findutils pour `find -printf`) viennent de Homebrew, pour
 # donner à la suite le même socle shell que les hôtes Linux qu'elle teste.
+#
+# #8394 : le nocturne du 27/11 (run 45997343328) n'a produit aucune preuve —
+# runner perdu à 45 min (part 1/12), `pypi.org` non résolu par le runner (part
+# 11/12, cinq essais pip en 3 min 40), et parts 3/12 et 8/12 coupées au
+# plafond de 90 min alors qu'elles passaient encore des tests. Aucun test
+# négatif : c'est un résultat non concluant (canon §3), mais la preuve de
+# portabilité de la nuit manquait. Le plafond d'une part passe à 120 min (pire
+# durée mesurée ~100 min plus 20 %), l'installation des dépendances a trois
+# tentatives bornées, et un cache pip est réservé aux runs de confiance
+# (`pull_request_target` en est exclu, #3207).
 name: macos
 
 on:
@@ -154,10 +164,17 @@ jobs:
       fail-fast: false
       matrix:
         part: ${{ fromJSON(needs.plan.outputs.psycopg) }}
-    # Une part : 20 à 47 min mesurées sous macOS (runs 40176501547,
-    # 40477342997), plus ~5 min d'installation. 90 min laissent la marge d'un
-    # runner lent sans retenir une part bloquée pendant des heures.
-    timeout-minutes: 90
+    # #8394 : une part dure de 26 à 87,5 min selon le runner — 87,5 min sur le
+    # run vert 45618065525 (25/11, part 4/12) — et les parts 3/12 et 8/12
+    # tournaient encore à 83-84 min sur le run 45997343328 (27/11), à 18 et
+    # 33 modules de la fin (~100 min au total pour 8/12). Le plafond de 90 min
+    # n'avait donc plus de marge et a coupé ces deux parts en cours de route.
+    # 120 min = pire durée mesurée (~100 min) plus 20 % ; au-delà, le timeout
+    # coupe la part fautive sans retenir les autres (fail-fast: false). Pas de
+    # redécoupage : la part la plus longue change de run en run (4/12 le
+    # 25/11, 3/12 et 8/12 le 27/11), et les durées de `durees.json` sont
+    # mesurées sous Linux, donc elles ne prédisent pas la lenteur macOS.
+    timeout-minutes: 120
     env:
       AMEESH_REQUIRE_DB: "1"
       AMEESH_CI_TETE: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -169,7 +186,25 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
-          # #3207 : pas de cache pip (voir le job plan).
+          # #3207 : toujours pas de `cache` pip de setup-python (clé tirée du
+          # pyproject de la PR, écrite dans la portée de la base sous
+          # `pull_request_target`). Le cache ci-dessous est borné aux runs de
+          # confiance et sa clé ne contient rien de la PR (#8394).
+      - name: cache pip (roues et index téléchargés, hors pull_request_target)
+        # #8394 : le runner du 27/11 a perdu la résolution de `pypi.org`
+        # (NameResolutionError, cinq essais pip en 3 min 40) ; le cache évite
+        # de re-télécharger les roues à chaque nuit et donne un repli local.
+        # #3207 : jamais sous `pull_request_target` — un run de PR écrirait le
+        # cache de la branche de base depuis la tête de la PR. La clé ne porte
+        # que le système, la version de Python et l'empreinte du workflow
+        # (donc de la ligne de dépendances), jamais un fichier de la PR.
+        if: github.event_name != 'pull_request_target'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-macos-3.12-${{ runner.arch }}-${{ hashFiles('.github/workflows/macos.yml') }}
+          restore-keys: |
+            pip-macos-3.12-${{ runner.arch }}-
       - name: PostgreSQL et outils GNU (Homebrew)
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -210,12 +245,38 @@ jobs:
           done
           createdb -h 127.0.0.1 -p 5432 -U ameesh ameesh
           psql -h 127.0.0.1 -p 5432 -U ameesh -d ameesh -v ON_ERROR_STOP=1 -c 'select version()'
-      - name: dépendances Python (psutil, psycopg, chiffrement, PyYAML)
-        run: >-
-          python -m pip install 'psutil>=5.9' 'psycopg[binary]>=3.1'
-          'cryptography>=41' 'pyyaml>=6' 'coverage>=7.10'
-      - name: paquet importable par les sous-processus hors du dépôt
-        run: python -m pip install --no-deps -e .
+      - name: "dépendances Python et paquet importable (réessai borné, #8394)"
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          set -euo pipefail
+          # #8394 : une panne DNS du runner (27/11) ne doit plus perdre la
+          # part ; trois tentatives bornées, puis l'échec explicite. `--retries
+          # 5 --timeout 30` laisse à pip ses propres reprises sur une coupure
+          # courte ; le cache pip ci-dessus sert les roues déjà téléchargées.
+          # Le paquet éditable est dans la même boucle : son isolation de
+          # build télécharge aussi `setuptools>=77`, donc il dépend du même
+          # index, et une part ne part pas sans lui (les sous-processus hors
+          # du dépôt importent `ameesh`). Le `&&` est explicite : une fonction
+          # appelée dans un `if` désactive `errexit`, et le paquet ne doit pas
+          # s'installer si les dépendances ont échoué.
+          deps=( 'psutil>=5.9' 'psycopg[binary]>=3.1' 'cryptography>=41'
+                 'pyyaml>=6' 'coverage>=7.10' )
+          installer() {
+            python -m pip install --timeout 30 --retries 5 "${deps[@]}" &&
+            python -m pip install --no-deps --timeout 30 --retries 5 -e .
+          }
+          for tentative in 1 2 3; do
+            if installer; then
+              break
+            fi
+            if [ "$tentative" -eq 3 ]; then
+              echo "::error::dépendances Python indisponibles après 3 tentatives (réseau ou index pypi)" >&2
+              exit 1
+            fi
+            echo "::warning::pip a échoué (tentative $tentative/3) ; nouvel essai dans $((tentative * 30)) s" >&2
+            sleep $((tentative * 30))
+          done
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: plan
