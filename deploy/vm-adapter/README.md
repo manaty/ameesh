@@ -790,6 +790,76 @@ déclarer le hook en permanence, et rendre un burst après 30 min sans
 travail hors fenêtre, il faut une interface qui compte les jobs guest d'un
 hôte prêteur (C5). C'est un lot de suite.
 
+## Mode veille de la base (#8420, #8029)
+
+Les VM `ameesh-agents-1` et `-2` portent les deux standbys synchrones du hub
+(deploy/serveur/replication/README.md, « Mode veille »). Avant d'arrêter la
+première, la liste synchrone du hub doit être vidée, sinon chaque `COMMIT`
+attendrait un standby éteint. Une cible qui porte une réplique se déclare
+ainsi dans l'enrôlement :
+
+- `"replica": true`, avec `standby_enter_argv` et `standby_exit_argv`
+  (commandes fixes et absolues, comme les autres) ; sans `replica: true`,
+  ces deux clés sont refusées ;
+- `standby_timeout_s` au niveau de l'enrôlement, obligatoire dès qu'une
+  cible est une réplique (entre `io_timeout_s` et 120 s).
+
+Comportement du worker :
+
+1. **Entrée, échec fermé.** Après chaque `quiesce` de la phase d'arrêt,
+   `standby_enter_argv` s'exécute : avant de poser l'intention d'arrêt, puis
+   à nouveau juste avant `halt_argv`. Une sortie non nulle (ou le délai)
+   donne `standby enter refused` : ni intention d'arrêt, ni arrêt. Le tick
+   suivant rejoue (le script est idempotent). Si l'intention était déjà posée,
+   la borne `halt_deadline_s` court et son alerte `halt_deadline` nomme
+   l'hôte, sans arrêt.
+2. **Sortie après le retour sain des deux répliques.** Quand le retour d'une
+   réplique est sain et réconcilié (`ready`), le worker vérifie que toutes
+   les cibles `replica` sont revenues (portes ouvertes, ou retour de la
+   génération courante terminé). Sinon il attend le retour de l'autre
+   (`ready; standby exit waits for the other replica`). Sinon il lance
+   `standby_exit_argv` (`mode-veille.sh sortir`, sans effet hors veille).
+3. **Échec de la sortie : alerte, le retour tient.** Le retour n'est jamais
+   défait. Le journal du worker porte
+   `ready; standby exit failed (synchronous list left empty)` et un événement
+   `vm.standby_exit_failed` (hôte, génération, époque) est écrit. La liste
+   reste vide : état sûr, durabilité dégradée. L'opérateur rejoue
+   `mode-veille.sh sortir` après `etat.sh` ; le retour suivant d'une
+   réplique le rejoue aussi.
+
+Commande opérateur. `mode-veille.sh` tourne en root sur le hub, et ses
+attentes (`ATTENTE_TOURS` 600 s, `ATTENTE_REVEIL` 900 s) dépassent la borne
+du worker. Les argv pointent donc sur un enveloppeur fixe, root:root 0755,
+qui raccourcit ces attentes sous `standby_timeout_s`. Le worker rejoue à
+chaque tick, et un processus tué au délai ne passe pas par le retour arrière
+du script. Exemple, sur le hub :
+
+```bash
+#!/bin/bash
+# /usr/local/sbin/ameesh-mode-veille (entrer|sortir)
+set -euo pipefail
+case ${1:-} in entrer | sortir) ;; *) exit 2 ;; esac
+export AMEESH_REPLICATION_ATTENTE_TOURS=40 AMEESH_REPLICATION_ATTENTE_REVEIL=40
+exec /opt/ameesh/src/deploy/serveur/replication/mode-veille.sh "$1" \
+  --raison "vm-adapter #8029"
+```
+
+Une règle sudoers n'autorise que ces deux argv au compte du worker. Si le
+contrôleur n'est pas le hub, l'enveloppeur est une commande SSH forcée vers le
+hub, du même modèle que `vm-commande.py`. Aucun secret ne passe en argument.
+
+**Préalable avant tout essai réel (bureau).** Vérifier l'état réel de la
+réplication (EP8, #6860 livré, adoption #6959 en attente) avec
+`deploy/serveur/replication/etat.sh` sur le hub. Si elle ne tourne pas, ne
+déclarer aucune cible `replica` : `mode-veille.sh` refuserait (primaire hors
+hub, ou aucun standby à rattraper au réveil) et aucune VM ne s'arrêterait. Ce
+lot livre le code et ses témoins, sans essai réel.
+
+Limite : l'échec de sortie est un événement et une ligne de journal, pas
+encore une alerte de `host_release.alerts`. Un retour qui rouvre les portes
+sans le worker (`ameesh host undrain`) ne lance pas `sortir` : le rejouer à
+la main.
+
 ## Contrôle et retour arrière
 
 Lire `vm_adapter_requests`, `vm_adapter_observations`, `host_lifecycle` et

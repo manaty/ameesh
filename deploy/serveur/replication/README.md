@@ -476,9 +476,10 @@ PYTHONPATH=src python -m unittest tests.test_6868_replication -v
 - Le réseau privé (#6859) et l'archivage/PITR (#6858) sont des prérequis
   d'autres lots ; les hôtes de `noeuds.conf` sont les adresses privées de
   #6859 (EP8.3, #6860).
-- Le mode veille (#8027) n'est pas encore branché sur le déclencheur
-  d'arrêt/réveil des VM (#8029) : il fournit l'interface (`entrer`/`sortir`)
-  et ses témoins, mais aucun hôte réel n'a été arrêté par ce lot.
+- Le mode veille (#8027) est branché sur le déclencheur d'arrêt/réveil des
+  VM par #8420 (cibles `replica` du `vm_adapter`, voir
+  deploy/vm-adapter/README.md, « Mode veille de la base ») ; aucun hôte réel
+  n'a encore été arrêté avec la veille.
 - Aucune alerte ni sonde de supervision : `etat.sh` est un outil
   d'exploitation, pas un service (EP8.4/EP8.5).
 - La bascule réelle, la fenêtre et la recette sur les trois nœuds restent le
