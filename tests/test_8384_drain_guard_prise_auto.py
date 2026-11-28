@@ -7,11 +7,13 @@ Incident R1 v3 du 27/11 : release-check vert à 22:49Z, prise automatique de
 #8312 par la sonde d'AG3 à 22:57Z, drainage à 23:03Z. Les quatre témoins du lot
 sont ici : (a) lot ouvert → drain refusé, lots nommés ; (b) release-check à 0 →
 drain accepté ; (c) hôte à hook déclaré / sonde → aucune prise ; (d) autre
-hôte → prise inchangée."""
+hôte → prise inchangée. (e) ajouté sur l'avis bloquant d'ameesh-cx2 : une
+lecture de fence en échec ne rend pas un ensemble vide, la prise se ferme."""
 from __future__ import annotations
 
 import dataclasses
 import unittest
+from unittest import mock
 
 from ameesh import host_lifecycle, host_release, storage, work
 
@@ -104,11 +106,36 @@ class AdapterTakeTest(_Lots):
             "UPDATE host_lifecycle SET mode='returning', claims_open=false,"
             " return_probe='probe1' WHERE host='vm-probe'")
         lot = self.lot("travail pendant le retour", app="nexlink")
-        self.assertIn("probe1", host_release.window_probe_agents(self.db))
+        probes, error = host_release.window_probe_agents(self.db)
+        self.assertIsNone(error)
+        self.assertIn("probe1", probes)
         self.assertIn("vm-probe", host_release.adapter_lot_hosts(
             self.cfg, self.db, storage.of(self.db).operations.listing(),
             canons=[]))
         self.assertEqual(self.take(), [])
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+    def test_e_liste_des_sondes_illisible_ne_prend_aucun_lot(self):
+        """Une lecture de fence en échec ne rend pas un ensemble vide : la
+        prise se ferme, sinon la sonde d'une fenêtre dont l'hôte n'a pas de
+        hook détecté prendrait un lot (verdict bloquant ameesh-cx2)."""
+        from ameesh import file_decoupage
+        self.agent("probe1", team="nexlink", host="vm-probe")
+        self.agent("plain1", team="nexlink", host="vm-plain")
+        lot = self.lot("travail", app="nexlink")
+        self.db.execute(
+            "INSERT INTO host_release_operations(operation,host,manifest_digest)"
+            " VALUES ('op-8384','vm-probe',repeat('a',64))")
+        self.db.execute(
+            "INSERT INTO host_release_fences(host,operation,probe)"
+            " VALUES ('vm-probe','op-8384','probe1')")
+
+        with mock.patch.object(file_decoupage, "window_probes",
+                               return_value=(set(), "Boom: fence")):
+            self.assertEqual(host_release.window_probe_agents(self.db),
+                             (set(), "Boom: fence"))
+            self.assertEqual(self.take(), [])
+
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
 
     def test_d_autre_hote_prend_comme_avant(self):

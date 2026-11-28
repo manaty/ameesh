@@ -791,13 +791,19 @@ def adapter_lot_hosts(cfg, db, listing, *, canons):
 
 
 def window_probe_agents(db):
-    """#8384: the identities a closed window admits alone (closed return or
-    live L232b fence). They never receive an automatically taken lot, even if
-    a caller reads the host as open (the health or handoff turn must stay
-    free). Same read as the decoupage's #8072 (`window_probes`)."""
+    """#8384: `({identities}, erreur)` d'une fenêtre d'hôte ouverte.
+
+    Ce sont les identités qu'une fenêtre fermée admet seules (retour fermé ou
+    clôture L232b vivante). Elles ne reçoivent jamais de lot pris
+    automatiquement, même si un appelant lit l'hôte comme ouvert (le tour de
+    santé ou de passation doit rester libre). Même lecture que le #8072 du
+    découpeur (`window_probes`).
+
+    Une lecture en échec rend l'erreur, jamais un ensemble vide : la sonde
+    d'une fenêtre peut se cacher derrière un fence illisible, et la prise
+    automatique doit alors se fermer (le doute ne donne aucun lot)."""
     from .file_decoupage import window_probes
-    probes, _error = window_probes(db)
-    return probes
+    return window_probes(db)
 
 
 def _known_hosts(canons, listing):

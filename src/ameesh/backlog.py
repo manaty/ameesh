@@ -1847,9 +1847,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         # propositions.
         adapter_hosts = host_release.adapter_lot_hosts(
             cfg, db, listing, canons=canons)
-        window_probes = host_release.window_probe_agents(db)
+        window_probes, window_error = host_release.window_probe_agents(db)
 
         def takes_team_lot(row) -> bool:
+            # #8384 : une liste de sondes illisible peut cacher la sonde d'une
+            # fenêtre fermée ; le doute ferme la prise au lieu de la donner.
+            if window_error:
+                return False
             return (row.get("host") not in adapter_hosts
                     and row.get("name") not in window_probes)
 
