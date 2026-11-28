@@ -379,6 +379,9 @@ class Profile:
     declared: bool = False
     #: #4944: explicitly assign historical unnamed balance readings to this profile.
     adopts_unnamed: bool = False
+    #: #8457 : l'opérateur atteste que `env`/`key_env` sont des noms de
+    #: variables publiables (lecture publique des profils)
+    public_names: bool = False
     #: #313/#2580 : raison du refus du compte par CE mesh (`accounts_shared:
     #: refuse` ou `account_sharing: strict`, identifiant déclaré aussi par un
     #: autre mesh de l'hôte, posée par `account_claims.mark_refused`) ; vide =
@@ -708,6 +711,10 @@ def parse(raw) -> dict[str, list[Profile]]:
             if not isinstance(adopts, bool) or (adopts and kind != "api_key_env"):
                 raise AccountError("account %s/%s: adopts_unnamed must be a boolean "
                                    "on an api_key_env profile" % (harness, name))
+            public_names = item.get("public_names", False)
+            if not isinstance(public_names, bool):
+                raise AccountError("account %s/%s: public_names must be a boolean"
+                                   % (harness, name))
             if adopts and any(p.adopts_unnamed for p in profiles):
                 raise AccountError("accounts.%s: only one profile may adopt unnamed "
                                    "balance readings" % harness)
@@ -717,6 +724,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 env=env or (default_key_env_of(harness) if kind == "api_key_env" else ""),
                 key_env=key_env, key_file=_expand(key_file) if key_file else "",
                 hourly_usd=hourly, min_balance=min_balance, adopts_unnamed=adopts,
+                public_names=public_names,
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, scope=scope, **caps,
                 pace_multiplier=pace_multiplier, pace_local=pace_local, declared=True,
@@ -774,9 +782,36 @@ def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
 
 #: schéma du document `ameesh accounts profiles --json`
 PUBLIC_PROFILES_SCHEMA = "ameesh-account-profiles/1"
-#: un nom de variable publiable ; toute autre valeur dans `env`/`key_env`
-#: (une clé collée par erreur à la place du nom) n'est jamais recopiée
-ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+#: #8457 : forme exigée de tout nom publié, même attesté
+ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+#: #8457 : suffixe admis après un nom par défaut de descripteur
+#: (`DEEPSEEK_API_KEY` → `DEEPSEEK_API_KEY_A`)
+ENV_SUFFIX_RE = re.compile(r"^_[A-Z0-9_]{1,32}$")
+
+
+def _trusted_env_name(value: str, profile: Profile, defaults: set[str]) -> bool:
+    """#8457 : `value` (`env`/`key_env`) est un nom de confiance, publiable.
+
+    Modèle de menace : une erreur de collage (une clé collée à la place du
+    nom), pas un adversaire — quiconque écrit la configuration tient déjà
+    les clés. Aucune forme ne distingue une clé d'un nom choisi : la
+    confiance est structurelle. Un nom est de confiance s'il est (a) un nom
+    par défaut déclaré par un descripteur de harnais (liste fermée), (b) un
+    tel nom suivi de `_` et d'un suffixe court (`ENV_SUFFIX_RE`) — un collage
+    ne produit jamais ce préfixe —, ou (c) un nom d'un profil qui porte
+    `public_names: true`. Dans tous les cas, la forme `ENV_NAME_RE` est exigée.
+    La garantie vaut contre le collage par erreur (une clé ne commence jamais
+    par un nom par défaut et ne porte pas d'attestation), pas contre un
+    opérateur qui écrit délibérément une clé sous un nom de confiance.
+    """
+    if not ENV_NAME_RE.match(value):
+        return False
+    if profile.public_names or value in defaults:
+        return True
+    return any(value.startswith(default) and ENV_SUFFIX_RE.match(value[len(default):])
+               for default in defaults)
+
+
 #: raisons fermées d'un profil écarté : jamais le texte de `AccountError`,
 #: qui cite des valeurs et des chemins
 PUBLIC_REFUSALS = ("invalid_accounts", "unknown_harness", "invalid_profile_list",
@@ -785,13 +820,17 @@ PUBLIC_REFUSALS = ("invalid_accounts", "unknown_harness", "invalid_profile_list"
                    "unpublishable_variable_name")
 
 
-def _public_row(profile: Profile) -> dict:
+def _public_row(profile: Profile, defaults: set[str]) -> dict:
+    def name(value: str):
+        return value if value and _trusted_env_name(value, profile, defaults) else None
+
     return {
         "harness": profile.harness,
         "name": profile.name,
         "kind": profile.kind,
-        "env": profile.env or None,
-        "key_env": profile.key_env or None,
+        # #8457 : nul quand le nom n'est pas de confiance (`key_source` le dit)
+        "env": name(profile.env),
+        "key_env": name(profile.key_env),
         # la présence d'un fichier de clé, jamais son chemin
         "key_source": ("file" if profile.key_file else "env" if profile.key_env
                        else None) if profile.kind == "api_key_env" else None,
@@ -805,7 +844,8 @@ def public_profiles(raw) -> dict:
 
     Ni valeur de clé, ni contenu ou chemin de fichier, ni dossier de
     configuration : le nom, le type, le harnais, les **noms** des variables
-    (`env`, `key_env`), la réserve et le compte de facturation. Aucune valeur
+    (`env`, `key_env`, nuls s'ils ne sont pas de confiance :
+    `_trusted_env_name`, #8457), la réserve et le compte de facturation. Aucune valeur
     de clé n'est lue, ni dans l'environnement ni dans un fichier : seule la
     configuration déjà chargée est analysée.
 
@@ -827,17 +867,20 @@ def public_profiles(raw) -> dict:
 
     def refuse(harness, index, name, reason):
         refused.append({
-            "harness": harness if isinstance(harness, str) and NAME_RE.match(harness) else None,
+            # #8457 : un harnais inconnu n'est jamais recopié (une clé collée
+            # à la place du nom de harnais correspondrait à NAME_RE)
+            "harness": harness if harness in known else None,
             "index": index,
             "name": name if isinstance(name, str) and NAME_RE.match(name) else None,
             "reason": reason})
 
+    known = set(harnesses.known_ids())
+    defaults = _all_account_keys("key_env")
     if raw in (None, "", {}):
         raw = {}
     if not isinstance(raw, dict):
         refuse(None, None, None, "invalid_accounts")
         raw = {}
-    known = harnesses.known_ids()
     for harness in sorted(raw, key=str):
         items = raw[harness]
         if harness not in known:
@@ -865,10 +908,6 @@ def public_profiles(raw) -> dict:
             except AccountError:
                 refuse(harness, index, name, "invalid_profile")
                 continue
-            if any(value and not ENV_NAME_RE.match(value)
-                   for value in (profile.env, profile.key_env)):
-                refuse(harness, index, name, "unpublishable_variable_name")
-                continue
             kept.append(profile)
         try:
             _refuse_shared_homes(harness, kept)
@@ -876,7 +915,7 @@ def public_profiles(raw) -> dict:
             # le refus vaut pour le harnais entier : les profils restent
             # listés (leurs noms ne sont pas secrets), le motif est signalé
             refuse(harness, None, None, "shared_configuration_dir")
-        rows.extend(_public_row(profile) for profile in kept)
+        rows.extend(_public_row(profile, defaults) for profile in kept)
     rows.sort(key=lambda row: (row["harness"], row["name"]))
     return {"schema": PUBLIC_PROFILES_SCHEMA, "valid": valid and not refused,
             "profiles": rows, "refused": refused}

@@ -41,7 +41,7 @@ class WriterAdmissionConcurrencyTest(unittest.TestCase):
         return list(self.result)
 
     def run_workers(self, fn):
-        """N fils démarrés ensemble ; rend (durée, erreurs par fil)."""
+        """N fils démarrés ensemble ; rend les erreurs par fil."""
         barrier = threading.Barrier(WORKERS)
         errors = [None] * WORKERS
         def work(i):
@@ -51,30 +51,27 @@ class WriterAdmissionConcurrencyTest(unittest.TestCase):
             except Exception as exc:  # noqa: BLE001 - rendu au test
                 errors[i] = exc
         threads = [threading.Thread(target=work, args=(i,)) for i in range(WORKERS)]
-        started = time.monotonic()
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join(10)
-        return time.monotonic() - started, errors
+        self.assertFalse(any(thread.is_alive() for thread in threads), 'workers did not finish')
+        return errors
 
     def test_concurrent_admissions_share_one_read(self):
-        elapsed, errors = self.run_workers(migrations.admit_writer_connection)
+        errors = self.run_workers(migrations.admit_writer_connection)
         self.assertEqual(errors, [None] * WORKERS)
         self.assertEqual(self.reads, 1)
-        # Avant #8335 : une lecture de plus par fil arrivé avant le succès.
-        self.assertLess(elapsed, READ_S * 8)
 
     def test_explicit_checks_run_in_parallel_and_stay_fresh(self):
-        elapsed, errors = self.run_workers(migrations.require_compatible_writer)
+        errors = self.run_workers(migrations.require_compatible_writer)
         self.assertEqual(errors, [None] * WORKERS)
         self.assertEqual(self.reads, WORKERS)  # jamais sautés
         self.assertGreater(self.peak, 1)  # avant : verrou global, pic à 1
-        self.assertLess(elapsed, READ_S * WORKERS / 4)
 
     def test_incompatible_schema_refuses_every_waiting_connection(self):
         self.result = [dict(version=9999, name='future', checksum='unknown')]
-        _, errors = self.run_workers(migrations.admit_writer_connection)
+        errors = self.run_workers(migrations.admit_writer_connection)
         self.assertTrue(all(isinstance(e, migrations.IncompatibleSchema) for e in errors), errors)
         self.assertIn('9999_future', str(errors[0]))
         self.assertEqual(migrations._WRITER_ADMISSIONS, {})

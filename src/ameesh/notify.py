@@ -467,6 +467,9 @@ TYPE_LABELS = {
     # #5932: a queued VM adapter request is a normal wait; this type names the
     # worker that stopped progressing after a durable poweroff intent.
     "host_release_adapter_stalled": "VM adapter worker stalled after a stop intent",
+    # #8459: the VM adapter could not restore the hub's synchronous standbys;
+    # the list stays empty (safe) until a replay succeeds.
+    "host_release_standby_exit_failed": "standby exit failed, synchronous list empty",
     "fingerprints_source_failing": "failure fingerprints source failing",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
@@ -1848,7 +1851,10 @@ def empty_state() -> dict:
             "avatar_brief_fallback": {},
             #: #8391 : avis de pose d'une pause opérateur datée déjà déposés,
             #: un par hôte et par épisode (hôte → pose, jusqu'à, agents).
-            "pause_notices": {}}
+            "pause_notices": {},
+            #: #8431 : hôtes dont l'avis de pose n'a pas trouvé de pilote, déjà
+            #: journalisés pour l'épisode (hôte → instant du journal).
+            "pause_notices_unrouted": {}}
 
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
@@ -3814,8 +3820,10 @@ class Notifier:
         ne garde qu'un avis par hôte : une maintenance qui pose vingt pauses
         d'affilée n'écrit pas vingt courriers, et un nouvel épisode sur le même
         hôte (toutes les pauses levées puis reposées) en reçoit un. Un envoi en
-        échec n'est pas marqué : la passe suivante réessaie. Jamais fatal au
-        passage.
+        échec n'est pas marqué : la passe suivante réessaie. Sans pilote
+        lisible, le journal ne parle qu'une fois par épisode et par hôte
+        (`pause_notices_unrouted`, #8431) ; la passe suivante réessaie quand
+        même. Jamais fatal au passage.
         """
         if db is None or not self._delivery_open() or self.dry_run:
             return
@@ -3830,28 +3838,42 @@ class Notifier:
             self.log("pause notices not computed (%s)" % exc)
             return
         state = self.state.setdefault("pause_notices", {})
+        unrouted = self.state.setdefault("pause_notices_unrouted", {})
         hosts = {notice["host"] for notice in notices}
-        for host in list(state):
-            if host not in hosts:
-                del state[host]
+        for kept in (state, unrouted):
+            for host in list(kept):
+                if host not in hosts:
+                    del kept[host]
         if not notices:
             return
+
+        def undelivered(text: str) -> None:
+            # #8431 : une ligne par épisode et par hôte, pas une par passe ;
+            # rien n'est marqué dans `state`, la passe suivante réessaie.
+            fresh = sorted(host for host in hosts
+                           if host not in state and host not in unrouted)
+            if not fresh:
+                return
+            for host in fresh:
+                unrouted[host] = now
+            self.log("%s (hosts: %s)" % (text, ", ".join(fresh)))
+
         # #8391 : le pilote est lu au canon, comme le lecteur du train
         # (`train_canon.pilot_of`), pour le projet que le canon sert.
         from . import train_canon
         try:
             recipient = train_canon.canon_pilot_of(self.cfg)(db)
         except Exception as exc:  # noqa: BLE001 - un avis ne fait pas tomber la passe
-            self.log("pause notices not delivered (pilot unreadable: %s)" % exc)
+            undelivered("pause notices not delivered (pilot unreadable: %s)" % exc)
             return
         if not recipient:
-            self.log("pause notices not delivered: no readable pilot in the canon")
+            undelivered("pause notices not delivered: no readable pilot in the canon")
             return
         pilot = next((row for row in listing if row.get("name") == recipient), None)
         if pilot is None or pilot.get("retired_ts"):
             # #3460 : un pilote retiré ne reçoit plus rien ; rien n'est marqué.
-            self.log("pause notices not delivered: pilot %s is not active"
-                     % recipient)
+            undelivered("pause notices not delivered: pilot %s is not active"
+                        % recipient)
             return
         for notice in notices:
             host = notice["host"]
@@ -3866,6 +3888,7 @@ class Notifier:
                 continue
             state[host] = {"since": notice.get("since"), "until": notice.get("until"),
                            "agents": list(notice.get("agents") or ()), "sent_ts": now}
+            unrouted.pop(host, None)
             self.log("[operator_pause_notice] delivered to %s for host %s"
                      % (recipient, host))
 

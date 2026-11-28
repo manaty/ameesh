@@ -4720,8 +4720,10 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                               "unique-ref") % v.noun)
     pw_add.add_argument("--external-executor", default=None, metavar="AGENT",
                         help=("#3447: declare the %s reserved to an external executor "
-                             "(an `externe` agent with a human owner, or human:<id>) "
-                             "without assigning it; L165 does not take it") % v.noun)
+                             "(an `externe` agent with a human owner, human:<id>, or a "
+                             "declared system:<name>) without assigning it; L165 does "
+                             "not take it. #8468: a declared system creating its own "
+                             "lot names itself in --actor") % v.noun)
     pw_add.add_argument("--external-session", default=None, metavar="SESSION",
                         help=("#6839: name the session the fire designates for the "
                              "external gesture; only it can take the claim"))

@@ -491,7 +491,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #5932 : asynchronous adapter wait (state, first instant and the
         -- generation/epoch fence that bounds it); the worker and the stall
         -- alert keep claims closed, nothing secret here.
-        'hook_wait_at', 'hook_wait_state', 'hook_wait_generation', 'hook_wait_epoch'
+        'hook_wait_at', 'hook_wait_state', 'hook_wait_generation', 'hook_wait_epoch',
+        -- #8459 (0615) : dette de veille du hub — entrée sans sortie et
+        -- premier `sortir` en échec ; lue par la projection d'alertes et le
+        -- worker, aucun secret.
+        'standby_entered_at', 'standby_exit_failed_at'
     ]),
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'

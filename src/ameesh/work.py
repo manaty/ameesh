@@ -218,7 +218,8 @@ def is_auditor(cfg, db, name: str) -> bool:
 
 
 def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
-              history: bool = True, auditor: bool = False) -> str:
+              history: bool = True, auditor: bool = False,
+              declared_system: str | None = None) -> str:
     """Qui corrige un état posé par erreur (`work move … --correct`) ; WorkError
     si la correction lui est refusée. `what` (#705) nomme le geste dans les
     messages : la désignation du relecteur demande les mêmes autorités.
@@ -235,7 +236,18 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
 
     `auditor=True` (#3324) ajoute l'auditeur aux autorités : la désignation et
     le retrait d'un relecteur lui sont ouverts (fiche du 24/10, niveau 1), pas
-    le plancher d'avis (`review_floor.set_floor` garde le défaut)."""
+    le plancher d'avis (`review_floor.set_floor` garde le défaut).
+
+    `declared_system` (#8468) est le nom du système non-agent déclaré
+    (`system:…`, #6091) auquel un `work.add` réserve le lot. Un acteur
+    `system:<nom>` n'est alors accepté que s'il est EXACTEMENT ce nom : un
+    système ne réserve que les lots qu'il crée pour lui-même, jamais pour un
+    autre exécutant, et une session liée à un agent ne prend jamais son
+    identité (le contrôle de liaison ci-dessus s'applique d'abord). Aucun
+    autre geste ne passe `declared_system` : la correction, la désignation,
+    la déclaration, le retrait et la levée d'une réservation restent des
+    gestes de pilote (`set_external_executor`, `declare_external_executor`,
+    `retire_external_executor`)."""
     from . import assignments, identity, registry
 
     text = (explicit or "").strip()
@@ -273,6 +285,19 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
         if what == "correction":
             raise WorkError("correction: say who corrects (--actor human:<id>)")
         raise WorkError("%s: say who does it (--actor human:<id>)" % what)
+    target = (declared_system or "").strip()
+    if target and text.startswith(SYSTEM_PREFIX):
+        # #8468 : un système non-agent déclaré ne réserve QUE le lot qu'il
+        # crée pour lui-même. Sa déclaration active est d'abord relue (et de
+        # nouveau sous le verrou d'écriture, `require_external_executor_active`)
+        # : un nom inconnu ou retiré est refusé avant toute écriture.
+        active = check_external_executor(db, text, cfg=cfg)
+        if text == target:
+            return active
+        raise WorkError(
+            "%s refused: %s is a declared non-agent system; it reserves only the "
+            "lots it creates for itself (--actor %s --external-executor %s), "
+            "never a lot reserved to %s" % (what, text, text, text, target))
     if text.startswith(HUMAN_PREFIX):
         return text
     human = known_human(db, text, cfg)
@@ -743,7 +768,12 @@ def add(
     lot est réservé, sans l'assigner : L165 ne le prend pas, l'alerte et le
     débit le nomment. Le geste est celui d'un pilote (`corrector`,
     `history=False`) ; un lot ne porte pas deux exécutants (`assignee` et
-    `external_executor` s'excluent).
+    `external_executor` s'excluent). #8468 : un système non-agent déclaré
+    (`system:<nom>`, #6091) qui crée le lot réservé à lui-même agit en son nom
+    (`--actor system:<nom>` == `--external-executor`) ; il ne peut ni réserver
+    pour un autre exécutant ni prendre un lot d'autrui, et le journal nomme le
+    système et son responsable humain. Les autres gestes de réservation
+    restent ceux d'un pilote.
 
     #6839 : `external_session` nomme la session que le feu désigne pour ce
     geste unique ; une autre session ne pourra pas le prendre. Sans elle,
@@ -1014,8 +1044,20 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
                             "external executor (or assign it instead)" % assignee)
         # #3447 : déclarer l'exécutant externe est un geste de pilote. Le lot
         # reste sans assigné (l'agent externe ne se réveille pas, 0030).
-        actor = corrector(cfg, db, actor, what="external executor", history=False)
+        # #8468 : exception étroite — un système non-agent déclaré qui crée le
+        # lot réservé à lui-même (`--actor system:<nom>` == `--external-executor`)
+        # agit en son nom ; la garde ne vaut que pour cette création.
+        actor = corrector(
+            cfg, db, actor, what="external executor", history=False,
+            declared_system=(external_executor
+                             if external_executor.startswith(SYSTEM_PREFIX) else None))
         external_executor = check_external_executor(db, external_executor, cfg=cfg)
+    system_reservation = None
+    if external_executor and external_executor.startswith(SYSTEM_PREFIX):
+        # #8468 : le journal de création nomme le système ET son responsable
+        # humain déclaré. Lecture après `check_external_executor` (déclaration
+        # active) ; la transaction d'écriture la reverrouille de toute façon.
+        system_reservation = storage.of(db).external_executors.get(external_executor)
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
     # #6525 : sans `--target`, une branche créée hérite de la cible déclarée
@@ -1031,8 +1073,11 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         impact = None
     created = ("created" + (" (plan: %s)" % package if package else "")
                + ("; estimate: %s" % span(minutes * 60) if minutes else "")
-               + ("; reserved to external executor %s%s" % (
+               + ("; reserved to external executor %s%s%s" % (
                    external_executor,
+                   "; declared non-agent system, responsible %s"
+                   % system_reservation["responsible"]
+                   if system_reservation else "",
                    " (session %s)" % external_session if external_session else "")
                   if external_executor else "")
                + ("; %s" % note if note else ""))

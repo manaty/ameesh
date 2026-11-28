@@ -269,7 +269,44 @@ def _merge_own_paths(repo: str, parents: list, sha: str) -> list[str]:
                        % sha[:12])
 
 
-def own_changes(repo: str, base: str, head: str, sources) -> dict:
+def contract_fold(db, vehicle: int, row, repo: str, head: str) -> Optional[str]:
+    """#8417 : le commit de pliage du contrat du véhicule, s'il est vérifié.
+
+    Décision du pilote sur le N4 de la relecture de #8395 : le commit simple
+    par lequel le composeur plie les fragments du contrat module v1 n'est pas
+    un delta propre quand (1) c'est le commit cité au manifeste du paquet,
+    (2) le contrôle de pliage de `paquet-inclusion` passe sur lui (commit
+    simple, ancêtre, contenu identique au numéro et à la dernière référence
+    additive près) et (3) il ne touche que le contrat, sa surface,
+    `CONTRACT_VERSION` et les fragments cités. Rend son SHA complet ; None
+    sinon, et alors le commit reste un delta propre : un manifeste illisible ou
+    un pliage non vérifiable ne dispense de rien.
+    """
+    from . import packet_snapshot, review_contract_fold
+
+    branch = str((row or {}).get("branch") or "").strip()
+    head = plan_git._commit(repo, head) if head else None
+    if not branch.startswith("integration/") or not head:
+        return None
+    # `integration/paquet-<nom>` → `reviews/integration-paquet-<nom>.md`
+    # (même dérivation que `paquet-auto.manifest_rel`).
+    rel = "reviews/%s.md" % branch.replace("/", "-", 1)
+    try:
+        text = packet_snapshot.text(
+            db=db, checkout=repo, head=head, branch=branch,
+            package_id=int(vehicle),
+            fallback=lambda: plan_git._out(repo, "show", "%s:%s" % (head, rel)))
+        if not text:
+            return None
+        commit, _errors = review_contract_fold.verified_fold_commit(
+            repo, head, text)
+    except Exception:  # noqa: BLE001 - pliage illisible : il reste propre
+        return None
+    return commit
+
+
+def own_changes(repo: str, base: str, head: str, sources,
+                fold: str | None = None) -> dict:
     """Le delta que le véhicule ajoute au-delà de ses membres.
 
     `sources` sont les têtes gelées des membres. Les commits du véhicule sont
@@ -279,6 +316,11 @@ def own_changes(repo: str, base: str, head: str, sources) -> dict:
     adaptation) est propre pour tout son diff. Rend `{paths, commits}` ; les
     chemins de test et de manifeste sont retirés, et un commit n'est retenu
     que s'il contribue au moins un chemin propre.
+
+    #8417 : `fold` est le commit de pliage du contrat que `contract_fold` a
+    vérifié sur le manifeste du véhicule. Comme une fusion mécanique, il n'est
+    pas un delta propre ; tout autre commit simple reste propre pour tout son
+    diff.
     """
     args = ["rev-list", "--topo-order", "--reverse", "%s..%s" % (base, head)]
     sources = [str(source) for source in (sources or ()) if source]
@@ -297,6 +339,8 @@ def own_changes(repo: str, base: str, head: str, sources) -> dict:
                                % sha[:12])
         parents = parents_text.split()[1:]
         if not parents:
+            continue
+        if fold and sha == fold and len(parents) == 1:
             continue
         changed = (_merge_own_paths(repo, parents, sha) if len(parents) >= 2
                    else _changed(repo, parents[0], sha))
@@ -340,7 +384,8 @@ def designation_changes(db, vehicle: int, row, repo: str, base: str, head: str,
             raise VehicleError("constituent #%d: frozen head %s is not a commit of the "
                                "repository" % (int(entry["lot"]), freeze["sha"][:12]))
         sources.append(frozen)
-    return own_changes(repo, base, head, sources)
+    return own_changes(repo, base, head, sources,
+                       fold=contract_fold(db, vehicle, row, repo, head))
 
 
 # --------------------------------------------------------------------------
@@ -649,7 +694,8 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
         if not start:
             raise VehicleError("cannot read merge-base(%s, %s)"
                                % (anchor[:12], head[:12]))
-        own = own_changes(repo, start, head, frozen_sources)
+        own = own_changes(repo, start, head, frozen_sources,
+                          fold=contract_fold(db, vehicle, row, repo, head))
     except VehicleError as exc:
         return {"ok": False, "required": None, "klass": None, "why": str(exc),
                 "members": found, "own_paths": []}

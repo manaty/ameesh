@@ -36,6 +36,10 @@ no cluster or cloud credential.
   intent; #6074: also at once for a halt past its deadline, an archive the
   provider does not allow, a `locked` VM or a `stopped in place` VM without
   a halt intent of the wave.
+* #8459: a replica's failed standby exit (`mode-veille.sh sortir`) leaves the
+  hub's synchronous list empty; the VM adapter keeps the debt on the control
+  and replays it, and this pass raises `host_release_standby_exit_failed`
+  until the list is restored.
 
 The scanner is serialised per host (`host_release_locks`): the many runners of
 a host do not each call the adapter. The expensive idle projection is spaced
@@ -1357,6 +1361,30 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
                               generation=control.get("generation"),
                               orchestrators=list(orchestrators)))
             continue
+        # #8459: #8420 empties the hub's synchronous list before halting a
+        # replica; a failed `sortir` leaves it empty (safe: no COMMIT blocks,
+        # but synchronous durability is degraded). The VM adapter records the
+        # debt and replays `sortir` at each tick; this alert is its stable
+        # signal, and it clears when the replay (or an operator) succeeds.
+        failed = resources.finite_float(control.get("standby_exit_failed_ts"))
+        if failed is not None:
+            detail = ("Host %s: the standby exit (`mode-veille.sh sortir`) failed "
+                      "(generation %s/epoch %s). The hub's "
+                      "synchronous_standby_names may still be empty: no COMMIT "
+                      "blocks, but synchronous durability is degraded until a "
+                      "replica is caught up again. The VM adapter replays the exit "
+                      "at each tick while the debt is recorded, and this alert "
+                      "clears on success. Check the hub "
+                      "(`deploy/serveur/replication/etat.sh`, `ameesh db status`) "
+                      "and the worker journal (`journalctl -u "
+                      "ameesh-vm-adapter`); an operator can replay the exit after "
+                      "`etat.sh`." % (host, control.get("generation"),
+                                      control.get("release_epoch")))
+            out.append(_alert("host_release_standby_exit_failed", None, failed,
+                              max(0.0, now - failed), 0.0, detail,
+                              host=host, generation=control.get("generation"),
+                              release_epoch=control.get("release_epoch"),
+                              orchestrators=list(orchestrators)))
         # #5932: a queued adapter request is a normal asynchronous wait, not a
         # failure. Only a durable poweroff intent that stops progressing (or a
         # queued request whose wave no longer matches the control) names the

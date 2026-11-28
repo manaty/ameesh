@@ -288,6 +288,15 @@ restent en place.
    marqueur de veille est reposé (état sûr : liste vide) ;
 4. consigne `mode=actif`, la liste rétablie, les répliques rattrapées.
 
+Branché sur le `vm_adapter` (#8420), `sortir` est rejoué : une entrée réussie
+laisse une dette durable sur la ligne de contrôle de la réplique
+(`standby_entered_at`), et un échec de `sortir` y ajoute
+`standby_exit_failed_at` (0615). Le worker rejoue `sortir` à chaque tick tant
+que la dette existe, et `host_release.alerts` lève
+`host_release_standby_exit_failed` jusqu'au succès (#8459) : une liste
+synchrone laissée vide n'est plus silencieuse. Le script reste idempotent,
+donc ce rejeu ne change rien hors veille.
+
 Le mode veille ne touche **aucune donnée** : il ne fait que lire (baux,
 `pg_stat_replication`) et réécrire le fragment de configuration. La sauvegarde
 logique est lue, pas produite. `etat.sh` affiche le mode et ne signale pas la

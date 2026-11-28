@@ -607,8 +607,13 @@ drainage automatique, ni `idle-drained`, ni la preuve d'arrêt du worker
 (`stop_evidence`) ne passent. `policy.runs_interface: none` ne vaut que
 si rien ne tourne hors tours et baux. **Un hôte prêteur (`policy.lend`) ne
 peut pas le déclarer** : le canon le refuse (#5905), et `lending` l'emporte
-même sur `runs_interfaces` en configuration. AG3 est prêteur : il porte le
-guest d'offload de la prévalidation au gel.
+sur `runs_interfaces` en configuration, sauf l'interface comptante `guest`
+(#7687) : `none` ne peut pas transformer une prêteuse en zéro prouvé. AG3
+déclare `policy.runs_interface: guest` : le comptage des jobs d'offload vivants
+(shell guest et slices `ameesh-job-*`). Un comptage absent, périmé ou
+illisible reste **inconnu**, jamais zéro : ni drainage automatique, ni
+`idle-drained` sur ce doute. AG3, prêteur qui porte le guest d'offload de la
+prévalidation au gel, est dans ce cas depuis #8418.
 
 Déclarer le hook arme deux effets à toute heure :
 - le drainage automatique (`_auto_drain`, burst inactif depuis
@@ -620,27 +625,76 @@ Déclarer le hook arme deux effets à toute heure :
   `host_release_adapter_stalled` le signale, au bout de
   `AMEESH_HOST_RELEASE_ADAPTER_STALL`.
 
+Le drainage automatique ne part que sur un hôte `burst` dont le relevé est
+frais et dont la fenêtre de repos est prouvée sans trou depuis
+`idle_after_s` (1800 s par défaut) : `guest_jobs = 0`, aucun tour, aucun bail
+de lot, aucune retenue, et l'hôte n'est ni détenteur ni réserve d'un rôle élu
+(`baseline_guard`). L'hystérésis d'allumage (`min_on_s`) et la durée de
+drainage native restent celles de l'adaptateur. Un job guest vivant, un
+relevé illisible ou un run non déclaré bloquent le drainage **et** la preuve
+`idle-drained` ; le doute ne vaut jamais zéro.
+
 Ce qui ne peut pas servir de garde-fou permanent :
 - une retenue (`ameesh hosts HOST --hold`) : elle ferme les baux de tous
   les agents de l'hôte (`claimable`) et expire au bout de 24 h ;
 - `capacity: baseline` : `stop_evidence` exige un hôte burst, ce qui
   bloquerait aussi la fenêtre.
 
-L'ordre retenu tient donc à **ne rien déclarer hors fenêtre**. Hors
-fenêtre, le hook est absent et `lend` présent. Le drainage automatique est
-refusé deux fois (`no lifecycle hook`, `declared runs unknown: lending`), et
-un drainage manuel se rouvre au retour par L232e (tests
-`test_4148_host_release`, `test_5905_runs_interface`). La déclaration passe
-par une PR canon « fenêtre », fusionnée au feu par le pilote, et retirée par
-une PR inverse :
+Jusqu'au R1 v3 (#6002), l'ordre retenu était de **ne rien déclarer hors
+fenêtre** : hors fenêtre, le hook était absent et `lend` présent ; la
+déclaration passait par une PR canon « fenêtre » (manaty/home#297), fusionnée
+au feu par le pilote, et retirée par une PR inverse (manaty/home#298). Le
+drainage automatique était refusé deux fois (`no lifecycle hook`, `declared
+runs unknown: lending`), et un drainage manuel se rouvrait au retour par
+L232e (tests `test_4148_host_release`, `test_5905_runs_interface`).
 
-| | hors fenêtre (carte actuelle) | PR fenêtre (au feu) |
-|---|---|---|
-| `policy.lend` | présent | retiré |
-| `policy.runs_interface` | absent | `none` |
-| `policy.lifecycle_hook` | absent | la commande ci-dessus |
+Depuis #7687 (comptage des jobs guest) et #8418, le mode permanent remplace
+cette fenêtre pour AG3 : la carte garde `lend` et déclare `runs_interface:
+guest` et le hook. C'est la carte qui est l'activation durable ; sa PR
+inverse est le retour arrière, sans fenêtre à refermer.
+
+### AG3 en permanent (#8418, tranche 1 de #8029)
+
+La carte `hotes/ameesh-agents-3.md` porte, dans `policy:` :
+
+    lend: ...                       # conservé
+    runs_interface: guest           # compte les jobs d'offload vivants
+    lifecycle_hook: "@ameesh-python -m ameesh.vm_adapter request"
+
+`@ameesh-python` est remplacé par le Python du scanner (#8068) ; le runtime
+doit contenir `ameesh.vm_adapter` sur chaque hôte au runner vivant.
+
+Ordre d'activation (aucun geste cloud) :
+
+1. **Bureau, avant la fusion de la carte** : copier
+   `/etc/ameesh-vm-adapter/enrollment.json` (0600), passer `"enabled": true`,
+   puis `systemctl enable --now ameesh-vm-adapter.timer` sur bureau-goal.
+   Vérifier une passe worker récente dans le journal et une ligne
+   `vm_adapter_observations` pour AG3 (sans elle, un hook resterait fermé en
+   `hook_wait`). Hors coupure (10:00Z, 22:00Z) et hors CI de paquet.
+2. **Pilote** : fusionner la PR canon sur sa tête gelée
+   (`gh pr merge --match-head-commit`), puis `ameesh canon sync --fetch
+   --json` sur chaque hôte au runner vivant. `ameesh hosts ameesh-agents-3`
+   doit rendre `runs_interface: guest (Host card)` et le hook.
+3. **Observation** : quand AG3 reste sans tour, sans bail de lot et sans job
+   guest pendant `idle_after_s`, le scanner démarre un drainage `automatic`.
+   Le worker acquitte `draining`, puis `idle-drained`, arrête l'OS, prouve
+   l'arrêt et archive ; une cause de réveil (courrier d'un agent placé, lot
+   assigné, job CI de ses runners, `return_ts`) redemande `busy`, rallume,
+   admet la sonde, vérifie santé et réconciliation, puis rouvre les prises.
+   Le lot #8418 exige cette observation une fois en staging.
+
+Retour arrière : si AG3 est arrêté ou en retour, d'abord le ramener et
+attendre `available` **en gardant le hook** ; puis fusionner la PR inverse
+(hook et `runs_interface` retirés, `lend` conservé), faire la synchronisation
+prouvée, et seulement ensuite, si le worker n'est plus nécessaire, arrêter
+le timer et remettre `enabled: false`. Ne jamais retirer le hook d'une VM
+encore arrêtée (« Contrôle et retour arrière »).
 
 ### Séquence R1 (plan de #6002, remplace l'étape « drain » de v3.4.1)
+
+> R1 est clos (28/11 02:31Z, #6002). Cette séquence est conservée comme
+> historique de la fenêtre ; le mode permanent d'AG3 est décrit ci-dessus.
 
 Deux PR canon home sont préparées, relues par une autre famille que Claude
 et gelées avant le feu : « fenêtre » (manaty/home#297) et « R2 »
@@ -785,12 +839,12 @@ largeur des cycles suivants.
      arrière »). Ensuite seulement : #298, synchronisation, R2.
 
 Pendant la fenêtre, la prévalidation au gel est indisponible (son seul hôte
-est AG3). C'est un résultat non concluant, qui ne retient rien (§3). Pour
-déclarer le hook en permanence, et rendre un burst après 30 min sans
-travail hors fenêtre, il faut une interface qui compte les jobs guest d'un
-hôte prêteur (C5). C'est un lot de suite.
+est AG3). C'est un résultat non concluant, qui ne retient rien (§3). Depuis
+#7687 (comptage des jobs guest) et #8418, le hook est déclaré en
+permanence : le mode décrit ci-dessus rend un burst après 30 min sans
+travail, hors fenêtre, sans retirer `lend`.
 
-## Mode veille de la base (#8420, #8029)
+## Mode veille de la base (#8420, #8459, #8029)
 
 Les VM `ameesh-agents-1` et `-2` portent les deux standbys synchrones du hub
 (deploy/serveur/replication/README.md, « Mode veille »). Avant d'arrêter la
@@ -802,7 +856,9 @@ ainsi dans l'enrôlement :
   (commandes fixes et absolues, comme les autres) ; sans `replica: true`,
   ces deux clés sont refusées ;
 - `standby_timeout_s` au niveau de l'enrôlement, obligatoire dès qu'une
-  cible est une réplique (entre `io_timeout_s` et 120 s).
+  cible est une réplique (entre `io_timeout_s` et 90 s : la transaction du
+  tick est sous `idle_in_transaction_session_timeout = 120 s`, la borne garde
+  une marge ; au-delà, l'enrôlement est refusé).
 
 Comportement du worker :
 
@@ -812,20 +868,28 @@ Comportement du worker :
    donne `standby enter refused` : ni intention d'arrêt, ni arrêt. Le tick
    suivant rejoue (le script est idempotent). Si l'intention était déjà posée,
    la borne `halt_deadline_s` court et son alerte `halt_deadline` nomme
-   l'hôte, sans arrêt.
+   l'hôte, sans arrêt. L'intention d'entrée est écrite **avant** l'appel
+   externe dans la ligne de contrôle de la réplique
+   (`standby_entered_at`, migration 0615) : une sonde en échec ou un worker
+   tué laisse donc la dette de sortie enregistrée.
 2. **Sortie après le retour sain des deux répliques.** Quand le retour d'une
    réplique est sain et réconcilié (`ready`), le worker vérifie que toutes
    les cibles `replica` sont revenues (portes ouvertes, ou retour de la
    génération courante terminé). Sinon il attend le retour de l'autre
    (`ready; standby exit waits for the other replica`). Sinon il lance
    `standby_exit_argv` (`mode-veille.sh sortir`, sans effet hors veille).
-3. **Échec de la sortie : alerte, le retour tient.** Le retour n'est jamais
-   défait. Le journal du worker porte
-   `ready; standby exit failed (synchronous list left empty)` et un événement
-   `vm.standby_exit_failed` (hôte, génération, époque) est écrit. La liste
-   reste vide : état sûr, durabilité dégradée. L'opérateur rejoue
-   `mode-veille.sh sortir` après `etat.sh` ; le retour suivant d'une
-   réplique le rejoue aussi.
+3. **Échec de la sortie : alerte et reprise.** Le retour n'est jamais défait.
+   Le journal du worker porte
+   `ready; standby exit failed (synchronous list left empty)` (ou
+   `inactive; …` au rejeu), un événement `vm.standby_exit_failed` (hôte,
+   génération, époque) est écrit **une fois par épisode**, et
+   `host_release.alerts` lève `host_release_standby_exit_failed` : visible
+   dans `ameesh alerts` et adressée aux agents comme les autres alertes de
+   sortie d'hôte. La liste reste vide : état sûr, durabilité dégradée. Le
+   worker rejoue `sortir` à chaque tick tant que la dette
+   (`standby_exit_failed_at`) est enregistrée ; un succès efface la dette de
+   toutes les répliques et l'alerte. L'opérateur peut aussi rejouer
+   `mode-veille.sh sortir` après `etat.sh`.
 
 Commande opérateur. `mode-veille.sh` tourne en root sur le hub, et ses
 attentes (`ATTENTE_TOURS` 600 s, `ATTENTE_REVEIL` 900 s) dépassent la borne
@@ -855,10 +919,10 @@ déclarer aucune cible `replica` : `mode-veille.sh` refuserait (primaire hors
 hub, ou aucun standby à rattraper au réveil) et aucune VM ne s'arrêterait. Ce
 lot livre le code et ses témoins, sans essai réel.
 
-Limite : l'échec de sortie est un événement et une ligne de journal, pas
-encore une alerte de `host_release.alerts`. Un retour qui rouvre les portes
-sans le worker (`ameesh host undrain`) ne lance pas `sortir` : le rejouer à
-la main.
+Limite : un retour qui rouvre les portes sans le worker
+(`ameesh host undrain`) ne termine pas la requête `busy` de la génération ;
+`replicas_back` attend donc encore cette réplique et le rejeu de `sortir`
+reste à la main (`mode-veille.sh sortir` après `etat.sh`).
 
 ## Contrôle et retour arrière
 

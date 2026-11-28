@@ -112,8 +112,10 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `core.commentChar=';'` à chaque invocation, `--continue` compris, et
   signale un sujet perdu après coup. À défaut,
   `git -c core.commentChar=';' rebase …` et
-  `git -c core.commentChar=';' commit --amend`. Après tout rebasage,
-  contrôlez `git log --format='%s' <base>..HEAD`.
+  `git -c core.commentChar=';' commit --amend`. Jamais
+  `commit.cleanup=whitespace` ni `verbatim` : sans éditeur ouvert, tout le
+  gabarit (« Please enter the commit message… ») reste dans le message
+  (#8441). Après tout rebasage, contrôlez `git log --format='%B' <base>..HEAD`.
 - **Ajouter plutôt que modifier** (L160a) : on ajoute des fichiers (un module,
   un test, une page, une décision par sujet) plutôt que de modifier un fichier
   commun, pour que deux PR ouvertes en même temps ne se gênent pas à la fusion.
