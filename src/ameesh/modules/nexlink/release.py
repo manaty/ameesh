@@ -1296,6 +1296,10 @@ def retag(cfg, db, project, *, version, sha, reason, actor, now):
             raise rc.ReleaseError("cutoff is already attested")
         if release_tags(project).get(version) != sha:
             raise rc.ReleaseError("remote release tag does not point to the requested SHA")
+        rc._git(project.repo, "fetch", "--no-tags", project.remote,
+                "refs/tags/" + TAG_PREFIX + version, check=True)
+        if release_tags(project).get(version) != sha:
+            raise rc.ReleaseError("remote release tag moved during verification")
         if rc.commit_of(project.repo, sha) != sha:
             raise rc.ReleaseError("requested SHA is not a commit")
         if rc._git(project.repo, "merge-base", "--is-ancestor", old, sha).returncode:
