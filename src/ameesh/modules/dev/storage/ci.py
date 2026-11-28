@@ -382,28 +382,38 @@ class CiResults(DevDomain, interface.CiResults):
             labels = r.get("labels")
             # #8031 : les étiquettes du runner, en ligne ou hors ligne, sont la
             # correspondance hôte → file qu'il peut servir. NULL = non relevé.
+            # #8422 : `online` distingue un runner libre d'un runner d'une VM
+            # arrêtée (un runner hors ligne n'est jamais busy) ; `last_busy_at`
+            # garde le dernier relevé busy, que la fin du job efface de
+            # `busy_since`.
             self.db.execute(
                 """
                 INSERT INTO ci_runner_state AS s
-                    (repo, runner_id, name, busy, job, busy_since, stuck_since, labels)
+                    (repo, runner_id, name, busy, job, busy_since, stuck_since,
+                     labels, online, last_busy_at)
                 VALUES (%s, %s, %s, %s, %s,
                         CASE WHEN %s THEN now() END,
                         CASE WHEN %s THEN now() END,
-                        %s::jsonb)
+                        %s::jsonb, %s,
+                        CASE WHEN %s THEN now() END)
                 ON CONFLICT (repo, runner_id) DO UPDATE SET
                     name        = excluded.name,
                     busy        = excluded.busy,
                     job         = excluded.job,
                     busy_since  = CASE WHEN excluded.busy
                                        THEN coalesce(s.busy_since, now()) ELSE NULL END,
+                    last_busy_at = CASE WHEN excluded.busy THEN now()
+                                        ELSE s.last_busy_at END,
                     stuck_since = CASE WHEN excluded.stuck_since IS NOT NULL
                                        THEN coalesce(s.stuck_since, now()) ELSE NULL END,
                     labels      = excluded.labels,
+                    online      = excluded.online,
                     seen_at     = now()
                 """,
                 (repo, int(r["id"]), r.get("name") or "", bool(r.get("busy")),
                  r.get("job"), bool(r.get("busy")), bool(r.get("stuck")),
-                 json.dumps(sorted(labels)) if labels is not None else None))
+                 json.dumps(sorted(labels)) if labels is not None else None,
+                 bool(r.get("online")), bool(r.get("busy"))))
         # un runner retiré du dépôt ne doit pas laisser une alerte derrière lui
         if ids:
             marks = ", ".join(["%s"] * len(ids))
@@ -430,11 +440,14 @@ class CiResults(DevDomain, interface.CiResults):
 
         En ligne ou hors ligne : GitHub les rend encore quand la VM est
         arrêtée, et c'est cette inscription qui nomme les étiquettes que
-        l'hôte peut servir au réveil."""
+        l'hôte peut servir au réveil. #8422 : `online` dit si le runner est
+        actuellement connecté, `last_busy_ts` date le dernier relevé où il
+        était occupé (NULL s'il n'a jamais été vu busy)."""
         return self.db.query(
             """
-            SELECT repo, runner_id, name, busy, labels,
-                   extract(epoch from seen_at)::float8 AS seen_ts
+            SELECT repo, runner_id, name, busy, labels, online,
+                   extract(epoch from seen_at)::float8       AS seen_ts,
+                   extract(epoch from last_busy_at)::float8  AS last_busy_ts
               FROM ci_runner_state
              ORDER BY repo, name
             """)

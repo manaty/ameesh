@@ -844,6 +844,57 @@ est AG3). C'est un résultat non concluant, qui ne retient rien (§3). Depuis
 permanence : le mode décrit ci-dessus rend un burst après 30 min sans
 travail, hors fenêtre, sans retirer `lend`.
 
+## Cible CI sans agent (#8422, tranche 5 de #8029)
+
+Les VM `ameesh-ci-1` à `ameesh-ci-3` n'hébergent ni agent ameesh ni carte
+d'hôte : elles ne portent que des runners GitHub. Une cible s'enrôle avec
+`"kind": "ci"` (défaut : `"agent"`, pour les enrôlements existants) :
+
+- `probe_agent`, `health_argv` et `reconcile_argv` sont facultatifs ; s'ils
+  sont présents, ils sont validés comme pour une cible agent ;
+- `quiesce_argv`, `halt_argv` et `halted_argv` restent obligatoires : l'arrêt
+  de l'OS passe par les mêmes commandes opérateur ;
+- `replica: true` est refusé (une VM CI ne porte pas de standby du hub).
+
+Le worker de l'adaptateur est le contrôleur de la cible : personne dans la VM
+ne demande le drainage. À chaque tick, tant que le contrôle est libre, il
+ouvre lui-même un drainage `automatic` (prises fermées) quand la preuve de
+repos est complète, puis file les deux requêtes `draining` et `idle-drained` ;
+la phase d'arrêt en deux temps existante fait le reste. Une requête perdue
+entre les deux écritures est réparée au tick suivant. Le repos est mesuré sur
+le domaine CI de la veille (#8031), pas sur une lecture d'hôte :
+
+- canon lisible ;
+- relevé des runners frais et lisible (`ok`) ;
+- file de réveil fraîche et **idle** (ni `waiting`, ni `unknown`) ;
+- aucun runner occupé ;
+- dernier passage occupé plus vieux que
+  `quiet_s = max(idle_after_s, min_on_s, 2 * wake_delay_s)`, et `on_since`
+  de la VM comprise dans cette borne. Un runner hors ligne ne bloque pas
+  l'arrêt : la VM éteinte, GitHub conserve son enregistrement.
+
+Le retour n'utilise ni lecture d'hôte ni sonde : il est prouvé par le même
+relevé, fait **après** l'instant d'allumage (`poweron_ts`, sinon `on_since`,
+sinon la demande de retour), et exige **tous** les runners enregistrés de
+l'hôte en ligne et aucun occupé. La requête `busy` est alors terminée
+(`runners online`), puis le contrôle est rouvert (`undrain`, prises ouvertes)
+et rendu `available` (`complete_return`), ce qui autorise un drainage
+ultérieur. Un runner hors ligne ou un relevé antérieur à l'allumage laisse le
+retour ouvert.
+
+La mesure des runners persiste deux faits sur `ci_runner_state` (migration
+0616) : `online` et `last_busy_at`, ce dernier survivant à la fin du job
+(contrairement à `busy_since`). La migration est additive : l'appliquer
+**avant** de redémarrer les workers (règle de staging, §11 bis).
+
+Les cartes d'hôte du canon `hotes/ameesh-ci-1..3.md` ne portent ni hook ni
+`staging.kind` (l'énumération n'a pas de valeur `ci`), avec
+`max_agents: 0` et `runs_interface: none` : aucun agent ne s'y place. Le
+bureau fournit les UUID et la zone dans l'enrôlement privé ; aucun UUID ni
+secret ne va dans le canon. `nexlink-ci-1` garde son `ci-autoscale`, hors de
+ce lot. L'auteur n'a exécuté aucun arrêt réel : le premier cycle se valide
+avec le bureau (§10).
+
 ## Mode veille de la base (#8420, #8459, #8029)
 
 Les VM `ameesh-agents-1` et `-2` portent les deux standbys synchrones du hub
