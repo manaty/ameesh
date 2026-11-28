@@ -24,8 +24,9 @@ class ProcessHandle:
     # Linux 5.3 can open pidfds but cannot yet use waitid(P_PIDFD).
     _wait_supported: bool | None = None
 
-    def __init__(self, pid: int, fd: int):
-        self.pid, self.fd = pid, fd
+    def __init__(self, pid: int, fd: int, start=None):
+        # `start` : l'heure de début validée à l'ouverture (identité du relevé)
+        self.pid, self.fd, self.start = pid, fd, start
 
     @classmethod
     def open(cls, pid: int, expected_start) -> "ProcessHandle | None":
@@ -40,7 +41,7 @@ class ProcessHandle:
             if start_time(pid) != expected_start:
                 os.close(fd)
                 return None
-            return cls(pid, fd)
+            return cls(pid, fd, expected_start)
         except Exception:
             if fd is not None:
                 os.close(fd)
@@ -48,7 +49,7 @@ class ProcessHandle:
 
     def duplicate(self) -> "ProcessHandle":
         """Retain this same kernel identity for the tracker's later waits."""
-        return ProcessHandle(self.pid, os.dup(self.fd))
+        return ProcessHandle(self.pid, os.dup(self.fd), self.start)
 
     def live(self) -> bool:
         if self.fd is None:

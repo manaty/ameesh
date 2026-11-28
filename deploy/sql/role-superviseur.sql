@@ -775,7 +775,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'repo', 'runner_id', 'name', 'busy', 'job', 'busy_since', 'stuck_since',
         'seen_at',
         -- #8031 (0603) : étiquettes servies par le runner, même nature qu'un nom
-        'labels'
+        'labels',
+        -- #8422 (0616) : veille des runners CI — en ligne, dernier instant
+        -- occupé, et l'instant du relevé qui a écrit ces deux faits. Même
+        -- nature que busy/busy_since : état et horodatages, aucun contenu.
+        'online', 'last_busy_at', 'state_seen_at'
     ]),
     ('ci_queue_state', ARRAY[
         'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at',
