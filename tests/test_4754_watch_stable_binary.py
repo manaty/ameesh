@@ -63,12 +63,22 @@ class StableBinaryTest(unittest.TestCase):
                          self.versioned)
 
     def test_la_veille_armee_depuis_un_venv_versionne(self):
+        # #8458 : le binaire d'une unité neuve n'est plus choisi dans le PATH
+        # de l'appelant (même un venv versionné) : sans le lanceur stable,
+        # l'armement est refusé ; avec lui, c'est lui qui est écrit. Le repli
+        # de #4754 ne vaut plus que pour réécrire une unité existante
+        # (`repin_units`).
         self.live()
-        with mock.patch.object(watch.shutil, "which", return_value=self.versioned), \
-                mock.patch.object(watch.os.path, "expanduser", return_value=self.home):
-            ameesh = watch._ameesh_binary()
-        self.assertNotIn("venv-52d1e28", ameesh)
+        with mock.patch.object(watch.shutil, "which", return_value=self.versioned):
+            with self.assertRaises(watch.WatchError):
+                watch._ameesh_binary({"HOME": self.home,
+                                      "PATH": os.path.dirname(self.versioned)})
+        ameesh = _exe(os.path.join(self.home, ".local", "bin", "ameesh"))
+        with mock.patch.object(watch.shutil, "which", return_value=self.versioned):
+            self.assertEqual(watch._ameesh_binary(
+                {"HOME": self.home, "PATH": os.path.dirname(self.versioned)}), ameesh)
         service = watch.units("a1", 1800, ameesh)[watch.unit_name("a1", "service")]
+        self.assertNotIn("venv-52d1e28", service)
         self.assertIn('ExecStart="%s" watch send --agent a1' % ameesh, service)
 
 

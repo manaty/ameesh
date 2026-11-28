@@ -1276,6 +1276,80 @@ def handoff_preflight(project, pending):
                            for row in entries]}
 
 
+
+def retag(cfg, db, project, *, version, sha, reason, actor, now):
+    """Adopt an already retagged, independently verified final tree."""
+    reason = str(reason or "").strip()
+    if not reason or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+        raise rc.ReleaseError("retag requires a reason and a full commit SHA")
+    with rc._locked(os.path.join(cfg.state_dir, "release", "release.lock")):
+        state = rc.load_state(cfg)
+        pending = rc.project_state(state, project.name).get("pending_nexlink")
+        if not isinstance(pending, dict) or pending.get("version") != version:
+            raise rc.ReleaseError("no frozen Nexlink cutoff for this version")
+        old = pending.get("sha")
+        if not old or not pending.get("main") or not pending.get("integration"):
+            raise rc.ReleaseError("pending Nexlink cutoff is incomplete")
+        if not pending.get("handoff"):
+            raise rc.ReleaseError("retag requires an active staging handoff")
+        if pending.get("staging_attestation"):
+            raise rc.ReleaseError("cutoff is already attested")
+        if release_tags(project).get(version) != sha:
+            raise rc.ReleaseError("remote release tag does not point to the requested SHA")
+        rc._git(project.repo, "fetch", "--no-tags", project.remote,
+                "refs/tags/" + TAG_PREFIX + version, check=True)
+        if release_tags(project).get(version) != sha:
+            raise rc.ReleaseError("remote release tag moved during verification")
+        integration = pending["integration"]
+        if rc._git(project.repo, "check-ref-format", "refs/heads/" + integration).returncode:
+            raise rc.ReleaseError("invalid integration ref")
+        remote_ref = "refs/remotes/%s/%s" % (project.remote, integration)
+        rc._git(project.repo, "fetch", "--no-tags", project.remote,
+                "+refs/heads/%s:%s" % (integration, remote_ref), check=True)
+        if rc.commit_of(project.repo, remote_ref) != sha:
+            raise rc.ReleaseError("remote integration branch does not point to the requested SHA")
+        if rc.commit_of(project.repo, sha) != sha:
+            raise rc.ReleaseError("requested SHA is not a commit")
+        if rc._git(project.repo, "merge-base", "--is-ancestor", old, sha).returncode:
+            raise rc.ReleaseError("retag must descend from the frozen candidate")
+        paths = rc._git(project.repo, "diff", "--no-renames", "--name-only", "-z",
+                        old, sha, check=True).stdout.split("\0")
+        allowed = (".ameesh/staging-migrations.json",)
+        bad = [path for path in paths if path and path not in allowed
+               and not path.startswith("docs/releases/")
+               and not path.startswith("website/src/app/releases/")]
+        if bad:
+            raise rc.ReleaseError("retag delta contains forbidden paths: " + ", ".join(bad))
+        candidate = dict(pending, sha=sha)
+        plan = ci_plan(project, candidate)
+        if not plan.get("parts"):
+            raise rc.ReleaseError("retag CI plan is empty")
+        evidence = []
+        for part in plan["parts"]:
+            workflow = part["workflow"]
+            rows = [row for row in runs(project, workflow, pending["integration"], sha)
+                    if row.get("headSha") == sha
+                    and row.get("headBranch") == pending["integration"]
+                    and row.get("event") == "workflow_dispatch"]
+            rows.sort(key=lambda row: row.get("createdAt", ""), reverse=True)
+            if not rows or rows[0].get("status") != "completed" or rows[0].get("conclusion") != "success":
+                raise rc.ReleaseError("retag CI has no successful final run for " + workflow)
+            evidence.append(rows[0])
+        requirements = migration_requirements(project, sha, pending["main"])
+        preflight = handoff_preflight(project, candidate)
+        trace = dict(old_sha=old, new_sha=sha, reason=reason, actor=actor, at=now,
+                     ci=evidence, migration_requirements=requirements)
+        pending["sha"] = sha
+        pending["handoff_preflight"] = preflight
+        pending.pop("migration_attestation", None)
+        pending.setdefault("retags", []).append(trace)
+        rc.save_state(cfg, state)
+        report = dict(version=version, **trace)
+        _announce(cfg, db, project,
+                  "Nexlink %s : re-tag déclaré de %s vers %s par %s : %s" %
+                  (version, old, sha, actor, reason), report)
+        return report
+
 def drop_abandoned(project, slot, save):
     """B1 cx3 (gel 34030): the refused cutoff pushed its integration ref but
     no tag, so the next cutoff reuses the version. Delete that ref only while

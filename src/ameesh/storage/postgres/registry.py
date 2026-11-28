@@ -1609,13 +1609,28 @@ class Leases(interface.Leases):
                 SELECT r.name,
                        md5((to_jsonb(r) - %s::text[])::text
                            || ':' || coalesce(a.n, 0) || ':' || coalesce(a.dernier, 0)
-                           || ':' || coalesce(""" + wake + """::text, '')) AS sig,
+                           || ':' || coalesce(""" + wake + """::text, '')
+                           || ':' || coalesce(lw.pending, false)::text) AS sig,
                        (coalesce(a.n, 0) > 0 OR r.pending_prompt IS NOT NULL) AS pending,
-                       """ + wake + """ AS wake_ts
-                  FROM agent_registry r LEFT JOIN actif a ON a.recipient = r.name
+                       """ + wake + """ AS wake_ts,
+                       coalesce(lw.pending, false) AS wake_pending
+                  FROM agent_registry r
+                  LEFT JOIN actif a ON a.recipient = r.name
+                  LEFT JOIN LATERAL (
+                      -- #8458 : une dette de réveil de lot (compté, tour non
+                      -- lancé) est un fait de la passe au repos : elle change
+                      -- l'empreinte et force le plein choix sans lecture de plus.
+                      -- Un écrivain N-1 qui avance last_wake_at sans les
+                      -- colonnes la rend caduque (elle est ignorée, pas rejouée).
+                      SELECT EXISTS (
+                          SELECT 1 FROM agent_lot_sessions l
+                           WHERE l.agent = r.name
+                             AND l.wake_pending_at IS NOT NULL
+                             AND l.wake_pending_at >= l.last_wake_at) AS pending
+                  ) lw ON true
                  WHERE r.name = ANY(%s::text[])
             )
-            SELECT a.name, a.sig, a.pending, a.wake_ts,
+            SELECT a.name, a.sig, a.pending, a.wake_ts, a.wake_pending,
                    (SELECT md5(coalesce(string_agg(
                                jsonb_build_object('h', j->'host', 'm', j->'mode',
                                    'g', j->'generation', 'c', j->'claims_open',
@@ -1625,7 +1640,7 @@ class Leases(interface.Leases):
                       FROM host_lifecycle c CROSS JOIN LATERAL to_jsonb(c) AS j) AS host_sig
               FROM agents a
              UNION ALL
-            SELECT NULL, NULL, NULL, NULL,
+            SELECT NULL, NULL, NULL, NULL, NULL,
                    (SELECT md5(coalesce(string_agg(
                                jsonb_build_object('h', j->'host', 'm', j->'mode',
                                    'g', j->'generation', 'c', j->'claims_open',
@@ -1640,7 +1655,8 @@ class Leases(interface.Leases):
         host_sig = rows[0]["host_sig"] if rows else ""
         return {"host": host_sig or "",
                 "agents": {row["name"]: {"sig": row["sig"], "pending": bool(row["pending"]),
-                                         "wake_ts": row["wake_ts"]}
+                                         "wake_ts": row["wake_ts"],
+                                         "wake_pending": bool(row["wake_pending"])}
                            for row in rows if row.get("name")}}
 
     def release(self, name, owner, epoch) -> bool:

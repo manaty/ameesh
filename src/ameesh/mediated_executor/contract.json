@@ -4759,7 +4759,7 @@
    "work": "hors du sous-ensemble de l'exécuteur médié ; suivi de livraison et lots empilés (stacked_on) réservés aux runners du mesh",
    "watches": "CI watches: mesh server only",
    "handoffs": "host handoff controller: mesh server only",
-   "lot_sessions": "session parking and activity wake listing: runner of the mesh server only; scheduled lot wakes pass by lot_sessions.due_wakes/claim_wake/consume_wake",
+   "lot_sessions": "session parking, activity wake listing and the wake-replay debt (#8458): runner of the mesh server only; scheduled lot wakes pass by lot_sessions.due_wakes/claim_wake/consume_wake",
    "host_lifecycle": "host withdrawal and loss recovery: mesh server only, except the claims_open read (#7799)",
    "github_watch": "GitHub intake cursors and deduplication: notifier host only",
    "notify_liveness": "notifier liveness and off-notifier brief claims (#3007): mesh server only",
@@ -5393,9 +5393,13 @@
    ],
    "lot_sessions": [
     "actionable",
+    "bump_lot_wake_replay",
+    "forget_lot_wake",
     "listing",
     "note_wake",
+    "pending_lot_wakes",
     "purge",
+    "settle_lot_wake",
     "switch"
    ],
    "host_lifecycle": [

@@ -1260,6 +1260,34 @@ def _abandon(cfg, args) -> int:
     return 0
 
 
+
+def _retag(cfg, args) -> int:
+    from . import release_cutoff
+    from .db import open_db
+    db = None
+    try:
+        projects = release_cutoff.projects(cfg)
+        name = _project_name(cfg, args)
+        if name not in projects:
+            raise release_cutoff.ReleaseError("project %r is not declared under release.projects" % name)
+        project = projects[name]
+        provider = release_cutoff.release_provider(project.model)
+        if provider is None or not callable(getattr(provider, "retag", None)):
+            raise release_cutoff.ReleaseError("release retag is not provided by this release model")
+        db = open_db(cfg)
+        _require_elected_release_host(cfg, db)
+        actor = work.corrector(cfg, db, args.actor, what="release retag", history=False)
+        report = provider.retag(cfg, db, project, version=args.version, sha=args.sha,
+                                reason=args.reason, actor=actor, now=time.time())
+        print(json.dumps(report, ensure_ascii=False, default=str))
+        return 0
+    except (work.WorkError, release_cutoff.ReleaseError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    finally:
+        if db is not None:
+            db.close()
+
 def run(cfg, args) -> int:
     """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch|attest|abandon`."""
     from . import release_cutoff
@@ -1270,6 +1298,8 @@ def run(cfg, args) -> int:
         return _catchup(cfg, args)
     if command == "attest":
         return _attest(cfg, args)
+    if command == "retag":
+        return _retag(cfg, args)
     if command == "abandon":
         return _abandon(cfg, args)
     if (command in ("tick", "packet-watch", "cutoff")
@@ -1458,6 +1488,13 @@ def add_parser(sub, func) -> None:
     attest_p.add_argument("--actor", default=None,
                           help="--skip at a human terminal: human:<id>")
     attest_p.set_defaults(func=func)
+    retag_p = rel.add_parser("retag", help="declare a verified retagged release cutoff")
+    retag_p.add_argument("--project", default=None)
+    retag_p.add_argument("--version", required=True)
+    retag_p.add_argument("--sha", required=True)
+    retag_p.add_argument("--reason", required=True)
+    retag_p.add_argument("--actor", default=None)
+    retag_p.set_defaults(func=func)
     abandon_p = rel.add_parser(
         "abandon", help="#7567: the verified pilot abandons a frozen release cutoff "
                         "whose final-tree CI part is conclusively red; no tag, no "

@@ -20,6 +20,10 @@ _COLUMNS = """
     extract(epoch from l.parked_at)::float8        AS parked_ts,
     extract(epoch from l.last_wake_at)::float8     AS last_wake_ts,
     extract(epoch from l.wake_activity_at)::float8 AS wake_activity_ts,
+    (l.wake_pending_at IS NOT NULL
+     AND l.wake_pending_at >= l.last_wake_at)       AS wake_pending,
+    coalesce(l.wake_retries, 0)::integer           AS wake_retries,
+    l.wake_retry_reason,
     extract(epoch from l.created_at)::float8       AS created_ts
 """
 
@@ -170,7 +174,11 @@ class LotSessions(interface.LotSessions):
                            )::float8 AS activity_ts,
                    coalesce(l.wakes, 0)::bigint AS wakes,
                    extract(epoch from l.last_wake_at)::float8     AS last_wake_ts,
-                   extract(epoch from l.wake_activity_at)::float8 AS wake_activity_ts
+                   extract(epoch from l.wake_activity_at)::float8 AS wake_activity_ts,
+                   (l.wake_pending_at IS NOT NULL
+                    AND l.wake_pending_at >= l.last_wake_at) AS wake_pending,
+                   coalesce(l.wake_retries, 0)::integer AS wake_retries,
+                   l.wake_retry_reason
               FROM work_items w
               LEFT JOIN agent_lot_sessions l ON l.agent = w.assignee AND l.work_item_id = w.id
               LEFT JOIN LATERAL (
@@ -240,20 +248,94 @@ class LotSessions(interface.LotSessions):
                 not file_decoupage.exhausted(notes[row["id"]], projects[row["id"]])]
 
     def note_wake(self, name, lot, activity_ts):
+        # #8458 : la dette porte le même instant que `last_wake_at` ; une
+        # écriture d'une version antérieure (déploiement par vagues) avance
+        # `last_wake_at` sans connaître ces colonnes et rend la dette caduque
+        # (voir `pending_lot_wakes`), au lieu de faire rejouer un réveil que
+        # ce tour-là a déjà lancé (B mty-amh-impl-11, N-1 sur ligne existante).
         rows = self.db.query(
             "INSERT INTO agent_lot_sessions AS l"
-            "       (agent, work_item_id, wakes, last_wake_at, wake_activity_at)"
-            " VALUES (%s, %s, 1, clock_timestamp(), to_timestamp(%s::float8))"
+            "       (agent, work_item_id, wakes, last_wake_at, wake_activity_at,"
+            "        wake_pending_at, wake_retries, wake_retry_reason)"
+            " SELECT %s, %s, 1, t, to_timestamp(%s::float8), t, 0, NULL"
+            "   FROM (SELECT clock_timestamp() AS t) AS s"
             " ON CONFLICT (agent, work_item_id) DO UPDATE"
             "    SET wakes = CASE WHEN l.wake_activity_at IS NULL"
             "                       OR excluded.wake_activity_at"
             "                          > l.wake_activity_at + interval '1 millisecond'"
             "                     THEN 1 ELSE l.wakes + 1 END,"
             "        last_wake_at = excluded.last_wake_at,"
-            "        wake_activity_at = greatest(l.wake_activity_at, excluded.wake_activity_at)"
+            "        wake_activity_at = greatest(l.wake_activity_at, excluded.wake_activity_at),"
+            "        wake_pending_at = excluded.wake_pending_at,"
+            "        wake_retries = 0,"
+            "        wake_retry_reason = NULL"
             " RETURNING " + _COLUMNS,
             (name, int(lot), None if activity_ts is None else float(activity_ts)))
         return rows[0] if rows else {}
+
+    def pending_lot_wakes(self, name):
+        # #8458 : une dette n'est due que si son instant n'a pas été dépassé
+        # par `last_wake_at` : un écrivain N-1 qui recompte le réveil sans les
+        # colonnes neuves l'a prise en charge, et la dette devient caduque.
+        return self.db.query(
+            "SELECT l.work_item_id AS id, l.wake_retries, l.wake_retry_reason"
+            "  FROM agent_lot_sessions l"
+            " WHERE l.agent = %s"
+            "   AND l.wake_pending_at IS NOT NULL"
+            "   AND l.wake_pending_at >= l.last_wake_at"
+            " ORDER BY l.work_item_id ASC", (name,))
+
+    def bump_lot_wake_replay(self, name, lot):
+        rows = self.db.query(
+            "UPDATE agent_lot_sessions"
+            "   SET wake_retries = wake_retries + 1"
+            " WHERE agent = %s AND work_item_id = %s"
+            "   AND wake_pending_at IS NOT NULL"
+            "   AND wake_pending_at >= last_wake_at"
+            " RETURNING wake_retries", (name, int(lot)))
+        return int(rows[0]["wake_retries"]) if rows else None
+
+    def settle_lot_wake(self, name, lot, *, launched, reason=None, max_retries=5):
+        if launched:
+            rows = self.db.query(
+                "UPDATE agent_lot_sessions"
+                "   SET wake_pending_at = NULL, wake_retries = 0,"
+                "       wake_retry_reason = NULL"
+                " WHERE agent = %s AND work_item_id = %s"
+                "   AND wake_pending_at IS NOT NULL"
+                " RETURNING (wake_pending_at IS NOT NULL) AS wake_pending,"
+                "           wake_retries, wake_retry_reason",
+                (name, int(lot)))
+        else:
+            lim = int(max_retries)
+            rows = self.db.query(
+                "UPDATE agent_lot_sessions"
+                "   SET wake_pending_at = CASE WHEN wake_retries >= %s"
+                "                             THEN NULL ELSE wake_pending_at END,"
+                "       wake_retries = CASE WHEN wake_retries >= %s"
+                "                           THEN 0 ELSE wake_retries END,"
+                "       wake_retry_reason = CASE WHEN wake_retries >= %s"
+                "                               THEN NULL ELSE %s END"
+                " WHERE agent = %s AND work_item_id = %s"
+                "   AND wake_pending_at IS NOT NULL"
+                "   AND wake_pending_at >= last_wake_at"
+                " RETURNING (wake_pending_at IS NOT NULL) AS wake_pending,"
+                "           wake_retries, wake_retry_reason",
+                (lim, lim, lim, reason, name, int(lot)))
+        row = rows[0] if rows else {}
+        return {"found": bool(rows),
+                "pending": bool(row.get("wake_pending", False)),
+                "retries": int(row.get("wake_retries") or 0),
+                "reason": row.get("wake_retry_reason")}
+
+    def forget_lot_wake(self, name, lot):
+        rows = self.db.query(
+            "UPDATE agent_lot_sessions"
+            "   SET wake_pending_at = NULL, wake_retries = 0, wake_retry_reason = NULL"
+            " WHERE agent = %s AND work_item_id = %s"
+            "   AND wake_pending_at IS NOT NULL"
+            " RETURNING work_item_id", (name, int(lot)))
+        return bool(rows)
 
     def due_wakes(self, name, now, claim_ttl_s=120.0):
         if not has_wake_at(self.db):

@@ -1578,6 +1578,17 @@ class ReveilTest(_Base):
                         " - make_interval(secs => %s) WHERE agent = %s AND work_item_id = %s",
                         (float(secondes), name, lot))
 
+    def _solder_reveil(self, worker, spec):
+        """#8458 : un réveil délivré par `pick` n'est soldé qu'au tour lancé.
+
+        Le banc n'exécute pas de harnais ici : il écrit la sortie « lancé » de
+        `_settle_lot_wake`, pour que le redémarrage éprouve le backoff gardé en
+        base, pas le rejeu de la dette (couvert par `test_8458_lot_wake_replay`).
+        """
+        self.assertTrue(spec and spec.get("lot_wake"), "réveil de lot attendu")
+        out = self.st.settle_lot_wake(worker.name, int(spec["lot"]), launched=True)
+        self.assertTrue(out.get("found"), "la dette du réveil doit exister")
+
     def test_reveil_sur_le_lot_actionnable(self):
         worker = self._worker("r1")
         qa = work.add(self.db, title="en relecture", assignee="r1", force=_FORCE)["id"]
@@ -1591,6 +1602,9 @@ class ReveilTest(_Base):
         self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(b)))
         self.assertIn("Resuming lot #%d" % b, spec["prompt"])
         self.assertIn('hold: <reason>', spec["prompt"])
+        # #8458 : le réveil est soldé par son tour lancé ; sans lui, la dette
+        # resterait due et se rejouerait (voir le rejeu borné, test_8458).
+        self._solder_reveil(worker, spec)
         self.assertIsNone(self.pick(worker), "pas deux réveils de suite")
 
     def test_future_wake_without_hold_waits_in_intake_and_build(self):
@@ -1682,7 +1696,12 @@ class ReveilTest(_Base):
     def test_backoff_en_base_survit_au_redemarrage(self):
         worker = self._worker("r2")
         b = work.add(self.db, title="à faire", assignee="r2", force=_FORCE)["id"]
-        self.assertIsNotNone(self.pick(worker))
+        premier = self.pick(worker)
+        self.assertIsNotNone(premier)
+        # #8458 : le réveil délivré est soldé par le tour qui l'a lancé ; sans
+        # ce tour, la dette resterait due et serait rejouée au redémarrage
+        # (rejeu borné couvert par `test_8458_lot_wake_replay`).
+        self._solder_reveil(worker, premier)
         relance = self._worker("r2")    # nouvel exécuteur, même agent
         relance.runner.idle_nudge = 100_000.0    # plafond du délai doublé
         self.assertIsNone(self.pick(relance))
@@ -1690,10 +1709,14 @@ class ReveilTest(_Base):
         self.recule("r2", b, 2 * base - 30)
         self.assertIsNone(self.pick(relance), "délai doublé")
         self.recule("r2", b, 31)
-        self.assertEqual(self.pick(relance)["lot"], str(b))
+        second = self.pick(relance)
+        self.assertEqual(second["lot"], str(b))
+        self._solder_reveil(relance, second)
         for _ in range(3):
             self.recule("r2", b, 100_000)
-            self.pick(relance)
+            spec = self.pick(relance)
+            if spec is not None:
+                self._solder_reveil(relance, spec)
         self.recule("r2", b, 100_000)
         self.assertEqual(self.st.listing("r2")[0]["wakes"], 3)
         self.assertIsNone(self.pick(relance), "au plus lot_wake_max réveils sans effet")

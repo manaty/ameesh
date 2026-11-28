@@ -11,9 +11,12 @@ unités différentes pour le même réveil.
 Témoins : le lanceur stable `~/.local/bin/ameesh`, que `UNIT_PATH` nomme, est
 préféré au binaire du `PATH` ; un réveil armé sous `PATH=/tmp/x:…` ne contient
 pas `/tmp/x` ; deux `PATH` différents rendent le même `ExecStart` ; `env` de la
-ligne d'exécution vient de `/usr/bin/env`, pas du `PATH`. Le repli de #4754
-reste : sans lanceur stable, un binaire de venv versionné est ramené au lien
-vivant.
+ligne d'exécution vient de `/usr/bin/env`, pas du `PATH`.
+
+#8458 : sans lanceur local, le choix est REFUSÉ — jamais de repli sur le
+`PATH` de l'appelant (deux shells auraient rendu deux `ExecStart`, et un
+chemin privé peut disparaître avant l'échéance). Le repli de #4754 reste dans
+`stable_binary` pour la réécriture d'une unité existante (`repin_units`).
 """
 from __future__ import annotations
 
@@ -69,16 +72,39 @@ class StableLauncherTest(unittest.TestCase):
         self.assertIn('"%s" watch fire --agent %s --wake %s'
                       % (self.stable, AGENT, SLUG), services[0])
 
-    def test_without_the_launcher_the_versioned_binary_stays_stable(self):
-        # #4754 is preserved: a versioned venv becomes the live link (or
-        # ~/.local/bin), even when the stable launcher itself is absent.
+    def test_without_the_launcher_the_choice_is_refused(self):
+        # #8458: no fallback to the caller's PATH, not even for a versioned
+        # venv: the unit would depend on who armed it.
+        bare = os.path.join(self.root, "bare")
+        os.makedirs(bare)
+        base = os.path.join(self.root, "share", "ameesh")
+        versioned = _exe(os.path.join(base, "venv-52d1e28", "bin", "ameesh"))
+        env = {"HOME": bare, "PATH": os.path.dirname(versioned) + ":/usr/bin:/bin"}
+        with self.assertRaises(watch.WatchError) as raised:
+            watch._ameesh_binary(env)
+        self.assertIn(os.path.join(bare, ".local", "bin", "ameesh"),
+                      str(raised.exception))
+        self.assertIn("PATH", str(raised.exception))
+
+    def test_two_paths_without_the_launcher_render_no_exec_start(self):
+        # #8458: two shells can no longer render two different ExecStart for
+        # the same wake — without the stable launcher both choices are refused
+        # before a unit is written.
+        bare = os.path.join(self.root, "bare")
+        os.makedirs(bare)
+        for path in (self.private + ":/usr/bin:/bin", "/usr/bin:/bin"):
+            with self.assertRaises(watch.WatchError):
+                watch._ameesh_binary({"HOME": bare, "PATH": path})
+
+    def test_stable_binary_still_remaps_a_versioned_venv(self):
+        # #4754 is preserved where it belongs: rewriting an existing unit's
+        # exec line (`repin_units`), not choosing a binary to arm a new one.
         bare = os.path.join(self.root, "bare")
         os.makedirs(bare)
         base = os.path.join(self.root, "share", "ameesh")
         versioned = _exe(os.path.join(base, "venv-52d1e28", "bin", "ameesh"))
         live = _exe(os.path.join(base, "venv-courant", "bin", "ameesh"))
-        env = {"HOME": bare, "PATH": os.path.dirname(versioned) + ":/usr/bin:/bin"}
-        self.assertEqual(watch._ameesh_binary(env), live)
+        self.assertEqual(watch.stable_binary(versioned, home=bare), live)
 
     @unittest.skipUnless(os.access("/usr/bin/env", os.X_OK), "no /usr/bin/env")
     def test_env_is_not_taken_from_the_caller_path(self):
@@ -137,6 +163,19 @@ class ArmedWakeTest(PgTestCase):
                                watch.wake_name(AGENT, SLUG, "service")),
                   encoding="utf-8") as fh:
             return fh.read()
+
+    def test_a_wake_without_the_stable_launcher_is_refused_and_writes_nothing(self):
+        # #8458: the refusal happens before any unit file is written.
+        bare = os.path.join(self.root, "bare")
+        os.makedirs(bare)
+        env = self.arm_env(self.private + ":/usr/bin:/bin")
+        env["HOME"] = bare
+        with self.assertRaises(watch.WatchError) as raised:
+            watch.arm(self.here, self.db, AGENT, SLUG, 1800, "REVEIL #8458",
+                      run=self.run_, env=env, actor="human:owner")
+        self.assertIn("launcher", str(raised.exception))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.units, watch.wake_name(AGENT, SLUG, "service"))))
 
     def test_a_wake_armed_from_two_paths_has_one_exec_start(self):
         # `arm` used to read the process PATH through `_ameesh_binary`, not the

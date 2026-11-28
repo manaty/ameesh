@@ -48,7 +48,8 @@ class DeadlineTest(unittest.TestCase):
 
         def arm(*args, **kwargs):
             return real_arm(*args, **kwargs, run=run,
-                            env={watch.UNIT_DIR_ENV: self.directory, "PATH": "/bin"})
+                            env={watch.UNIT_DIR_ENV: self.directory, "PATH": "/bin",
+                                 "HOME": support.launcher_home("ameesh-1737-home-")})
 
         with mock.patch.object(watch.time, "time", side_effect=lambda: self.clock), \
                 mock.patch.object(watch.platform, "is_linux", return_value=True), \

@@ -31,7 +31,7 @@ from unittest import mock
 from ameesh import db as db_mod
 from ameesh import exploitation, role_run, role_timers, storage, watch
 
-from .support import PgTestCase
+from .support import PgTestCase, launcher_home
 
 NAME = "gov-7933"
 EVERY = 1800
@@ -51,7 +51,8 @@ class WatchRoleLeaseTest(PgTestCase):
         self.atelier = dataclasses.replace(self.cfg, host="atelier")
         self.now = time.time()
         self.env = {watch.UNIT_DIR_ENV: tempfile.mkdtemp(prefix="ameesh-7933-"),
-                    "PATH": "/usr/bin:/bin"}
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": launcher_home("ameesh-7933-home-")}
         self.addCleanup(shutil.rmtree, self.env[watch.UNIT_DIR_ENV], True)
         self.linger = "yes"
         self.calls = []

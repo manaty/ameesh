@@ -45,6 +45,10 @@ class ReveilLanceLeTourTest(_Base):
         worker._scheduled_wake_checked = float("-inf")
         return worker._pick_for_turn()
 
+    def dette(self, name):
+        """#8458 : la dette de réveil vit en base, par lot."""
+        return {str(r["id"]): r for r in self.st.pending_lot_wakes(name)}
+
     def tours(self) -> int:
         return len(self.turns()) if os.path.exists(self.turns_log) else 0
 
@@ -68,7 +72,7 @@ class ReveilLanceLeTourTest(_Base):
         with self._env():
             self.assertTrue(worker.run_turn(spec))
         self.assertEqual(self.tours(), 1, "un tour de lot part au réveil")
-        self.assertIsNone(worker._lot_wake_retry)
+        self.assertEqual(self.dette("t8423a"), {})
         self.assertEqual(self.st.listing("t8423a")[0]["wakes"], 1)
 
     def test_pression_au_lancement_dit_la_raison_et_rejoue_le_reveil(self):
@@ -90,7 +94,7 @@ class ReveilLanceLeTourTest(_Base):
         with self._env():
             self.assertTrue(worker.run_turn(again))
         self.assertEqual(self.tours(), 1)
-        self.assertIsNone(worker._lot_wake_retry)
+        self.assertEqual(self.dette("t8423b"), {})
 
     def test_rejeux_bornes_puis_delai_double(self):
         worker = self._worker("t8423c")
@@ -103,7 +107,7 @@ class ReveilLanceLeTourTest(_Base):
             self.assertIsNotNone(spec)
         journal = self._refuse_par_pression(worker, spec)
         self.assertTrue(any("given up after" in ligne for ligne in journal), journal)
-        self.assertIsNone(worker._lot_wake_retry)
+        self.assertEqual(self.dette("t8423c"), {})
         self.assertIsNone(self.choix(worker), "le délai doublé reprend la main")
         self.assertEqual(self.st.listing("t8423c")[0]["wakes"], 1)
 
@@ -112,7 +116,7 @@ class ReveilLanceLeTourTest(_Base):
         lot = self._lot("t8423d")
         spec = self.choix(worker)
         self._refuse_par_pression(worker, spec)
-        self.assertIsNotNone(worker._lot_wake_retry)
+        self.assertIn(str(lot), self.dette("t8423d"))
         work.note(self.db, lot, "hold: attend une décision", actor="t8423d")
         self.assertIsNone(self.choix(worker))
-        self.assertIsNone(worker._lot_wake_retry)
+        self.assertEqual(self.dette("t8423d"), {})

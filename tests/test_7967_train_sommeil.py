@@ -413,7 +413,7 @@ class TrainStuckHourTest(unittest.TestCase):
         rules = types.SimpleNamespace(next_packet=lambda at: (
             23 * 3600.0 if at < 23 * 3600.0 else 35 * 3600.0))
         started = 11 * 3600.0
-        db = self.Db([self.row(started_ts=started)])
+        db = self.Db([self.row(phase="ci", started_ts=started)])
         with mock.patch.object(exploitation, "_packet_calendar",
                                return_value=rules):
             self.assertEqual(exploitation._train_stuck(

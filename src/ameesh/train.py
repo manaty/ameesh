@@ -63,6 +63,20 @@ class PublicationRefused(TrainError):
     Une indisponibilité de prévalidation n'en est pas une (non bloquante)."""
 
 
+class TrainObjectMissing(TrainError):
+    """#8480 : un commit du plan (tête gelée, base) reste absent du clone de
+    ce moteur après le fetch borné de la branche d'intégration et de la cible.
+
+    Le clone est propre au propriétaire de la réservation : un plan composé
+    et publié par un autre runner n'y existe pas tant qu'il n'est pas
+    récupéré. Absent après ce fetch, c'est un incident nommé : le plan reste
+    en `draining` (cible tenue, aucune promotion) et le pilote est prévenu une
+    fois par commit manquant, jamais une boucle muette."""
+    def __init__(self, plan_id, sha, why):
+        super().__init__(why)
+        self.incident = dict(kind="train-object-missing", plan=plan_id, sha=sha)
+
+
 class MemberDeferred(TrainError):
     """A named composition exclusion, never an accusation or queue ejection."""
     def __init__(self, row, reason):
@@ -645,7 +659,10 @@ class Engine:
                     state["error"] = str(exc)
                     state = self._save(state)
                 self.ports.notify(str(exc), state)
-            return {"result": "refused", "error": str(exc)}
+            refused = {"result": "refused", "error": str(exc)}
+            if isinstance(exc, TrainObjectMissing):
+                refused["incident"] = dict(exc.incident)
+            return refused
         finally:
             if state is None or state.get("phase") in TERMINAL:
                 self.ports.release(epoch)
@@ -984,8 +1001,11 @@ class Engine:
             return self._drained_terminal(state, str(exc), stage="ci")
         except TrainError as exc:
             # Lecture impossible : rien ne prouve la fin des runs.
-            return {"result": "draining", "plan": state["plan"],
-                    "error": "reservation expired, CI unreadable: %s" % exc}
+            result = {"result": "draining", "plan": state["plan"],
+                      "error": "reservation expired, CI unreadable: %s" % exc}
+            if isinstance(exc, TrainObjectMissing):
+                result["incident"] = dict(exc.incident)    # #8480
+            return result
         if ci["status"] == "absent" and not state.get("fire") \
                 and self._unpublished(state):
             return self._drained_terminal(

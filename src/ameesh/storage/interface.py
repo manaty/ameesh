@@ -707,10 +707,11 @@ class Leases(Domain):
 
         Rend {"host": empreinte du cycle de vie des hôtes, "agents": {nom:
         {"sig": empreinte, "pending": travail en attente, "wake_ts":
-        prochain réveil programmé ou None}}}. L'empreinte d'un agent change
-        avec sa ligne du registre (hors horodatages de bail et de présence),
-        son courrier actif non remis et ses réveils programmés. None : pas de
-        passe groupée ici (chaque worker garde son pas)."""
+        prochain réveil programmé ou None, "wake_pending": dette de réveil de
+        lot (#8458)}}}. L'empreinte d'un agent change avec sa ligne du
+        registre (hors horodatages de bail et de présence), son courrier actif
+        non remis, ses réveils programmés et sa dette de réveil de lot. None :
+        pas de passe groupée ici (chaque worker garde son pas)."""
         return None
 
     @abc.abstractmethod
@@ -6704,7 +6705,13 @@ class LotSessions(Domain):
     """Une ligne par (agent, lot) : la session mise de côté pour ce lot
     (`session_id` et le harnais, le compte et le dossier sous lesquels seuls
     elle se reprend), et les réveils de l'exécuteur sur ce lot (règle 1).
-    La session ACTIVE reste au registre (`session_id`, `session_work_item`)."""
+    La session ACTIVE reste au registre (`session_id`, `session_work_item`).
+    #8458 : la ligne porte aussi la dette d'un réveil compté dont le tour n'a
+    pas lancé son harnais (`wake_pending_at`, `wake_retries`,
+    `wake_retry_reason`), effacée au lancement ou abandonnée après les
+    rejeux — par lot, et sans perdre l'état à un redémarrage. La dette porte
+    l'instant du réveil : un écrivain N-1 qui avance `last_wake_at` sans les
+    colonnes neuves la rend caduque (il a pris ce réveil en charge)."""
 
     #: lots que la règle 1 reprend
     ACTIONABLE_STATES = lifecycle.ACTIVE
@@ -6764,14 +6771,55 @@ class LotSessions(Domain):
         comme `planned_waits.active_holds`). Chaque
         ligne : `id`, `title`, `state`, `priority`, `activity_ts` (dernier
         signe de vie du lot : lot, journal, pointe de branche, courrier sur
-        le lot), `wakes`, `last_wake_ts`, `wake_activity_ts`."""
+        le lot), `wakes`, `last_wake_ts`, `wake_activity_ts`, `wake_pending`,
+        `wake_retries`, `wake_retry_reason` (#8458 : dette d'un réveil non
+        lancé, rejeu dû sans attendre le délai doublé)."""
 
     @abc.abstractmethod
     def note_wake(self, name: str, lot: int, activity_ts: float | None) -> dict:
         """Note un réveil de l'agent sur le lot, horloge de la base : le
         compte repart à 1 si le lot a vécu depuis le réveil précédent
         (`activity_ts` plus récent que `wake_activity_at`), sinon il croît.
-        Rend la ligne."""
+        La ligne devient une dette (#8458, `wake_pending_at` au même instant
+        que `last_wake_at`) : elle reste tant qu'un tour de ce lot n'a pas
+        lancé son harnais, et `settle_lot_wake` l'efface ou l'abandonne après
+        les rejeux. Une écriture N-1 qui avance ensuite `last_wake_at` sans
+        les colonnes neuves rend la dette caduque (aucun rejeu). Rend la
+        ligne."""
+
+    @abc.abstractmethod
+    def pending_lot_wakes(self, name: str) -> list[dict]:
+        """#8458 : les réveils de lot comptés dont aucun tour n'a lancé son
+        harnais (`wake_pending_at` non dépassé par `last_wake_at`), un par
+        lot : `id` du lot, `wake_retries`, `wake_retry_reason`. La dette vit
+        en base : un redémarrage de l'exécuteur la relit, et chaque lot a la
+        sienne — le rejeu d'un lot n'est ni effacé ni compté par un autre.
+        Une dette rendue caduque par un écrivain N-1 n'est pas rejouée."""
+
+    @abc.abstractmethod
+    def bump_lot_wake_replay(self, name: str, lot: int) -> int | None:
+        """#8458 : réclame un rejeu de la dette du lot (écriture atomique) et
+        rend le nombre de rejeux déjà réclamés (`wake_retries` incrémenté), ou
+        None si le lot n'a plus de dette (lancé, abandonné ou jamais compté)."""
+
+    @abc.abstractmethod
+    def settle_lot_wake(self, name: str, lot: int, *, launched: bool,
+                        reason: str | None = None,
+                        max_retries: int = 5) -> dict:
+        """#8458 : clôt la dette d'un réveil de lot après un tour.
+
+        `launched=True` : le harnais est parti — la dette est effacée
+        (`wake_pending` faux, compteur et raison remis à zéro). Sinon : la
+        raison du tour non lancé est notée ; quand les rejeux réclamés
+        atteignent `max_retries`, la dette est abandonnée (compteur remis à
+        zéro) et le délai doublé reprend. Rend `{found, pending, retries,
+        reason}` tel qu'écrit."""
+
+    @abc.abstractmethod
+    def forget_lot_wake(self, name: str, lot: int) -> bool:
+        """#8458 : efface la dette d'un réveil de lot devenue sans objet (lot
+        fini, réassigné, tenu, plus actionnable). Rend vrai si une ligne en
+        dette a été effacée."""
 
     @abc.abstractmethod
     def due_wakes(self, name: str, now: float, claim_ttl_s: float = 120.0) -> list[dict]:
