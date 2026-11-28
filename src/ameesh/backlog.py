@@ -1003,6 +1003,92 @@ def _held_now(db, item: dict, *, cfg=None, now: float | None = None) -> bool:
     return _hold_blocks(item, holds.get(ident), now)
 
 
+#: #8375 : temps de grâce après la levée d'une réservation à un exécutant
+#: externe. La levée est un passage de main (clôture par le pilote, ou nouvelle
+#: demande explicite), jamais une nouvelle demande : la file ne la défait pas
+#: dans la minute. 15 min est le délai du palier 1 du canon (§9), le temps
+#: donné au pilote pour lire le brief et clore.
+EXTERNAL_RELEASE_GRACE_S = 15 * 60
+
+
+def external_release_blocked(db, rows, *, now: float | None = None) -> set[int]:
+    """#8375 : les lots qu'une levée de réservation externe met hors de la
+    prise automatique (L165).
+
+    `ameesh work external-executor <lot> --clear` écrit `external executor
+    cleared` au journal : le lot quitte son exécutant externe et redevient
+    `intake` sans assigné. Sans garde, la passe de prise suivante le donne
+    aussitôt à un agent de construction — trois fois le 27/11 (#8325, #8348,
+    #8361) pour des lots déjà livrés qu'il ne restait qu'à clore. Le champ
+    courant est déjà vide : la levée se lit au journal, pas sur la ligne.
+
+    Deux règles :
+    * toute levée plus récente que `EXTERNAL_RELEASE_GRACE_S` écarte le lot :
+      le pilote a le temps de clore ou de confier explicitement ; une
+      réservation abandonnée revient à la file après la fenêtre ;
+    * une levée dont la dernière réservation fermée porte une preuve de travail
+      fait (`slo.external_done_evidence`, #8163 : « livré », « vérifié », une
+      note du bureau…) écarte le lot jusqu'à sa clôture : il est **à clore**,
+      pas à réassigner. Une attribution explicite (`ameesh work assign`) reste
+      la nouvelle demande qui le remet au travail.
+
+    Rend l'ensemble des ids bloqués. `rows` : les candidats ; la lecture est
+    groupée, et le journal complet n'est lu que pour les lots dont la levée
+    sort de la fenêtre."""
+    from . import slo
+    from .storage.interface import EXTERNAL_EXECUTOR_CLEARED_NOTE
+
+    candidates = [row for row in rows if row.get("id") is not None]
+    if not candidates:
+        return set()
+    stamp = time.time() if now is None else float(now)
+    ids = [int(row["id"]) for row in candidates]
+    events = storage.of(db).progress.lot_hold_events(
+        ids, (r"^" + EXTERNAL_EXECUTOR_CLEARED_NOTE,))
+    cleared: dict[int, float] = {}
+    for event in events:
+        note = str(event.get("note") or "").strip()
+        if not note.startswith(EXTERNAL_EXECUTOR_CLEARED_NOTE):
+            continue
+        at = event.get("created_ts")
+        if at is None:
+            continue
+        lot = int(event["work_item_id"])
+        cleared[lot] = max(cleared.get(lot, float("-inf")), float(at))
+    if not cleared:
+        return set()
+    blocked = {lot for lot, at in cleared.items()
+               if stamp - at < EXTERNAL_RELEASE_GRACE_S}
+    older = [lot for lot in cleared if lot not in blocked]
+    if not older:
+        return blocked
+    by_id = {int(row["id"]): row for row in candidates}
+    journal = storage.of(db).progress.lot_events(older)
+    per_lot: dict[int, list[dict]] = {}
+    for event in journal:
+        per_lot.setdefault(int(event["work_item_id"]), []).append(event)
+    for lot in older:
+        row = by_id.get(lot)
+        if row is None:
+            continue
+        history = per_lot.get(lot, ())
+        # Une attribution explicite APRÈS la levée est la nouvelle demande :
+        # le lot a été confié, puis éventuellement rendu à la file par son
+        # porteur — la prise le reprend normalement (la boucle de prise
+        # automatique écrit une autre note, `LOT_TAKE_NOTE`, qui ne compte
+        # pas comme un geste nommé).
+        released = cleared[lot]
+        if any(str(event.get("note") or "").startswith(("assigned to ",
+                                                        "delegated to "))
+               and float(event.get("created_ts") or 0.0) > released
+               for event in history):
+            continue
+        periods = slo.external_reservation_periods(row, history)
+        if slo.external_done_evidence(periods, history, now=stamp):
+            blocked.add(lot)
+    return blocked
+
+
 def lot_takeable(item: dict, today: str | None = None, *, holds=None,
                  now: float | None = None) -> bool:
     """Un lot du projet peut-il être pris sans qu'on le confie ? Jamais un lot
@@ -1082,6 +1168,13 @@ def roadmap_waiting(db: Db, project: str, *, now: float | None = None) -> list:
            and not review_lot.review_ref(item) and not is_review_followup(item)]
     if not out:
         return []
+    # #8375 : la levée d'une réservation externe n'est pas une nouvelle
+    # demande ; le lot « à clore » ne retient pas une amélioration derrière lui.
+    released = external_release_blocked(db, out, now=stamp)
+    if released:
+        out = [item for item in out if int(item["id"]) not in released]
+        if not out:
+            return []
     from . import project_plan
     out = project_plan.eligible(db, out, cfg=getattr(db, "cfg", None), now=stamp)
     return sous_utilisation.waiting_project_lots(out, db=db, now=stamp)
@@ -1267,7 +1360,11 @@ def _assign_ready(db, item: dict, assignee: str, note: str, take,
     sans courrier. Celle-ci est un point de sauvegarde sous psycopg et se
     joint à la session sous psql. Une connexion d'exécuteur médiée n'a pas
     de transaction : elle garde la lecture de la sélection (garde non
-    applicable)."""
+    applicable).
+
+    #8375 : la même relecture sous le verrou couvre la levée d'une réservation
+    externe (`external_release_blocked`) — une levée arrivée depuis la
+    sélection annule l'attribution, comme un hold."""
     st = storage.of(db)
     args = dict(current=None, note=note, actor=SENDER, max_build=cap,
                 take=take, ready_only=True)
@@ -1280,6 +1377,8 @@ def _assign_ready(db, item: dict, assignee: str, note: str, take,
                 if _held_now(tx, done, cfg=cfg, now=now):
                     raise _HoldPlaced
                 if done.get("type") != ITEM_TYPE:
+                    if int(done["id"]) in external_release_blocked(tx, [done], now=now):
+                        raise _HoldPlaced
                     from . import project_plan
                     if not project_plan.assignment_ready(tx, item, done, cfg=cfg, now=now,
                                                          can_take=plan_can_take):
@@ -1586,6 +1685,11 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     lots = [item for item in lots
             if lot_takeable(item, today, now=now)
             and now - float(item.get("created_ts") or now) >= LOT_MIN_AGE_S]
+    # #8375 : une réservation externe levée (fenêtre de clôture, ou preuve de
+    # livraison) écarte le lot de la prise ; le pilote clôt ou confie.
+    released = external_release_blocked(db, lots, now=now)
+    if released:
+        lots = [item for item in lots if int(item["id"]) not in released]
     from . import project_plan
     plan_snapshots = {}
     lots = project_plan.eligible(db, lots, cfg=cfg, now=now, phase=False,
