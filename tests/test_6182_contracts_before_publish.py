@@ -167,7 +167,8 @@ class ScopeAndBudgetTest(unittest.TestCase):
             clock[0] += 3
             return ['tests.test_x']
         def execute(*args, **kwargs):
-            self.assertEqual(kwargs, {'timeout': 9, 'heavy': True, 'wall': 9, 'failfast': True})
+            self.assertEqual(kwargs, {'timeout': 9, 'heavy': True, 'wall': 9, 'failfast': True,
+                          'offload': False})
             clock[0] += 9
             return auto.TestRun('contrats', ['tests.test_x'], None, 'slot timeout', 9, timed_out=True)
         with mock.patch.object(auto.time, 'monotonic', side_effect=lambda: clock[0]), \
