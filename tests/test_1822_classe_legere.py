@@ -110,6 +110,7 @@ class ReviewClassOfTest(unittest.TestCase):
         memo: dict = {}
         with mock.patch.object(lot_class, "repository", return_value="repo"), \
              mock.patch.object(lot_class, "default_base", return_value="main"), \
+             mock.patch.object(plan_git, "local_commit", return_value="a" * 40), \
              mock.patch.object(plan_git, "_commit", return_value="a" * 40), \
              mock.patch.object(canon, "git_range_paths", return_value=["README.md"]), \
              mock.patch.object(lot_class, "class_of_paths", return_value={"class": "light", "doubt": False}), \

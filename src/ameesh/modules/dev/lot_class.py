@@ -559,17 +559,25 @@ def target_warning(cfg, item: dict, repo: Optional[str]) -> str:
 
 
 def _refreshed_base(repo: str, target: str) -> str:
-    """Le commit de la cible `target` relu à la forge après un fetch, ou '' (#8377).
+    """Le commit de la cible `target` relu à la forge, ou '' (#8377).
 
-    Un clone qui vient d'être rafraîchi pour porter un gel absent peut encore
-    avoir une cible périmée : le diff depuis cette ref contiendrait les
-    fusions déjà entrées dans la cible depuis le dernier fetch, et la classe
-    couvrirait plus que le lot. Même lecture que la désignation (#4673) : la
-    pointe publiée est lue par `ls-remote`, puis l'objet exact est rapatrié —
-    la ref partagée reste intacte. Une forge muette laisse la ref locale faire
-    foi ('')."""
+    La ref locale d'un clone n'est fraîche que de son dernier fetch : même
+    quand la tête gelée est déjà présente (rapatriée par une lecture
+    précédente, `repo_for_freeze` ou la prévalidation), `origin/<cible>` peut
+    nommer un ancêtre de la cible publiée. Le diff depuis cette ref
+    contiendrait alors les fusions déjà entrées dans la cible, et la classe
+    couvrirait plus que le lot. La pointe publiée est donc lue par
+    `ls-remote`, puis l'objet exact est rapatrié — la ref partagée reste
+    intacte. Une forge muette laisse la ref locale faire foi (''), et une
+    échéance de balayage épuisée écarte la lecture (#2851)."""
     try:
         from ... import review_authors
+        # #2851 : une échéance de balayage épuisée ne paie pas le réseau ; la
+        # ref locale fait foi comme avant #8377 (classe prudente, jamais
+        # rassurante). Un balayage encore ouvert garde sa borne habituelle.
+        sweep = review_authors.active_sweep()
+        if sweep is not None and sweep.deadline.expired():
+            return ""
         return review_authors.refreshed_target(repo, target) or ""
     except Exception:  # noqa: BLE001 - forge muette : la ref locale fait foi
         return ""
@@ -1267,10 +1275,17 @@ def _of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     # pas, et le diff depuis lui rapportait au lot tout ce qui a été fusionné
     # depuis (#2955 léger affiché sensible, 60 fichiers au lieu de 3).
     revision = base_sha
-    if not revision and fetched:
-        # #8377 : le clone vient d'être rafraîchi ; relire la cible publiée
-        # évite de classer le lot sur un diff qui contient les fusions déjà
-        # entrées dans la cible depuis le dernier fetch.
+    if not revision and landing:
+        # #8377 B1 (cx2) : la base ne dépend pas du fetch de la tête fait dans
+        # cet appel. Une tête déjà locale (rapatriée par `repo_for_freeze`, la
+        # prévalidation ou une lecture précédente) n'autorise pas à lire
+        # `origin/<cible>` resté en arrière : le diff rendrait au lot les
+        # fusions déjà entrées dans la cible et pourrait le surclasser. La
+        # cible publiée est donc relue à chaque classification ; la ref
+        # partagée n'est pas déplacée et la lecture reste bornée
+        # (`review_authors.TARGET_REFRESH_TIMEOUT`). Une forge muette laisse
+        # la ref locale faire foi, comme avant. La base **nommée** par
+        # l'appelant reste la sienne (#2464/#2505) : elle n'est jamais réécrite.
         revision = _refreshed_base(repo, base)
     revision = revision or (_landing_ref(repo, base) if landing else base)
     if not revision:

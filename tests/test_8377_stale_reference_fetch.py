@@ -111,6 +111,13 @@ class StaleReferenceTest(unittest.TestCase):
              self.frozen + "^{commit}"], capture_output=True)
         return proc.returncode == 0
 
+    def _class(self) -> dict:
+        return lot_class.of_lot(
+            None, 8377, cfg=self.cfg, item=self.item,
+            milestones=[{"kind": "frozen", "sha": self.frozen, "id": 1,
+                         "at_ts": 0}],
+            canons=[])
+
     def test_la_porte_fetche_la_tete_poussee_apres_le_dernier_fetch(self):
         self.assertFalse(self._has_frozen())
         with mock.patch("ameesh.db.is_dry_pass", return_value=False), \
@@ -140,6 +147,47 @@ class StaleReferenceTest(unittest.TestCase):
                          ["lot.txt"])
         self.assertNotIn("not a commit", out["why"])
         self.assertIn("no readable canon", out["why"])
+
+    def test_deux_appels_consecutifs_gardent_la_cible_publiee(self):
+        # B1 (cx2) : au premier appel la tête est rapatriée, au second elle
+        # est déjà locale. La base ne doit pas dépendre du fetch de cet appel :
+        # sinon `origin/main`, resté à `base`, rend au lot `merged.txt`, déjà
+        # entré dans la cible, et peut le surclasser en sensible.
+        first = self._class()
+        self.assertEqual(first["frozen_sha"], self.frozen)
+        self.assertEqual(first["base_sha"], self.target)
+        self.assertEqual([entry["path"] for entry in first["files"]],
+                         ["lot.txt"])
+        self.assertTrue(self._has_frozen())
+        # La lecture de la cible publiée ne déplace aucune ref partagée.
+        self.assertEqual(
+            _git(self.reference, "rev-parse", "refs/remotes/origin/main"),
+            self.base)
+        second = self._class()
+        self.assertEqual(second["frozen_sha"], self.frozen)
+        self.assertEqual(second["base_sha"], self.target)
+        self.assertEqual([entry["path"] for entry in second["files"]],
+                         ["lot.txt"])
+
+    def test_repo_for_freeze_puis_of_lot_garde_la_cible_publiee(self):
+        # B1 (cx2) : `repo_for_freeze` (ou la prévalidation) peut rapatrier la
+        # tête avant le premier `of_lot`. Le gel est alors présent d'emblée et
+        # la base doit quand même être la cible publiée, jamais `origin/main`.
+        self.assertFalse(self._has_frozen())
+        with mock.patch("ameesh.db.is_dry_pass", return_value=False), \
+                mock.patch("ameesh.registry.get",
+                           return_value={"cwd": self.empty}), \
+                mock.patch("ameesh.registry.overview", return_value=[]), \
+                mock.patch.object(lot_class.os, "getcwd", return_value=self.empty):
+            found, commit = lot_class.repo_for_freeze(
+                None, self.cfg, self.item, self.frozen)
+        self.assertEqual(found, os.path.realpath(self.reference))
+        self.assertEqual(commit, self.frozen)
+        out = self._class()
+        self.assertEqual(out["frozen_sha"], self.frozen)
+        self.assertEqual(out["base_sha"], self.target)
+        self.assertEqual([entry["path"] for entry in out["files"]],
+                         ["lot.txt"])
 
     def test_un_balayage_epuise_ne_paie_pas_le_fetch(self):
         # #2851 : la passe d'alertes borne ses lectures ; une échéance épuisée
