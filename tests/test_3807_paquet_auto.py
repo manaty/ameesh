@@ -1117,8 +1117,9 @@ class PaquetAutoBanc(unittest.TestCase):
         text = text.replace("Contract revision: **%s," % base,
                             "Contract revision: **%s," % first)
         text = text.replace(
-            "The [IMA mapping]", "Revision %s adds `ameesh ancien` (#4); it is "
-            "additive to %s.\nThe [IMA mapping]" % (first, base), 1)
+            "\n\nThe [IMA mapping]",
+            "\nRevision %s adds `ameesh ancien` (#4); it is additive to %s."
+            "\n\nThe [IMA mapping]" % (first, base), 1)
         self.write("docs/api/module-contract-v1.md", text)
         old_style = self.commit("#4 : révision écrite")
         self.git("switch", "-q", "main", cwd=self.repo)

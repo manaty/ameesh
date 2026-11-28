@@ -776,9 +776,10 @@ CONTRACT_ITEM_NUMBER_RE = re.compile(r"^Revision \d+\.\d+ adds\b")
 def _revision_list_lines(text: str) -> list[str]:
     """Les lignes de la liste des révisions, sans les sections qui suivent.
 
-    La liste commence à la première ligne « Revision 1.N adds » et s'arrête au
-    premier titre ou à « The [IMA mapping] », comme le pliage. Une ligne
-    « Revision 1.8 adds … » en tête de section n'en fait donc pas partie (N).
+    La liste commence à la première ligne « Revision 1.N adds » et s'arrête à
+    la première ligne vide, comme le pliage (#8395). Une ligne
+    « Revision 1.8 adds … » en tête de section, ou le paragraphe de mapping qui
+    suit le bloc, n'en fait donc pas partie (N).
     """
     lines = str(text).splitlines()
     start = None
@@ -790,8 +791,7 @@ def _revision_list_lines(text: str) -> list[str]:
         return []
     end = len(lines)
     for index in range(start + 1, len(lines)):
-        if (lines[index].startswith("## ")
-                or lines[index].startswith("The [IMA mapping]")):
+        if not lines[index].strip() or lines[index].startswith("## "):
             end = index
             break
     return lines[start:end]

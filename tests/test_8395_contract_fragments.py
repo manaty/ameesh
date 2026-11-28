@@ -25,6 +25,7 @@ installed external module and its client processes.
 <!-- the number is assigned by the packet composer -->
 Revision 1.10 adds ten (#10); it is additive to 1.9.
 Revision 1.11 adds eleven (#11); it is additive to 1.10.
+
 The [IMA mapping](mapping.md) records the consumer.
 
 ## Body
@@ -59,9 +60,13 @@ def fragment(lot: int, adds: str, sections: str = "") -> cf.Fragment:
 
 
 def with_paragraphs(*paragraphs: str) -> str:
-    """Le contrat courant d'un lot à l'ancienne manière : paragraphes ajoutés."""
-    marker = "The [IMA mapping](mapping.md) records the consumer."
-    return CONTRACT.replace(marker, "\n".join(paragraphs) + "\n" + marker, 1)
+    """Le contrat courant d'un lot à l'ancienne manière : paragraphes ajoutés.
+
+    Les paragraphes restent dans le bloc de révisions (pas de ligne vide avant
+    eux) ; la ligne vide qui ferme le bloc et le mapping qui suit sont gardés.
+    """
+    marker = "\n\nThe [IMA mapping](mapping.md) records the consumer."
+    return CONTRACT.replace(marker, "\n" + "\n".join(paragraphs) + marker, 1)
 
 
 class FragmentParseTest(unittest.TestCase):

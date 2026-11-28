@@ -65,7 +65,9 @@ locaux, exécute un pliage mécanique (`scripts/paquet-auto.py` s'appuie sur
 - il attribue les numéros à partir de la révision de l'en-tête de la base, en
   continuant `1.N` ; il date l'en-tête du jour de composition ;
 - il insère chaque ligne `Revision 1.N adds …` après la dernière révision
-  existante, et les sections des fragments avant l'ancre
+  existante ; la liste des révisions est un bloc de paragraphes consécutifs
+  terminé par une ligne vide (le paragraphe de mapping qui suit reste intact),
+  et les sections des fragments vont avant l'ancre
   `<!-- contract-revision-sections: … -->` ;
 - il met à jour `"contract"` dans la surface et `CONTRACT_VERSION`, puis
   supprime les fragments ;

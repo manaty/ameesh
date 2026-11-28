@@ -51,7 +51,6 @@ _HEADER = re.compile(
 _HEADER_LINE = re.compile(
     r"(?m)^Contract revision: \*\*\d+\.\d+, [^*\n]+\*\*(?: ?\([^\n]*\))?")
 _REVISION_ITEM = re.compile(r"(?m)^Revision \d+\.\d+ adds\b")
-_TERMINATOR = re.compile(r"(?m)^(?:The \[IMA mapping\]|## )")
 _SURFACE = re.compile(r'("contract"\s*:\s*")(\d+\.\d+)(")')
 _VERSION = re.compile(r'(?m)^CONTRACT_VERSION = "(\d+\.\d+)"$')
 _ADDITIVE = re.compile(r"\badditive to (?:revision )?\d+\.\d+\b")
@@ -328,8 +327,14 @@ def plan_fold(base_contract: str, contract: str, surface: str, version: str,
     if not starts:
         raise FragmentError("liste des révisions introuvable dans le contrat")
     revision_start = starts[0].start()
-    terminator = _TERMINATOR.search(contract, revision_start)
-    revision_end = terminator.start() if terminator else len(contract)
+    # La liste des révisions est un bloc de paragraphes consécutifs : elle
+    # s'arrête à la première ligne vide. Aucun nom de client n'est écrit ici
+    # (#4259) : ce qui suit le bloc (mapping IMA, sections) est du texte libre.
+    blank = contract.find("\n\n", revision_start)
+    revision_end = len(contract) if blank < 0 else blank
+    tail = contract[revision_end:]
+    if not tail and contract.endswith("\n"):
+        tail = "\n"
     items: list[str] = []
     for index, match in enumerate(starts):
         if match.start() >= revision_end:
@@ -396,7 +401,7 @@ def plan_fold(base_contract: str, contract: str, surface: str, version: str,
     rebuilt = (contract[:header_match.start()] + header
                + contract[header_match.end():revision_start]
                + "\n".join(remaining + folded)
-               + "\n" + contract[revision_end:])
+               + tail)
 
     section_lots = [lot for lot in ordered
                     if lot in fragments and fragments[lot].sections.strip()]
