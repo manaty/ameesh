@@ -1845,7 +1845,10 @@ def empty_state() -> dict:
             #: #7749 : avatars sans destinataire vivant déjà journalisés pour
             #: un brief (clé de brief → raison), pour un seul repli par
             #: épisode et non un journal à chaque passe.
-            "avatar_brief_fallback": {}}
+            "avatar_brief_fallback": {},
+            #: #8391 : avis de pose d'une pause opérateur datée déjà déposés,
+            #: un par hôte et par épisode (hôte → pose, jusqu'à, agents).
+            "pause_notices": {}}
 
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
@@ -2987,6 +2990,7 @@ class Notifier:
             entry.update(severity=level, ack_subjects=subjects)
         self._journal_capacity(db, current, now)
         self._brief_agents(db, current, router, now, unreadable=unreadable)
+        self._pause_pose_notices(db, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
             if (entry["alert"].get("type") == "slo_breach" and entry.get("human")
@@ -3798,6 +3802,73 @@ class Notifier:
         self._attempt(entry, "raised", now)
 
     # -- agents qui peuvent agir (L132) ---------------------------------------
+    def _pause_pose_notices(self, db, now: float) -> None:
+        """#8391 : un avis passif par hôte au pilote du canon à la pose d'une pause.
+
+        Une pause opérateur humaine qui porte une échéance et un motif ne
+        réveille personne : cet avis part en `info` (lu au tour suivant) et
+        l'alerte `operator_pause_long`/`operator_pause_host` ne parle qu'à
+        l'échéance dépassée. Le destinataire vient du canon — le pilote de son
+        projet, jamais un nom écrit dans le cœur (#7660) ; sans pilote lisible,
+        l'avis n'est pas déposé et le journal le dit. L'état `pause_notices`
+        ne garde qu'un avis par hôte : une maintenance qui pose vingt pauses
+        d'affilée n'écrit pas vingt courriers, et un nouvel épisode sur le même
+        hôte (toutes les pauses levées puis reposées) en reçoit un. Un envoi en
+        échec n'est pas marqué : la passe suivante réessaie. Jamais fatal au
+        passage.
+        """
+        if db is None or not self._delivery_open() or self.dry_run:
+            return
+        try:
+            listing = storage.of(db).operations.listing()
+        except Exception as exc:  # noqa: BLE001 - un avis ne fait pas tomber la passe
+            self.log("pause notices not prepared (%s)" % exc)
+            return
+        try:
+            notices = exploitation.operator_pause_notices(listing, now)
+        except Exception as exc:  # noqa: BLE001
+            self.log("pause notices not computed (%s)" % exc)
+            return
+        state = self.state.setdefault("pause_notices", {})
+        hosts = {notice["host"] for notice in notices}
+        for host in list(state):
+            if host not in hosts:
+                del state[host]
+        if not notices:
+            return
+        # #8391 : le pilote est lu au canon, comme le lecteur du train
+        # (`train_canon.pilot_of`), pour le projet que le canon sert.
+        from . import train_canon
+        try:
+            recipient = train_canon.canon_pilot_of(self.cfg)(db)
+        except Exception as exc:  # noqa: BLE001 - un avis ne fait pas tomber la passe
+            self.log("pause notices not delivered (pilot unreadable: %s)" % exc)
+            return
+        if not recipient:
+            self.log("pause notices not delivered: no readable pilot in the canon")
+            return
+        pilot = next((row for row in listing if row.get("name") == recipient), None)
+        if pilot is None or pilot.get("retired_ts"):
+            # #3460 : un pilote retiré ne reçoit plus rien ; rien n'est marqué.
+            self.log("pause notices not delivered: pilot %s is not active"
+                     % recipient)
+            return
+        for notice in notices:
+            host = notice["host"]
+            if host in state:
+                continue
+            try:
+                mail.send(db, work.SYSTEM_SENDER, recipient, notice["detail"],
+                          kind="event", payload={"info": True,
+                                                 "operator_pause": notice})
+            except Exception as exc:  # noqa: BLE001 - la passe suivante réessaie
+                self.log("pause notice for host %s not delivered (%s)" % (host, exc))
+                continue
+            state[host] = {"since": notice.get("since"), "until": notice.get("until"),
+                           "agents": list(notice.get("agents") or ()), "sent_ts": now}
+            self.log("[operator_pause_notice] delivered to %s for host %s"
+                     % (recipient, host))
+
     def _brief_agents(self, db, current: list, router: Router, now: float,
                       *, unreadable=()) -> None:
         """`idle_capacity`, `stale_lot`, `plan_underused`, `mail_undeliverable` :
