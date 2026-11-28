@@ -305,10 +305,11 @@ if _yaml is not None:
     # #8474 : le lecteur C de libyaml quand PyYAML le fournit (2 à 3 fois plus
     # rapide sur une fiche) ; le refus des clés en double est réinstallé
     # au-dessus, comme sur SafeLoader. `use_pyyaml=False` garde `_MiniYaml`.
-    _SafeLoader = getattr(_yaml, "CSafeLoader", _yaml.SafeLoader)
-
-    class _StrictLoader(_SafeLoader):  # type: ignore[misc,name-defined]
-        """SafeLoader qui refuse les clés en double (deux `responsible:` = ambigu)."""
+    # Le lecteur C est plus strict sur les caractères (il refuse un échappement
+    # de surrogate isolé que le lecteur Python accepte) : `load_yaml` relit
+    # alors avec le lecteur Python, mêmes règles, pour que la sémantique ne
+    # dépende pas de la présence de libyaml.
+    _SafeLoader = _yaml.SafeLoader
 
     def _strict_mapping(loader, node, deep=False):
         seen = set()
@@ -323,8 +324,21 @@ if _yaml is not None:
                 raise YamlError("line %d: non-scalar key" % (key_node.start_mark.line + 1))
         return loader.construct_mapping(node, deep=deep)
 
-    _StrictLoader.add_constructor(
+    class _PortableStrictLoader(_SafeLoader):  # type: ignore[misc,name-defined]
+        """SafeLoader de référence (Python), clés en double refusées."""
+
+    _PortableStrictLoader.add_constructor(
         _yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _strict_mapping)
+
+    _CSafeLoader = getattr(_yaml, "CSafeLoader", None)
+    if _CSafeLoader is not None and _CSafeLoader is not _SafeLoader:
+        class _StrictLoader(_CSafeLoader):  # type: ignore[misc,name-defined]
+            """Lecteur C rapide, clés en double refusées."""
+
+        _StrictLoader.add_constructor(
+            _yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _strict_mapping)
+    else:
+        _StrictLoader = _PortableStrictLoader  # type: ignore[misc]
 
 
 def load_yaml(text: str, *, use_pyyaml: bool | None = None) -> Any:
@@ -337,8 +351,18 @@ def load_yaml(text: str, *, use_pyyaml: bool | None = None) -> Any:
                 raise YamlError("PyYAML unavailable")
             try:
                 return _normalize(_yaml.load(text, Loader=_StrictLoader))  # noqa: S506 (SafeLoader)
-            except _yaml.YAMLError as exc:
-                raise YamlError(" ".join(str(exc).split())) from exc
+            except _yaml.YAMLError as fast_exc:
+                if _StrictLoader is _PortableStrictLoader:
+                    raise YamlError(" ".join(str(fast_exc).split())) from fast_exc
+                # #8474 : le lecteur C refuse des caractères que le lecteur
+                # Python accepte (échappement `\uD800` : fiche #538). Relecture
+                # au lecteur de référence, mêmes règles ; un document vraiment
+                # invalide échoue des deux côtés.
+                try:
+                    return _normalize(_yaml.load(  # noqa: S506 (SafeLoader)
+                        text, Loader=_PortableStrictLoader))
+                except _yaml.YAMLError as exc:
+                    raise YamlError(" ".join(str(exc).split())) from fast_exc
         return _MiniYaml(text).parse()
     except RecursionError as exc:
         raise YamlError("nesting too deep") from exc

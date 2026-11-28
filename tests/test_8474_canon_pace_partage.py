@@ -320,6 +320,22 @@ class LoaderTest(_PaceCase):
         with self.assertRaises(canon.YamlError):
             canon.load_yaml("a: 1\na: 2\n", use_pyyaml=True)
 
+    @unittest.skipUnless(canon._yaml is not None, "PyYAML absent")
+    def test_the_pure_loader_still_refuses_duplicate_keys(self):
+        with self.assertRaises(canon.YamlError):
+            canon._yaml.load("a: 1\na: 2\n", Loader=canon._PortableStrictLoader)
+
+    @unittest.skipUnless(canon._yaml is not None, "PyYAML absent")
+    def test_a_surrogate_escape_falls_back_to_the_pure_loader(self):
+        """#538 : le lecteur C refuse `\\uD800`, le Python l'accepte et le nettoie."""
+        loaded = canon.load_yaml('title: "\\uD800"\n', use_pyyaml=True)
+        self.assertEqual(loaded, {"title": "\ud800"})
+
+    @unittest.skipUnless(canon._yaml is not None, "PyYAML absent")
+    def test_an_invalid_document_still_fails_after_the_fallback(self):
+        with self.assertRaises(canon.YamlError):
+            canon.load_yaml("a: [1,\n", use_pyyaml=True)
+
 
 class LocalConfigurationFallbackTest(_PaceCase):
     """Sans canon configuré, le cache reste par objet de configuration."""
