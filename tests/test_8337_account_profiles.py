@@ -87,11 +87,12 @@ class PublicProfilesTest(unittest.TestCase):
         document = accounts.public_profiles(self.raw)
         self.assertFalse(document["valid"])
         self.assertEqual([r["name"] for r in document["profiles"]],
-                         ["secondaire", "cle-a", "cle-b"])
+                         ["secondaire", "cle-a", "cle-b", "collee"])
+        # #8457 : la clé collée est publiée à null, le profil reste listé
+        self.assertIsNone(document["profiles"][-1]["key_env"])
         self.assertEqual(
             [(r["harness"], r["index"], r["name"], r["reason"]) for r in document["refused"]],
-            [("deepseek", 2, "collee", "unpublishable_variable_name"),
-             ("deepseek", 3, "relative", "invalid_profile"),
+            [("deepseek", 3, "relative", "invalid_profile"),
              ("deepseek", 4, "cle-a", "duplicate_name"),
              ("deepseek", 5, None, "not_an_object"),
              (None, None, None, "unknown_harness")])
@@ -160,52 +161,62 @@ class PublicProfilesTest(unittest.TestCase):
             [sys.executable, "-m", "ameesh", "accounts", "profiles", "--json"],
             env=env, capture_output=True, text=True, timeout=120).stdout)
         self.assertEqual([r["name"] for r in document["profiles"]],
-                         ["secondaire", "cle-a", "cle-b"])
+                         ["secondaire", "cle-a", "cle-b", "collee"])
         self.assertFalse(document["valid"])
-        self.assertEqual([r["reason"] for r in document["refused"]],
-                         ["unpublishable_variable_name", "invalid_profile"])
+        self.assertEqual([r["reason"] for r in document["refused"]], ["invalid_profile"])
 
 
-class KeyShapedValuesAreNeverPublishedTest(unittest.TestCase):
+class UntrustedNamesAreNeverPublishedTest(unittest.TestCase):
     """#8457 (manaty/ameesh#6666) : témoin de non-publication.
 
-    Une valeur au format clé collée dans `env`/`key_env`, ou à la place d'un
-    nom de harnais, n'apparaît jamais dans le document public, JSON compris.
+    Une valeur non de confiance dans `env`/`key_env` (une clé collée à la
+    place du nom), ou à la place d'un nom de harnais, n'apparaît jamais dans
+    le document public, JSON compris ; le profil reste listé, `valid` intact.
     """
 
-    #: formes de clés qui passaient l'ancien `ENV_NAME_RE`
-    KEYS = ("a3f9c2e1d4b5a6978877665544332211",      # hex minuscule
-            "DeadBeef0123456789abcdefCAFE",           # hex mêlé
-            "A3F9C2E1D4B5A6978877665544332211",      # hex majuscule
-            "AKIAIOSFODNN7EXAMPLE",                   # identifiant d'accès
-            "ghpTokenAbc123XyZ",
-            # relecture ameesh-cx2 : majuscules avec soulignés, lettres seules
+    #: formes de clés, dont celles des relectures d'ameesh-cx2
+    KEYS = ("a3f9c2e1d4b5a6978877665544332211",
+            "DeadBeef0123456789abcdefCAFE",
+            "A3F9C2E1D4B5A6978877665544332211",
+            "AKIAIOSFODNN7EXAMPLE",
             "ABCDEFGH12345678_IJKLMNOP12345678",
+            "ABCDEFGH_IJKLMNOP_QRSTUVWX_YZABCDEF",
             "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF",
-            "ABCDEFGHIJKLMNOP",
-            "KEY_ABCDEFGHIJKLMNOPQRSTUV",
-            "AB12_CD3456789_EF",
-            "SK_LIVE_51H8X9AB",
-            "TOKEN_123456789012")
+            # préfixe de confiance sans le souligné, ou suffixe trop long
+            "DEEPSEEK_API_KEYABCDEFGH12345678",
+            "DEEPSEEK_API_KEY_" + "A" * 33,
+            "sk-fake-8457-0123456789abcdef")
 
     def assertNotPublished(self, document, key):
-        self.assertNotIn(key, json.dumps(document))
-        self.assertNotIn(key, json.dumps(document, ensure_ascii=False))
-        self.assertNotIn(key.lower(), json.dumps(document).lower())
+        text = json.dumps(document)
+        self.assertNotIn(key, text)
+        self.assertNotIn(key.lower(), text.lower())
 
-    def test_key_pasted_in_env_or_key_env_is_refused_and_not_copied(self):
+    def _one(self, item, harness="deepseek"):
+        return accounts.public_profiles({harness: [item]})
+
+    def test_untrusted_value_in_env_or_key_env_is_published_as_null(self):
         for key in self.KEYS:
             for field in ("key_env", "env"):
                 item = {"name": "collee", "type": "api_key_env", "key_env": "DEEPSEEK_API_KEY"}
                 item[field] = key
                 with self.subTest(key=key, field=field):
-                    document = accounts.public_profiles({"deepseek": [item]})
-                    self.assertFalse(document["valid"])
-                    self.assertEqual(document["profiles"], [])
-                    self.assertEqual(document["refused"], [
-                        {"harness": "deepseek", "index": 0, "name": "collee",
-                         "reason": "unpublishable_variable_name"}])
+                    document = self._one(item)
+                    self.assertTrue(document["valid"])
+                    self.assertEqual(document["refused"], [])
+                    (row,) = document["profiles"]
+                    self.assertEqual(row["name"], "collee")
+                    self.assertIsNone(row[field])
+                    self.assertEqual(row["key_source"], "env")
                     self.assertNotPublished(document, key)
+
+    def test_attestation_still_requires_the_variable_shape(self):
+        for key in ("a3f9c2e1d4b5a6978877665544332211", "sk-fake-8457-0123456789abcdef"):
+            with self.subTest(key=key):
+                document = self._one({"name": "a", "type": "api_key_env",
+                                      "key_env": key, "public_names": True})
+                self.assertIsNone(document["profiles"][0]["key_env"])
+                self.assertNotPublished(document, key)
 
     def test_key_pasted_as_harness_is_refused_and_not_copied(self):
         for key in self.KEYS:
@@ -216,16 +227,37 @@ class KeyShapedValuesAreNeverPublishedTest(unittest.TestCase):
                      "reason": "unknown_harness"}])
                 self.assertNotPublished(document, key)
 
-    def test_variable_names_stay_published(self):
-        for name in ("DEEPSEEK_API_KEY_A", "OPENAI_API_KEY", "K", "_X", "DSK",
-                     "AMEESH_TEST_CLE_1021", "CLAUDE2_KEY",
-                     "OWNING_EXECUTOR_KEY_REFERENCE", "CODEX1_FAKE_SOURCE_A",
-                     "AMEESH_3969_ABSENTE", "SUPER_SECRET_KEY_ENV"):
-            with self.subTest(name=name):
-                document = accounts.public_profiles(
-                    {"deepseek": [{"name": "a", "type": "api_key_env", "key_env": name}]})
-                self.assertEqual(document["refused"], [])
-                self.assertEqual(document["profiles"][0]["key_env"], name)
+    def test_trusted_names_stay_published(self):
+        cases = [
+            ("deepseek", {"key_env": "DEEPSEEK_API_KEY"}),           # (a) défaut
+            ("deepseek", {"key_env": "DEEPSEEK_API_KEY_A"}),         # (b) suffixe
+            ("deepseek", {"key_env": "OPENAI_API_KEY_CLE_2"}),       # (b) autre défaut
+            ("deepseek", {"key_env": "CODEX1_FAKE_SOURCE_A", "public_names": True}),  # (c)
+            ("deepseek", {"env": "OPENAI_API_KEY", "key_env": "AUTRE",
+                          "public_names": True}),
+        ]
+        for harness, fields in cases:
+            item = {"name": "a", "type": "api_key_env", **fields}
+            with self.subTest(fields=fields):
+                document = self._one(item, harness)
+                self.assertTrue(document["valid"])
+                (row,) = document["profiles"]
+                for field in ("env", "key_env"):
+                    if field in fields:
+                        self.assertEqual(row[field], fields[field])
+        row = self._one({"name": "a", "type": "api_key_env",
+                         "key_env": "CODEX1_FAKE_SOURCE_A"})["profiles"][0]
+        self.assertIsNone(row["key_env"])
+        self.assertEqual(row["env"], "DEEPSEEK_API_KEY")
+
+    def test_public_names_must_be_a_strict_boolean(self):
+        with self.assertRaises(accounts.AccountError):
+            accounts.parse({"deepseek": [{"name": "a", "type": "api_key_env",
+                                          "key_env": "DEEPSEEK_API_KEY",
+                                          "public_names": "yes"}]})
+        document = self._one({"name": "a", "type": "api_key_env",
+                              "key_env": "DEEPSEEK_API_KEY", "public_names": 1})
+        self.assertEqual([r["reason"] for r in document["refused"]], ["invalid_profile"])
 
 
 if __name__ == "__main__":

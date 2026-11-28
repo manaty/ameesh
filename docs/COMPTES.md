@@ -171,6 +171,12 @@ dans le canon :
   un compte au seuil bascule, un plafond du mesh atteint met en pause. `min_balance` : le compte est au seuil quand son dernier solde
   relevé est au plus ce montant (relevé par l'exécuteur, ou
   `ameesh cost balance --record`).
+* `public_names: true` (facultatif, booléen, #8457) : l'opérateur atteste
+  que `env`/`key_env` sont des noms de variables publiables par
+  `ameesh accounts profiles`. Sans elle, seul un nom par défaut d'un
+  descripteur de harnais (ou ce nom suivi de `_` et d'un court suffixe,
+  `DEEPSEEK_API_KEY_A`) est publié ; tout autre nom l'est à `null` — une clé
+  collée par erreur à la place du nom n'est jamais recopiée.
 * `adopts_unnamed: true` (facultatif, `api_key_env`, #4944) : déclare que
   **tous les relevés de solde sans compte de ce fournisseur** appartiennent à
   ce profil. Une seule adoption est permise par fournisseur ; sa valeur est
