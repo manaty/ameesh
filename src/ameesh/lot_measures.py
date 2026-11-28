@@ -53,6 +53,9 @@ an agent of its host that holds the merge commit. A lot measured without a
 diff (no repository holds the merge commit yet) is measured again for
 `RETRY_DIFF_S`; a commit already probed ABSENT is not probed again before
 `ABSENT_TTL_S` (#8414: the probe walks every promisor pack of a partial clone).
+A lot whose merge lives in another repository than the issue's (the freeze
+mark `ameesh-freeze-repo`, a canon lot merged in home) is left to the hosts
+that have that repository: the pass probes only clones of the named origin.
 Older lots: `work measure` (the 50 most recent not
 measured yet, or the lots named). The measure is a fact about one lot; the analysis across
 lots stays with the auditor (`work estimates --publish`).
@@ -846,6 +849,48 @@ def gh_ci_runs(repo: str, branch: str | None) -> list[dict] | None:
 # measure and store
 # --------------------------------------------------------------------------
 
+def _origin_slugs(repos) -> dict:
+    """Le dépôt GitHub de l'`origin` de chaque clone de l'hôte (#8414).
+
+    None quand l'origine est illisible ou n'est pas GitHub : on ne peut pas
+    prouver que ce clone ne porte pas le commit, il reste candidat."""
+    from . import migrations
+
+    out = {}
+    for repo in repos or ():
+        try:
+            out[repo] = migrations.origin_repo(repo)
+        except Exception:  # noqa: BLE001 - une origine illisible ne filtre pas
+            out[repo] = None
+    return out
+
+
+def _repos_for(cand: dict, repos, slugs: dict, db) -> list:
+    """Les dépôts de l'hôte qui peuvent porter la fusion de ce lot (#8414).
+
+    La marque machine du gel (`ameesh-freeze-repo`, #6735) dit où vit la
+    tête — un lot canon a son issue dans ameesh et sa fusion dans home. Sans
+    elle, le dépôt de l'issue (ou du projet). On ne garde que les clones de
+    ce dépôt ; à défaut, ceux dont l'origine est illisible (ils pourraient
+    l'être) ; aucun : la passe écarte le lot, la sonde ne constaterait qu'une
+    absence, et un hôte qui a le dépôt le mesurera."""
+    from . import migrations, review_authors, work
+
+    named = review_authors.freeze_repository({"note": cand.get("freeze_note")})
+    if not named:
+        try:
+            named = work.lot_repository(dict(cand), getattr(db, "cfg", None))
+        except Exception:  # noqa: BLE001 - dépôt inconnu : rien à écarter
+            named = ""
+    if not named:
+        return list(repos)
+    key = migrations.repo_key(named)
+    matched = [repo for repo in repos if slugs.get(repo) == key]
+    if matched:
+        return matched
+    return [repo for repo in repos if not slugs.get(repo)]
+
+
 def _repo_for(sha: str | None, repos) -> str | None:
     for repo in repos or ():
         if repo and os.path.isdir(repo) and sha and has_commit(repo, sha):
@@ -939,17 +984,27 @@ def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
     cands = storage.of(db).work.measure_candidates(
         ids=None if ids is None else [int(i) for i in ids], retry_diff_s=RETRY_DIFF_S,
         since_s=since_s, limit=limit)
+    # #8414 : un lot dont la fusion vit dans un autre dépôt que ceux de l'hôte
+    # (un canon livré dans home) ne peut que constater une absence — on
+    # l'écarte, et on ne sonde que les clones du dépôt nommé.
+    slugs = _origin_slugs(repos) if ids is None else {}
     out = []
     for cand in cands:
         if budget_s is not None and time.monotonic() - started >= budget_s:
             break
         try:
-            # a lot already measured is retried (diff, CI) only when a
-            # repository holds its merge commit now
-            if ids is None and cand["measured"] and not _repo_for(cand.get("merge_sha"),
-                                                                  repos):
-                continue
-            out.append(measure_one(db, cand, repos=repos, ci=ci,
+            if ids is None:
+                cand_repos = _repos_for(cand, repos, slugs, db)
+                if not cand_repos:
+                    continue
+                # a lot already measured is retried (diff, CI) only when a
+                # repository holds its merge commit now
+                if cand["measured"] and not _repo_for(cand.get("merge_sha"),
+                                                       cand_repos):
+                    continue
+            else:
+                cand_repos = list(repos)
+            out.append(measure_one(db, cand, repos=cand_repos, ci=ci,
                                    replace_size=ids is not None))
         except Exception as exc:  # noqa: BLE001 - one lot never blocks the others
             if errors is not None:

@@ -12,11 +12,14 @@ absent parcourt tous les packs promisor, alors qu'un présent coûte ~0,01 s.
 
 Témoins :
 * N sondes du même absent, y compris depuis deux worktrees d'un même
-  common-dir, ne font qu'un `cat-file` ;
+  common-dir, ne font qu'un `cat-file` ; idem dans un vrai clone partiel ;
 * le constat est borné (durée, nombre d'entrées) et expiré il est re-sondé ;
 * un fetch réussi l'oublie, donc un commit rapatrié est vu tout de suite ;
 * une passe de mesure ne re-sonde plus un lot déjà mesuré dont la fusion est
-  absente (le cas 1ecc7dff), et une mesure explicitement demandée re-sonde.
+  absente (le cas 1ecc7dff) ;
+* un lot dont la fusion vit dans un autre dépôt que ceux de l'hôte (marque
+  `ameesh-freeze-repo`, ou dépôt de l'issue) n'est pas sondé du tout ; le même
+  lot est mesuré sur un hôte qui a ce dépôt.
 """
 from __future__ import annotations
 
@@ -55,6 +58,30 @@ def make_repo(root: str) -> str:
     _git(repo, "add", "README")
     _git(repo, "commit", "-q", "-m", "base")
     return repo
+
+
+def make_partial_clone(root: str) -> str:
+    """Un vrai clone partiel (`blob:none`, sans checkout) : des blobs manquent.
+
+    Le clone local `file://` garde le témoin hors réseau ;
+    `uploadpack.allowFilter` fait servir un pack filtré par la source."""
+    src = os.path.join(root, "source")
+    os.makedirs(src)
+    _git(src, "init", "-q", "-b", "main")
+    _git(src, "config", "user.email", "t@example.invalid")
+    _git(src, "config", "user.name", "t")
+    _git(src, "config", "uploadpack.allowFilter", "true")
+    with open(os.path.join(src, "README"), "w", encoding="utf-8") as fh:
+        fh.write("base\n")
+    _git(src, "add", "README")
+    _git(src, "commit", "-q", "-m", "base")
+    dst = os.path.join(root, "partial")
+    proc = subprocess.run(
+        ["git", "clone", "-q", "--filter=blob:none", "--no-local",
+         "--no-checkout", "file://" + src, dst], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise AssertionError("clone partiel : %s" % proc.stderr)
+    return dst
 
 
 def missing_sha(tag: int = 1) -> str:
@@ -100,6 +127,24 @@ class AbsentProbeTest(unittest.TestCase):
             self.assertFalse(lot_measures.has_commit(self.repo, missing))
             self.assertFalse(lot_measures.has_commit(self.repo, missing))
             self.assertFalse(lot_measures.has_commit(worktree, missing))
+        self.assertEqual(len(calls), 1, calls)
+
+    def test_absent_probe_once_in_a_partial_clone(self):
+        """Le cas AG1 : un clone partiel dont un objet absent coûte cher."""
+        clone = make_partial_clone(self.tmp.name)
+        self.assertEqual(_git(clone, "config", "--get", "remote.origin.promisor"),
+                         "true")
+        blob = _git(clone, "rev-parse", "HEAD:README")
+        read = subprocess.run(
+            ["git", "-C", clone, "cat-file", "-e", blob],
+            env=dict(os.environ, GIT_NO_LAZY_FETCH="1"), capture_output=True)
+        self.assertNotEqual(read.returncode, 0,
+                            "le clone doit être partiel : le blob reste absent")
+        missing = missing_sha()
+        calls, patched = _probes()
+        with patched:
+            self.assertFalse(lot_measures.has_commit(clone, missing))
+            self.assertFalse(lot_measures.has_commit(clone, missing))
         self.assertEqual(len(calls), 1, calls)
 
     def test_absent_constat_expires(self):
@@ -174,3 +219,79 @@ class MeasureAbsentPgTest(PgTestCase):
         with lot_measures._ABSENT_LOCK:
             lot_measures._ABSENT.clear()
             lot_measures._COMMON_DIRS.clear()
+
+
+class MeasureForeignRepoPgTest(PgTestCase):
+    """#8414 (2) : la fusion d'un lot peut vivre dans un autre dépôt.
+
+    Un lot canon porte souvent une issue `manaty/ameesh` et sa fusion dans
+    `manaty/home` (marque `ameesh-freeze-repo`). Sur un hôte qui n'a que des
+    clones ameesh, la sonde ne peut que constater une absence : la passe
+    l'écarte. Le même lot est mesuré sur un hôte qui a le dépôt nommé."""
+
+    def setUp(self):
+        super().setUp()
+        with lot_measures._ABSENT_LOCK:
+            lot_measures._ABSENT.clear()
+            lot_measures._COMMON_DIRS.clear()
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        with lot_measures._ABSENT_LOCK:
+            lot_measures._ABSENT.clear()
+            lot_measures._COMMON_DIRS.clear()
+
+    def _lot(self, root, origin, marker="", issue="manaty/ameesh#6616"):
+        repo = make_repo(root)
+        if origin:
+            _git(repo, "remote", "add", "origin", origin)
+        lot = work.add(self.db, title="lot d'un autre dépôt", branch="canon/x",
+                       issue_ref=issue)
+        lid = int(lot["id"])
+        work.move(self.db, lid, "build")
+        frozen = _git(repo, "rev-parse", "HEAD")
+        note = ("ameesh-freeze-repo: %s" % marker) if marker else ""
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, note, at)"
+            " VALUES (%s, 'frozen', %s, 'test', %s, now() - interval '2 minutes')",
+            (lid, frozen, note))
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, note, at)"
+            " VALUES (%s, 'merged', %s, 'test', '', now())", (lid, missing_sha()))
+        registry.upsert(self.db, "solo", host=self.cfg.host, cwd=repo)
+        return lid, repo
+
+    def test_merge_outside_the_host_is_not_probed(self):
+        with tempfile.TemporaryDirectory(prefix="ameesh-8414-foreign-") as root:
+            lid, _repo = self._lot(root, "https://github.com/manaty/ameesh.git",
+                                   marker="manaty/home")
+            calls, patched = _probes()
+            with patched:
+                rows = lot_measures.measure_pending(
+                    self.db, host=self.cfg.host, ci=None)
+            self.assertEqual(rows, [])
+            self.assertEqual(len(calls), 0, calls)
+            self.assertIsNone(storage.of(self.db).work.measure(lid))
+
+    def test_merge_in_the_named_repository_is_measured(self):
+        with tempfile.TemporaryDirectory(prefix="ameesh-8414-home-") as root:
+            lid, _repo = self._lot(root, "https://github.com/manaty/home.git",
+                                   marker="manaty/home")
+            calls, patched = _probes()
+            with patched:
+                rows = lot_measures.measure_pending(
+                    self.db, host=self.cfg.host, ci=None)
+            self.assertEqual([r["work_item_id"] for r in rows], [lid])
+            self.assertEqual(len(calls), 1, calls)
+
+    def test_lot_of_another_project_is_not_probed(self):
+        with tempfile.TemporaryDirectory(prefix="ameesh-8414-issue-") as root:
+            lid, _repo = self._lot(root, "https://github.com/manaty/ameesh.git",
+                                   issue="manaty/home#42")
+            calls, patched = _probes()
+            with patched:
+                rows = lot_measures.measure_pending(
+                    self.db, host=self.cfg.host, ci=None)
+            self.assertEqual(rows, [])
+            self.assertEqual(len(calls), 0, calls)
+            self.assertIsNone(storage.of(self.db).work.measure(lid))
