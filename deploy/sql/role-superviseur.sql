@@ -424,9 +424,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L165b (0384): sessions put aside per (agent, lot) and the runner's
     -- wake bookkeeping; a session id, like agent_registry.session_id
+    -- #8458 (0614): replay debt of a counted wake whose turn has not
+    -- launched — same state as wakes/last_wake_at (instant, counter, reason
+    -- code from a closed vocabulary), no session content
     ('agent_lot_sessions', ARRAY[
         'agent', 'work_item_id', 'session_id', 'harness', 'account', 'cwd',
-        'parked_at', 'wakes', 'last_wake_at', 'wake_activity_at', 'created_at'
+        'parked_at', 'wakes', 'last_wake_at', 'wake_activity_at',
+        'wake_pending_at', 'wake_retries', 'wake_retry_reason', 'created_at'
     ]),
     -- L385 (0373): explicit prerequisites and their audit attribution.
     ('work_item_dependencies', ARRAY[
