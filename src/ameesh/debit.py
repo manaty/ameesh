@@ -577,6 +577,11 @@ def _terminal_at(milestones: list[dict]) -> float | None:
 
 #: états d'une vraie reprise de revue : le lot retravaille sa tête
 _OPEN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.QA, lifecycle.VALIDATED)
+#: #8396 : seuls ces états prouvent une reprise après un jalon terminal. Un
+#: `validated` peut suivre la fusion sans reprise : la note d'entretien du
+#: canon (`review-canon-refresh:…:checked:`) écrit l'état lu avant la fusion,
+#: et le journal finit alors sur `validated` pour un lot livré.
+_REWORK_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.QA)
 #: états d'une retenue de fermeture : le contenu est déjà dans la cible
 _CLOSURE_STATES = ("blocked", "waiting_human")
 #: états terminaux (le jalon, pas seulement la colonne)
@@ -622,7 +627,13 @@ def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
     rouvert puis retenu (blocked, waiting_human) reste ouvert — mais seulement
     s'il a vraiment repris (intake/build/qa) depuis le jalon : une écriture
     `blocked` de fermeture après la fusion ne rouvre pas une revue (#3497,
-    #3444 classé `qa_merge` alors que son contenu était dans main)."""
+    #3444 classé `qa_merge` alors que son contenu était dans main).
+
+    #8396 : un `validated` écrit après la fusion ne prouve pas à lui seul une
+    reprise. La note d'entretien du canon (`review-canon-refresh:…:checked:`)
+    porte l'état lu avant la fusion ; le journal d'un lot livré finit alors sur
+    `validated`. Il ne garde la revue ouverte que s'il suit un vrai retour au
+    travail (intake/build/qa) après le jalon."""
     if terminal_ts is None:
         return False
     later = [e for e in events or ()
@@ -634,12 +645,14 @@ def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
     for event in sorted(later, key=lambda e: (float(e.get("at_ts") or 0.0),
                                               int(e.get("id") or 0))):
         state = str(event["state"])
-        if state in _OPEN_STATES:
+        if state in _REWORK_STATES:
             resumed = True
         elif state in _TERMINAL_STATES:
             resumed = False
         latest_state = state
     if latest_state in _CLOSURE_STATES:
+        return resumed
+    if latest_state == lifecycle.VALIDATED:
         return resumed
     return latest_state in _OPEN_STATES
 
