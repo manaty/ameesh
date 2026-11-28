@@ -148,11 +148,38 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
     def test_it_does_not_cache_pip_under_pull_request_target(self):
         # #3207 : sous `pull_request_target`, `cache: pip` de setup-python
         # écrirait un cache dans la portée de la branche de base à partir du
-        # pyproject de la PR (N de sécurité de la revue #3198). La suite
-        # tourne une fois par nuit ou à la demande : le cache n'est pas
-        # nécessaire, et le remettre rouvrirait l'exposition.
+        # pyproject de la PR (N de sécurité de la revue #3198).
         self.assertNotIn("cache: pip", self.text)
         self.assertNotIn("cache-dependency-path", self.text)
+
+    def test_the_pip_cache_is_reserved_to_trusted_runs(self):
+        # #8394 : un cache pip rend chaque nuit moins dépendante de la
+        # résolution de `pypi.org` (panne DNS du 27/11). #3207 : il reste
+        # interdit sous `pull_request_target`, où le cache de la branche de
+        # base serait écrit depuis la tête d'une PR ; la clé ne porte que le
+        # système, la version de Python et l'empreinte du workflow, jamais un
+        # fichier de la PR.
+        self.assertIn(
+            "uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830",
+            self.suite)
+        self.assertIn("if: github.event_name != 'pull_request_target'", self.suite)
+        self.assertIn("path: ~/Library/Caches/pip", self.suite)
+        self.assertIn(
+            "key: pip-macos-3.12-${{ runner.arch }}-${{ hashFiles('.github/workflows/macos.yml') }}",
+            self.suite)
+
+    def test_the_pip_install_is_retried_with_a_bound(self):
+        # #8394 : une panne DNS passagère du runner ne perd plus la part ;
+        # trois tentatives espacées, puis un échec explicite. La boucle est
+        # bornée (pas de `until`), elle couvre aussi le paquet éditable (son
+        # isolation de build dépend du même index), et pip garde ses reprises.
+        self.assertIn("for tentative in 1 2 3; do", self.suite)
+        self.assertIn("python -m pip install --timeout 30 --retries 5", self.suite)
+        self.assertIn(
+            "python -m pip install --no-deps --timeout 30 --retries 5 -e .",
+            self.suite)
+        self.assertIn("sleep $((tentative * 30))", self.suite)
+        self.assertIn("après 3 tentatives", self.suite)
 
     def test_it_runs_the_whole_plan_under_macos(self):
         self.assertIn("test-plan.py plan", self.job)
@@ -219,7 +246,9 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
     def test_the_runner_is_the_standard_x64_image(self):
         self.assertIn("runs-on: macos-26-intel", self.suite)
         # #4063 : une part de 20 à 47 min mesurées, plus l'installation.
-        self.assertIn("timeout-minutes: 90", self.suite)
+        # #8394 : 87,5 min sur le run vert 45618065525 et ~100 min sur le
+        # 27/11 ; 120 min = pire durée mesurée plus 20 %.
+        self.assertIn("timeout-minutes: 120", self.suite)
         self.assertNotIn("timeout-minutes: 240", self.text)
 
 

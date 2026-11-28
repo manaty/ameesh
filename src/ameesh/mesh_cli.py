@@ -2629,7 +2629,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
                 return 0
             if args.clear:
-                print(('%s #%d: external executor cleared (was %s); the %s is back in the ordinary queue') % (v.noun, out["item"]["id"], out["previous"] or "nobody", v.noun))
+                from . import backlog
+                print(('%s #%d: external executor cleared (was %s); L165 does not take it '
+                       'for %d min — close it if the work is done, or assign it explicitly')
+                      % (v.noun, out["item"]["id"], out["previous"] or "nobody",
+                         backlog.EXTERNAL_RELEASE_GRACE_S // 60))
             else:
                 print(('%s #%d: reserved to %s (external executor; not assigned — L165 does not take it)%s') % (
                     v.noun, out["item"]["id"], out["executor"],
@@ -4993,7 +4997,12 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
                                   "human:<id>, or declared system:<name>); omitted with "
                                   "--clear")
     pw_executor.add_argument("--clear", action="store_true",
-                             help=("clear the reservation (the %s returns to the ordinary queue)") % v.noun)
+                             help=("clear the reservation: the %s is not auto-taken "
+                                  "while its L165 take is held (#8375: 15 min, and until "
+                                  "closure when the reservation records the work done) — "
+                                  "close it if delivered, or assign it explicitly; an "
+                                  "abandoned reservation returns to the queue after the "
+                                  "window") % v.noun)
     pw_executor.add_argument("--session", default=None, metavar="SESSION",
                              help=("#6839: name the session the fire designates for this "
                                   "external gesture; only it can take the claim"))

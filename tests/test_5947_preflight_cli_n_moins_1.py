@@ -433,8 +433,11 @@ class RetourFinitParLeControleTest(unittest.TestCase):
         texte = SCRIPT.read_text(encoding='utf-8')
         debut = texte.index('retour_agents() {')
         corps = texte[debut:texte.index('\n}\n', debut)]
-        self.assertTrue(corps.rstrip().endswith('redemarrer_agents\n  controler_agents'),
-                        corps[-200:])
+        # #8380 : le retour repose les unités avec le CLI installé avant de
+        # les contrôler ; ce qui compte ici est que le contrôle reste le
+        # dernier geste, après le redémarrage et la pose.
+        self.assertTrue(corps.rstrip().endswith('controler_agents'), corps[-200:])
+        self.assertLess(corps.index('redemarrer_agents'), corps.index('controler_agents'))
         self.assertRegex(texte, r'\n    verifier\|controler\) controler_agents ;;\n')
 
 

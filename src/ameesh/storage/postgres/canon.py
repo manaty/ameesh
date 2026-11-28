@@ -41,7 +41,7 @@ class Canon(interface.Canon):
 
     def record_state(self, host, status, *, root, source, commit, good,
                      diagnostic, canon="", canon_id=None,
-                     expected=None) -> str | None:
+                     expected=None, refused_commit=None) -> str | None:
         # #3955 : `expected` rend l'avance du commit audité conditionnelle.
         # `None` : sans condition (comportement historique, écritures non-`ok`) ;
         # une chaîne ('' comprise) : la valeur enregistrée doit encore être
@@ -56,8 +56,8 @@ class Canon(interface.Canon):
             """
             INSERT INTO canon_state AS s
                 (host, canon, canon_id, status, root, source, last_good_commit, last_good_at,
-                 diagnostic, checked_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s, now())
+                 refused_commit, diagnostic, checked_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s, %s, now())
             ON CONFLICT (host, canon) DO UPDATE SET
                 canon_id         = coalesce(excluded.canon_id, s.canon_id),
                 status           = CASE WHEN excluded.status <> 'ok'
@@ -89,22 +89,35 @@ class Canon(interface.Canon):
                 checked_at       = CASE WHEN excluded.status <> 'ok'
                                               OR %s::boolean
                                               OR coalesce(s.last_good_commit, '') = %s
-                                        THEN excluded.checked_at ELSE s.checked_at END
+                                        THEN excluded.checked_at ELSE s.checked_at END,
+                -- #8340 : un contrôle non-`ok` écrit son commit refusé (None
+                -- l'efface aussi) ; un `ok` qui gagne le CAS l'efface, mais un
+                -- `ok` que le CAS refuse ne doit pas effacer le refus du
+                -- gagnant (le statut et le diagnostic restent ceux du gagnant).
+                refused_commit   = CASE WHEN excluded.status <> 'ok'
+                                        THEN excluded.refused_commit
+                                        WHEN %s::boolean
+                                             OR coalesce(s.last_good_commit, '') = %s
+                                        THEN NULL
+                                        ELSE s.refused_commit END
             RETURNING last_good_commit
             """,
-            (host, canon or "", canon_id, status, root, source, commit, good, diagnostic,
+            (host, canon or "", canon_id, status, root, source, commit, good,
+             refused_commit, diagnostic,
              expected is None, expected or "",      # status
              expected is None, expected or "",      # root
              expected is None, expected or "",      # source
              expected is None, expected or "",      # last_good_commit
              expected is None, expected or "",      # last_good_at
              expected is None, expected or "",      # diagnostic
-             expected is None, expected or ""),     # checked_at
+             expected is None, expected or "",      # checked_at
+             expected is None, expected or ""),     # refused_commit
         )
         return rows[0]["last_good_commit"] if rows else None
 
     _STATE_COLUMNS = """
         host, canon, canon_id, status, root, source, last_good_commit, process_commit, diagnostic,
+        refused_commit,
         extract(epoch from last_good_at)::float8 AS last_good_ts,
         extract(epoch from checked_at)::float8   AS checked_ts,
         auth_status, auth_diagnostic,

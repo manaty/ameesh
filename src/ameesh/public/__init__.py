@@ -34,12 +34,15 @@ adds the machine-readable migration dry-run report `ameesh migrate --dry-run
 additive to 1.9 and changes no migration application path. Contract 1.11 adds
 the bounded, read-only fleet view of the account reservations still counted
 (``ameesh reservations --json`` and ``GET /api/v1/reservations``, #8343); it is
-additive to 1.10 and adds no Python name.
+additive to 1.10 and adds no Python name. Contract 1.12 adds no Python name: it
+makes the governed canon-refusal write public as the CLI ``ameesh canon
+refuse`` (#8340), so an installed module no longer imports ``ameesh.canon_sync``;
+it is additive to 1.11 and changes no other state.
 """
 from __future__ import annotations
 
 #: revision of the written contract served by this package
-CONTRACT_VERSION = "1.11"
+CONTRACT_VERSION = "1.12"
 
 from . import connectors, database, fixture, mail  # noqa: E402  (the version is defined before the surface)
 from .database import connect  # noqa: E402

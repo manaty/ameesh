@@ -561,28 +561,12 @@ def _fetch_frozen(repo: str, frozen_sha: str, branch: str) -> bool:
     checkout holds yet. The fetch is bounded, never shallow (canon §7), only
     writes a private `refs/ameesh/frozen/<sha>` ref, and the exact commit id is
     checked afterwards. The shallow option is never used.
+
+    #8377 : la mécanique vit dans `plan_git.fetch_frozen`, partagée avec les
+    lectures qui concluaient au doute (classe de revue, prévalidation, porte).
     """
-    refspecs: list[str] = []
-    if _SHA_TEXT.fullmatch(str(frozen_sha or "")):
-        refspecs.append(str(frozen_sha))
-    branch = _valid_branch(branch)
-    if branch and _SHA_TEXT.fullmatch(str(frozen_sha or "")):
-        refspecs.append("+refs/heads/%s:refs/ameesh/frozen/%s" % (branch, frozen_sha))
-    for refspec in refspecs:
-        try:
-            proc = subprocess.run(
-                ["git", "-C", repo, "fetch", "--no-tags", "--quiet", "origin", refspec],
-                capture_output=True, timeout=FETCH_TIMEOUT)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if proc.returncode != 0:
-            continue
-        try:
-            if plan_git._commit(repo, frozen_sha):
-                return True
-        except Exception:  # noqa: BLE001 - unreadable clone: next refspec
-            continue
-    return False
+    return plan_git.fetch_frozen(repo, frozen_sha, _valid_branch(branch),
+                                 timeout=FETCH_TIMEOUT)
 
 
 def _fetch_from_local_clone(paths: Sequence[str], slug: str, frozen_sha: str,
@@ -670,7 +654,9 @@ def _repo_holding(path: str, frozen_sha: str, seen: set) -> str:
         return ""
     seen.add(repo)
     try:
-        return repo if plan_git._commit(repo, frozen_sha) else ""
+        # #8377/#2851 : sonde locale ; le fetch explicite de la tête exacte
+        # est tenté par `_fetch_from_local_clone` si aucun clone ne la tient.
+        return repo if plan_git.local_commit(repo, frozen_sha) else ""
     except Exception:  # noqa: BLE001 - unreadable repository: next hint
         return ""
 
@@ -762,6 +748,16 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
     named = _frozen_repository(db, item, frozen_sha)
     slugs = [value for value in (named, slug) if value]
     if not slugs:
+        # #8377 : un profil de relecteurs peut ne pas déclarer
+        # `github.projects` (son dépôt de référence vit dans `radar.projects`).
+        # Le dépôt du lot se lit alors sur ce que l'hôte déclare pour son app,
+        # avant de conclure qu'aucun clone ne tient la tête. Le SHA exact reste
+        # la preuve : le fetch ne peut pas faire entrer un autre commit.
+        try:
+            slugs = lot_class.declared_repo_slugs(cfg, dict(item or {}))
+        except Exception:  # noqa: BLE001 - configuration illisible : doute
+            slugs = []
+    if not slugs:
         return ""
     needles = [needle for needle in
                (lot, str((item or {}).get("assignee") or "").strip())
@@ -777,10 +773,15 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
     # bounded, and verify the SHA.
     if not fetch:
         return ""
-    return _fetch_from_local_clone(
-        list(candidates) + list(hints) + canons + list(neighbours), slugs[0],
-        frozen_sha,
-        str((item or {}).get("branch") or "").strip(), set())
+    paths = list(candidates) + list(hints) + canons + list(neighbours)
+    branch = str((item or {}).get("branch") or "").strip()
+    # #8377 : plusieurs dépôts peuvent être déclarés (le lot, puis son clone) ;
+    # chacun n'est fetché que dans un clone dont l'origine est ce dépôt.
+    for value in slugs[:3]:
+        found = _fetch_from_local_clone(paths, value, frozen_sha, branch, set())
+        if found:
+            return found
+    return ""
 
 
 def _declared_parent_heads(db, item: Mapping, repo: str, head: str) -> tuple[str, ...]:

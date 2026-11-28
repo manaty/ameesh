@@ -55,10 +55,12 @@ MAX_TIMEOUT_MINUTES = 60
 #: complète sous macOS tourne sur un runner **hébergé** (elle ne retient aucun
 #: runner de la flotte). #4063 : une part psycopg par job de la matrice (20 à
 #: 47 min mesurées sous macOS, plus l'installation) ; les huit parts en série
-#: dépassaient le plafond provisoire de 240 min. La suite a quitté le chemin du
-#: paquet (#3198) : elle vit dans `macos.yml`, nocturne et à la demande, et ne
-#: bloque aucune fusion. Toute autre borne au-dessus du plafond reste refusée.
-TIMEOUT_EXCEPTIONS = {("macos.yml", "suite"): 90}
+#: dépassaient le plafond provisoire de 240 min. #8394 : une part a mesuré
+#: 87,5 min sur un run vert et ~100 min sur le 27/11 ; 120 min = pire durée
+#: mesurée plus 20 %. La suite a quitté le chemin du paquet (#3198) : elle vit
+#: dans `macos.yml`, nocturne et à la demande, et ne bloque aucune fusion.
+#: Toute autre borne au-dessus du plafond reste refusée.
+TIMEOUT_EXCEPTIONS = {("macos.yml", "suite"): 120}
 
 #: Un job : une clé, nom nu ou entre guillemets, suivie du reste de la ligne.
 _JOB = re.compile(r"""^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:(.*)$""")

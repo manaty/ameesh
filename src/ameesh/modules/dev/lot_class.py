@@ -295,6 +295,49 @@ def declared_repo_paths(cfg, item: dict) -> list[str]:
     return paths
 
 
+def declared_repo_slugs(cfg, item: dict) -> list[str]:
+    """Les dépôts GitHub que cet hôte déclare pour l'app du lot (#8377).
+
+    `work.lot_repository` lit `github.projects` ; un profil de relecteurs n'en
+    a pas (son dépôt de référence est déclaré par `radar.projects.<app>`, ou
+    par les blocs `packet_watch`/`release`). Sans cette lecture, la
+    désignation d'un gel absent ne savait pas quel dépôt fetcher et rendait
+    « no repository holds the frozen head ». Les slugs viennent d'abord du
+    bloc `radar` (`github`), puis de l'`origin` des clones déclarés (même
+    ordre que [`declared_repo_paths`]).
+
+    Un chemin n'est qu'une piste : l'appelant fetche ce clone et garde la
+    règle « seul le commit exact décide ». Une configuration illisible est
+    ignorée, les autres slugs restent."""
+    if cfg is None:
+        return []
+    name = str((item or {}).get("app") or "").strip()
+    slugs: list[str] = []
+
+    def add(value) -> None:
+        text = str(value or "").strip().lower()
+        if text and text not in slugs:
+            slugs.append(text)
+
+    if name:
+        try:
+            from ... import radar
+            project = radar.settings_of(cfg).projects.get(name)
+            add(getattr(project, "github", "") or "")
+        except Exception:  # noqa: BLE001 - réglages illisibles : les clones
+            pass
+    try:
+        paths = declared_repo_paths(cfg, dict(item or {}))
+    except Exception:  # noqa: BLE001 - configuration illisible : aucun slug
+        paths = []
+    for path in paths:
+        try:
+            add(_origin_slug(path))
+        except Exception:  # noqa: BLE001 - origine illisible : piste suivante
+            continue
+    return slugs
+
+
 def named_repo_paths(cfg, item: dict, slug: str) -> list[str]:
     """Les clones locaux dont l'`origin` est le dépôt GitHub `slug` (#8236).
 
@@ -515,6 +558,31 @@ def target_warning(cfg, item: dict, repo: Optional[str]) -> str:
                project))
 
 
+def _refreshed_base(repo: str, target: str) -> str:
+    """Le commit de la cible `target` relu à la forge, ou '' (#8377).
+
+    La ref locale d'un clone n'est fraîche que de son dernier fetch : même
+    quand la tête gelée est déjà présente (rapatriée par une lecture
+    précédente, `repo_for_freeze` ou la prévalidation), `origin/<cible>` peut
+    nommer un ancêtre de la cible publiée. Le diff depuis cette ref
+    contiendrait alors les fusions déjà entrées dans la cible, et la classe
+    couvrirait plus que le lot. La pointe publiée est donc lue par
+    `ls-remote`, puis l'objet exact est rapatrié — la ref partagée reste
+    intacte. Une forge muette laisse la ref locale faire foi (''), et une
+    échéance de balayage épuisée écarte la lecture (#2851)."""
+    try:
+        from ... import review_authors
+        # #2851 : une échéance de balayage épuisée ne paie pas le réseau ; la
+        # ref locale fait foi comme avant #8377 (classe prudente, jamais
+        # rassurante). Un balayage encore ouvert garde sa borne habituelle.
+        sweep = review_authors.active_sweep()
+        if sweep is not None and sweep.deadline.expired():
+            return ""
+        return review_authors.refreshed_target(repo, target) or ""
+    except Exception:  # noqa: BLE001 - forge muette : la ref locale fait foi
+        return ""
+
+
 def _landing_ref(repo: str, target: str) -> str:
     """La référence qui lit la cible d'atterrissage `target` dans `repo`.
 
@@ -555,12 +623,21 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
     (#2564) — ou `("", "")` si aucun dépôt ne le résout : l'appelant ne conclut
     pas (jamais de classe rassurante par défaut). `overview` réutilise les
     lignes de `registry.overview` déjà lues par l'appelant (une passe = une
-    lecture pour N lots, #2564) ; `None` les relit. Lecture seule.
+    lecture pour N lots, #2564) ; `None` les relit.
 
     #2851 : la sonde est locale (`plan_git.local_commit`). Un clone partiel
     d'un autre projet dont le commit manque lançait sinon un fetch paresseux
     (~10 s) avant d'échouer, et le balayage des dossiers du registre payait ce
-    délai plusieurs fois par passe d'alertes."""
+    délai plusieurs fois par passe d'alertes.
+
+    #8377 : un clone **déclaré** (dépôt de référence, miroir de relecteur)
+    n'est pas tenu à jour par un minuteur ; un gel poussé après son dernier
+    fetch y est absent et la porte restait « inconclusive ». Après le balayage
+    local, un fetch borné de la tête exacte est tenté dans les clones déclarés
+    (`declared_repo_paths`) et dans `extra_paths`, puis la sonde locale
+    reprend. Le SHA exact décide : un clone qui ne l'obtient pas ne change
+    rien au doute. La borne de #2851 tient : le réseau n'est touché que sur
+    un gel réellement absent, une fois par clone et par tête."""
     from ... import db as db_mod, registry
 
     frozen = str(frozen or "").strip()
@@ -582,11 +659,13 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
             candidates.append((registry.get(db, assignee) or {}).get("cwd") or "")
     except Exception:  # noqa: BLE001 - registre illisible : les autres pistes
         pass
+    declared: list[str] = []
     try:
         # #6984 : le dépôt du projet et les clones que l'hôte déclare pour lui
         # (`packet_watch`, `release`). Sur un hôte sans `radar`, la porte et la
         # lecture d'auteurs n'avaient aucune piste et rendaient un doute.
-        candidates.extend(declared_repo_paths(cfg, item))
+        declared = declared_repo_paths(cfg, item)
+        candidates.extend(declared)
     except Exception:  # noqa: BLE001 - pas de réglage radar : les autres pistes
         pass
     try:
@@ -618,6 +697,47 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
         try:
             commit = plan_git.local_commit(root, frozen)
         except Exception:  # noqa: BLE001 - commit illisible : piste suivante
+            continue
+        if commit:
+            return root, commit
+    # #8377 : le gel peut avoir été poussé après le dernier fetch du clone
+    # déclaré. La lecture tente le SHA exact sur l'origine de ce clone, puis
+    # re-sonde ses objets locaux. `extra_paths` vient d'une marque de gel et
+    # d'un clone canon : même confiance, même borne.
+    # #2851 : sous une échéance de balayage (passe d'alertes), le fetch ne
+    # prend que le temps qui reste ; une échéance épuisée laisse le doute
+    # d'avant, sans ajouter un délai réseau à la passe.
+    deadline = None
+    timeout = plan_git.FETCH_FROZEN_TIMEOUT_S
+    try:
+        from ... import review_authors
+        sweep = review_authors.active_sweep()
+        if sweep is not None:
+            deadline = sweep.deadline
+            timeout = min(timeout, max(0.0, deadline.remaining()))
+    except Exception:  # noqa: BLE001 - pas de balayage lisible : borne fixe
+        pass
+    if timeout <= 0.0:
+        return "", ""
+    branch = str((item or {}).get("branch") or "")
+    fetched: set[str] = set()
+    for path in list(declared) + list(extra_paths or ()):
+        path = os.path.expanduser(str(path or "").strip())
+        if not path or not os.path.isdir(path):
+            continue
+        try:
+            root = _TOPLEVELS.get(path) or canon_mod.git_repository(path)
+        except Exception:  # noqa: BLE001 - pas un dépôt : piste suivante
+            root = None
+        if not root or root in fetched:
+            continue
+        fetched.add(root)
+        try:
+            if not plan_git.fetch_frozen(root, frozen, branch,
+                                         timeout=timeout, deadline=deadline):
+                continue
+            commit = plan_git.local_commit(root, frozen)
+        except Exception:  # noqa: BLE001 - fetch ou sonde échoués : doute
             continue
         if commit:
             return root, commit
@@ -1061,10 +1181,29 @@ def _of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         return out
     if not repo:
         repo = repository(cfg, row)
+    if not repo:
+        # #8377 : un hôte sans bloc `radar` (le profil d'un exécuteur, par
+        # exemple) déclare le clone de l'app par `packet_watch`/`release` ;
+        # sans cette lecture, la classe rendait « no repository known » et un
+        # doute, alors que le dépôt déclaré portait le gel. Le chemin n'est
+        # qu'une piste : la sonde et le SHA exact décident.
+        try:
+            for path in declared_repo_paths(cfg, dict(row or {})):
+                try:
+                    found = canon_mod.git_repository(
+                        os.path.expanduser(str(path or "").strip()))
+                except Exception:  # noqa: BLE001 - pas un dépôt : piste suivante
+                    found = None
+                if found:
+                    repo = found
+                    break
+        except Exception:  # noqa: BLE001 - configuration illisible : doute
+            pass
     out["repo"] = repo or ""
     if not repo:
         out["why"] = "no repository known for the lot"
         return out
+    fetched = False
     if not head:
         freeze = plan_git.latest_freeze(work.milestones(db, lot) if milestones is None
                                         else milestones)
@@ -1078,11 +1217,38 @@ def _of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
             out["why"] = ("the freeze %r is not a commit id (the last freeze must "
                           "name the full commit)" % (frozen[:24],))
             return out
-        try:
-            head = plan_git._commit(repo, frozen)
-        except canon_mod.GitError as exc:
-            out["why"] = "cannot read the freeze: %s" % exc
-            return out
+        # #8377/#2851 : la première sonde est locale. `_commit` sur un clone
+        # partiel réveille le promisor (~24 s) avant de rendre l'absence ;
+        # `local_commit` lit les objets seuls, puis le fetch explicite borné
+        # ci-dessous décide. Le SHA exact reste la preuve.
+        head = plan_git.local_commit(repo, frozen)
+        if not head:
+            # #8377 : le clone déclaré n'est pas tenu à jour par un minuteur ;
+            # un gel poussé après son dernier fetch y est absent. La lecture
+            # rapatrie la tête exacte avant de conclure au doute, puis relit
+            # le commit — jamais un autre objet. Seul un dépôt **déclaré** est
+            # fetché (le lot dit « dépôt déclaré ») : un arbre de passage ne
+            # fait pas de réseau pour un SHA qui n'est pas le sien.
+            declared_roots: set[str] = set()
+            try:
+                for path in declared_repo_paths(cfg, dict(row or {})):
+                    try:
+                        root = canon_mod.git_repository(
+                            os.path.expanduser(str(path or "").strip()))
+                    except Exception:  # noqa: BLE001 - piste illisible
+                        root = None
+                    if root:
+                        declared_roots.add(os.path.realpath(root))
+            except Exception:  # noqa: BLE001 - configuration illisible : doute
+                declared_roots = set()
+            if os.path.realpath(repo) in declared_roots:
+                try:
+                    fetched = plan_git.fetch_frozen(
+                        repo, frozen, str(row.get("branch") or ""),
+                        timeout=plan_git.FETCH_FROZEN_TIMEOUT_S)
+                    head = plan_git.local_commit(repo, frozen) if fetched else None
+                except (canon_mod.GitError, canon_mod.GitDeadline):
+                    head = None
         if not head:
             out["why"] = "the freeze %s is not a commit of %s" % (frozen[:12], repo)
             return out
@@ -1108,7 +1274,20 @@ def _of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     # file (#2207) : dans le clone partagé des agents, `main` local n'avance
     # pas, et le diff depuis lui rapportait au lot tout ce qui a été fusionné
     # depuis (#2955 léger affiché sensible, 60 fichiers au lieu de 3).
-    revision = base_sha or (_landing_ref(repo, base) if landing else base)
+    revision = base_sha
+    if not revision and landing:
+        # #8377 B1 (cx2) : la base ne dépend pas du fetch de la tête fait dans
+        # cet appel. Une tête déjà locale (rapatriée par `repo_for_freeze`, la
+        # prévalidation ou une lecture précédente) n'autorise pas à lire
+        # `origin/<cible>` resté en arrière : le diff rendrait au lot les
+        # fusions déjà entrées dans la cible et pourrait le surclasser. La
+        # cible publiée est donc relue à chaque classification ; la ref
+        # partagée n'est pas déplacée et la lecture reste bornée
+        # (`review_authors.TARGET_REFRESH_TIMEOUT`). Une forge muette laisse
+        # la ref locale faire foi, comme avant. La base **nommée** par
+        # l'appelant reste la sienne (#2464/#2505) : elle n'est jamais réécrite.
+        revision = _refreshed_base(repo, base)
+    revision = revision or (_landing_ref(repo, base) if landing else base)
     if not revision:
         out["why"] = "no target branch: freeze the lot or name its target"
         return out
