@@ -37,12 +37,15 @@ the bounded, read-only fleet view of the account reservations still counted
 additive to 1.10 and adds no Python name. Contract 1.12 adds no Python name: it
 makes the governed canon-refusal write public as the CLI ``ameesh canon
 refuse`` (#8340), so an installed module no longer imports ``ameesh.canon_sync``;
-it is additive to 1.11 and changes no other state.
+it is additive to 1.11 and changes no other state. Contract 1.13 adds no Python
+name: the CLI ``ameesh prices --json`` (#8338), schema ``ameesh-prices/1``,
+publishes the effective price schedule so a module no longer imports
+``ameesh.cost``; it is additive to 1.12.
 """
 from __future__ import annotations
 
 #: revision of the written contract served by this package
-CONTRACT_VERSION = "1.12"
+CONTRACT_VERSION = "1.13"
 
 from . import connectors, database, fixture, mail  # noqa: E402  (the version is defined before the surface)
 from .database import connect  # noqa: E402

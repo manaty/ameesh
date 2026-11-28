@@ -15,9 +15,9 @@ distribution (copied outside the checkout, imports only
 `tests.test_7665_module_contract.CoverageTableTest` checks that every element
 has exactly one row and that every cited test exists.
 
-The surface freezes revision 1.12; its baseline commit stays the revision 1.0
+The surface freezes revision 1.13; its baseline commit stays the revision 1.0
 comparison point, and the elements that revisions 1.1, 1.2, 1.3, 1.5, 1.6, 1.7,
-1.8, 1.9, 1.10, 1.11 and 1.12 add are now listed (revision 1.4 adds no name). The
+1.8, 1.9, 1.10, 1.11, 1.12 and 1.13 add are now listed (revision 1.4 adds no name). The
 comparison is additive-compatible, as the contract's compatibility rule states:
 
 - HTTP: every schema is flattened per field (type, `const`, `enum`, bounds,
@@ -49,6 +49,7 @@ comparison is additive-compatible, as the contract's compatibility rule states:
 | `cli:ameesh agent observe` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7670_agent_observation.AgentObservationTest.test_cli_and_http_use_the_builder` |
 | `cli:ameesh accounts profiles` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_8337_account_profiles.PublicProfilesTest.test_cli_json_needs_no_database_and_carries_no_secret`, `tests.test_8337_account_profiles.PublicProfilesTest.test_every_declared_profile_is_listed_sorted_and_redacted`, `tests.test_8337_account_profiles.PublicProfilesTest.test_an_unreadable_profile_is_reported_without_breaking_the_list` |
 | `cli:ameesh reservations` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_8343_account_reservations.AccountReservationsTest.test_cli_and_http_are_one_document`, `tests.test_8343_account_reservations.AccountReservationsTest.test_several_reservations_are_sorted_bounded_and_aged`, `tests.test_8343_account_reservations.AccountReservationsTest.test_unreadable_row_is_signalled_and_never_breaks_json` |
+| `cli:ameesh prices` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_8338_prices.PriceScheduleTest.test_defaults_without_file`, `tests.test_8338_prices.PriceScheduleTest.test_local_file_overrides_and_is_dated`, `tests.test_8338_prices.PriceScheduleTest.test_unreadable_or_malformed_file_is_signalled_not_fatal`, `tests.test_8338_prices.PriceScheduleTest.test_unknown_family_never_prices_at_zero`, `tests.test_8338_prices.PriceScheduleTest.test_invalid_entries_are_counted_never_copied`, `tests.test_8338_prices.PriceScheduleTest.test_cli_json_needs_no_database_and_carries_no_secret` |
 | `cli:ameesh list` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7675_deferral.PublicViewsTest.test_list_json_carries_the_same_block` |
 | `cli:ameesh show` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7675_deferral.PublicViewsTest.test_show_json_carries_the_block` |
 | `cli:ameesh migrate` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_migrations_additives`, `tests.test_8339_migrate_dry_run_json.MigrateDryRunJsonTest` |
@@ -123,3 +124,6 @@ row and
 Revision 1.12 (#8340) adds the public canon-refusal CLI and no Python name; its
 recording, idempotence, replacement, claim-blocking and secret-refusal
 witnesses join the `cli:ameesh canon refuse` row.
+Revision 1.13 (#8338) adds `ameesh prices` and no Python name; its default,
+local-file, unreadable-file, unknown-family and no-secret witnesses join the
+`cli:ameesh prices` row.

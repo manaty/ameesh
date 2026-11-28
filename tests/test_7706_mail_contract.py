@@ -405,10 +405,11 @@ class ContractVersionTest(unittest.TestCase):
         # fixture's agent states in 1.7, #8342 the public action connectors in
         # 1.8, #8337 the public account profiles in 1.9, #8339 the migration
         # dry-run report in 1.10, #8343 the account reservations in 1.11,
-        # #8340 the public canon-refusal CLI in 1.12); the
+        # #8340 the public canon-refusal CLI in 1.12, #8338 the public price
+        # schedule in 1.13); the
         # mail surface keeps the revision that last changed it, so a caller's
         # 1.4 gate stays true.
-        self.assertEqual(public.CONTRACT_VERSION, "1.12")
+        self.assertEqual(public.CONTRACT_VERSION, "1.13")
         self.assertEqual(public_mail.CONTRACT_VERSION, "1.4")
         self.assertEqual(public.fixture.CONTRACT_VERSION, "1.7")
         self.assertEqual(public.database.CONTRACT_VERSION, "1.6")

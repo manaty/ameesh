@@ -1,6 +1,6 @@
 # IMA → public module contract: inventory and replacement plan
 
-Document revision 6, 27 November 2026. This is the consumer mapping for
+Document revision 7, 28 November 2026. This is the consumer mapping for
 [contract v1](../api/module-contract-v1.md), requested by
 [#7664 / #5856](https://github.com/manaty/ameesh/issues/5856), under
 [#7636 / #5827](https://github.com/manaty/ameesh/issues/5827).
@@ -72,9 +72,9 @@ private helper: the gap column preserves the remaining requirement.
 | 8 | [`scripts/ameesh-role-runner.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-role-runner.py): config/db import, dynamically installed Runner replacement, direct `runner.main` | Installed `agent-runner`, governed harness adapters and `--agents-file`; native `own_cgroup` pressure. Account admission qualification → **E1b**; remaining policy/diagnostics → **E3a/E3b**. Remove the placeholder role harness only with real role execution correlated to the native turn/sandbox, tracked in IMA#1803. |
 | 9 | [`scripts/ameesh-runtime-admission.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-runtime-admission.py): `accounts.parse`, direct `account_budgets` SQL | Native governed account admission/budget caps; HTTP `/budget` for observation. **E1b** supplies the admitted profile/capacity check required before runtime startup without exposing credentials. Keep IMA's own provider/endpoint allowlist in IMA. |
 | 10 | [`scripts/ameesh-upgrade-runtime.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/ameesh-upgrade-runtime.py): `config`, `db`, `migrations`, `cli.main` | Execute `ameesh migrate --dry-run --json` (revision 1.10, `ameesh-migrate-dry-run/1`: pending core/module migrations with checksum and non-additive reasons, applied migrations modified after the fact, unknown versions) and the documented upgrade/doctor CLI under existing operator gates. IMA replaces `cli.cmd_migrate`, `migrations.check` and `migrations.non_additive` with that object once adopted. **F** for disposable upgrade fixtures; **S** for pin and qualification across stable versions. This mapping authorizes no migration application. |
-| 11 | [`scripts/document-ameesh-preflight-smoke.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-preflight-smoke.py): `PgTestCase`, canon sync, registry/storage, accounts/budgets, `CostBook/load_prices` | **F** replaces fixture/seed/ledger test internals with public setup and observations. Native canon, `/budget` and `turn observe` for assertions; **E1b** for admission capacity evidence. IMA owns its expected cost examples. |
+| 11 | [`scripts/document-ameesh-preflight-smoke.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-preflight-smoke.py): `PgTestCase`, canon sync, registry/storage, accounts/budgets, `CostBook/load_prices` | **F** replaces fixture/seed/ledger test internals with public setup and observations. Native canon, `/budget` and `turn observe` for assertions; **E1b** for admission capacity evidence; **PR** (`ameesh prices --json`, #6578) replaces `load_prices`. IMA owns its expected cost examples. |
 | 12 | [`scripts/document-ameesh-preflight.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-preflight.py): config/db/registry, private registry binding reads and package location | `ameesh --version`, public agents/hosts observations and **E1b** for complete admitted binding evidence. Immutable source identity comes from **S**, not `ameesh.__file__`. |
-| 13 | [`scripts/document-ameesh-runner.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-runner.py): canon/config/db imports, `cost.load_prices/max_price_of`, direct bindings, installed monkey patches | Installed `agent-runner --agents-file`; native admission priority and `own_cgroup`; governed canon and budget admission. **E1b** for preflight bindings/capacity; **E3a/E3b** for policy/diagnostics; **E2c** for interrupted request replay. IMA's business binding restrictions stay in its module. |
+| 13 | [`scripts/document-ameesh-runner.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-ameesh-runner.py): canon/config/db imports, `cost.load_prices/max_price_of`, direct bindings, installed monkey patches | **PR** (`ameesh prices --json`, #6578) replaces `cost.load_prices/max_price_of`. Installed `agent-runner --agents-file`; native admission priority and `own_cgroup`; governed canon and budget admission. **E1b** for preflight bindings/capacity; **E3a/E3b** for policy/diagnostics; **E2c** for interrupted request replay. IMA's business binding restrictions stay in its module. |
 | 14 | [`scripts/document-canon-check.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-canon-check.py): `canon`, `canon_sync`, `config`, `db` and package/source checks | `ameesh canon check/sync`; **E1a** for source SHA and monotonic snapshot admission evidence; **E1c** replaces the invalid `canon_state` write when IMA's own checks refuse the canon (`canon_sync.record_state(...)`, `document-canon-check.py:43`) with `ameesh canon refuse`. Synchronization must retain existing canon authority checks. Pin → **S**. |
 | 15 | [`scripts/document-container-pressure.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-container-pressure.py): Runner subclass, `host_pressure`, `_pressure_lock`, replacement of `self.db._tx_lock` | Native canon `policy.resources.pressure_scope: own_cgroup`, resource thresholds and native shared-connection admission priority (`admission_lock`, on by default). Native priority boosts awakened/control work, not a permanent document-agent class: **E3b** must qualify IMA's latency/fairness requirement before removal. CPU/throttling/request-limit threshold parity must be checked, not assumed — the [#7675 qualification](../design/7675-native-pressure-admission-qualification.md) adds opt-in `max_cgroup_cpu_used` / `max_cgroup_throttled_periods`; requests stay a consumer scheduling input. |
 | 16 | [`scripts/document-runtime-handover.py`](https://github.com/thepackengers/issue-manager-agent/blob/23e0a944bc82647e929a2cb96b4af3245030354c/scripts/document-runtime-handover.py): Runner shutdown subclass, worker locks/epoch/host_yield, raw mailbox and registry updates | Native drain/withdrawal is the control path; **E2c** adds core-owned interrupted-request requeue with captured lease identity, exact request IDs and reply-race protection. No external callback writes restored prompts. |
@@ -169,6 +169,31 @@ aggregation or the final capacity decision.
   `GET /api/v1/reservations`
 - upstream: [#6583](https://github.com/manaty/ameesh/issues/6583);
   implementation lot #8343.
+
+### Price schedule (post-inventory, #6578)
+
+`scripts/document-ameesh-runner.py` (row 13, lines 221–224 cited by
+#6578) imports `cost.load_prices()` and `cost.max_price_of()` to bound a
+document turn's cost, and `document-ameesh-preflight-smoke.py` (row 11) plus
+two IMA integration tests read the same schedule. From contract revision 1.13
+the supported read is `ameesh prices --json` (`ameesh-prices/1`): each model's
+`input`, `cached_input` and `output` (USD per million tokens) with its
+`origin` (`default` or `file`), and per harness `max_price` — exactly
+`max_price_of` on the effective schedule — and `unknown_model_price`, which
+falls back to the whole schedule's maximum with `fallback: true` when a family
+has no price, never to zero. `source` gives the file path and its origin
+(`AMEESH_PRICES` or the default path), `status` (`absent`, `loaded`,
+`unreadable`, `malformed`; an unreadable file is reported, the defaults stay in
+force), and `sha256`/`mtime` of the content read: the core re-reads the
+schedule on every turn, so a consumer compares the digest rather than caching
+across a change. IMA removes both imports; its cost-control decision stays in
+IMA.
+
+- [CLI boundary](../api/module-contract-v1.md#cli-boundary), frozen as
+  `cli:ameesh prices` in
+  [module-contract-v1.surface.json](../api/module-contract-v1.surface.json)
+- upstream: [#6578](https://github.com/manaty/ameesh/issues/6578);
+  implementation lot #8338.
 
 ## Indirect runner and connection dependencies
 
@@ -284,8 +309,8 @@ delivery work, not available APIs. Later consumer requests add E2d (#6573,
 implemented by #8333), E3c (#6574, proposal only, implementation lot #8334)
 A (#6582, implemented by #8342), P (#6577, implemented by #8337), the
 migration dry-run report (#6579, implemented by #8339), R (#6583,
-implemented by #8343) and E1c (#6580, manaty/ameesh#6580, implemented by
-#8340). F/S are the existing qualification/stable lots. Each
+implemented by #8343), E1c (#6580, manaty/ameesh#6580, implemented by
+#8340) and PR (#6578, implemented by #8338). F/S are the existing qualification/stable lots. Each
 upstream delivery needs a corresponding removal commit referenced in IMA#1803
 before the external request closes.
 

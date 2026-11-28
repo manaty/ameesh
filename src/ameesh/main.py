@@ -204,6 +204,8 @@
         child-pod provisioner: heartbeat the frozen template, start one
         requested child, delete expired pods and hosts (#7697, system actor;
         requires the Kubernetes ServiceAccount of deploy/k8s/pod-provisioner);
+  ameesh prices [--json]      #8338 : barème effectif (défauts ou fichier local),
+        par modèle et majorant d'un modèle inconnu par harnais (lecture seule) ;
   ameesh process check <page.md> [--ref REF] [--version N] [--json]
         compile the workflow block of a canon Process card (#2225);
   ameesh process-approvals refresh|check|show
@@ -373,6 +375,8 @@ MESH_COMMANDS = (
     "budget",
     # #8343 : réservations de comptes encore comptées (`ameesh reservations`)
     "reservations",
+    # #8338 : barème effectif, lecture publique (`ameesh prices`)
+    "prices",
     # L131 : suites lourdes plafonnées par hôte (`ameesh heavy -- <commande>`)
     "heavy",
     # L161c (#744) : la CI lue par `ameesh ci status <lot>` — le parseur existait

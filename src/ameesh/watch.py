@@ -584,11 +584,25 @@ def stable_binary(binary: str, home: str | None = None) -> str:
     return binary
 
 
-def _ameesh_binary() -> str:
-    found = shutil.which("ameesh")
+def _ameesh_binary(env: dict | None = None) -> str:
+    """The binary a watch or wake unit will run, never the caller's first
+    `ameesh` (#8390).
+
+    `~/.local/bin/ameesh` is the launcher `UNIT_PATH` names and the stable
+    entry point of an installation; a caller's `PATH` may put a private
+    directory (an agent's `.menage/bin`, a temporary tree) first, and writing
+    that path into `ExecStart` made the unit depend on who armed it. The
+    launcher wins when it is executable; otherwise `stable_binary` keeps the
+    #4754 rule on the binary the caller's `PATH` resolves."""
+    env = os.environ if env is None else env
+    home = env.get("HOME") or os.path.expanduser("~")
+    stable = os.path.join(home, ".local", "bin", "ameesh")
+    if os.access(stable, os.X_OK):
+        return stable
+    found = shutil.which("ameesh", path=env.get("PATH") or None)
     if found:
-        return stable_binary(os.path.abspath(found))
-    return os.path.join(os.path.expanduser("~"), ".local", "bin", "ameesh")
+        return stable_binary(os.path.abspath(found), home=home)
+    return stable
 
 
 def repin_units(directory: str, *, run: Callable = subprocess.run, dry_run: bool = False,
@@ -641,7 +655,14 @@ def repin_units(directory: str, *, run: Callable = subprocess.run, dry_run: bool
 def _env_binary() -> str:
     """`env` (coreutils), which applies the wake's identity on its exec line:
     systemd's `EnvironmentFile=` overrides `Environment=` (verified on
-    systemd 255), so the identity must be set on the command itself."""
+    systemd 255), so the identity must be set on the command itself.
+
+    The canonical `/usr/bin/env` wins over the caller's `PATH` (#8390): like
+    the launcher, `env` must not name a private directory of whoever armed
+    the wake."""
+    for candidate in ("/usr/bin/env", "/bin/env"):
+        if os.access(candidate, os.X_OK):
+            return candidate
     found = shutil.which("env")
     return os.path.abspath(found) if found else "/usr/bin/env"
 
@@ -897,7 +918,7 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
             "%s%s.timer (then remove its unit files)" % (agent, LEGACY_PREFIX, agent))
     os.makedirs(directory, exist_ok=True)
     source = os.environ if env is None else env
-    files = units(agent, every_s, _ameesh_binary(), directory,
+    files = units(agent, every_s, _ameesh_binary(source), directory,
                   role=(role.get("role") or agent) if role is not None else None)
     # the pinned variables may hold a DSN with its password: owner only
     files[env_name(agent)] = pinned_env(dict(source), host)
@@ -1716,7 +1737,7 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
     os.makedirs(directory, exist_ok=True)
     prune_legacy_wakes(directory, run)
     source = os.environ if env is None else env
-    files = wake_units(agent, slug, delay_s, _ameesh_binary(), directory,
+    files = wake_units(agent, slug, delay_s, _ameesh_binary(source), directory,
                        deadline=deadline)
     files[wake_env_name(agent, slug)] = pinned_env(dict(source), host)
     files[wake_name(agent, slug, "wake.json")] = json.dumps(
