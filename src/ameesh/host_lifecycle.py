@@ -66,9 +66,14 @@ def closed_hosts(db, *, readings=None, holds=None) -> dict:
 
 
 def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
-          automatic=False, force_short_reason=None):
+          automatic=False, force_short_reason=None, force_reason=None):
     """`actor`: the human the API authenticated (L87); otherwise the session's
-    corrector (a human, an orchestrator or a design agent)."""
+    corrector (a human, an orchestrator or a design agent).
+
+    #8384: before opening a window, the R1 entry guard is replayed here: an
+    open lot of an agent placed on the host refuses the drain, naming the lots
+    exactly as `ameesh host release-check` does. `force_reason` (the CLI's
+    `--force REASON`) records an explicit override in the journal."""
     if not isinstance(host, str) or not NAME_RE.fullmatch(host):
         raise ValueError("invalid host name")
     if duration is not None and (isinstance(duration, bool) or not isinstance(duration, int)
@@ -78,6 +83,12 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
         actor = work.corrector(cfg, db)
     elif not actor.startswith(work.HUMAN_PREFIX):
         raise ValueError("drain: an explicit actor is a human (human:<id>)")
+    if force_reason is not None:
+        if not isinstance(force_reason, str) or not force_reason.strip():
+            raise ValueError('--force requires a non-empty reason')
+        force_reason = force_reason.strip()
+        if len(force_reason) > 500:
+            raise ValueError('--force reason must be at most 500 characters')
     critical = set(critical) | critical_names(cfg, db)
     # #4148: only an external adapter requires the durable claim gate; without
     # one, `draining` alone closes claims and `returning` must reopen at once
@@ -107,6 +118,22 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
     if any(h.title == host and h.fiche.data.get('capacity') == host_idle.CAPACITY_SERVICES
            for canon in canons for h in canon.hosts):
         raise ValueError('drain refused: host carries protected services')
+    # #8384: the guard that the R1 v3 of AG3 had to run by hand. It is read
+    # before the hook and before the short-drain bound: a lot that would wake
+    # the host at the adapter's first pass is the operator's problem to move,
+    # not a race lost later. A host already draining/lost is idempotent: the
+    # window is open, and repeating the command changes nothing.
+    store = storage.of(db)
+    controls = {str(row["host"]): row for row in store.host_lifecycle.listing()}
+    current = controls.get(host)
+    if force_reason is None and not (
+            current and current.get("mode") in ("draining", "lost")):
+        check = host_release.release_check(
+            host, store.operations.listing(), store.operations.open_lots_activity(None),
+            controls=controls,
+            holds={str(row["host"]): row for row in store.hosts.holds()})
+        if not check["ok"]:
+            raise ValueError(host_release.release_check_text(check))
     try:
         hook = host_release.hook_for(cfg, canons, host)
     except ValueError:
@@ -135,7 +162,11 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
     # A configured canon that did not load may hold the only Host card with
     # the hook: fail closed rather than reopen the gate.
     close_claims = bool(hook) or (configured and not canons)
-    kwargs = {} if force_short_reason is None else {'force_short_reason': force_short_reason}
+    kwargs = {}
+    if force_short_reason is not None:
+        kwargs['force_short_reason'] = force_short_reason
+    if force_reason is not None:
+        kwargs['force_reason'] = force_reason
     return storage.of(db).host_lifecycle.drain(
         host, actor=actor, duration=duration, critical=critical,
         automatic=bool(automatic), close_claims=close_claims, **kwargs)
@@ -439,6 +470,8 @@ def main(argv=None):
     withdraw.add_argument("host")
     withdraw.add_argument("--for", dest="duration", help="request return after this duration, e.g. 8h")
     withdraw.add_argument("--force-court", metavar="REASON", help="override the short-drain bound with a reason")
+    withdraw.add_argument("--force", metavar="REASON",
+                          help="override the release-check guard with a traced reason")
     withdraw.add_argument("--actor", help="who drains (human:<id>) from an unbound terminal")
     restore = commands.add_parser("undrain", help="reopen the host and request agents' return")
     restore.add_argument("host")
@@ -471,7 +504,8 @@ def main(argv=None):
             # a bound agent session must not claim a human's name.
             actor = work.corrector(cfg, db, args.actor) if args.actor else None
             result = drain(cfg, db, args.host, duration=duration, actor=actor,
-                           force_short_reason=args.force_court)
+                           force_short_reason=args.force_court,
+                           force_reason=args.force)
             # #4148: best-effort adapter acknowledgement; the runner scanner
             # retries, and a failure keeps the claims closed.
             result = enter_draining(cfg, db, args.host,

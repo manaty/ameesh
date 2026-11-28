@@ -244,16 +244,7 @@ def cmd_release_check(cfg: Config, db, args) -> int:
         print(json.dumps(dict(result, schema="ameesh-host-release-check/1"),
                          ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
-    if result["ok"]:
-        print("%s : aucun lot ouvert assigné à un agent placé" % args.host)
-    else:
-        print("%s : %d lot(s) ouvert(s) d'agents placés, à finir ou déplacer avant la vidange :"
-              % (args.host, len(result["blockers"])))
-        for lot in result["blockers"]:
-            print("  #%s %-10s %-20s %s" % (lot["id"], lot["state"], lot["assignee"],
-                                            lot["title"][:70]))
-    if result["return_targets"]:
-        print("réveil immédiat (return_targets) : %s" % ", ".join(result["return_targets"]))
+    print(host_release.release_check_text(result))
     return 0 if result["ok"] else 1
 
 

@@ -732,6 +732,74 @@ def release_check(host, listing, lots, *, controls, holds):
     return {"host": host, "ok": not blockers, "blockers": blockers, "return_targets": wake}
 
 
+def release_check_text(result):
+    """#8384: the operator text of `release_check`, shared by the command and
+    by the drain refusal (the two must name the same lots, word for word)."""
+    host = result["host"]
+    if result["ok"]:
+        lines = ["%s : aucun lot ouvert assigné à un agent placé" % host]
+    else:
+        lines = ["%s : %d lot(s) ouvert(s) d'agents placés, à finir ou déplacer "
+                 "avant la vidange :" % (host, len(result["blockers"]))]
+        for lot in result["blockers"]:
+            lines.append("  #%s %-10s %-20s %s" % (lot["id"], lot["state"],
+                                                   lot["assignee"], lot["title"][:70]))
+    if result["return_targets"]:
+        lines.append("réveil immédiat (return_targets) : %s"
+                     % ", ".join(result["return_targets"]))
+    return "\n".join(lines)
+
+
+def adapter_lot_hosts(cfg, db, listing, *, canons):
+    """#8384: hosts where L165 must not open a team lot.
+
+    A declared lifecycle hook means the host may be withdrawn at any hour
+    (automatic drain, or an operator window announced by the adapter): a lot
+    taken there just before the window is exactly the R1 v3 incident of
+    27/11, where the probe of ameesh-agents-3 took #8312 at 22:57Z, three
+    minutes before the drain. Explicit assignment still places work there;
+    only the automatic take is closed (reviews and mail are unchanged). The
+    read is `hook_for`: a mesh-wide `lifecycle_hook` closes L165 on every
+    host, as it makes every host withdrawable.
+
+    A host in `returning` with claims closed is also closed to the take: only
+    its probe may claim, and giving it a lot would stop the health turn.
+
+    Returns `{host: reason}`. An ambiguous hook (two Host cards) is a reason
+    to refuse, never to guess; an unreadable control read is no extra host
+    (the caller already read the same listing for `closed_hosts`).
+    """
+    out = {}
+    for host in sorted({str(row.get("host")) for row in listing or ()
+                        if row.get("host")}):
+        try:
+            hook = hook_for(cfg, canons, host)
+        except ValueError:
+            out[host] = "host lifecycle hook ambiguous"
+            continue
+        if hook:
+            out[host] = "host lifecycle hook declared"
+    try:
+        controls = {str(row["host"]): row
+                    for row in storage.of(db).host_lifecycle.listing() or ()}
+    except Exception:  # noqa: BLE001 - the caller's own control read decides
+        controls = {}
+    for host, control in controls.items():
+        if control.get("mode") == "returning" and not control.get("claims_open"):
+            out.setdefault(host, "host returning with claims closed")
+    return out
+
+
+def window_probe_agents(db):
+    """#8384: the identities a closed window admits alone (closed return or
+    live L232b fence). They never receive an automatically taken lot, even if
+    a caller reads the host as open (the health or handoff turn must stay
+    free). Same read as the decoupage's #8072 (`window_probes`)."""
+    from .file_decoupage import window_probes
+    probes, _error = window_probes(db)
+    return probes
+
+
 def _known_hosts(canons, listing):
     names = {row.get("host") for row in listing or () if row.get("host")}
     for canon in canons or ():

@@ -1763,7 +1763,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     alerts = alerts or []
     blocked = _blocked_hosts(alerts)
     # #254 : un hôte en pause ne prend pas de travail, ni ses agents
-    from . import host_holds, host_lifecycle
+    from . import host_holds, host_lifecycle, host_release
     holds = host_holds.live(db)
     blocked |= set(holds)
     # #5867 : un hôte qui ne peut pas ouvrir de tour (drainage, hôte perdu,
@@ -1839,8 +1839,24 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         except Exception:
             orchestras = []
     if lots:
+        # #8384 : la prise automatique (L165) ne confie aucun lot d'équipe à un
+        # agent dont l'hôte a un adaptateur déclaré (une fenêtre peut s'ouvrir
+        # à toute heure, incident R1 v3 du 27/11) ou dont la sonde d'un retour
+        # fermé doit rester libre. Relecture désignée et courrier inchangés :
+        # la garde ne s'applique qu'au pool des lots d'équipe, jamais aux
+        # propositions.
+        adapter_hosts = host_release.adapter_lot_hosts(
+            cfg, db, listing, canons=canons)
+        window_probes = host_release.window_probe_agents(db)
+
+        def takes_team_lot(row) -> bool:
+            return (row.get("host") not in adapter_hosts
+                    and row.get("name") not in window_probes)
+
         # L165b : un agent dont tous les lots attendent un autre est libre
-        pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
+        pool = [row for row in candidates(lot_idle_s, skip=set(orchestras),
+                                          waiting_free=True)
+                if takes_team_lot(row)]
         # #1739 : plus aucun autre preneur ? un orchestrateur peut se servir,
         # mais ses candidats passent en dernier : il ne prend que les lots que
         # les autres ont laissés, et la note d'attribution garde la trace.
@@ -1851,7 +1867,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if lots and agents is None:
             seen = {row["name"] for row in pool}
             pool += [row for row in candidates(lot_idle_s, skip=(), waiting_free=True)
-                     if row["name"] not in seen]
+                     if row["name"] not in seen and takes_team_lot(row)]
         for index, row in enumerate(pool):
             fallback = index >= taker_count
             # #804 : place relue avant chaque prise (compteur partagé)
