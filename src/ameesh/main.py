@@ -129,7 +129,7 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
-  ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
+  ameesh host drain HOST [--for 8h] | undrain HOST | wake --all | reconcile HOST | status [HOST]
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
   ameesh host reattach SOURCE AGENT --to NEW_HOST
@@ -587,7 +587,7 @@ def _dispatch(argv: list[str] | None) -> int:
         # #7697 (P4 de #7633) : l'autorité d'admission des pods enfants
         from . import pod_admission
         return pod_admission.main(rest)
-    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "reattach", "status"):
+    if command == "host" and rest and rest[0] in ("drain", "undrain", "wake", "reconcile", "reattach", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
     if command == "role":
