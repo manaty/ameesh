@@ -3169,6 +3169,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             print(line)
     except Exception as exc:  # noqa: BLE001 - un diagnostic ne casse jamais le doctor
         print("memory     : repositories not checked (%s)" % exc)
+    # #8345 : les heures calmes par humain — fenêtre, fuseau et état maintenant.
+    try:
+        from . import notify as notify_mod
+        for line in notify_mod.quiet_hours_lines(cfg, canons=canons):
+            print("quiet hours: %s" % line)
+    except Exception as exc:  # noqa: BLE001 - un diagnostic ne casse jamais le doctor
+        print("quiet hours: not checked (%s)"
+              % (" ".join(str(exc).split())[:120],))
     # #3103 : un pont Docker sur le réseau local de l'hôte (incident #3092) ;
     # lu avant la base, injoignable quand le réseau local est capté
     from . import netcheck
