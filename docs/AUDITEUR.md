@@ -448,6 +448,15 @@ revue à l'auditeur :
   jour manque, il le signale au bureau et au pilote dans son rapport. Le
   rapprochement est alors déclaré non concluant, jamais conforme.
 
+* **client de base en réseau de l'hôte** (décision de l'owner #235878, option
+  b, signée, approbation #467, 28/11/2026 ; lot #8392) : sur BG, le bureau
+  lance un `pg_dump` (ou tout client de base) hors docker par défaut. Un
+  conteneur en `--network host` (`net_mode=host` dans la trace) n'est admis
+  qu'avec une note **préalable** au geste, sur le lot qui l'autorise et citant
+  ce lot. À chaque digest `bg-docker-trace`, l'auditeur rapproche chaque
+  `net_mode=host` de cette note ; sans note préalable, c'est un écart, remonté
+  comme ci-dessus.
+
 Le rapport de nuit porte une ligne « usages root BG » : le nombre d'usages
 tracés, de notes, d'écarts, et la période couverte.
 
