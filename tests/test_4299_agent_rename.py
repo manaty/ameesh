@@ -4,24 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import tempfile
 import unittest
 from unittest import mock
 
 from ameesh import agent_names, agent_rename, authority, mail, registry, storage, work
+from ameesh.agent_rename import IDENTITY_COLUMNS, IGNORED, NOT_AGENTS
 from .support import PgTestCase
-
-# Column names that hold an agent spelling somewhere in the schema; each such
-# column must be classified, so a new table is never silently left behind.
-IDENTITY_COLUMNS = re.compile(
-    r"^(agent|persona|assignee|reviewers?|recipient|sender|delegate|owner|approver|actor|"
-    r"holder|external_executor|name|primary_name|supplied_name|old_name|new_name|"
-    r"agents_allowlist|[a-z_]+_by)$")
-NOT_AGENTS = {
-    # Identity-like names that never hold an agent spelling.
-    "agent_registry.name",
-}
 
 
 class AgentRenameTest(PgTestCase):
@@ -63,7 +52,7 @@ class AgentRenameTest(PgTestCase):
                               if IDENTITY_COLUMNS.match(c.split('.', 1)[1])
                               and c not in known and c not in NOT_AGENTS)
         # `name` / `owner` are generic: only agent-valued ones are listed; the
-        # others go to IGNORED below with a reason.
+        # others are in `IGNORED` (agent_rename) with a reason.
         unclassified = [c for c in unclassified if c not in IGNORED]
         self.assertEqual(unclassified, [], "classify these columns in agent_rename")
         self.assertEqual(sorted(c for c in known if c not in columns), [],
@@ -530,22 +519,6 @@ class LocalStateTest(unittest.TestCase):
         os.makedirs(os.path.join(root, 'fourth'))
         with self.assertRaises(agent_rename.RenameError):
             agent_rename.move_local_state(cfg, 'third', 'fourth')
-
-
-# Generic columns matched by IDENTITY_COLUMNS that never hold agent names.
-IGNORED = {
-    # #4148 (0507): a scanner lock token "<actor>:<host>", not an agent name;
-    # it expires within the scan, a rename never needs to move it.
-    "host_release_locks.owner",
-    # #6091 (0554): the declared non-agent executor is `system:<name>`, a
-    # system identity that can never collide with an agent (`NAME_RE` forbids
-    # the colon); a rename never moves it.
-    "external_executors.name",
-    # #7649 (0591): the per-module migration registry labels a migration
-    # (`0001_init`), never an agent; a rename never moves it.
-    "module_schema_migrations.name",
-    "module_schema_non_additive_migrations.name",
-}
 
 
 if __name__ == '__main__':

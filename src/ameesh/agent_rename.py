@@ -182,6 +182,40 @@ KEPT = (
     "work_module_milestones.actor",
 ) + dev_tables.KEPT
 
+#: Noms de colonnes qui peuvent désigner une identité d'agent quelque part
+#: dans le schéma. Toute colonne de ce genre doit être classée ci-dessus
+#: (`REWRITTEN`, `CASCADED`, `KEPT`) ou ci-dessous (`IGNORED`, `NOT_AGENTS`),
+#: pour qu'une nouvelle table ou un `ADD COLUMN` ne reste jamais silencieux.
+#: Le test `test_every_identity_column_is_classified` le lit sur le schéma
+#: Postgres ; `scripts/garde-colonnes-identite.py` en donne la variante
+#: statique au gel, sur les migrations du diff (#8387).
+IDENTITY_COLUMNS = re.compile(
+    r"^(agent|persona|assignee|reviewers?|recipient|sender|delegate|owner|approver|actor|"
+    r"holder|external_executor|name|primary_name|supplied_name|old_name|new_name|"
+    r"agents_allowlist|[a-z_]+_by)$")
+
+#: Noms qui ressemblent à une identité mais n'en portent jamais.
+NOT_AGENTS = {
+    # Identity-like names that never hold an agent spelling.
+    "agent_registry.name",
+}
+
+#: Colonnes génériques retenues par `IDENTITY_COLUMNS` qui ne portent jamais
+#: de nom d'agent, avec leur raison : un renommage ne les déplace pas.
+IGNORED = {
+    # #4148 (0507): a scanner lock token "<actor>:<host>", not an agent name;
+    # it expires within the scan, a rename never needs to move it.
+    "host_release_locks.owner",
+    # #6091 (0554): the declared non-agent executor is `system:<name>`, a
+    # system identity that can never collide with an agent (`NAME_RE` forbids
+    # the colon); a rename never moves it.
+    "external_executors.name",
+    # #7649 (0591): the per-module migration registry labels a migration
+    # (`0001_init`), never an agent; a rename never moves it.
+    "module_schema_migrations.name",
+    "module_schema_non_additive_migrations.name",
+}
+
 #: Colonnes dont la valeur est préfixée par le type d'acteur ; seul `agent:`
 #: suit le renommage, `human:` reste une preuve intacte (#7865).
 PREFIXED = {"spend_ledger.decided_by": "agent:"}

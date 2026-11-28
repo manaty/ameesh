@@ -54,6 +54,14 @@ canon a dû être complété après le gel. Hors gel (composition d'un paquet,
 lancement manuel), la variable est absente et le contrôle s'inactive en le
 disant ; le gel, lui, refuse un diff de renommages illisible.
 
+#8387 : deux contrats négatifs ne se voyaient qu'en CI de paquet (retraits de
+#8340 et #8344, 1 h 19 et 44 min perdues). `ClientLiteralsGuard` (#4259) est
+statique, sans base, et court ; il tourne désormais au gel. Le classement des
+colonnes d'identité de test_4299 est un `PgTestCase`, impossible au gel : sa
+variante statique, `scripts/garde-colonnes-identite.py`, lit les `CREATE
+TABLE` et `ADD COLUMN` des migrations du diff et refuse une colonne
+`IDENTITY_COLUMNS` non classée dans `agent_rename`.
+
 Usage : scripts/freeze-checks.py   (à la racine d'un arbre ameesh)
 Sortie : 0 tous verts, 1 au moins un rouge, 2 hors d'un arbre ameesh.
 """
@@ -108,6 +116,18 @@ CHECKS = (
     # #1060 : chaque type d'alerte littéral est déclaré
     ("alert types #1060", ["-m", "unittest", "-q",
                            "tests.test_1060_alert_types.AlertTypesDeclaredTest"]),
+    # #8387 : le contrat des littéraux clients (#4259) est statique et sans
+    # base ; il ne se voyait qu'en CI de paquet (#8340). Le gel le joue sur la
+    # tête gelée, avant la relecture. Dériver tous les contrats sans base de
+    # moins de 10 s a été mesuré à 15 modules et 61 s : trop pour un gel qui
+    # partage 570 s avec la prévalidation, et le contrat nommé est le rouge
+    # observé.
+    ("littéraux clients #4259", ["-m", "unittest", "-q",
+                                 "tests.test_4259_client_literals.ClientLiteralsGuard"]),
+    # #8387 : variante statique du classement des colonnes d'identité de
+    # test_4299 (un PgTestCase, impossible au gel qui est sans base) : les
+    # `CREATE TABLE` et `ADD COLUMN` des migrations du diff.
+    ("colonnes d'identité #4299", ["scripts/garde-colonnes-identite.py", "--root", "."]),
     # #5555 : un `DISTINCT ON` sur quota_gauge_readings hors du seek de
     # `_gauge_heads` trie tout l'historique (19 s/appel, central à 98 % CPU,
     # revue de #5466 passée à côté) : refusé au gel, pas seulement en CI.
