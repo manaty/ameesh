@@ -408,6 +408,7 @@ def main(argv: list | None = None) -> int:
 
         decision = quick_decision(previous, state, arrivals, read_error=read_error)
         debit = None
+        fallback = []
         if decision is None:
             try:
                 from . import debit as debit_mod
@@ -422,6 +423,18 @@ def main(argv: list | None = None) -> int:
             decision = final_decision(report, decisions_rows, now, since=since,
                                       read_error=read_error)
             debit = debit_check(report) if report is not None else None
+            # #8388 : une alerte de capacité qui persiste au-delà de
+            # `file_decoupage.FALLBACK_S` déclenche le courrier de repli,
+            # avec la même clé d'idempotence que la passe de découpage. Un
+            # échec du repli ne défait pas la passe : le tick suivant réessaie.
+            if report is not None:
+                try:
+                    from . import file_decoupage
+                    fallback = file_decoupage.fallbacks_from_capacity(
+                        db, report, now=now, auditor=agent, dry_run=args.dry_run)
+                except Exception as exc:  # noqa: BLE001 - la passe reste due
+                    print("ameesh auditor tick: fallback not sent: %s" % exc,
+                          file=sys.stderr)
 
         payload = {
             "schema": SCHEMA,
@@ -432,6 +445,10 @@ def main(argv: list | None = None) -> int:
             "mail": arrivals,
             "state": state,
         }
+        if fallback:
+            # #8388 : le courrier de repli est parti (ou serait parti en
+            # a-blanc) — la passe le dit dans son rapport.
+            payload["fallback"] = [dict(row) for row in fallback]
         if args.dry_run:
             _print(payload, args.json, dry_run=True)
             return 0

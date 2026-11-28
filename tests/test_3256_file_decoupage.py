@@ -294,6 +294,145 @@ class PassTest(PgTestCase):
         out = self.run_pass(1800 + 3700, listing)
         self.assertEqual([g["kind"] for g in out], ["fallback"])
 
+    def post_note(self, lot, text, *, actor="pilote", at=None):
+        """Écrit une note, puis la date dans le temps du passage si demandé.
+
+        Le journal prend l'heure de la base ; les témoins qui simulent un
+        `now` lointain doivent donc poser la date de la note, sinon la note
+        paraît antérieure à la passe suivante."""
+        work.note(self.db, int(lot), text, actor=actor)
+        row = self.db.query(
+            "SELECT id, extract(epoch from created_at)::float8 AS ts"
+            "  FROM work_item_events WHERE work_item_id = %s"
+            " ORDER BY id DESC LIMIT 1", (int(lot),))[0]
+        if at is not None:
+            self.db.execute(
+                "UPDATE work_item_events SET created_at = to_timestamp(%s)"
+                " WHERE id = %s", (float(at), int(row["id"])))
+            row["ts"] = float(at)
+        return row
+
+    def test_a_lot_held_by_footprint_does_not_hold_the_fallback(self):
+        # #8388, témoin de l'incident #8035 : un lot créé après le découpage
+        # mais retenu par l'empreinte n'est pas du découpage produit ; le
+        # repli part quand même après une heure de silence.
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
+        lot = int(self.split_lots()[0]["id"])
+        # le sentinelle de l'incident : ouvert depuis six jours
+        self.db.execute("UPDATE work_items SET created_at = now() - interval '6 days'"
+                        " WHERE id = %s", (lot,))
+        occupe = work.add(self.db, title="occupe", app="ameesh", actor="pilote")
+        self.db.execute("UPDATE work_items SET state = 'build', assignee = 'devb0'"
+                        " WHERE id = %s", (occupe["id"],))
+        retenu = work.add(self.db, title="retenu", app="ameesh", actor="pilote")
+        _footprint(self.db, occupe, "src/ameesh/x.py")
+        _footprint(self.db, retenu, "src/ameesh/x.py")
+        out = self.run_pass(1800 + 3700, listing)
+        self.assertEqual([g["kind"] for g in out], ["fallback"])
+        mails = self.db.query("SELECT recipient FROM agent_mailbox"
+                              " WHERE work_item_id = %s", (str(lot),))
+        self.assertEqual([m["recipient"] for m in mails], ["auditeur"])
+        self.assertTrue(any(n.startswith(fd.FALLBACK_MARK) for n in self.notes(lot)))
+
+    def test_a_reopening_rearms_the_fallback(self):
+        # #8388 : la marque du repli se réarme à chaque « roadmap: rouverte » ;
+        # un second silence après la réouverture produit un nouveau courrier.
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
+        lot = int(self.split_lots()[0]["id"])
+        out = self.run_pass(1800 + 3700, listing)
+        self.assertEqual([g["kind"] for g in out], ["fallback"])
+        self.post_note(lot, "roadmap: rouverte ameesh (reprise)",
+                       at=self.t0 + 5600)
+        out = self.run_pass(5600 + 100, listing)
+        self.assertNotIn("fallback", [g["kind"] for g in out])
+        out = self.run_pass(5600 + 3700, listing)
+        self.assertEqual([g["kind"] for g in out], ["fallback"])
+        mails = self.db.query("SELECT recipient FROM agent_mailbox"
+                              " WHERE work_item_id = %s ORDER BY id", (str(lot),))
+        self.assertEqual([m["recipient"] for m in mails],
+                         ["auditeur", "auditeur"])
+        # une troisième passe ne redouble pas le second courrier
+        self.assertEqual(self.run_pass(5600 + 4000, listing), [])
+
+    def test_a_roadmap_move_restarts_the_fallback_clock(self):
+        # #8388 : le délai court depuis le dernier mouvement utile, pas
+        # depuis la création du sentinelle.
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
+        lot = int(self.split_lots()[0]["id"])
+        self.post_note(lot, "roadmap: point du 27/11, rien à découper",
+                       at=self.t0 + 1800 + 2000)
+        out = self.run_pass(1800 + 2000 + 100, listing)
+        self.assertNotIn("fallback", [g["kind"] for g in out])
+        out = self.run_pass(1800 + 2000 + 3700, listing)
+        self.assertEqual([g["kind"] for g in out], ["fallback"])
+
+    def test_a_capacity_alert_persisting_sends_the_same_fallback_mail(self):
+        # #8388 : l'alerte de capacité qui dure au-delà de FALLBACK_S déclenche
+        # le courrier de repli, avec la même marque que la passe de découpage.
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
+        lot = int(self.split_lots()[0]["id"])
+        # un lot créé depuis mais retenu par l'empreinte ne compte pas non
+        # plus par cette voie (#8388).
+        occupe = work.add(self.db, title="occupe", app="ameesh", actor="pilote")
+        self.db.execute("UPDATE work_items SET state = 'build', assignee = 'devb0'"
+                        " WHERE id = %s", (occupe["id"],))
+        retenu = work.add(self.db, title="retenu", app="ameesh", actor="pilote")
+        _footprint(self.db, occupe, "src/ameesh/x.py")
+        _footprint(self.db, retenu, "src/ameesh/x.py")
+        report = {"capacity": {"alerts": [{
+            "project": "ameesh", "fallback": True,
+            "decoupage": {"lot": lot, "quiet_s": 4000.0}}]}}
+        out = fd.fallbacks_from_capacity(self.db, report, self.t0 + 5500,
+                                         auditor="auditeur")
+        self.assertEqual([g["lot"] for g in out], [lot])
+        mails = self.db.query("SELECT recipient FROM agent_mailbox"
+                              " WHERE work_item_id = %s", (str(lot),))
+        self.assertEqual([m["recipient"] for m in mails], ["auditeur"])
+        self.assertTrue(any(n.startswith(fd.FALLBACK_MARK) for n in self.notes(lot)))
+        # la passe de découpage ne redouble pas le même courrier
+        self.assertEqual(self.run_pass(5500, listing), [])
+        mails = self.db.query("SELECT recipient FROM agent_mailbox"
+                              " WHERE work_item_id = %s", (str(lot),))
+        self.assertEqual(len(mails), 1)
+
+    def test_an_exhausted_route_does_not_send_the_capacity_fallback(self):
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
+        lot = int(self.split_lots()[0]["id"])
+        self.post_note(lot, "roadmap: épuisée ameesh (feuille de route)",
+                       at=self.t0 + 2000)
+        report = {"capacity": {"alerts": [{
+            "project": "ameesh", "fallback": True,
+            "decoupage": {"lot": lot, "quiet_s": 4000.0}}]}}
+        self.assertEqual(fd.fallbacks_from_capacity(
+            self.db, report, self.t0 + 5500, auditor="auditeur"), [])
+        mails = self.db.query("SELECT recipient FROM agent_mailbox"
+                              " WHERE work_item_id = %s", (str(lot),))
+        self.assertEqual(mails, [])
+
+    def test_a_capacity_alert_without_fallback_does_not_send(self):
+        listing = self.listing() + [agent("auditeur", roles=["auditeur"])]
+        self.run_pass(0, listing)
+        self.run_pass(1800, listing)
+        lot = int(self.split_lots()[0]["id"])
+        report = {"capacity": {"alerts": [{
+            "project": "ameesh", "fallback": False,
+            "decoupage": {"lot": lot, "quiet_s": 4000.0}}]}}
+        self.assertEqual(fd.fallbacks_from_capacity(
+            self.db, report, self.t0 + 5500, auditor="auditeur"), [])
+        mails = self.db.query("SELECT recipient FROM agent_mailbox"
+                              " WHERE work_item_id = %s", (str(lot),))
+        self.assertEqual(mails, [])
+
     def test_exhausted_roadmap_sleeps_idle_executors_alerts_and_wakes(self):
         self.run_pass(0)
         self.run_pass(1800)
