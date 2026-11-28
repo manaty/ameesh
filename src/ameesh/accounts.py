@@ -987,12 +987,16 @@ def _pace_key(cfg):
     règle de rythme. Sans canon configuré (bancs, CLI, tests), la clé reste
     l'objet : un id réutilisé ne doit pas servir une valeur étrangère."""
     from . import canon as canon_mod
-    entries = canon_mod.configured(cfg)
-    if not entries:
+    try:
+        entries = canon_mod.configured(cfg)
+        key = tuple((entry.path, getattr(entry, "ref", ""),
+                     bool(getattr(entry, "untrusted", False)))
+                    for entry in entries)
+    except Exception:  # noqa: BLE001 — configuration factice (tests) : clé objet
+        key = ()
+    if not key:
         return ("cfg", id(cfg))
-    return tuple((entry.path, getattr(entry, "ref", ""),
-                  bool(getattr(entry, "untrusted", False)))
-                 for entry in entries)
+    return key
 
 
 def _pace_remember(key, value) -> None:

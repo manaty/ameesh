@@ -333,6 +333,15 @@ class LocalConfigurationFallbackTest(_PaceCase):
             self.assertEqual(accounts.canon_pace(second), (None, "no canon"))
         self.assertEqual(len(accounts._CANON_PACE), 2)
 
+    def test_a_configuration_with_a_non_iterable_canon_entries_still_answers(self):
+        """Configurations factices des tests : `canon_entries` n'est pas itérable."""
+        cfg = mock.Mock()
+        cfg.canon_entries = object()
+        with mock.patch.object(mechanics, "configured",
+                               side_effect=mechanics.MechanicsError("no canon")):
+            self.assertEqual(accounts.canon_pace(cfg), (None, "no canon"))
+        self.assertIn(("cfg", id(cfg)), accounts._CANON_PACE)
+
     def test_a_reused_object_id_is_still_guarded(self):
         first = config.Config(accounts=dict(ACCOUNTS))
         second = config.Config(accounts=dict(ACCOUNTS))
