@@ -1014,7 +1014,13 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
                             "external executor (or assign it instead)" % assignee)
         # #3447 : déclarer l'exécutant externe est un geste de pilote. Le lot
         # reste sans assigné (l'agent externe ne se réveille pas, 0030).
-        actor = corrector(cfg, db, actor, what="external executor", history=False)
+        # #8468 : sauf un système déclaré qui crée son propre lot.
+        try:
+            actor = corrector(cfg, db, actor, what="external executor", history=False)
+        except WorkError:
+            actor = _system_self_reservation(cfg, db, actor, external_executor)
+            if actor is None:
+                raise
         external_executor = check_external_executor(db, external_executor, cfg=cfg)
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
@@ -2329,6 +2335,37 @@ def waive_ownless_vehicle(db: Db, item_id: int, actor: str, event: str) -> bool:
     row = storage.of(db).work.designate_reviewer(int(item_id), REVIEWER_NONE,
                                                 actor=actor, event=event)
     return row is not None
+
+
+def _system_self_reservation(cfg, db, actor: str, executor: str | None) -> str | None:
+    """#8468 : un système non-agent déclaré (`system:…`, #6091) crée un lot
+    réservé à lui-même.
+
+    La déclaration est le geste de pilote (`declare_external_executor`, avec
+    son responsable humain) ; ensuite le système n'a plus besoin d'un pilote
+    pour chaque lot qu'il porte (le miroir de backlog d'un outil externe crée
+    les siens). Rend le nom du système, ou None : l'appelant garde alors le
+    refus de `corrector`.
+
+    Seulement à la création, seulement pour lui-même (`actor` == exécutant,
+    tous deux `system:…`) et seulement hors session d'agent : une session qui
+    porte une identité d'agent (`identity.resolve_binding`) ne parle pas au
+    nom d'un système. La déclaration doit exister et ne pas être retirée
+    (`check_external_executor`, relu ensuite par l'appelant et sous le verrou
+    du stockage). Réserver un lot à un autre, changer ou lever une réservation
+    (`set_external_executor`) restent des gestes de pilote."""
+    from . import identity
+
+    name = (actor or "").strip()
+    if not name.startswith(SYSTEM_PREFIX) or name != (executor or "").strip():
+        return None
+    binding = identity.resolve_binding(cfg, db)
+    if binding.name or binding.source != "none" or os.environ.get("AGENT_MAIL_NAME"):
+        return None
+    row = storage.of(db).external_executors.get(name)
+    if row is None or row.get("retired_at"):
+        return None
+    return name
 
 
 def check_external_executor(db: Db, executor: str, *, cfg=None) -> str:
