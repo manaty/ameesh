@@ -844,7 +844,7 @@ est AG3). C'est un résultat non concluant, qui ne retient rien (§3). Depuis
 permanence : le mode décrit ci-dessus rend un burst après 30 min sans
 travail, hors fenêtre, sans retirer `lend`.
 
-## Mode veille de la base (#8420, #8029)
+## Mode veille de la base (#8420, #8459, #8029)
 
 Les VM `ameesh-agents-1` et `-2` portent les deux standbys synchrones du hub
 (deploy/serveur/replication/README.md, « Mode veille »). Avant d'arrêter la
@@ -856,7 +856,9 @@ ainsi dans l'enrôlement :
   (commandes fixes et absolues, comme les autres) ; sans `replica: true`,
   ces deux clés sont refusées ;
 - `standby_timeout_s` au niveau de l'enrôlement, obligatoire dès qu'une
-  cible est une réplique (entre `io_timeout_s` et 120 s).
+  cible est une réplique (entre `io_timeout_s` et 90 s : la transaction du
+  tick est sous `idle_in_transaction_session_timeout = 120 s`, la borne garde
+  une marge ; au-delà, l'enrôlement est refusé).
 
 Comportement du worker :
 
@@ -866,20 +868,28 @@ Comportement du worker :
    donne `standby enter refused` : ni intention d'arrêt, ni arrêt. Le tick
    suivant rejoue (le script est idempotent). Si l'intention était déjà posée,
    la borne `halt_deadline_s` court et son alerte `halt_deadline` nomme
-   l'hôte, sans arrêt.
+   l'hôte, sans arrêt. L'intention d'entrée est écrite **avant** l'appel
+   externe dans la ligne de contrôle de la réplique
+   (`standby_entered_at`, migration 0615) : une sonde en échec ou un worker
+   tué laisse donc la dette de sortie enregistrée.
 2. **Sortie après le retour sain des deux répliques.** Quand le retour d'une
    réplique est sain et réconcilié (`ready`), le worker vérifie que toutes
    les cibles `replica` sont revenues (portes ouvertes, ou retour de la
    génération courante terminé). Sinon il attend le retour de l'autre
    (`ready; standby exit waits for the other replica`). Sinon il lance
    `standby_exit_argv` (`mode-veille.sh sortir`, sans effet hors veille).
-3. **Échec de la sortie : alerte, le retour tient.** Le retour n'est jamais
-   défait. Le journal du worker porte
-   `ready; standby exit failed (synchronous list left empty)` et un événement
-   `vm.standby_exit_failed` (hôte, génération, époque) est écrit. La liste
-   reste vide : état sûr, durabilité dégradée. L'opérateur rejoue
-   `mode-veille.sh sortir` après `etat.sh` ; le retour suivant d'une
-   réplique le rejoue aussi.
+3. **Échec de la sortie : alerte et reprise.** Le retour n'est jamais défait.
+   Le journal du worker porte
+   `ready; standby exit failed (synchronous list left empty)` (ou
+   `inactive; …` au rejeu), un événement `vm.standby_exit_failed` (hôte,
+   génération, époque) est écrit **une fois par épisode**, et
+   `host_release.alerts` lève `host_release_standby_exit_failed` : visible
+   dans `ameesh alerts` et adressée aux agents comme les autres alertes de
+   sortie d'hôte. La liste reste vide : état sûr, durabilité dégradée. Le
+   worker rejoue `sortir` à chaque tick tant que la dette
+   (`standby_exit_failed_at`) est enregistrée ; un succès efface la dette de
+   toutes les répliques et l'alerte. L'opérateur peut aussi rejouer
+   `mode-veille.sh sortir` après `etat.sh`.
 
 Commande opérateur. `mode-veille.sh` tourne en root sur le hub, et ses
 attentes (`ATTENTE_TOURS` 600 s, `ATTENTE_REVEIL` 900 s) dépassent la borne
@@ -909,10 +919,10 @@ déclarer aucune cible `replica` : `mode-veille.sh` refuserait (primaire hors
 hub, ou aucun standby à rattraper au réveil) et aucune VM ne s'arrêterait. Ce
 lot livre le code et ses témoins, sans essai réel.
 
-Limite : l'échec de sortie est un événement et une ligne de journal, pas
-encore une alerte de `host_release.alerts`. Un retour qui rouvre les portes
-sans le worker (`ameesh host undrain`) ne lance pas `sortir` : le rejouer à
-la main.
+Limite : un retour qui rouvre les portes sans le worker
+(`ameesh host undrain`) ne termine pas la requête `busy` de la génération ;
+`replicas_back` attend donc encore cette réplique et le rejeu de `sortir`
+reste à la main (`mode-veille.sh sortir` après `etat.sh`).
 
 ## Contrôle et retour arrière
 

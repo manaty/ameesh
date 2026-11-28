@@ -33,6 +33,15 @@ halt intent and again before the halt: no halt while it fails. Its
 `standby_exit_argv` (mode-veille.sh sortir) runs once its return is healthy
 and every replica target is back; a failure is journalled and alerted
 (`vm.standby_exit_failed`), the return itself stands.
+
+#8459: the standby debt is durable on the replica's control (`standby_*`
+columns, 0615). The enter intent is written before the external call, the
+first failed exit is journalled once and raises
+`host_release_standby_exit_failed` through `host_release.alerts`, and every
+idle tick replays `sortir` while the debt is recorded: a transient failure no
+longer waits for the next replica return or an operator. A successful exit
+clears the debt of every replica; `standby_timeout_s` stays strictly under
+the tick transaction's 120 s idle timeout.
 """
 from __future__ import annotations
 
@@ -54,7 +63,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from . import config, db as db_mod, election, host_idle, host_lifecycle, host_release, storage
-from .storage.postgres.vm_adapter import Queue
+from .storage.postgres.vm_adapter import IDLE_IN_TRANSACTION_S, Queue
 
 
 class Refused(ValueError):
@@ -80,6 +89,10 @@ POWERON_SENT = 'poweron sent'
 # Leave time for a candidate to start before also requesting its successor.
 # Election itself remains the authority that chooses the holder.
 ROLE_WAKE_FAILOVER_S = 150
+#: #8459: the standby commands run within the tick's transaction, which
+#: `Queue.lock` puts under `IDLE_IN_TRANSACTION_S`. The enrolled bound keeps a
+#: 30 s margin so a slow `entrer` is never cut mid-call by the database.
+STANDBY_TIMEOUT_MAX_S = IDLE_IN_TRANSACTION_S - 30
 
 
 def private_json(path):
@@ -163,13 +176,17 @@ def enrollment(value, *, local_host=None):
     # #8420: the standby commands wait for turns or for a replica to catch up,
     # longer than an I/O call; their own bound is explicit once a replica is
     # enrolled. The operator's argv bounds its waits below it (README).
+    # #8459: strictly under the tick transaction's idle timeout, with a margin
+    # for the queries that already ran in it (STANDBY_TIMEOUT_MAX_S).
     targets = value.get('targets')
     if isinstance(targets, dict) and any(
             isinstance(t, dict) and t.get('replica') is True for t in targets.values()):
         bound = value.get('standby_timeout_s')
         if (isinstance(bound, bool) or not isinstance(bound, (float, int)) or not math.isfinite(bound)
-                or not value['io_timeout_s'] <= bound <= 120):
-            raise Refused('explicit standby timeout required (at most 120 seconds)')
+                or not value['io_timeout_s'] <= bound <= STANDBY_TIMEOUT_MAX_S):
+            raise Refused('explicit standby timeout required (at most %d seconds, '
+                          'strictly under the %d s idle-in-transaction timeout)'
+                          % (STANDBY_TIMEOUT_MAX_S, IDLE_IN_TRANSACTION_S))
     # #6074: explicit bound on the halt phase, counted from the halt intent.
     bound = value.get('halt_deadline_s')
     if (isinstance(bound, bool) or not isinstance(bound, (float, int)) or not math.isfinite(bound)
@@ -670,9 +687,20 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
                 # worker stall alert) carries the database side.
                 pass
         raise
-    if result == 'ready' and policy['targets'][host].get('replica'):
-        # After the commit: the return stands whatever the exit answers.
-        return standby_exit(db, policy, host, probe)
+    if policy['targets'][host].get('replica'):
+        if result == 'ready':
+            # After the commit: the return stands whatever the exit answers.
+            return standby_exit(db, policy, host, probe)
+        # #8459: an exit owed by an earlier return is replayed at every tick,
+        # even once the control left the release (`inactive`): the hub's
+        # synchronous list stays empty until `sortir` succeeds. Never during a
+        # release: `entrer` owns the standby state then.
+        control = Queue(db).control(host) or {}
+        if (result == 'inactive'
+                and control.get('mode') not in ('draining', 'returning')
+                and (control.get('standby_entered_ts') is not None
+                     or control.get('standby_exit_failed_ts') is not None)):
+            return standby_exit(db, policy, host, probe, prefix='inactive')
     return result
 
 
@@ -700,24 +728,39 @@ def replicas_back(db, policy):
     return True
 
 
-def standby_exit(db, policy, host, probe):
-    """#8420: `mode-veille.sh sortir` once every replica is back, else wait.
+def standby_exit(db, policy, host, probe, *, prefix='ready'):
+    """#8420/#8459: `mode-veille.sh sortir` once every replica is back, else wait.
 
     Idempotent on the hub (no standby mode: nothing to restore), so each
-    completed replica return may call it. A failure never undoes the return:
-    it is journalled and alerted, and the list stays empty (safe, degraded
-    durability) until an operator or the next replica return replays it."""
+    completed replica return calls it, and #8459 replays it at every idle tick
+    while the debt is recorded. A failure never undoes the return: it is
+    journalled once per episode and alerted
+    (`host_release_standby_exit_failed`), and the list stays empty (safe,
+    degraded durability) until a later tick or an operator restores it. On
+    success every replica's debt is cleared: the standby list belongs to the
+    hub, not to one VM."""
     if not replicas_back(db, policy):
-        return 'ready; standby exit waits for the other replica'
+        return prefix + '; standby exit waits for the other replica'
+    replicas = [name for name, target in policy['targets'].items()
+                if target.get('replica')]
     if probe(policy['targets'][host]['standby_exit_argv'], policy['standby_timeout_s']):
-        return 'ready; standby exited'
-    control = Queue(db).control(host) or {}
+        with db.transaction() as tx:
+            Queue(tx).note_standby_exit_ok(replicas)
+        return prefix + '; standby exited'
     with db.transaction() as tx:
-        tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
-                   "VALUES ('vm.standby_exit_failed',%s,NULL,%s::jsonb)",
-                   (host, json.dumps(dict(generation=control.get('generation'),
-                                          release_epoch=control.get('release_epoch')))))
-    return 'ready; standby exit failed (synchronous list left empty)'
+        q = Queue(tx)
+        controls = {name: q.control(name) for name in replicas}
+        # One event per episode: a replay every 30 s must not fill the journal.
+        first = not any(control and control.get('standby_exit_failed_ts') is not None
+                        for control in controls.values())
+        control = controls.get(host) or {}
+        if first:
+            tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
+                       "VALUES ('vm.standby_exit_failed',%s,NULL,%s::jsonb)",
+                       (host, json.dumps(dict(generation=control.get('generation'),
+                                              release_epoch=control.get('release_epoch')))))
+        q.note_standby_exit_failed(host, replicas)
+    return prefix + '; standby exit failed (synchronous list left empty)'
 
 
 def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
@@ -903,15 +946,27 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
                 return 'on hysteresis'
             if result not in (STOP_PREPARED, HALT_INTENT):
                 q.stop_intent(request)
+                # #8459 B1 (cx2): the standby debt is committed with the stop
+                # intent, a tick before `entrer`; a worker killed while the
+                # probe runs can no longer roll it back. Conservative: if the
+                # host never enters standby, the replay of `sortir` is a no-op.
+                if target.get('replica'):
+                    q.note_standby_enter(host)
                 return 'stop prepared'
             q.refresh_stop_intent(host)
             if not probe(target['quiesce_argv'], policy['io_timeout_s']):
                 return 'quiesce pending'
             # #8420: fail closed. No halt intent, and no halt, while the hub
             # cannot enter standby mode (idempotent: a replay verifies it).
-            if target.get('replica') and not probe(target['standby_enter_argv'],
-                                                   policy['standby_timeout_s']):
-                return 'standby enter refused'
+            # #8459 B1 (cx2): the debt was committed with the stop intent (or
+            # by this branch for a request prepared before this version); a
+            # failed or killed `entrer` cannot erase it.
+            if target.get('replica'):
+                if control.get('standby_entered_ts') is None:
+                    q.note_standby_enter(host)
+                    return 'standby enter prepared'
+                if not probe(target['standby_enter_argv'], policy['standby_timeout_s']):
+                    return 'standby enter refused'
             if result == STOP_PREPARED:
                 q.finish(request, 'pending', HALT_INTENT)
                 return 'halt prepared'

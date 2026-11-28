@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#8420: mode-veille.sh entrer before a replica halt, sortir after both return."""
+"""#8420: mode-veille.sh entrer before a replica halt, sortir after both return.
+
+#8459: a failed sortir stays durable (alert, replay at each idle tick) and the
+enrollment bound keeps a margin under the tick's idle-in-transaction timeout.
+"""
 from __future__ import annotations
 
 from dataclasses import replace
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from tests.support import PgTestCase
 from tests.test_5925_vm_adapter import TARGET, policy
-from ameesh import storage, vm_adapter as vm
+from ameesh import host_release, storage, vm_adapter as vm
 from ameesh.storage.postgres.vm_adapter import Queue
 
 FRESH = mock.patch('ameesh.vm_adapter.host_release._fresh_reading', return_value={'sampled_ts': 1})
@@ -47,6 +52,17 @@ class EnrollmentTest(unittest.TestCase):
                     replicas(standby_timeout_s=121), replicas(standby_timeout_s=float('nan'))):
             with self.assertRaisesRegex(vm.Refused, 'standby timeout'):
                 vm.enrollment(bad, local_host='controller')
+
+    def test_standby_timeout_stays_strictly_under_the_idle_transaction_timeout(self):
+        """#8459: `entrer` runs inside the tick transaction, whose
+        `idle_in_transaction_session_timeout` is 120 s; a bound of 120 s (or
+        more) can be cut mid-call by the database."""
+        self.assertLess(vm.STANDBY_TIMEOUT_MAX_S, 120)
+        self.assertEqual(vm.enrollment(replicas(standby_timeout_s=90),
+                                       local_host='controller')['standby_timeout_s'], 90)
+        for bad in (90.5, 91, 119, 120):
+            with self.assertRaisesRegex(vm.Refused, 'standby timeout'):
+                vm.enrollment(replicas(standby_timeout_s=bad), local_host='controller')
 
     def test_standby_commands_without_replica_are_refused(self):
         self.assertNotIn('replica', vm.enrollment(policy(), local_host='controller')['targets']['burst'])
@@ -155,6 +171,44 @@ class EnterTest(Base):
         self.assertEqual(self.tick(), 'halt sent')
         self.assertEqual(self.argvs(), [['/quiesce'], ['/quiesce'], ['/halt']])
 
+    def test_enter_records_a_durable_standby_debt(self):
+        """#8459 B1: committed with the stop intent, a tick before `entrer`."""
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
+        self.assertEqual(self.tick(), 'halt prepared')
+        self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
+
+    def test_a_killed_worker_after_enter_keeps_the_debt(self):
+        """#8459 B1 (cx2): the debt is committed before the external call, so
+        a worker killed after `entrer` and before the tick commits still owes
+        `sortir`; the rolled-back probe cannot erase the earlier commit."""
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
+        entered = []
+
+        def killed(argv, *args, **kwargs):
+            if argv == ['/entrer']:
+                entered.append(argv)
+                raise RuntimeError('worker killed after entrer')
+            return True
+
+        self.probe.side_effect = killed
+        with self.assertRaisesRegex(RuntimeError, 'killed after entrer'):
+            self.tick()
+        self.assertEqual(entered, [['/entrer']])
+        # The probe transaction rolled back; the committed debt stands.
+        self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
+        self.probe.side_effect = None
+        self.probe.return_value = True
+        self.assertEqual(self.tick(), 'halt prepared')
+
+    def test_refused_enter_still_records_the_debt(self):
+        self.answer(['/entrer'])
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertEqual(self.tick(), 'standby enter refused')
+        self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
+        self.assertIsNone(self.q.control('burst')['standby_exit_failed_ts'])
+
 
 class ExitTest(Base):
     request_state = 'busy'
@@ -220,6 +274,104 @@ class ExitTest(Base):
         control = self.q.control('burst')
         self.assertEqual(events[0]['data'], {'generation': control['generation'],
                                              'release_epoch': control['release_epoch']})
+
+    # -- #8459: the debt alerts, survives and is replayed ---------------------
+    def control_of(self, host='burst'):
+        return self.q.control(host) or {}
+
+    def available(self, host='burst'):
+        """The scanner's `complete_return` after `ready` (out of this worker)."""
+        self.db.execute("UPDATE host_lifecycle SET mode='available',claims_open=true,"
+                        "return_probe=NULL WHERE host=%s", (host,))
+
+    def failing_exit(self):
+        self.probe.side_effect = lambda argv, *a, **k: argv != ['/sortir']
+
+    def standby_alerts(self):
+        return [a for a in host_release.alerts(self.cfg, self.db, time.time())
+                if a['type'] == 'host_release_standby_exit_failed']
+
+    def test_exit_failure_is_durable_and_alerted(self):
+        self.failing_exit()
+        self.assertEqual(self.returned(), 'ready; standby exit failed (synchronous list left empty)')
+        control = self.control_of()
+        self.assertIsNotNone(control['standby_exit_failed_ts'])
+        alerts = self.standby_alerts()
+        self.assertEqual([(a['host'], a['since'], a['threshold']) for a in alerts],
+                         [('burst', round(control['standby_exit_failed_ts'], 3), 0.0)])
+        self.assertIn('synchronous_standby_names', alerts[0]['detail'])
+        self.assertEqual(alerts[0]['generation'], control['generation'])
+
+    def test_failed_exit_is_replayed_on_an_idle_tick_then_cleared(self):
+        self.failing_exit()
+        self.assertEqual(self.returned(), 'ready; standby exit failed (synchronous list left empty)')
+        self.assertEqual(len(self.standby_alerts()), 1)
+        self.available()
+        self.probe.reset_mock()
+        self.probe.side_effect = None
+        self.probe.return_value = True
+        self.assertEqual(self.tick(), 'inactive; standby exited')
+        self.assertEqual(self.argvs(), [['/sortir']])
+        control = self.control_of()
+        self.assertIsNone(control['standby_entered_ts'])
+        self.assertIsNone(control['standby_exit_failed_ts'])
+        self.assertEqual(self.standby_alerts(), [])
+
+    def test_replay_keeps_one_event_and_the_first_failure_instant(self):
+        self.failing_exit()
+        self.assertEqual(self.returned(), 'ready; standby exit failed (synchronous list left empty)')
+        failed = self.control_of()['standby_exit_failed_ts']
+        self.available()
+        self.assertEqual(self.tick(),
+                         'inactive; standby exit failed (synchronous list left empty)')
+        self.assertEqual(self.tick(),
+                         'inactive; standby exit failed (synchronous list left empty)')
+        self.assertEqual(self.control_of()['standby_exit_failed_ts'], failed)
+        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.standby_alerts()), 1)
+
+    def test_replay_waits_for_a_replica_that_is_not_back(self):
+        self.failing_exit()
+        self.assertEqual(self.returned(), 'ready; standby exit failed (synchronous list left empty)')
+        self.available()
+        self.other('draining', False)
+        self.probe.reset_mock()
+        self.assertEqual(self.tick(), 'inactive; standby exit waits for the other replica')
+        self.assertEqual(self.probe.call_args_list, [])
+        # Once that replica is back, the next idle tick restores the list.
+        self.db.execute("UPDATE host_lifecycle SET mode='available',claims_open=true "
+                        "WHERE host='other'")
+        self.probe.side_effect = None
+        self.probe.return_value = True
+        self.assertEqual(self.tick(), 'inactive; standby exited')
+
+    def test_success_clears_the_debt_of_every_replica(self):
+        self.db.execute("INSERT INTO host_lifecycle(host,mode,actor,claims_open,"
+                        "release_state,hook_state) VALUES "
+                        "('other','available','tester',true,'busy','busy')")
+        self.db.execute("UPDATE host_lifecycle SET standby_entered_at=clock_timestamp(),"
+                        "standby_exit_failed_at=clock_timestamp() "
+                        "WHERE host IN ('burst','other')")
+        self.assertEqual(self.returned(), 'ready; standby exited')
+        for host in ('burst', 'other'):
+            with self.subTest(host=host):
+                control = self.control_of(host)
+                self.assertIsNone(control['standby_entered_ts'])
+                self.assertIsNone(control['standby_exit_failed_ts'])
+
+    def test_an_n1_writer_row_carries_no_debt(self):
+        """#8459: the columns are additive; an older writer leaves them NULL."""
+        self.db.execute("DELETE FROM host_lifecycle")
+        self.db.execute("DELETE FROM vm_adapter_requests")
+        self.previous_insert('host_lifecycle',
+                             {'host': 'burst', 'mode': 'available', 'actor': 'n-1',
+                              'release_state': 'busy', 'hook_state': 'busy',
+                              'claims_open': True},
+                             added=('standby_entered_at', 'standby_exit_failed_at'))
+        control = self.control_of()
+        self.assertIsNone(control['standby_entered_ts'])
+        self.assertIsNone(control['standby_exit_failed_ts'])
+        self.assertEqual(self.standby_alerts(), [])
 
     def test_a_target_without_replica_returns_plain_ready(self):
         self.policy = policy()

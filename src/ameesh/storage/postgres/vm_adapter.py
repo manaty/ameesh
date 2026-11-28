@@ -4,6 +4,12 @@ from .hosts import Hosts
 from .host_lifecycle import HostLifecycle
 
 
+#: #8459: the bounded external call of a tick runs under this idle-in-
+#: transaction bound. The enrollment of `standby_timeout_s` derives its own
+#: maximum from it, with a margin for the queries that already ran.
+IDLE_IN_TRANSACTION_S = 120
+
+
 class Queue:
     def observations(self):
         """Last provider observation and its uninterrupted observed interval."""
@@ -30,7 +36,9 @@ class Queue:
     def lock(self, host):
         # Bounded external I/O is performed under this gate: a new generation
         # cannot reopen claims between the final check and a provider action.
-        self.db.execute("SET LOCAL idle_in_transaction_session_timeout='120s'")
+        # #8459: the enrollment's standby bound is derived from this value.
+        self.db.execute("SET LOCAL idle_in_transaction_session_timeout='%ds'"
+                        % IDLE_IN_TRANSACTION_S)
         Hosts._lock_gate(self.db, host)
         # Native transition attempts and return intents also update this row
         # directly. Fence them through the bounded provider action as well.
@@ -225,3 +233,39 @@ class Queue:
 
     def return_intent(self, host):
         return HostLifecycle(self.db).note_return_request(host, actor='vm-adapter')
+
+    # -- #8459: the hub's standby debt, carried by each replica control -------
+    def note_standby_enter(self, host):
+        """Standby may be active: `sortir` is owed. Committed with the stop
+        intent, a tick before `entrer` runs (durable like the halt intent): a
+        failed or killed probe still records that the synchronous list may be
+        empty. Idempotent: the first instant of the debt is kept across
+        replays and waves."""
+        self.db.execute("UPDATE host_lifecycle SET standby_entered_at="
+                        "coalesce(standby_entered_at,clock_timestamp()) "
+                        "WHERE host=%s", (host,))
+
+    def note_standby_exit_failed(self, host, replicas):
+        """One failed `sortir` of the episode: the first failing `host` owns it.
+
+        The entered marker is cleared on every replica because the failed
+        marker now carries the debt: one host replays `sortir`, so one alert
+        names one host. If another replica already carries the failure (the
+        debt outlived a new stop), this host does not add a second owner;
+        `coalesce` keeps the first failure as the alert's stable instant."""
+        self.db.execute("UPDATE host_lifecycle SET standby_entered_at=NULL "
+                        "WHERE host=ANY(%s)", (list(replicas),))
+        self.db.execute("UPDATE host_lifecycle SET standby_exit_failed_at="
+                        "coalesce(standby_exit_failed_at,clock_timestamp()) "
+                        "WHERE host=%s AND NOT EXISTS (SELECT 1 FROM host_lifecycle "
+                        "WHERE host=ANY(%s) AND standby_exit_failed_at IS NOT NULL)",
+                        (host, list(replicas),))
+
+    def note_standby_exit_ok(self, replicas):
+        """`sortir` succeeded: no replica owes an exit any more.
+
+        The synchronous list belongs to the hub, not to one VM: clearing every
+        replica's debt keeps a second target from replaying a no-op `sortir`."""
+        self.db.execute("UPDATE host_lifecycle SET standby_entered_at=NULL,"
+                        "standby_exit_failed_at=NULL WHERE host=ANY(%s)",
+                        (list(replicas),))

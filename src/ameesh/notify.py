@@ -467,6 +467,9 @@ TYPE_LABELS = {
     # #5932: a queued VM adapter request is a normal wait; this type names the
     # worker that stopped progressing after a durable poweroff intent.
     "host_release_adapter_stalled": "VM adapter worker stalled after a stop intent",
+    # #8459: the VM adapter could not restore the hub's synchronous standbys;
+    # the list stays empty (safe) until a replay succeeds.
+    "host_release_standby_exit_failed": "standby exit failed, synchronous list empty",
     "fingerprints_source_failing": "failure fingerprints source failing",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
