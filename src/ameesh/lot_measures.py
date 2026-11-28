@@ -995,7 +995,10 @@ def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
         try:
             if ids is None:
                 cand_repos = _repos_for(cand, repos, slugs, db)
-                if not cand_repos:
+                # un hôte sans aucun dépôt mesure quand même les phases (le
+                # diff reste inconnu) : le filtre ne s'applique qu'à des
+                # dépôts existants qu'aucun ne peut porter.
+                if repos and not cand_repos:
                     continue
                 # a lot already measured is retried (diff, CI) only when a
                 # repository holds its merge commit now
