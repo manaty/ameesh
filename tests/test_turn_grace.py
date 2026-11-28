@@ -667,8 +667,16 @@ class SousMoissonneurTest(_Base):
         os.makedirs(cwd, exist_ok=True)
         self.register("fond-code", "claude", cwd=cwd, prompt="lance le travail")
         fini = os.path.join(self.tmp, "travail-fini")
-        proc = self.runner_popen(
-            "--agents", "fond-code", "--poll", "1",
+        # Le vrai fil de suivi reste actif, mais son attente de 5 s en service
+        # ajoute une latence inutile à ce test de bout en bout. Ce réglage ne
+        # concerne que le processus enfant, pas les exécuteurs en service.
+        lanceur = (
+            "import runpy; from ameesh.background import Tracker; "
+            "Tracker.TICK_S = 0.2; runpy.run_module('ameesh.runner', run_name='__main__')"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", lanceur, "--agents", "fond-code", "--poll", "1"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=self.tmp,
             env=self.env(AMEESH_TEST_BACKGROUND=(
                 "while [ ! -e %s ]; do sleep 0.1; done; exit 3" % shlex.quote(fini)),
                          AMEESH_TURN_GRACE_SECONDS="120"))
