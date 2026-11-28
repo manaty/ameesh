@@ -700,7 +700,9 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict,
             continue
         missing = [line for line in required if line not in head_lines]
         present = len(required) - len(missing)
-        if present == 0:
+        # B2 (#8395) : un lot qui ne fait que retirer des lignes n'a rien à
+        # retrouver ; sans `required`, present=0 ne dit pas « absent ».
+        if present == 0 and required:
             verdict = "absent"
         elif missing:
             verdict = "partiel"
@@ -750,7 +752,8 @@ def lot_verdict(entries: list[dict]) -> str:
 CONTRACT_HEADING_RE = re.compile(r"contrat module v1", re.IGNORECASE)
 CONTRACT_COMMIT_RE = re.compile(
     r"Commit de composition\s*:\s*`([0-9a-f]{7,40})`")
-CONTRACT_REVISION_LOT_RE = re.compile(r"(\d+\.\d+)\s*\(#(\d+)")
+CONTRACT_REVISION_LOT_RE = re.compile(
+    r"(\d+\.\d+)\s*\(#(\d+)(?:,\s*([^)]+))?\)")
 
 #: le contrat module v1 et les deux satellites que le pliage aligne
 CONTRACT_REL = "docs/api/module-contract-v1.md"
@@ -767,6 +770,46 @@ CONTRACT_SURFACE_RE = re.compile(r'^\s*"contract"\s*:\s*"(\d+\.\d+)",?\s*$')
 CONTRACT_ADDITIVE_RE = re.compile(
     r"\badditive to (?:revision )?\d+\.\d+\b")
 FRAGMENT_FILE_RE = re.compile(r"^([1-9][0-9]*)\.md$")
+CONTRACT_ITEM_NUMBER_RE = re.compile(r"^Revision \d+\.\d+ adds\b")
+
+
+def _revision_list_lines(text: str) -> list[str]:
+    """Les lignes de la liste des révisions, sans les sections qui suivent.
+
+    La liste commence à la première ligne « Revision 1.N adds » et s'arrête au
+    premier titre ou à « The [IMA mapping] », comme le pliage. Une ligne
+    « Revision 1.8 adds … » en tête de section n'en fait donc pas partie (N).
+    """
+    lines = str(text).splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if CONTRACT_ITEM_RE.match(line):
+            start = index
+            break
+    if start is None:
+        return []
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if (lines[index].startswith("## ")
+                or lines[index].startswith("The [IMA mapping]")):
+            end = index
+            break
+    return lines[start:end]
+
+
+def _norm_revision_line(line: str) -> str:
+    """Une ligne de révision, numéro et dernière référence additive neutralisés.
+
+    Le pliage ne réécrit qu'un numéro de révision et la dernière mention
+    « additive to 1.N » d'un paragraphe ; le reste doit être identique pour
+    prouver que le contenu a été renuméroté, pas supprimé.
+    """
+    text = CONTRACT_ITEM_NUMBER_RE.sub("Revision X adds", line, count=1)
+    matches = list(CONTRACT_ADDITIVE_RE.finditer(text))
+    if matches:
+        match = matches[-1]
+        text = (text[:match.start()] + "additive to X" + text[match.end():])
+    return text
 
 
 def _contract_section(text: str) -> str | None:
@@ -918,19 +961,37 @@ def contract_fold_paths(repo: Path, head: str, text: str
     header_value = None
     if CONTRACT_REL in changed:
         added_lines = lines_for(added, CONTRACT_REL, "ajoutées")
+        parent_contract = git(repo, "show", "%s:%s" % (parent, CONTRACT_REL),
+                              check=False)
+        parent_revisions = (
+            _revision_list_lines(parent_contract.stdout.decode("utf-8", "replace"))
+            if parent_contract.returncode == 0 else [])
+        added_set = set(added_lines)
+        added_norms = {_norm_revision_line(line) for line in added_lines}
         for line in lines_for(removed, CONTRACT_REL, "retirées"):
-            # Le pliage ne retire que : l'en-tête, une ligne « Revision 1.N
-            # adds », la référence finale « additive to 1.N » d'un paragraphe
-            # renuméroté, ou une ligne qu'il réécrit ailleurs à l'identique
-            # (paragraphe ancien déplacé dans l'ordre du manifeste). Toute
-            # autre ligne retirée est un contenu perdu, pas un pliage.
-            if not (CONTRACT_HEADER_ONLY_RE.match(line)
-                    or CONTRACT_ITEM_RE.match(line)
-                    or CONTRACT_ADDITIVE_RE.search(line)
-                    or line in added_lines):
+            # Le pliage ne retire que : l'en-tête ; une ligne de la liste des
+            # révisions, renumérotée et/ou réécrite (même contenu, numéro ou
+            # référence finale neutralisés) ; ou une ligne réécrite ailleurs à
+            # l'identique (paragraphe ancien déplacé dans l'ordre du
+            # manifeste). Une ligne de section, même commençant par
+            # « Revision 1.N adds », n'est pas une révision (N) ; sans
+            # réécriture correspondante, c'est un contenu perdu (B1 legacy).
+            if CONTRACT_HEADER_ONLY_RE.match(line):
+                continue
+            if line in added_set:
+                continue
+            if (line in parent_revisions
+                    and _norm_revision_line(line) in added_norms):
+                continue
+            if line in parent_revisions:
                 errors.append(
-                    "commit de pliage %s : %s retire une ligne que le pliage "
-                    "n'explique pas : %s"
+                    "commit de pliage %s : %s retire une ligne de révision "
+                    "sans réécriture correspondante : %s"
+                    % (sha, CONTRACT_REL, line.strip()[:80]))
+            else:
+                errors.append(
+                    "commit de pliage %s : %s retire une ligne hors de la "
+                    "liste des révisions : %s"
                     % (sha, CONTRACT_REL, line.strip()[:80]))
         headers = [CONTRACT_HEADER_LINE_RE.match(line)
                    for line in added_lines]
@@ -988,12 +1049,38 @@ def contract_fold_paths(repo: Path, head: str, text: str
                                         for item in sorted(known.items()))))
 
     body = _contract_section(text) or ""
-    revisions = [(match.group(1), int(match.group(2)))
+    revisions = [(match.group(1), int(match.group(2)),
+                  (match.group(3) or "").strip().casefold())
                  for match in CONTRACT_REVISION_LOT_RE.finditer(body)]
     head_contract = blob_lines(repo, head, CONTRACT_REL)
     if head_contract is None:
         errors.append("contrat %s illisible à la tête %s"
                       % (CONTRACT_REL, head[:12]))
+    # Le pliage ajoute une liste de révisions qui doit tenir à la tête : une
+    # ligne de liste perdue après le pliage est un contenu disparu, même si
+    # elle avait été retirée puis réécrite par le pliage (« déplacée »).
+    fold_head = git(repo, "show", "%s:%s" % (commit, CONTRACT_REL), check=False)
+    if fold_head.returncode == 0 and head_contract is not None:
+        for line in _revision_list_lines(
+                fold_head.stdout.decode("utf-8", "replace")):
+            if line.strip() and line not in head_contract:
+                errors.append(
+                    "commit de pliage %s : ligne de la liste des révisions "
+                    "absente à la tête : %s"
+                    % (sha, line.strip()[:80]))
+                break
+    head_text = git(repo, "show", "%s:%s" % (head, CONTRACT_REL), check=False)
+    head_revisions = (
+        _revision_list_lines(head_text.stdout.decode("utf-8", "replace"))
+        if head_text.returncode == 0 else [])
+    for number, lot, kind in revisions:
+        if kind.startswith("fragment"):
+            continue
+        if kind and not any(line.startswith("Revision %s adds" % number)
+                            for line in head_revisions):
+            errors.append(
+                "révision écrite %s (#%d) absente de la liste des révisions "
+                "à la tête" % (number, lot))
     header_before = None
     base_contract = git(repo, "show", "%s:%s" % (parent, CONTRACT_REL),
                         check=False)
@@ -1018,8 +1105,8 @@ def contract_fold_paths(repo: Path, head: str, text: str
             errors.append("fragment %s : premier paragraphe « adds: » "
                           "illisible" % path)
             continue
-        positions = [index for index, (_number, cited) in enumerate(revisions)
-                     if cited == lot]
+        positions = [index for index, (_number, cited, _kind)
+                     in enumerate(revisions) if cited == lot]
         if len(positions) != 1:
             errors.append("fragment %s : la section du manifeste ne cite pas "
                           "le lot #%d (ou le cite deux fois)" % (path, lot))
@@ -1042,20 +1129,16 @@ def contract_fold_paths(repo: Path, head: str, text: str
 
     if errors:
         return {}, errors
-    shared = {path: set(lines_for(removed, path, "retirées"))
+    shared = {path: set(removed.get(path) or [])
               for path in sorted(changed & CONTRACT_FILE_RELS)}
-    if errors:
-        return {}, errors
     table: dict[int, dict[str, set[str]]] = {}
     for lot in lots:
         entry = {path: set(lines) for path, lines in shared.items()}
         fragment = f"{CONTRACT_DIR_REL}/{lot}.md"
         if fragment in changed:
-            entry[fragment] = set(lines_for(removed, fragment, "retirées"))
+            entry[fragment] = set(removed.get(fragment) or [])
         table[lot] = entry
-    if errors:
-        return {}, errors
-    return table, errors
+    return table, []
 
 
 def entry_exemptions(table: dict[int, dict[str, set[str]]], lots
