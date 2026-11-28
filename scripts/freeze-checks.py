@@ -62,6 +62,14 @@ variante statique, `scripts/garde-colonnes-identite.py`, lit les `CREATE
 TABLE` et `ADD COLUMN` des migrations du diff et refuse une colonne
 `IDENTITY_COLUMNS` non classée dans `agent_rename`.
 
+#8485 : le lint de classement des colonnes (#5697, `test_cluster`) ne tournait
+qu'en prévalidation, souvent non concluante (gate-preempted, run-incomplete) :
+trois lots du 28/11 ont gelé une migration qui ajoute une colonne sans
+l'accorder dans `deploy/sql/role-superviseur.sql` ni la classer dans `EXCLUES`
+(#8458 0614, #8459 0615, #8422 0616). Il tourne désormais à chaque gel, sans
+condition de diff : statique (fichiers de migration et contrat, ni base ni
+psql), de l'ordre de la seconde.
+
 Usage : scripts/freeze-checks.py   (à la racine d'un arbre ameesh)
 Sortie : 0 tous verts, 1 au moins un rouge, 2 hors d'un arbre ameesh.
 """
@@ -128,6 +136,15 @@ CHECKS = (
     # test_4299 (un PgTestCase, impossible au gel qui est sans base) : les
     # `CREATE TABLE` et `ADD COLUMN` des migrations du diff.
     ("colonnes d'identité #4299", ["scripts/garde-colonnes-identite.py", "--root", "."]),
+    # #8485 : le classement des colonnes (#5697) ne tournait qu'en
+    # prévalidation, souvent non concluante (gate-preempted, run-incomplete) :
+    # trois lots du 28/11 ont gelé une migration qui ajoute une colonne sans
+    # l'accorder dans deploy/sql/role-superviseur.sql ni la classer dans
+    # EXCLUES (#8458 0614, #8459 0615, #8422 0616). Il tourne à chaque gel,
+    # sans condition de diff : statique (fichiers de migration et contrat, ni
+    # base ni psql), de l'ordre de la seconde.
+    ("classement des colonnes #5697", ["-m", "unittest", "-q",
+                                       "tests.test_cluster.ContratDesColonnesTest"]),
     # #5555 : un `DISTINCT ON` sur quota_gauge_readings hors du seek de
     # `_gauge_heads` trie tout l'historique (19 s/appel, central à 98 % CPU,
     # revue de #5466 passée à côté) : refusé au gel, pas seulement en CI.
