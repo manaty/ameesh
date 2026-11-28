@@ -181,8 +181,11 @@ attente de plus de 2 h. Le geste dépend de l'état :
   admis, #8198 — ou la création d'un lot qui le cite ; #7848, #8199 : une
   note `hold:`/`unhold:` ordinaire ou de veille ne remet pas le compteur à
   zéro) sans lot démarrable : le **repli** de la spec §2.2, geste de niveau 1
-  ci-dessous. Une fenêtre d'observation non échue sur le lot tient ce repli
-  jusqu'à son échéance (#8199).
+  ci-dessous. Un lot créé depuis mais retenu par la garde d'empreinte ne
+  compte pas ; une `roadmap: rouverte` réarme le repli (#8388). Une fenêtre
+  d'observation non échue sur le lot tient ce repli jusqu'à son échéance
+  (#8199) ; une alerte `capacity.alerts` qui dure au-delà de l'heure porte
+  `fallback: true` et le courrier de repli part de lui-même (#8388).
 
 Une feuille de route notée épuisée (`roadmap: épuisée <projet>` sur le lot de
 découpage, seule ou comme raison d'un hold, fenêtre comprise : `hold: fenêtre :
@@ -821,7 +824,7 @@ FIN
 | orchestrateur muet avec du courrier | `agent-mail send <orchestrateur> "…"` | aucun |
 | « Idle with an actionable lot: … » (`idle_actionable_lot`, #408) : un agent au repos détient un lot `intake`/`build` et les réveils de son exécuteur (règle 1) sont restés sans effet | **relancer, pas seulement nommer** : `agent-mail send <agent> "…" --lot <lot>` (ce qui est attendu sur le lot, ou qu'il note pourquoi il ne peut pas avancer : `ameesh work note <lot> "hold: <raison>"`) ; exécuteur pas vivant : `ameesh resume <agent>` d'abord ; s'il ne peut pas prendre le lot : `ameesh work assign <lot> <agent>` | `ameesh work assign <lot> <ancien>` |
 | « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
-| lot de découpage sans mouvement depuis plus d'une heure (seule une note `roadmap:` du pilote — préfixe `hold:`/`unhold:` admis — ou un lot créé qui le cite compte, #7848, #8199 ; une note `hold:`/`unhold:` ordinaire ou de veille ne compte pas ; une fenêtre d'observation non échue tient le repli jusqu'à son échéance) sans lot démarrable créé (`capacity.alerts`, repli de la spec #3256 §2.2) | créer lui-même les lots démarrables du projet, d'au plus une journée chacun, depuis la feuille de route citée par le lot de découpage : `ameesh work add --app <projet> --estimate <durée> …`, puis les nommer dans une note du lot de découpage ; il ne touche ni au code ni à la priorité des lots du pilote | `ameesh work close <lot>` |
+| lot de découpage sans mouvement depuis plus d'une heure (seule une note `roadmap:` du pilote — préfixe `hold:`/`unhold:` admis — ou un lot créé qui le cite compte, #7848, #8199 ; une note `hold:`/`unhold:` ordinaire ou de veille ne compte pas ; un lot retenu par l'empreinte n'est pas du découpage produit ; une `roadmap: rouverte` réarme, #8388 ; une fenêtre d'observation non échue tient le repli jusqu'à son échéance) sans lot démarrable créé (`capacity.alerts`, `fallback: true`, repli de la spec #3256 §2.2) | créer lui-même les lots démarrables du projet, d'au plus une journée chacun, depuis la feuille de route citée par le lot de découpage : `ameesh work add --app <projet> --estimate <durée> …`, puis les nommer dans une note du lot de découpage ; il ne touche ni au code ni à la priorité des lots du pilote | `ameesh work close <lot>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
 | avis dû depuis plus de 2 h sur la tête gelée (`reviews_by_reviewer`) | relancer le relecteur avec la liste de ses avis dus (le débit la porte : `agent-mail send <relecteur> "…" --lot <lot>`) ; au repos, `ameesh resume <relecteur>` ; s'il est marqué `en pause : …`, ne pas le relancer : le pilote désigne un autre relecteur de la même famille ou attend la levée (`agent-mail send mesh-design …`) | le verdict rendu, la redésignation, ou la levée de la pause |

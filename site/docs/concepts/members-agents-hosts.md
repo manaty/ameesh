@@ -13,11 +13,16 @@ type: Member
 title: alice
 roles: [project-lead, reviewer]
 authenticators: []        # enrolled passkeys, added by reviewed pull request
+timezone: Europe/Paris    # optional: IANA zone for local hours
+quiet_hours: "22:00-07:00"   # optional: hold non-urgent pushes until the window ends
 ```
 
 `authenticators` lists the public keys a human may sign approvals with (see
 [Receipts and ameesh-approve](receipts-and-approve.md)). Adding or removing one
-is a reviewed change to the canon.
+is a reviewed change to the canon. `quiet_hours` is local to `timezone`:
+during the window `ameesh notify` holds non-urgent pushes and sends one
+summary at the end; urgent alerts pass. Without a readable time zone the
+window is ignored (fail-open) and `canon check` names the defect.
 
 ## `Agent`
 

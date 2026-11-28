@@ -3085,6 +3085,18 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
         # #8199 : une fenêtre non échue tait le repli (quiet_s ne le voyait
         # pas), mais jamais la prise d'un lot qui attend.
         fallback_held = window is not None and not pending
+        # #8388 : le repli est dû quand le lot de découpage est sans
+        # mouvement depuis plus d'une heure (`quiet_s`) et qu'aucun lot
+        # démarrable n'attend. Ce champ est le déclencheur de
+        # `file_decoupage.fallbacks_from_capacity` : compter l'alerte ne
+        # faisait partir aucun courrier.
+        quiet = (entry["decoupage"] or {}).get("quiet_s")
+        fallback = bool(entry["decoupage"] is not None
+                        and not entry["startable_lots"]
+                        and entry.get("roadmap_exhausted") is None
+                        and window is None
+                        and quiet is not None
+                        and float(quiet) >= file_decoupage.FALLBACK_S)
         if (gating_ok and repos_part is not None and entry["wakeable"]
                 and entry["idle_share"] >= float(repos_part)
                 and (entry["roadmap_exhausted"] is None or pending)
@@ -3095,7 +3107,8 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
                 "startable_lots": entry["startable_lots"][:20],
                 "footprint_lots": entry["footprint_lots"][:20],
                 "decoupage": entry["decoupage"],
-                "gesture": _capacity_gesture(project, entry)})
+                "fallback": fallback,
+                "gesture": _capacity_gesture(project, entry, fallback=fallback)})
     mesh = summary(awake, None)
     mesh["startable_lots"] = sum(len(v) for v in startable_by.values())
     mesh["footprint_lots"] = sum(len(v) for v in footprint_by.values())
@@ -3127,16 +3140,26 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     }
 
 
-def _capacity_gesture(project: str, entry: Mapping[str, Any]) -> str:
+def _capacity_gesture(project: str, entry: Mapping[str, Any], *,
+                      fallback: bool = False) -> str:
     """Le geste d'une alerte de capacité, dans l'ordre de docs/AUDITEUR.md :
     confier d'abord les lots démarrables, puis nommer les lots en attente
     d'empreinte et le lot qui les retient (#4561), puis le repli du découpage,
-    puis l'ouverture du lot de découpage au pilote."""
+    puis l'ouverture du lot de découpage au pilote.
+
+    #8388 : quand le repli est dû, le geste le dit même si des lots attendent
+    l'empreinte — ces lots ne sont pas du découpage produit, et le courrier
+    de repli part par `file_decoupage.fallbacks_from_capacity`."""
     head = "lots démarrables pour %d agent(s) de %s : " % (entry["idle"], project)
     if entry.get("startable_lots"):
         return head + "confier les lots démarrables (ameesh work assign)"
     if entry.get("footprint_lots"):
-        return head + _footprint_gesture(entry["footprint_lots"])
+        gesture = head + _footprint_gesture(entry["footprint_lots"])
+        if fallback and entry.get("decoupage"):
+            gesture += (" ; le lot de découpage #%d est sans mouvement depuis plus "
+                        "d'une heure : le repli de l'%s (niveau 1) est dû"
+                        % (entry["decoupage"]["lot"], AUDITOR_ROLES[0]))
+        return gesture
     if entry.get("decoupage"):
         return head + ("le lot de découpage #%d est sans mouvement depuis plus d'une "
                        "heure, sans lot démarrable — l'%s crée les lots (niveau 1, "

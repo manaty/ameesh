@@ -95,7 +95,11 @@ from .roles import AUDITOR_ROLES
 
 #: identité du lot de découpage d'un projet (un seul ouvert)
 SOURCE_PREFIX = "file-decoupage:"
-#: repli de l'auditeur : une heure après la création (§2.2, 3)
+#: l'acteur des gestes du découpage (sommeil, repli) ; les deux
+#: déclencheurs du repli signent du même acteur, pour que la clé
+#: d'idempotence désigne bien le même courrier (#8388).
+DECOUPAGE_ACTOR = SLEEP_ACTOR
+#: repli de l'auditeur : une heure après le dernier mouvement (§2.2, 3)
 FALLBACK_S = 3600.0
 #: marque du repli, posée une fois sur le lot de découpage
 FALLBACK_MARK = "repli " + AUDITOR_ROLES[0]
@@ -634,17 +638,93 @@ def _tell_refusal(db, lot: int, project: str, pilot: str | None, why: str, *,
 TAKEN_FROM_NOBODY = "(before: nobody)"
 
 
-def _created_since(db, lots: list, project: str, split: dict, waits: dict) -> list:
-    """Les lots du projet arrivés démarrables depuis le lot de découpage :
-    créés depuis, qu'aucune attente ne retient, et créés SANS assigné —
-    encore sans assigné, ou pris depuis (`assigned to … (before: nobody)`).
-    Un lot créé déjà assigné n'est pas passé par la file."""
-    from . import projects as projects_mod
+def _note_ts(row) -> float:
+    """L'instant d'une ligne du journal (`created_ts`) ou d'une lecture SQL
+    (`at_ts`) ; 0.0 sans date."""
+    return float((row or {}).get("created_ts")
+                 or (row or {}).get("at_ts") or 0.0)
+
+
+def last_reopened(notes: list, project: str) -> dict | None:
+    """#8388 : la dernière note `roadmap: rouverte <projet>`, ou None.
+
+    C'est le geste qui réarme le repli : une marque antérieure à cet
+    événement ne compte plus, et le délai du repli court depuis lui. L'ordre
+    du journal (`id`, monotone) fait foi, pas l'horloge."""
+    found = None
+    for row in _roadmap_order(notes):
+        match = REOPENED_RE.match(str((row or {}).get("note") or ""))
+        if match and match.group(1).strip(".,;:") == project:
+            found = row
+    return found
+
+
+def last_movement(split: dict, notes: list, lots: list) -> float:
+    """#7848/#8199 : le dernier mouvement utile du lot de découpage.
+
+    Seule une note `roadmap:` de son assigné — le préfixe `hold:`/`unhold:`
+    est déjà admis par `roadmap_notes` — ou un lot créé qui cite `#<id>`
+    compte ; une note de retenue ordinaire ou de veille ne remet pas le
+    délai à zéro. Jamais avant la création du lot : une date incohérente ne
+    rajeunit rien."""
     start = float(split.get("created_ts") or 0.0)
+    moved = start
+    assignee = str(split.get("assignee") or "").strip()
+    for row in _roadmap_order(notes):
+        actor = str((row or {}).get("actor") or "").strip()
+        if assignee and actor != assignee:
+            continue
+        moved = max(moved, _note_ts(row))
+    ident = int(split["id"])
+    cited = re.compile(r"#%d(?!\d)" % ident)
+    for lot in lots or ():
+        if int((lot or {}).get("id") or 0) == ident:
+            continue
+        created = float((lot or {}).get("created_ts") or 0.0)
+        if created < start:
+            continue
+        text = " ".join(str((lot or {}).get(key) or "")
+                        for key in ("title", "body", "source"))
+        if cited.search(text):
+            moved = max(moved, created)
+    return moved
+
+
+def split_since(split: dict, notes: list, lots: list, project: str) -> tuple:
+    """#8388 : `(départ du délai du repli, id de la réouverture)`.
+
+    Le délai court depuis le dernier mouvement utile ou la dernière
+    réouverture, jamais depuis la seule création d'un sentinelle ancien ;
+    c'est aussi le début du compte des lots que le découpage a produits.
+    La réouverture est rendue par son `id` : c'est lui qui décide si une
+    marque de repli est antérieure (`_fallback`), sans dépendre d'une
+    horloge."""
+    reopened = last_reopened(notes, project)
+    return (max(float(split.get("created_ts") or 0.0),
+                last_movement(split, notes, lots), _note_ts(reopened)),
+            int((reopened or {}).get("id") or 0))
+
+
+def _created_since(db, lots: list, project: str, split: dict, waits: dict, *,
+                   since: float | None = None, footprint: dict | None = None) -> list:
+    """Les lots du projet arrivés démarrables depuis le dernier mouvement du
+    lot de découpage (`since`, #8388 ; son seul `created_ts` avant) :
+    créés depuis, qu'aucune attente ni la garde d'empreinte ne retient, et
+    créés SANS assigné — encore sans assigné, ou pris depuis
+    (`assigned to … (before: nobody)`).
+
+    Un lot créé déjà assigné n'est pas passé par la file ; un lot retenu par
+    empreinte n'est pas un lot démarrable produit (#8388, même lecture que
+    le débit #4561/#4699) : le compter laissait le repli muet pendant que
+    tous les lots créés attendaient un bloqueur."""
+    from . import projects as projects_mod
+    start = float(since if since is not None
+                  else (split.get("created_ts") or 0.0))
+    footprint = footprint or {}
     out = []
     for lot in lots:
         ident = int(lot["id"])
-        if (ident == int(split["id"]) or ident in waits
+        if (ident == int(split["id"]) or ident in waits or ident in footprint
                 or projects_mod.lot_project(lot) != project
                 or float(lot.get("created_ts") or 0.0) < start):
             continue
@@ -675,37 +755,132 @@ def _observation_until(db, lot: int, now: float, *, cfg=None) -> float | None:
 
 
 def _fallback(db, project: str, split: dict, created: list, now: float, *,
-              actor: str, listing: list, canons=None, cfg=None) -> dict | None:
-    """Repli (§2.2, 3) : un seul courrier à l'auditeur, marqué sur le lot.
+              since_ts: float, reopened_id: int = 0, actor: str,
+              listing: list, canons=None, cfg=None, startable=(),
+              auditor: str | None = None) -> dict | None:
+    """Repli (§2.2, 3) : un seul courrier à l'auditeur par silence, marqué
+    sur le lot.
 
     #7661 : l'auditeur est l'agent dont la fiche du canon déclare le rôle
     (`roles: [auditeur]`), jamais un nom de persona. Sans ce rôle, le repli
     n'a pas de destinataire : rien n'est inventé et rien n'est marqué.
     #8199 : une fenêtre d'observation non échue sur le lot tient le repli
-    jusqu'à son échéance — le pilote a daté l'attente."""
+    jusqu'à son échéance — le pilote a daté l'attente.
+    #8388 : le délai court depuis `since_ts` (dernier mouvement ou dernière
+    réouverture), jamais depuis la seule création d'un sentinelle ancien.
+    Une marque de repli dont l'`id` est antérieur à `reopened_id` ne compte
+    plus : une `roadmap: rouverte` réarme le repli. La clé d'idempotence
+    porte l'id de réouverture, donc les deux déclencheurs (passe de
+    découpage, alerte de capacité) adressent le même courrier. Le corps est
+    constant pour une même époque : une réponse perdue est rejouée sans
+    changer le texte. Un lot démarrable qui attend encore un preneur tient
+    le repli : le découpage a produit du travail."""
     from . import alert_briefs, mail
     lot = int(split["id"])
-    if created or now - float(split.get("created_ts") or now) < FALLBACK_S:
+    since_ts = float(since_ts)
+    if created or startable or now - since_ts < FALLBACK_S:
         return None
     if _observation_until(db, lot, now, cfg=cfg) is not None:
         return None
-    if work.events_noted(db, lot, FALLBACK_MARK):
+    marks = work.events_noted(db, lot, FALLBACK_MARK)
+    if any(int((row or {}).get("id") or 0) > int(reopened_id)
+           for row in marks):
         return None
-    names = alert_briefs.auditors(listing, canons)
-    if not names:
-        return None
-    auditor = names[0]
-    body = ("Repli du lot de découpage #%d (#3256 A, canon §4) : créé il y a %s, il n'a "
-            "donné lieu à aucun lot démarrable de %s. Geste de niveau 1 : créez vous-même "
+    if auditor is None:
+        names = alert_briefs.auditors(listing, canons)
+        if not names:
+            return None
+        auditor = names[0]
+    body = ("Repli du lot de découpage #%d (#3256 A, canon §4) : sans mouvement "
+            "utile depuis plus d'une heure, il n'a donné lieu à aucun lot "
+            "démarrable de %s. Geste de niveau 1 : créez vous-même "
             "les lots démarrables (au plus une journée chacun, classe du §1), sans toucher "
             "au code ni à la priorité des lots du pilote ; puis notez-les sur #%d."
-            % (lot, su._duration(now - float(split["created_ts"])), project, lot))
+            % (lot, project, lot))
     mail.send(db, actor, auditor, body, work_item_id=str(lot),
-              idempotency_key="file-decoupage-repli-%d" % lot)
+              idempotency_key="file-decoupage-repli-%d-%d"
+                              % (lot, int(reopened_id)))
     work.note(db, lot, "%s : aucun lot démarrable créé en %s, %s prévenu"
-              % (FALLBACK_MARK, su._duration(now - float(split["created_ts"])),
-                 auditor), actor=actor)
+              % (FALLBACK_MARK, su._duration(now - since_ts), auditor),
+              actor=actor)
     return {"lot": lot, "auditor": auditor}
+
+
+def fallbacks_from_capacity(db, report, now: float, *, auditor: str | None = None,
+                            actor: str = DECOUPAGE_ACTOR,
+                            dry_run: bool = False) -> list:
+    """#8388 : le repli déclenché par une alerte de capacité persistante.
+
+    `debit.read_capacity` marque `fallback` sur une alerte dont le lot de
+    découpage est sans mouvement depuis plus de `FALLBACK_S` et qu'aucun lot
+    démarrable n'attend. Compter cette alerte ne déclenchait rien : ce
+    passage envoie le courrier de repli, avec la même marque et la même clé
+    d'idempotence que la passe de découpage. Les deux déclencheurs envoient
+    donc un seul courrier par silence, réarmé par `roadmap: rouverte`.
+
+    Le compte des lots produits est refait avec la règle de `run`
+    (`_created_since`, empreinte exclue) : l'alerte seule ne voit pas les
+    lots créés sans porteur puis pris. Une lecture en échec laisse la passe
+    suivante réessayer : le tick ne fait pas de ce repli un échec de sa
+    passe."""
+    report = report or {}
+    if report.get("unreadable"):
+        # Une lecture partielle n'est pas une mesure : le tick suivant réessaie.
+        return []
+    alerts = (report.get("capacity") or {}).get("alerts") or ()
+    eligible = [alert for alert in alerts
+                if isinstance(alert, dict) and alert.get("fallback")]
+    if not eligible:
+        return []
+    try:
+        lots = [lot for lot in storage.of(db).operations.open_lots_activity(None)
+                if not lifecycle.is_follow_up(lot)]
+    except Exception:  # noqa: BLE001 - sans les lots, le compte n'est pas sûr
+        return []
+    waits = planned_waits.read(db, lots, now=now) if lots else {}
+    footprint = (su.footprint_blockers(db, su.waiting_project_lots(lots), lots)
+                 if lots else {})
+    out = []
+    for alert in eligible:
+        entry = alert.get("decoupage") or {}
+        try:
+            lot = int(entry.get("lot"))
+        except (TypeError, ValueError):
+            continue
+        project = str(alert.get("project") or "").strip()
+        if not project:
+            continue
+        split = work.get(db, lot)
+        if split is None or str(split.get("state") or "") not in work.OPEN_STATES:
+            continue
+        if not split.get("created_ts"):
+            split = dict(split, created_ts=entry.get("created_ts"))
+        if split.get("created_ts") is None:
+            # Sans date de création, l'âge n'est pas une mesure : pas de repli.
+            continue
+        notes = roadmap_notes(db, lot)
+        if roadmap_state(notes, project) == EXHAUSTED_STATE:
+            # Une feuille de route épuisée n'appelle pas le repli : l'auditeur
+            # est déjà prévenu et les dormeurs attendent une réouverture.
+            continue
+        since, reopened_id = split_since(split, notes, lots, project)
+        created = _created_since(db, lots, project, split, waits,
+                                 since=since, footprint=footprint)
+        if dry_run:
+            if (created or alert.get("startable_lots")
+                    or now - since < FALLBACK_S):
+                continue
+            out.append({"lot": lot, "auditor": auditor, "dry_run": True,
+                        "project": project})
+            continue
+        done = _fallback(db, project, split, created, now,
+                         since_ts=since, reopened_id=reopened_id, actor=actor,
+                         listing=[], canons=None,
+                         startable=alert.get("startable_lots") or (),
+                         auditor=auditor)
+        if done:
+            out.append(done)
+    return out
 
 
 def _owner_of(rows: list) -> str | None:
@@ -1628,7 +1803,7 @@ def _journal_reopen(db, split_id, project: str, notes: list, woken: list) -> Non
 
 
 def run(cfg, db, *, now: float | None = None, state: dict | None = None,
-        dry_run: bool = False, actor: str = "ameesh:file-decoupage",
+        dry_run: bool = False, actor: str = DECOUPAGE_ACTOR,
         listing: list | None = None, canons=None, settings=None) -> list:
     """Une passe : déclencheur, repli, sommeil et réveil. Rend les gestes
     (`{"kind": ..., "project": ...}`) ; `state` (celui du notifieur) garde le
@@ -1737,9 +1912,13 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
             continue
         if split.get("created_ts") is None or dry_run:
             continue
+        since_ts, reopened_id = split_since(split, notes, lots, project)
         done = _fallback(db, project, split,
-                         _created_since(db, lots, project, split, waits), now,
-                         actor=actor, listing=listing, canons=canons, cfg=cfg)
+                         _created_since(db, lots, project, split, waits,
+                                        since=since_ts, footprint=footprint),
+                         now, since_ts=since_ts, reopened_id=reopened_id,
+                         actor=actor, listing=listing,
+                         canons=canons, cfg=cfg, startable=item.startable)
         if done:
             out.append(dict(done, kind="fallback", project=project))
     return out

@@ -51,7 +51,12 @@ The runner measures the lots delivered in the last `PENDING_WINDOW_S` and
 not measured yet, after its branch sweep (`measure_pending`): the repository is the working directory of
 an agent of its host that holds the merge commit. A lot measured without a
 diff (no repository holds the merge commit yet) is measured again for
-`RETRY_DIFF_S`. Older lots: `work measure` (the 50 most recent not
+`RETRY_DIFF_S`; a commit already probed ABSENT is not probed again before
+`ABSENT_TTL_S` (#8414: the probe walks every promisor pack of a partial clone).
+A lot whose merge lives in another repository than the issue's (the freeze
+mark `ameesh-freeze-repo`, a canon lot merged in home) is left to the hosts
+that have that repository: the pass probes only clones of the named origin.
+Older lots: `work measure` (the 50 most recent not
 measured yet, or the lots named). The measure is a fact about one lot; the analysis across
 lots stays with the auditor (`work estimates --publish`).
 """
@@ -64,6 +69,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 
 from . import storage
@@ -91,6 +97,19 @@ PASS_LIMIT = 50
 PASS_BUDGET_S = 60.0
 #: timeout of one git or gh call (s)
 CALL_TIMEOUT_S = 20
+#: timeout of a commit-presence probe (s): on the partial clone of AG1 an
+#: ABSENT object took ~22 s to walk the promisor packs, so the generic 20 s
+#: cut the probe before its answer (#8414). The negative cache below makes
+#: this cost rare.
+PROBE_TIMEOUT_S = 30.0
+#: how long a presence probe's "absent" is believed (s) (#8414): an ABSENT
+#: object in a promisor clone walks every promisor pack (~20 s), and every
+#: runner pass used to repeat it every 5 min. Long enough not to repeat a
+#: known absence, short enough that a commit fetched by another process is
+#: seen the same day; a fetch done here forgets the entry at once.
+ABSENT_TTL_S = 6 * 3600.0
+#: absence entries kept at most (oldest dropped)
+ABSENT_MAX_ENTRIES = 4096
 #: timeout of a `git ls-remote` read of the published target (s): short, the
 #: runner's measure pass has a budget and a forge that does not answer must
 #: not eat it (#3038)
@@ -109,6 +128,17 @@ PUBLISHED_TIP_TTL_S = 60.0
 #: published tips read recently, `(repo, remote, branch)` → `(read_at, (kind,
 #: sha))`, see `_remote_tip` (#3038, #3056)
 _PUBLISHED_TIPS: dict = {}
+#: #8414 : absences constatées, `(common-dir, instance, sha)` → monotonic
+#: instant of the probe. The key is the object store shared by the worktrees
+#: of a clone, not the worktree path: the ~15 working directories of an agent
+#: host all read the same `.git`.
+_ABSENT: dict = {}
+#: common-dir already resolved, `(worktree path)` → common-dir path
+_COMMON_DIRS: dict = {}
+_ABSENT_LOCK = threading.Lock()
+#: #8414 : décalage du TTL par processus (±10 %) — les runners d'un même hôte
+#: démarrés ensemble ne re-sondent pas tous dans la même passe à l'expiration.
+_ABSENT_JITTER = 0.9 + (time.monotonic_ns() % 21) / 100.0
 _SHORTSTAT_RE = {
     "files": re.compile(r"(\d+) files? changed"),
     "insertions": re.compile(r"(\d+) insertions?\(\+\)"),
@@ -247,13 +277,115 @@ def _git(repo: str, *args: str, env_extra: dict | None = None,
     return proc.stdout if proc.returncode == 0 else None
 
 
+def _common_dir(repo: str) -> str:
+    """The object store shared by the worktrees of `repo` (#8414).
+
+    The presence probe costs its ~20 s in the packs of the object store, not
+    in the worktree: a host where fifteen agents work in fifteen worktrees of
+    the same clone paid the walk fifteen times per probe. The common-dir is
+    resolved once per working directory (a cheap `rev-parse`, no pack read)
+    and every worktree of the clone then shares the same absence entries."""
+    path = os.path.realpath(os.path.abspath(repo or "."))
+    with _ABSENT_LOCK:
+        known = _COMMON_DIRS.get(path)
+    if known is not None:
+        return known
+    common = (_git(path, "rev-parse", "--git-common-dir") or "").strip()
+    if common:
+        if not os.path.isabs(common):
+            common = os.path.join(path, common)
+        common = os.path.realpath(common)
+    else:
+        common = path           # not a repository: the probe will fail anyway
+    with _ABSENT_LOCK:
+        _COMMON_DIRS[path] = common
+    return common
+
+
+def _instance(common: str):
+    """`(device, inode)` of the object store, or None when it is unreadable.
+
+    A repository removed then recreated at the same path is another store:
+    its inode changes, so the absences recorded for the old one are not
+    believed for the new one (#3829 has the same concern for content reads)."""
+    try:
+        info = os.stat(common)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _absent_key(repo: str, sha: str) -> tuple:
+    common = _common_dir(repo)
+    return (common, _instance(common), str(sha or "").strip().lower())
+
+
+def _absent_known(repo: str, sha: str) -> bool:
+    key = _absent_key(repo, sha)
+    now = time.monotonic()
+    ttl = ABSENT_TTL_S * _ABSENT_JITTER
+    with _ABSENT_LOCK:
+        seen = _ABSENT.get(key)
+        if seen is None:
+            return False
+        if now - seen < ttl:
+            return True
+        _ABSENT.pop(key, None)
+        return False
+
+
+def _note_absent(repo: str, sha: str) -> None:
+    key = _absent_key(repo, sha)
+    now = time.monotonic()
+    ttl = ABSENT_TTL_S * _ABSENT_JITTER
+    with _ABSENT_LOCK:
+        _ABSENT[key] = now
+        if len(_ABSENT) <= ABSENT_MAX_ENTRIES:
+            return
+        for old in [k for k, at in _ABSENT.items() if now - at >= ttl]:
+            _ABSENT.pop(old, None)
+        if len(_ABSENT) > ABSENT_MAX_ENTRIES:
+            oldest = sorted(_ABSENT.items(), key=lambda item: item[1])
+            for old, _at in oldest[:len(_ABSENT) - ABSENT_MAX_ENTRIES // 2]:
+                _ABSENT.pop(old, None)
+
+
+def _forget_absent(repo: str | None = None, shas=()) -> None:
+    """Forget recorded absences for `repo` and these SHAs (all when no repo).
+
+    Called after a successful fetch (#8414): the forge may have served the
+    object, and a stale "absent" must not hide it. A measure explicitly asked
+    by id also forgets them, so `work measure <id>` re-probes."""
+    if repo is None:
+        with _ABSENT_LOCK:
+            _ABSENT.clear()
+        return
+    common = _common_dir(repo)
+    wanted = {str(sha or "").strip().lower() for sha in shas}
+    with _ABSENT_LOCK:
+        for key in list(_ABSENT):
+            if key[0] == common and (not wanted or key[2] in wanted):
+                _ABSENT.pop(key, None)
+
+
 def has_commit(repo: str, sha: str) -> bool:
     # #1749 : sonde de présence — pas de fetch paresseux dans un clone
     # partiel (chaque échec laissait un `git <defunct>` adopté par
     # l'exécuteur).
-    return bool(sha and _SHA_RE.match(sha)
-                and _git(repo, "cat-file", "-e", "%s^{commit}" % sha,
-                         env_extra=NO_LAZY_FETCH) is not None)
+    # #8414 : un absent déjà constaté n'est plus re-sondé à chaque passe ; le
+    # constat est partagé par les worktrees d'un même common-dir et borné
+    # (durée, nombre d'entrées). Un fetch réussi l'oublie.
+    sha = str(sha or "").strip()
+    if not sha or not _SHA_RE.match(sha):
+        return False
+    if _absent_known(repo, sha):
+        return False
+    out = _git(repo, "cat-file", "-e", "%s^{commit}" % sha,
+               env_extra=NO_LAZY_FETCH, timeout=PROBE_TIMEOUT_S)
+    if out is None:
+        _note_absent(repo, sha)
+        return False
+    return True
 
 
 def parse_shortstat(text: str) -> dict:
@@ -497,6 +629,9 @@ def refresh_target(repo: str, target: str | None, shas) -> str:
                 (failed if out is None else done).append("%s %s" % (remote, sha[:12]))
         parts = []
         if done:
+            # #8414 : la forge a répondu ; un objet arrivé par ce fetch ne
+            # doit pas rester masqué par un constat d'absence antérieur.
+            _forget_absent(repo, wanted)
             parts.append("fetch de %s" % ", ".join(done))
         if failed:
             parts.append("fetch impossible : %s" % ", ".join(failed))
@@ -714,6 +849,48 @@ def gh_ci_runs(repo: str, branch: str | None) -> list[dict] | None:
 # measure and store
 # --------------------------------------------------------------------------
 
+def _origin_slugs(repos) -> dict:
+    """Le dépôt GitHub de l'`origin` de chaque clone de l'hôte (#8414).
+
+    None quand l'origine est illisible ou n'est pas GitHub : on ne peut pas
+    prouver que ce clone ne porte pas le commit, il reste candidat."""
+    from . import migrations
+
+    out = {}
+    for repo in repos or ():
+        try:
+            out[repo] = migrations.origin_repo(repo)
+        except Exception:  # noqa: BLE001 - une origine illisible ne filtre pas
+            out[repo] = None
+    return out
+
+
+def _repos_for(cand: dict, repos, slugs: dict, db) -> list:
+    """Les dépôts de l'hôte qui peuvent porter la fusion de ce lot (#8414).
+
+    La marque machine du gel (`ameesh-freeze-repo`, #6735) dit où vit la
+    tête — un lot canon a son issue dans ameesh et sa fusion dans home. Sans
+    elle, le dépôt de l'issue (ou du projet). On ne garde que les clones de
+    ce dépôt ; à défaut, ceux dont l'origine est illisible (ils pourraient
+    l'être) ; aucun : la passe écarte le lot, la sonde ne constaterait qu'une
+    absence, et un hôte qui a le dépôt le mesurera."""
+    from . import migrations, review_authors, work
+
+    named = review_authors.freeze_repository({"note": cand.get("freeze_note")})
+    if not named:
+        try:
+            named = work.lot_repository(dict(cand), getattr(db, "cfg", None))
+        except Exception:  # noqa: BLE001 - dépôt inconnu : rien à écarter
+            named = ""
+    if not named:
+        return list(repos)
+    key = migrations.repo_key(named)
+    matched = [repo for repo in repos if slugs.get(repo) == key]
+    if matched:
+        return matched
+    return [repo for repo in repos if not slugs.get(repo)]
+
+
 def _repo_for(sha: str | None, repos) -> str | None:
     for repo in repos or ():
         if repo and os.path.isdir(repo) and sha and has_commit(repo, sha):
@@ -801,21 +978,36 @@ def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
     and the next one measured; past `budget_s` seconds, the pass stops (the
     rest waits for the next pass)."""
     started = time.monotonic()
+    if ids is not None:
+        _forget_absent()               # mesure demandée : re-sonde les absents
     _PUBLISHED_TIPS.clear()          # one read of each published tip per pass
     cands = storage.of(db).work.measure_candidates(
         ids=None if ids is None else [int(i) for i in ids], retry_diff_s=RETRY_DIFF_S,
         since_s=since_s, limit=limit)
+    # #8414 : un lot dont la fusion vit dans un autre dépôt que ceux de l'hôte
+    # (un canon livré dans home) ne peut que constater une absence — on
+    # l'écarte, et on ne sonde que les clones du dépôt nommé.
+    slugs = _origin_slugs(repos) if ids is None else {}
     out = []
     for cand in cands:
         if budget_s is not None and time.monotonic() - started >= budget_s:
             break
         try:
-            # a lot already measured is retried (diff, CI) only when a
-            # repository holds its merge commit now
-            if ids is None and cand["measured"] and not _repo_for(cand.get("merge_sha"),
-                                                                  repos):
-                continue
-            out.append(measure_one(db, cand, repos=repos, ci=ci,
+            if ids is None:
+                cand_repos = _repos_for(cand, repos, slugs, db)
+                # un hôte sans aucun dépôt mesure quand même les phases (le
+                # diff reste inconnu) : le filtre ne s'applique qu'à des
+                # dépôts existants qu'aucun ne peut porter.
+                if repos and not cand_repos:
+                    continue
+                # a lot already measured is retried (diff, CI) only when a
+                # repository holds its merge commit now
+                if cand["measured"] and not _repo_for(cand.get("merge_sha"),
+                                                       cand_repos):
+                    continue
+            else:
+                cand_repos = list(repos)
+            out.append(measure_one(db, cand, repos=cand_repos, ci=ci,
                                    replace_size=ids is not None))
         except Exception as exc:  # noqa: BLE001 - one lot never blocks the others
             if errors is not None:

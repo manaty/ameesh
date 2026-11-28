@@ -326,11 +326,17 @@ class RunnerTest(PgTestCase):
         self.register("lent", "claude", cwd=cwd, prompt="tour préparé lentement")
         runner = Runner(self.cfg, self.db, once=True)
         runner.lease_ttl = 3.0
-        lease = registry.claim(self.db, "lent", runner.runner_id, 3.0)
+        # #8429 : la base juge l'échéance à son horloge réelle
+        # (`clock_timestamp()`) ; un bail pris pour 3 s expirait en base avant
+        # le premier battement sous charge (run 46094840596, psql 5/16). Le
+        # bail initial couvre donc tout le témoin ; le battement garde son pas
+        # de 1 s, et `GREATEST` ne raccourcit jamais l'échéance (#3115).
+        bail_initial = scaled(120.0)
+        lease = registry.claim(self.db, "lent", runner.runner_id, bail_initial)
         self.assertIsNotNone(lease)
         # Gelée, calée sur l'échéance rendue par la base : le veilleur ne peut
         # pas expirer, et le témoin ne dépend pas de l'écart d'horloges.
-        horloge = HorlogeSimulee(float(lease["lease_expires_ts"]) - runner.lease_ttl)
+        horloge = HorlogeSimulee(float(lease["lease_expires_ts"]) - bail_initial)
         runner.clock = horloge
         worker = AgentWorker(runner, registry.get(self.db, "lent"), lease)
         self.addCleanup(worker.watchdog_stop.set)

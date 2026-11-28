@@ -142,6 +142,61 @@ class TriggerTest(unittest.TestCase):
         self.assertEqual(len(cap["alerts"]), 1)
         self.assertEqual(cap["alerts"][0]["decoupage"]["quiet_s"], 2 * H)
         self.assertIn("sans mouvement", cap["alerts"][0]["gesture"])
+        # #8388 : l'alerte porte le déclencheur du courrier de repli.
+        self.assertTrue(cap["alerts"][0]["fallback"])
+
+    def test_a_startable_lot_is_not_a_fallback_even_on_a_quiet_split(self):
+        # #8388 : confier d'abord ; le repli ne part pas quand un lot
+        # démarrable attend un preneur.
+        lots = [split_lot(created_ts=T - 2 * H)]
+        cap = measure(team(2, 8), open_lots=lots,
+                      startable=[{"id": 12, "app": "ameesh"}])
+        self.assertEqual(len(cap["alerts"]), 1)
+        self.assertFalse(cap["alerts"][0]["fallback"])
+
+    def test_footprint_lots_do_not_hold_the_fallback(self):
+        # #8388, témoin #8035 : des lots retenus par l'empreinte ne sont pas
+        # du découpage produit ; l'alerte garde le repli dû et nomme les
+        # deux gestes.
+        lots = [split_lot(created_ts=T - 48 * H, moved_ts=T - 2 * H),
+                {"id": 12, "app": "ameesh", "state": "intake", "title": "lot",
+                 "created_ts": T - H}]
+        cap = measure(team(2, 8), open_lots=lots,
+                      footprint={12: [{"id": 9, "state": "build"}]})
+        alert = cap["alerts"][0]
+        self.assertEqual(alert["footprint_lots"][0]["lot"], 12)
+        self.assertTrue(alert["fallback"])
+        self.assertIn("repli", alert["gesture"])
+        self.assertIn("empreinte", alert["gesture"])
+
+    def test_an_observation_window_holds_the_fallback(self):
+        # #8199 : une fenêtre d'observation non échue tient le repli, même
+        # quand un lot retenu par empreinte fait lever l'alerte.
+        lots = [split_lot(created_ts=T - 48 * H, moved_ts=T - 2 * H),
+                {"id": 12, "app": "ameesh", "state": "intake", "title": "lot",
+                 "created_ts": T - H}]
+        cap = measure(team(2, 8), open_lots=lots,
+                      footprint={12: [{"id": 9, "state": "build"}]},
+                      window_waits=[{"lot": 90, "due_ts": T + H,
+                                     "what": "window"}])
+        alert = cap["alerts"][0]
+        self.assertEqual(alert["footprint_lots"][0]["lot"], 12)
+        self.assertFalse(alert["fallback"])
+        self.assertNotIn("repli", alert["gesture"])
+
+    def test_an_exhausted_roadmap_is_not_a_fallback(self):
+        # #4623/#8388 : une feuille de route épuisée n'appelle pas le repli,
+        # même quand un lot retenu par l'empreinte fait lever l'alerte.
+        lots = [split_lot(created_ts=T - 48 * H, moved_ts=T - 2 * H),
+                {"id": 12, "app": "ameesh", "state": "intake", "title": "lot",
+                 "created_ts": T - H}]
+        notes = [{"work_item_id": 90, "source": SPLIT,
+                  "note": "roadmap: épuisée ameesh (feuille)", "at_ts": T - H}]
+        cap = measure(team(2, 8), open_lots=lots, roadmap_notes=notes,
+                      footprint={12: [{"id": 9, "state": "build"}]})
+        alert = cap["alerts"][0]
+        self.assertFalse(alert["fallback"])
+        self.assertNotIn("repli", alert["gesture"])
 
     def test_a_move_before_creation_never_rejuvenates_the_lot(self):
         lots = [split_lot(created_ts=T - 2 * H, moved_ts=T - 3 * H)]

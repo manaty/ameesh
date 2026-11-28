@@ -131,6 +131,7 @@ from . import db as db_mod
 from . import alert_briefs, app_alerts, avatars, exploitation, fil, mail, notify_gap, \
     sous_utilisation, storage, work
 from . import vocab
+from . import quiet_hours as quiet_mod
 from .config import Config
 from .modules import registry
 from .platform import notify as platform_notify
@@ -315,7 +316,7 @@ CHANNEL_OPTIONS = {
     "app": ("type", "timeout"),
 }
 TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per_minute",
-            "max_attempts", "interval", "timeout")
+            "max_attempts", "interval", "timeout", "quiet_hours")
 
 
 def channel_kinds() -> tuple:
@@ -569,6 +570,28 @@ URGENT_TYPES = ("host_unsampled", "stopped_with_mail", "avatar_failover",
                 # base s'arrête ou va s'arrêter.
                 "db_no_primary", "db_etcd_no_quorum", "db_disk_low",
                 "host_network_overlap")
+
+
+def alert_urgent(alert: dict | None) -> bool:
+    """#8345 : cette alerte traverse-t-elle les heures calmes ?
+
+    Un type de `URGENT_TYPES`, une alerte d'application marquée `urgent`, un
+    niveau critique, ou une sévérité `urgent` : la même règle que le message
+    poussé, pour que l'urgence ne dépende pas du canal qui la porte.
+    """
+    if not isinstance(alert, dict):
+        return False
+    if alert.get("urgent") or alert.get("critical"):
+        return True
+    if alert.get("type") in URGENT_TYPES:
+        return True
+    for key in ("severity", "level"):
+        value = alert.get(key)
+        if isinstance(value, str) and value.strip().lower() in ("urgent", "critical"):
+            return True
+    return False
+
+
 #: #8180 : ces alertes d'identifiant ne peuvent pas être retirées par
 #: `notify.types`. C'est le défaut de l'incident du 23/11 : le login expiré de
 #: `secondaire` existait dans `ameesh alerts`, mais le notifieur le filtrait et
@@ -651,6 +674,10 @@ class NotifyConfig:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     interval: float | None = None
     timeout: float = DEFAULT_TIMEOUT_S
+    #: #8345 : `human:<id>` → `quiet_hours.Window` declared by this host.  The
+    #: Member card remains the canonical place; this map is the host override
+    #: (and its explicit time zone, when the card carries none).
+    quiet_hours: dict = field(default_factory=dict)
 
     def channels_for(self, human: str | None) -> list:
         """Canaux d'un humain : sa route, sinon `notify.default`."""
@@ -846,6 +873,24 @@ def parse_config(raw) -> NotifyConfig:
                     "and let `fallback` cover it"
                     % (human or "(default)", name, channel.kind, fallback,
                        channel.kind))
+    # #8345 : fenêtres calmes déclarées par CET hôte (la carte Member reste
+    # la voie canonique, lue à la livraison). Le fuseau explicite de la
+    # configuration l'emporte ; sans fuseau, celui de la carte Member.
+    quiet_raw = raw.get("quiet_hours") or {}
+    if not isinstance(quiet_raw, dict):
+        raise NotifyConfigError(
+            "notify.quiet_hours: object {\"human:<id>\": \"HH:MM-HH:MM\"} expected")
+    quiet_hours = {}
+    for who, value in quiet_raw.items():
+        human = normalize_human(who)
+        if human is None or not str(who).startswith("human:"):
+            raise NotifyConfigError("notify.quiet_hours: key %r, `human:<id>` "
+                                    "expected" % who)
+        try:
+            quiet_hours[human] = quiet_mod.parse_value(
+                value, where="notify.quiet_hours.%s" % who)
+        except quiet_mod.QuietHoursError as exc:
+            raise NotifyConfigError(str(exc)) from None
     rate = int(_positive(raw.get("rate_per_minute", DEFAULT_RATE_PER_MINUTE),
                          "notify.rate_per_minute"))
     attempts = max(1, int(_positive(raw.get("max_attempts", DEFAULT_MAX_ATTEMPTS),
@@ -856,7 +901,96 @@ def parse_config(raw) -> NotifyConfig:
     return NotifyConfig(default_human=default_human, types=types, routes=routes,
                         default=default, channels=channels, rate_per_minute=rate,
                         max_attempts=attempts, interval=interval, timeout=timeout or
-                        DEFAULT_TIMEOUT_S)
+                        DEFAULT_TIMEOUT_S, quiet_hours=quiet_hours)
+
+
+# --------------------------------------------------------------------------
+# heures calmes (#8345)
+# --------------------------------------------------------------------------
+
+def _members_from_canons(canons) -> dict:
+    """`human:<id>` → Member, pour les canons qui résolvent un humain unique."""
+    out = {}
+    for canon in canons or ():
+        for member in getattr(canon, "members", ()) or ():
+            human = "human:%s" % member.title
+            if human in out:
+                continue
+            try:
+                resolved = canon.resolve_human(human)
+            except Exception:  # noqa: BLE001 — un canon bancal ne fait pas d'humain
+                resolved = None
+            if resolved == human:
+                out[human] = member
+    return out
+
+
+def quiet_members(cfg) -> dict:
+    """Les Members des canons configurés, lus une fois (`human:<id>` → Member).
+
+    Un canon illisible rend `{}` : aucun humain n'est alors réputé en heures
+    calmes (fail-open), et `doctor` garde sa ligne « canon illisible ».
+    """
+    if not getattr(cfg, "canon", None):
+        return {}
+    try:
+        from . import canon as canon_mod
+        return _members_from_canons(canon_mod.load_configured(cfg))
+    except Exception:  # noqa: BLE001 — la livraison ne tombe pas sur un canon
+        return {}
+
+
+def quiet_state(cfg, ncfg: NotifyConfig, human: str, now: float, *,
+                members: dict | None = None) -> quiet_mod.State:
+    """L'état d'heures calmes d'un humain à `now` (epoch).
+
+    La fenêtre vient de `notify.quiet_hours` de l'hôte si elle y est déclarée,
+    sinon de la carte Member (`quiet_hours`) ; le fuseau explicite de la
+    configuration l'emporte, sinon celui de la carte. Sans fenêtre, ou sans
+    fuseau lisible, l'état est inactif et nommé (`State.problem`).
+    """
+    members = quiet_members(cfg) if members is None else members
+    member = members.get(human)
+    window = ncfg.quiet_hours.get(human)
+    source = "notify" if window is not None else None
+    if window is None and member is not None and member.quiet_hours:
+        try:
+            window = quiet_mod.parse(member.quiet_hours)
+        except quiet_mod.QuietHoursError:
+            window = None
+        source = "canon" if window is not None else None
+    timezone = (window.timezone if window is not None and window.timezone else
+                (member.timezone if member is not None else None))
+    return quiet_mod.state(window, timezone, now, source=source)
+
+
+def quiet_humans(cfg, ncfg: NotifyConfig, *, members: dict | None = None) -> list:
+    """Les humains qui déclarent une fenêtre calme (configuration ou carte)."""
+    members = quiet_members(cfg) if members is None else members
+    humans = set(ncfg.quiet_hours)
+    humans.update(human for human, member in members.items()
+                  if getattr(member, "quiet_hours", None))
+    return sorted(humans)
+
+
+def quiet_hours_lines(cfg, *, now: float | None = None, members: dict | None = None,
+                      ncfg: NotifyConfig | None = None, canons=None) -> list:
+    """Les lignes de diagnostic des heures calmes (`doctor`, `--test`).
+
+    `canons` évite une seconde lecture quand l'appelant les a déjà ; `members`
+    peut venir d'un cache de passe. Sans humain déclaré : une ligne le dit.
+    """
+    if ncfg is None:
+        ncfg = parse_config(getattr(cfg, "notify", None))
+    if members is None:
+        members = (_members_from_canons(canons) if canons is not None
+                   else quiet_members(cfg))
+    humans = quiet_humans(cfg, ncfg, members=members)
+    if not humans:
+        return ["none declared (a human is never held without quiet hours)"]
+    now = time.time() if now is None else float(now)
+    return [quiet_state(cfg, ncfg, human, now, members=members).line(human)
+            for human in humans]
 
 
 # --------------------------------------------------------------------------
@@ -1116,9 +1250,19 @@ def _summary_resolved_count(resolved) -> int:
     return int(resolved or 0)
 
 
+def _summary_raised_urgent(raised) -> bool:
+    """Un membre levé porte-t-il l'urgence (#8345, alertes d'application) ?"""
+    if not isinstance(raised, dict):
+        return False
+    return any(isinstance(member, dict) and bool(member.get("urgent"))
+               for member in raised.values())
+
+
 def render_summary(bucket: dict, host: str, *, alert_id: str | None = None,
-                   occurred_at: str | None = None) -> Message:
-    raised = _summary_raised_counts(bucket.get("raised"))
+                   occurred_at: str | None = None,
+                   quiet: dict | None = None) -> Message:
+    raw_raised = bucket.get("raised")
+    raised = _summary_raised_counts(raw_raised)
     resolved = _summary_resolved_count(bucket.get("resolved"))
     total = sum(raised.values()) + resolved
     parts = []
@@ -1127,15 +1271,28 @@ def render_summary(bucket: dict, host: str, *, alert_id: str | None = None,
             "%d %s" % (n, kind) for kind, n in sorted(raised.items())))
     if resolved:
         parts.append("resolved: %d" % resolved)
-    title = "ameesh: %d alert(s) not detailed (rate limit)" % total
+    if quiet:
+        # #8345 : la fenêtre a retenu ces poussées ; le titre le dit, sans
+        # réveiller pour autant (le résumé part à la sortie de la fenêtre).
+        window = quiet.get("window") or "?"
+        zone = quiet.get("timezone")
+        title = "ameesh: %d alert(s) held during quiet hours (%s)" % (total, window)
+        prefix = "held during quiet hours %s%s" % (
+            window, (" " + zone) if zone else "")
+    else:
+        title = "ameesh: %d alert(s) not detailed (rate limit)" % total
+        prefix = ""
     # L94 : la sous-utilisation a sa ligne dans le résumé
     underuse = sum(n for kind, n in raised.items() if kind in sous_utilisation.UNDERUSE_TYPES)
     if underuse:
         parts.append("underuse: %d (%s)" % (underuse, ", ".join(
             "%d %s" % (n, type_label(kind)) for kind, n in sorted(raised.items())
             if kind in sous_utilisation.UNDERUSE_TYPES)))
-    body = "%s\nsee `ameesh alerts` on host %s" % ("; ".join(parts) or "—", host)
-    return Message(title, body, urgent=any(k in URGENT_TYPES for k in raised),
+    body = "%s%s\nsee `ameesh alerts` on host %s" % (
+        (prefix + "\n") if prefix else "", "; ".join(parts) or "—", host)
+    return Message(title, body,
+                   urgent=(any(k in URGENT_TYPES for k in raised)
+                           or _summary_raised_urgent(raw_raised)),
                    alert_id=alert_id, kind="summary", occurred_at=occurred_at)
 
 
@@ -1688,7 +1845,10 @@ def empty_state() -> dict:
             #: #7749 : avatars sans destinataire vivant déjà journalisés pour
             #: un brief (clé de brief → raison), pour un seul repli par
             #: épisode et non un journal à chaque passe.
-            "avatar_brief_fallback": {}}
+            "avatar_brief_fallback": {},
+            #: #8391 : avis de pose d'une pause opérateur datée déjà déposés,
+            #: un par hôte et par épisode (hôte → pose, jusqu'à, agents).
+            "pause_notices": {}}
 
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
@@ -2467,6 +2627,47 @@ class Notifier:
         #: #8344 : canaux des routes d'application du canon, lus une fois par
         #: passe (`_channels_for`)
         self._app_routes = None
+        #: #8345 : Members et états d'heures calmes, lus une fois par passe.
+        self._quiet_members = None
+        self._quiet_states: dict = {}
+
+    def _quiet_state(self, human: str, now: float) -> quiet_mod.State:
+        """L'état d'heures calmes de `human`, calculé une fois par passe."""
+        state = self._quiet_states.get(human)
+        if state is None:
+            if self._quiet_members is None:
+                self._quiet_members = quiet_members(self.cfg)
+            state = quiet_state(self.cfg, self.ncfg, human, now,
+                                members=self._quiet_members)
+            self._quiet_states[human] = state
+        return state
+
+    def _quiet_hold(self, entry: dict, human: str, now: float, *,
+                    event: str = "raised") -> bool:
+        """Retient une poussée non urgente pendant les heures calmes.
+
+        Rend True quand l'entrée a été versée au résumé de la fenêtre : aucun
+        canal n'a sonné. Le mail à l'avatar, lui, a déjà été écrit par
+        `_deliver_avatar` ; ce sont les canaux directs qui attendent.
+        """
+        if not human or not human.startswith("human:"):
+            return False
+        state = self._quiet_state(human, now)
+        if not state.active or alert_urgent(entry.get("alert")):
+            return False
+        bucket = self._bucket(human)
+        self._summary_add(bucket, event, entry)
+        bucket["quiet"] = {"window": state.window.text,
+                           "timezone": state.timezone,
+                           "ends_at": (state.ends_at.strftime("%Y-%m-%dT%H:%M:%S%z")
+                                       if state.ends_at is not None else None)}
+        self.log("[%s] %s → %s: held during quiet hours (%s %s; until %s)"
+                 % ((entry.get("alert") or {}).get("type") or event,
+                    _subject(entry.get("alert") or {}), human,
+                    state.window.text, state.timezone,
+                    state.ends_at.strftime("%Y-%m-%d %H:%M %Z")
+                    if state.ends_at is not None else "?"))
+        return True
 
     def _channels_for(self, human) -> list:
         """Les canaux d'un destinataire : ceux de l'humain sur cet hôte
@@ -2559,6 +2760,8 @@ class Notifier:
             selected = frozenset(ONLY_PASSES) - self.skip
         now = float(self.clock())
         self._app_routes = None
+        self._quiet_members = None
+        self._quiet_states = {}
         # #3057 : la passe restreinte d'une minuterie de rôle ne livre aucune
         # alerte humaine (`_run_tail`). Elle rend donc AVANT le battement de
         # #3007 : sinon une minuterie vivante rafraîchirait `notify_liveness`
@@ -2787,6 +2990,7 @@ class Notifier:
             entry.update(severity=level, ack_subjects=subjects)
         self._journal_capacity(db, current, now)
         self._brief_agents(db, current, router, now, unreadable=unreadable)
+        self._pause_pose_notices(db, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
             if (entry["alert"].get("type") == "slo_breach" and entry.get("human")
@@ -2886,6 +3090,8 @@ class Notifier:
         now = float(self.clock() if now is None else now)
         records: list = []
         self._records = records
+        self._quiet_members = None
+        self._quiet_states = {}
         from . import db_sante, migration_alerts, pgbouncer_local
         unobserved: set[str] = set()
         try:
@@ -3469,6 +3675,12 @@ class Notifier:
         # #8344 : une alerte d'application non urgente ne fait pas sonner
         # l'humain non plus ; les alertes du mesh gardent leur signal urgent.
         alert = entry["alert"]
+        if self._quiet_hold(entry, human, now, event="raised"):
+            # #8345 : le mail à l'avatar est déjà écrit ; le signal direct qui
+            # réveillerait l'humain attend le résumé de fin de fenêtre.
+            entry["signal_ts"] = now
+            self._record("raised", entry, "resumee", {})
+            return
         urgent = bool(alert.get("urgent")) if _app_alert(alert) else True
         message = Message(title="Ton avatar a besoin de toi",
                           body="Une alerte attend dans la boîte de ton avatar.",
@@ -3572,6 +3784,13 @@ class Notifier:
             self.log("[%s] %s already notified to %s (same alert, same severity): "
                      "not sent again" % (alert.get("type"), _subject(alert), human))
             return
+        if self._quiet_hold(entry, human, now, event="raised"):
+            # #8345 : poussée non urgente pendant la fenêtre calme — retenue,
+            # pas perdue : le résumé de fin de fenêtre la portera.
+            entry["status"] = "resumee"
+            entry["channels"] = {}
+            self._record("raised", entry, "resumee", {})
+            return
         if not self._allow(human, now):
             entry["status"] = "resumee"
             self._summary_add(self._bucket(human), "raised", entry)
@@ -3583,6 +3802,73 @@ class Notifier:
         self._attempt(entry, "raised", now)
 
     # -- agents qui peuvent agir (L132) ---------------------------------------
+    def _pause_pose_notices(self, db, now: float) -> None:
+        """#8391 : un avis passif par hôte au pilote du canon à la pose d'une pause.
+
+        Une pause opérateur humaine qui porte une échéance et un motif ne
+        réveille personne : cet avis part en `info` (lu au tour suivant) et
+        l'alerte `operator_pause_long`/`operator_pause_host` ne parle qu'à
+        l'échéance dépassée. Le destinataire vient du canon — le pilote de son
+        projet, jamais un nom écrit dans le cœur (#7660) ; sans pilote lisible,
+        l'avis n'est pas déposé et le journal le dit. L'état `pause_notices`
+        ne garde qu'un avis par hôte : une maintenance qui pose vingt pauses
+        d'affilée n'écrit pas vingt courriers, et un nouvel épisode sur le même
+        hôte (toutes les pauses levées puis reposées) en reçoit un. Un envoi en
+        échec n'est pas marqué : la passe suivante réessaie. Jamais fatal au
+        passage.
+        """
+        if db is None or not self._delivery_open() or self.dry_run:
+            return
+        try:
+            listing = storage.of(db).operations.listing()
+        except Exception as exc:  # noqa: BLE001 - un avis ne fait pas tomber la passe
+            self.log("pause notices not prepared (%s)" % exc)
+            return
+        try:
+            notices = exploitation.operator_pause_notices(listing, now)
+        except Exception as exc:  # noqa: BLE001
+            self.log("pause notices not computed (%s)" % exc)
+            return
+        state = self.state.setdefault("pause_notices", {})
+        hosts = {notice["host"] for notice in notices}
+        for host in list(state):
+            if host not in hosts:
+                del state[host]
+        if not notices:
+            return
+        # #8391 : le pilote est lu au canon, comme le lecteur du train
+        # (`train_canon.pilot_of`), pour le projet que le canon sert.
+        from . import train_canon
+        try:
+            recipient = train_canon.canon_pilot_of(self.cfg)(db)
+        except Exception as exc:  # noqa: BLE001 - un avis ne fait pas tomber la passe
+            self.log("pause notices not delivered (pilot unreadable: %s)" % exc)
+            return
+        if not recipient:
+            self.log("pause notices not delivered: no readable pilot in the canon")
+            return
+        pilot = next((row for row in listing if row.get("name") == recipient), None)
+        if pilot is None or pilot.get("retired_ts"):
+            # #3460 : un pilote retiré ne reçoit plus rien ; rien n'est marqué.
+            self.log("pause notices not delivered: pilot %s is not active"
+                     % recipient)
+            return
+        for notice in notices:
+            host = notice["host"]
+            if host in state:
+                continue
+            try:
+                mail.send(db, work.SYSTEM_SENDER, recipient, notice["detail"],
+                          kind="event", payload={"info": True,
+                                                 "operator_pause": notice})
+            except Exception as exc:  # noqa: BLE001 - la passe suivante réessaie
+                self.log("pause notice for host %s not delivered (%s)" % (host, exc))
+                continue
+            state[host] = {"since": notice.get("since"), "until": notice.get("until"),
+                           "agents": list(notice.get("agents") or ()), "sent_ts": now}
+            self.log("[operator_pause_notice] delivered to %s for host %s"
+                     % (recipient, host))
+
     def _brief_agents(self, db, current: list, router: Router, now: float,
                       *, unreadable=()) -> None:
         """`idle_capacity`, `stale_lot`, `plan_underused`, `mail_undeliverable` :
@@ -4345,6 +4631,8 @@ class Notifier:
         if status == "resumee":
             bucket = self._bucket(human)
             self._adopt_summary_entry(entry, bucket)
+            if self._quiet_hold(entry, human, now, event="resolved"):
+                return
             self._summary_add(bucket, "resolved", entry)
             return
         # #3536 : un repli livré n'est pas une livraison du primaire ; la
@@ -4361,6 +4649,11 @@ class Notifier:
                     "human": human, "source": entry.get("source"), "status": "envoi",
                     "channels": {name: {"ok": False, "attempts": 0, "error": None}
                                  for name in delivered}}
+        if self._quiet_hold(resolved, human, now, event="resolved"):
+            # #8345 : la résolution attend la sortie de la fenêtre avec la
+            # levée qu'elle clôt ; le résumé la compte une seule fois.
+            self._record("resolved", resolved, "resumee", {})
+            return
         if not self._allow(human, now):
             self._summary_add(self._bucket(human), "resolved", resolved)
             self._record("resolved", resolved, "resumee", {})
@@ -4590,7 +4883,11 @@ class Notifier:
                 "type": alert.get("type"),
                 "since": since,
                 "episode": episode,
-                "human": human}
+                "human": human,
+                # #8345 : une alerte urgente freinée par le débit garde son
+                # urgence dans le résumé (une application la porte par ce seul
+                # booléen, son type ne dit rien à `URGENT_TYPES`).
+                "urgent": alert_urgent(alert)}
 
     @staticmethod
     def _summary_member_id(member: dict) -> str:
@@ -4672,7 +4969,8 @@ class Notifier:
                               "type": member.get("type"),
                               "since": member.get("since"),
                               "episode": member.get("episode"),
-                              "human": human}
+                              "human": human,
+                              "urgent": bool(member.get("urgent"))}
                 if self._summary_forbidden(human, normalized["type"]):
                     self.log("owner rate summary: slo_breach member filtered (#2395)")
                     continue
@@ -4706,7 +5004,8 @@ class Notifier:
                               "type": member.get("type"),
                               "since": member.get("since"),
                               "episode": member.get("episode"),
-                              "human": human}
+                              "human": human,
+                              "urgent": bool(member.get("urgent"))}
                 if self._summary_forbidden(human, normalized["type"]):
                     continue
                 out[self._summary_member_id(normalized)] = normalized
@@ -4762,6 +5061,10 @@ class Notifier:
                 self.state["summary"].pop(human, None)
             return
         bucket.setdefault(event, {})[self._summary_member_id(member)] = member
+        if member.get("urgent"):
+            # #8345 : un résumé qui contient une urgence traverse les heures
+            # calmes (l'urgence ne peut pas attendre 07:00).
+            bucket["urgent"] = True
 
     def _mark_member_notified(self, member: dict, now: float) -> None:
         human = member.get("human")
@@ -4853,7 +5156,11 @@ class Notifier:
         if isinstance(frozen, dict) and (frozen.get("raised") or frozen.get("resolved")):
             return frozen
         frozen = {"raised": dict(bucket.get("raised") or {}),
-                  "resolved": dict(bucket.get("resolved") or {})}
+                  "resolved": dict(bucket.get("resolved") or {}),
+                  # #8345 : la fenêtre calme et l'urgence appartiennent à
+                  # l'épisode figé ; un membre arrivé ensuite forme le suivant.
+                  "quiet": bucket.pop("quiet", None),
+                  "urgent": bool(bucket.pop("urgent", False))}
         if not frozen["raised"] and not frozen["resolved"]:
             return frozen
         bucket["frozen"] = frozen
@@ -4873,6 +5180,11 @@ class Notifier:
         if notified:
             self._mark_summary_notified(frozen, now)
         self._summary_clear_episode(bucket)
+        if not bucket.get("raised") and not bucket.get("resolved"):
+            # Aucun membre vivant : les marqueurs de l'épisode clos ne doivent
+            # pas colorer un futur résumé de débit (#8345).
+            bucket.pop("quiet", None)
+            bucket.pop("urgent", None)
 
     def _summary_cancel_frozen(self, bucket: dict) -> None:
         """Annule un épisode figé (membre acquitté) : ses autres membres
@@ -4882,6 +5194,10 @@ class Notifier:
             live = bucket.setdefault(event, {})
             for identity, member in (frozen.get(event) or {}).items():
                 live.setdefault(identity, member)
+        if frozen.get("quiet") and not bucket.get("quiet"):
+            bucket["quiet"] = frozen["quiet"]
+        if frozen.get("urgent"):
+            bucket["urgent"] = True
         self._summary_clear_episode(bucket)
 
     def _summaries(self, now: float) -> None:
@@ -4893,6 +5209,23 @@ class Notifier:
             if not self._summary_has_members(bucket):
                 # Stock entièrement filtré (ancien résumé SLO owner, #2395 B1).
                 del self.state["summary"][human]
+                continue
+            # #8345 : pendant la fenêtre calme, le résumé attend la sortie —
+            # sauf s'il porte une urgence, qui ne peut pas attendre 07:00.
+            frozen = bucket.get("frozen")
+            frozen_full = (isinstance(frozen, dict)
+                           and bool(frozen.get("raised") or frozen.get("resolved")))
+            quiet_state_now = self._quiet_state(human, now)
+            if quiet_state_now.active and not (
+                    bool(frozen.get("urgent")) if frozen_full
+                    else bool(bucket.get("urgent"))):
+                if not frozen_full:
+                    bucket["quiet"] = {
+                        "window": quiet_state_now.window.text,
+                        "timezone": quiet_state_now.timezone,
+                        "ends_at": (quiet_state_now.ends_at.strftime(
+                            "%Y-%m-%dT%H:%M:%S%z")
+                            if quiet_state_now.ends_at is not None else None)}
                 continue
             last = self.state["last_summary"].get(human)
             if last is not None and now - float(last) < RATE_WINDOW_S:
@@ -4907,7 +5240,8 @@ class Notifier:
             occurred_at = bucket.get("occurred_at") or iso_utc(now)
             bucket["occurred_at"] = occurred_at
             message = render_summary(frozen, self.cfg.host, alert_id=alert_id,
-                                     occurred_at=occurred_at)
+                                     occurred_at=occurred_at,
+                                     quiet=frozen.get("quiet"))
             states = bucket.setdefault("channels", {})
             for channel in channels:
                 states.setdefault(channel.name, {"ok": False, "attempts": 0,
@@ -5274,6 +5608,11 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
     if human is None or not str(args.test).startswith("human:"):
         print("ameesh notify --test: `human:<id>` expected", file=sys.stderr)
         return 2
+    # #8345 : le test dit toujours si cet humain est en heures calmes
+    # maintenant — même sans canal, pour que la cause soit lisible.
+    quiet = quiet_state(cfg, ncfg, human, time.time())
+    if not args.json:
+        print("quiet hours: %s" % quiet.line(human))
     if not ncfg.channels_for(human):
         print("ameesh notify --test: no channel for %s (notify.routes, notify.default) — "
               "this host cannot push anything to that human (no decision, no alert); "
@@ -5301,7 +5640,8 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
                     if channel is not None else None)
         if args.json:
             record = {"schema": NOTIFY_SCHEMA, "event": "test", "human": human,
-                      "channel": name, "ok": error is None, "error": error}
+                      "channel": name, "ok": error is None, "error": error,
+                      "quiet_hours": quiet.to_dict()}
             if receipt is not None:
                 record["receipt"] = receipt
             if fallback is not None:

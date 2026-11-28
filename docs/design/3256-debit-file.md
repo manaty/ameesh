@@ -80,10 +80,13 @@ canon), et ses deux paramètres viennent du bloc mécanique du canon :
 2. Le pilote crée des lots démarrables, d'au plus une journée chacun et
    conformes à la classe du §1 du canon. Le lot de découpage se ferme dès que
    la file compte des lots démarrables pour N agents.
-3. **Repli** : si, une heure après sa création, le lot de découpage n'a donné
-   lieu à aucun lot démarrable, l'auditeur crée lui-même les lots au niveau 1.
+3. **Repli** : si, une heure après son dernier mouvement utile ou sa dernière
+   réouverture, le lot de découpage n'a donné lieu à aucun lot démarrable,
+   l'auditeur crée lui-même les lots au niveau 1 (#8388).
    - Créer un lot est réversible : il suffit de le fermer.
    - Il ne touche ni au code ni à la priorité des lots du pilote.
+   - Un lot retenu par la garde d'empreinte n'est pas du découpage produit :
+     il ne compte pas dans les lots démarrables créés (#8388).
 4. Le pilote n'attend pas d'être réveillé par l'alerte : le lot entre dans son
    brief de reprise comme un lot à priorité 1.
 
@@ -141,12 +144,32 @@ ou retenu par l'empreinte. Le débit (`capacity.alerts`) et le remplissage de
 file (`file_decoupage`) appliquent la même règle ; un agent dont la fiche
 dit `auth_blocked` n'est pas une capacité réveillable (#8201 b).
 
+#8388 : le délai du repli court depuis le dernier mouvement **ou la dernière
+réouverture**, et une marque de repli antérieure à la réouverture ne compte
+plus — une `roadmap: rouverte` réarme donc le repli (clé d'idempotence
+distincte par réouverture, pour un courrier par silence). Les lots créés
+depuis le découpage mais **retenus par la garde d'empreinte** ne sont pas du
+découpage produit : les compter laissait le repli muet alors que tous les
+lots créés attendaient un bloqueur (#8035). Enfin, une alerte de capacité
+`capacity.alerts` qui persiste au-delà de `FALLBACK_S` porte `fallback: true`
+et déclenche elle-même le courrier de repli (`auditor_pass`), avec la même
+marque et la même clé que la passe de découpage : compter l'alerte ne faisait
+partir aucun courrier.
+
 ### 2.4 Acceptation de A
 
 - Un projet sans lot démarrable, avec 20 % d'agents au repos depuis 30 min,
   reçoit un seul lot de découpage, assigné à son pilote.
 - Sans lot démarrable créé dans l'heure, le passage suivant de l'auditeur crée
-  les lots.
+  les lots ; un lot créé mais retenu par l'empreinte ne suffit pas à retenir
+  le repli (#8388).
+- Une alerte de capacité persistante au-delà de `FALLBACK_S` produit le
+  courrier de repli, une seule fois par silence (même clé d'idempotence que
+  la passe de découpage) ; une réouverture réarme (#8388).
+- Un élément de la file de valeur ≥ 30 (au seuil de lot du canon) est un lot :
+  un agent libre le prend au passage suivant, même si un lot de roadmap attend
+  un preneur ; sous le seuil, il attend que la roadmap soit servie (#8388,
+  témoin #8352).
 - Une feuille de route notée épuisée met les agents en sommeil, rend les hôtes
   burst et envoie une seule alerte à l'owner.
 - Témoins :
@@ -206,7 +229,10 @@ depuis 30 min et qu'aucun lot de découpage n'a moins d'une heure, comme pour
 une attente de plus de 2 h sans geste. Le mouvement se lit comme au §2.2
 (note `roadmap:` ou lot citant le découpage, #8199) et une fenêtre
 d'observation non échue tient le repli jusqu'à son échéance, sauf si un lot
-démarrable ou retenu par l'empreinte attend encore.
+démarrable ou retenu par l'empreinte attend encore. L'alerte porte
+`fallback: true` quand le repli est dû (aucun lot démarrable, lot de découpage
+silencieux depuis plus de `FALLBACK_S`) ; `ameesh auditor tick` en envoie le
+courrier de repli (#8388).
 
 ### 3.2 La consigne de l'auditeur
 
