@@ -476,7 +476,11 @@ class QuietPassTest(_PgCase):
 class DiagnosticsTest(_PgCase):
     def run_test(self, *argv) -> tuple:
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        # `cmd_test` lit l'horloge réelle : le diagnostic doit être rejouable
+        # hors de la fenêtre calme (défaut vu à la composition du paquet
+        # h-20261128-01, 10:35 à Manille) — l'heure est fixée.
+        with mock.patch.object(notify.time, "time", return_value=self.now), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = notify.cmd_test(self.cfg, self.ncfg(),
                                    argparse.Namespace(test=argv[0],
                                                       json="--json" in argv))
@@ -509,7 +513,8 @@ class DiagnosticsTest(_PgCase):
 
     def test_doctor_affiche_la_ligne(self):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with mock.patch.object(notify.time, "time", return_value=self.now), \
+                contextlib.redirect_stdout(out):
             cli.cmd_doctor(self.cfg, notify_test=False)
         self.assertIn("quiet hours: human:proprio: in quiet hours now",
                       out.getvalue())
