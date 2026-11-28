@@ -273,7 +273,7 @@ class OffloadedSeriesTest(unittest.TestCase):
         # `heavy` : runs the command at once
         fake.write_text(
             "#!/bin/sh\n"
-            "echo \"$*\" >> \"$FAKE_CALLS\"\n"
+            "printf '%s\\n' \"$*\" >> \"$FAKE_CALLS\"\n"
             "if [ \"$1\" = heavy ]; then while [ \"$1\" != -- ]; do shift; done; shift;"
             " exec \"$@\"; fi\n"
             "case \"$FAKE_OFFLOAD\" in\n"

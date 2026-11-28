@@ -3492,6 +3492,121 @@ def _offload_call(worktree: Path, host: str, script: str, *, timeout: int,
     return proc, prevalidation.classify(proc.returncode, _output(proc))
 
 
+#: #8466 : la sonde des moteurs du guest. Le guest n'a pas l'environnement
+#: du composeur : l'absence de docker/podman chez lui ne doit pas se lire
+#: comme un rouge réel de la série déportée (canon §3). Le programme de sonde
+#: écrit une ligne par exécutable prouvé inutilisable, que le composeur relit.
+OFFLOAD_ENGINE_MARK = "paquet-auto: moteur invité "
+
+_OFFLOAD_ENGINE_PROBE = r'''
+import json
+import re
+import subprocess
+import sys
+
+FAILED = re.compile(__FAILED__)
+DAEMON = re.compile(__DAEMON__, re.IGNORECASE)
+MARK = __MARK__
+
+try:
+    with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
+        text = handle.read()
+except OSError:
+    sys.exit(0)
+
+for executable in sorted({match.group("exe")
+                          for match in FAILED.finditer(text)}):
+    if "/" in executable and not executable.startswith("/"):
+        continue
+    try:
+        proc = subprocess.run([executable, "info"], capture_output=True,
+                              stdin=subprocess.DEVNULL, timeout=20)
+    except FileNotFoundError:
+        state = "absent"
+    except (OSError, subprocess.SubprocessError):
+        continue
+    else:
+        if proc.returncode == 0:
+            continue
+        if proc.returncode == 127:
+            state = "absent"
+        else:
+            said = (proc.stdout + b"\n" + proc.stderr).decode("utf-8", "replace")
+            if not DAEMON.search(said):
+                continue
+            state = "unreachable"
+    print(MARK + json.dumps({"exe": executable, "state": state}), flush=True)
+'''
+
+
+def offload_engine_probe() -> str:
+    """#8466 : le programme de sonde joué dans l'environnement du guest.
+
+    Même règle que `container_engine_state` : seule une réponse `info` prouve
+    quelque chose (`absent` sur 127 ou exécutable introuvable, `unreachable`
+    sur le dire du client) ; un chemin relatif n'est jamais sondé. Le
+    programme n'importe rien de l'arbre : le guest n'a que son interpréteur et
+    la sortie de la série."""
+    return (_OFFLOAD_ENGINE_PROBE
+            .replace("__FAILED__", repr(CONTAINER_FAILED_RE.pattern))
+            .replace("__DAEMON__", repr(DAEMON_UNREACHABLE_RE.pattern))
+            .replace("__MARK__", repr(OFFLOAD_ENGINE_MARK)))
+
+
+def offload_tests_script(modules: list[str], *, failfast: bool = False) -> str:
+    """#8437/#8466 : le job du guest : la série, puis la sonde si elle rougit.
+
+    La sortie passe par `tee` pour que la sonde lise exactement ce que le
+    composeur reçoit ; le code de `unittest` reste celui du job
+    (`PIPESTATUS`), et une sonde en panne ne le change pas. Le programme de
+    sonde est passé en `-c` : le job reste une ligne, comme avant #8466."""
+    flags = "-f " if failfast else ""
+    names = " ".join(shlex.quote(module) for module in modules)
+    probe = "exec(%r)" % offload_engine_probe()
+    return (
+        'py="${AMEESH_TEST_VENV:+$AMEESH_TEST_VENV/bin/python3}"; '
+        '[ -n "$py" ] || py=python3; '
+        'out=$(mktemp); '
+        f'PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 "$py" -m unittest -q '
+        f'{flags}{names} 2>&1 | tee "$out"; '
+        'rc=${PIPESTATUS[0]}; '
+        'if [ "$rc" -eq 1 ]; then '
+        f'PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 "$py" -c '
+        f'{shlex.quote(probe)} "$out"; '
+        'fi; '
+        'rm -f "$out"; exit "$rc"'
+    )
+
+
+def offload_unusable_engines(output: str) -> frozenset:
+    """#8466 : les moteurs que la sonde du guest a prouvés inutilisables.
+
+    Seuls les exécutables **cités** par un échec docker/podman de la série
+    comptent : une ligne de sonde ne blanchit jamais un rouge qu'elle ne
+    nomme pas, et un test qui l'écrirait ne suffit pas. Le chemin local garde
+    `probe_engines` ; celui-ci lit la sonde jouée dans le même environnement
+    que les tests."""
+    cited = {found.group("exe")
+             for found in CONTAINER_FAILED_RE.finditer(output or "")}
+    if not cited:
+        return frozenset()
+    unusable = set()
+    for line in (output or "").splitlines():
+        if not line.startswith(OFFLOAD_ENGINE_MARK):
+            continue
+        try:
+            found = json.loads(line[len(OFFLOAD_ENGINE_MARK):])
+        except ValueError:
+            continue
+        if not isinstance(found, dict):
+            continue
+        executable = found.get("exe")
+        state = found.get("state")
+        if executable in cited and state in (ENGINE_ABSENT, ENGINE_UNREACHABLE):
+            unusable.add((executable, state))
+    return frozenset(unusable)
+
+
 def run_tests_offloaded(worktree: Path, label: str, modules: list[str], *,
                         host: str, timeout: int, wall: int | None,
                         failfast: bool = False) -> TestRun | None:
@@ -3499,17 +3614,16 @@ def run_tests_offloaded(worktree: Path, label: str, modules: list[str], *,
 
     None : le job n'a pas été joué (hôte injoignable, porte fermée ou drain),
     l'appelant rejoue la série en local. Une connexion perdue en cours de job
-    n'est jamais rejouée (la série tourne peut-être encore) : non concluant."""
+    n'est jamais rejouée (la série tourne peut-être encore) : non concluant.
+    #8466 : une série rouge est sondée dans le guest ; un docker/podman cité
+    et prouvé absent ou injoignable là-bas est non concluant, pas un rouge."""
     start = time.monotonic()
     try:
         snapshot = _offload_snapshot(worktree)
     except PaquetAutoError as exc:
         offload_down(host, str(exc))
         return None
-    script = ('py="${AMEESH_TEST_VENV:+$AMEESH_TEST_VENV/bin/python3}"; '
-              '[ -n "$py" ] || py=python3; PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 '
-              'exec "$py" -m unittest -q %s%s'
-              % ("-f " if failfast else "", " ".join(shlex.quote(m) for m in modules)))
+    script = offload_tests_script(modules, failfast=failfast)
     bound = wall if wall is not None else timeout + 60
     proc, outcome = _offload_call(worktree, host, script, timeout=timeout,
                                   wall=bound, snapshot=snapshot)
@@ -3532,7 +3646,9 @@ def run_tests_offloaded(worktree: Path, label: str, modules: list[str], *,
     return save_test_log(TestRun(
         label=label, modules=list(modules), returncode=proc.returncode,
         output=output, seconds=seconds,
-        timed_out=proc.returncode == HEAVY_CAPPED_EXIT))
+        timed_out=proc.returncode == HEAVY_CAPPED_EXIT,
+        unusable_engines=(offload_unusable_engines(output)
+                          if proc.returncode == 1 else frozenset())))
 
 
 @dataclass
