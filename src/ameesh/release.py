@@ -1488,7 +1488,7 @@ def add_parser(sub, func) -> None:
     attest_p.add_argument("--actor", default=None,
                           help="--skip at a human terminal: human:<id>")
     attest_p.set_defaults(func=func)
-    retag_p = rel.add_parser("retag", help="declare a verified retagged Nexlink cutoff")
+    retag_p = rel.add_parser("retag", help="declare a verified retagged release cutoff")
     retag_p.add_argument("--project", default=None)
     retag_p.add_argument("--version", required=True)
     retag_p.add_argument("--sha", required=True)
