@@ -304,9 +304,17 @@ def _reservation_settled(fixture, db, name, row, options):
     # opened only when there is none.
     budgets = storage.of(db).budgets
     spend_key = options.get("spend_key")
+    account = str(options["account"]) if options.get("account") else None
     if not spend_key:
-        opened = _reservations(db, name, ("open",))
+        opened = _reservations(db, name, ("open",), account=account)
         spend_key = opened[0]["spend_key"] if opened else None
+    if spend_key:
+        owners = db.query("SELECT agent, billing_account FROM account_reservations"
+                          " WHERE spend_key = %s", (spend_key,))
+        if owners and (owners[0]["agent"] != name or
+                       (account is not None and owners[0]["billing_account"] != account)):
+            raise StateNotReached("reservation does not belong to agent %s"
+                                  " and the requested account" % name)
     reservation = budgets.account_get(spend_key) if spend_key else None
     if reservation is None:
         spend_key = _reservation_open(fixture, db, name, row, options)["spend_key"]
@@ -351,11 +359,13 @@ def _cost(fixture, db, name, row, options):
     return report
 
 
-def _reservations(db, name, states):
+def _reservations(db, name, states, *, account=None):
     """This agent's reservations in ``states``, the latest first."""
+    account_filter = " AND billing_account = %s" if account is not None else ""
+    params = (name, list(states)) + ((account,) if account is not None else ())
     return db.query("SELECT id, spend_key FROM account_reservations"
-                    " WHERE agent = %s AND state = ANY(%s) ORDER BY id DESC",
-                    (name, list(states)))
+                    " WHERE agent = %s AND state = ANY(%s)" + account_filter +
+                    " ORDER BY id DESC", params)
 
 
 def _spend_key(name):

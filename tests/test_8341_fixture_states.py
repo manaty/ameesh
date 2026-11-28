@@ -236,6 +236,60 @@ class FixtureStatesDatabaseTest(unittest.TestCase):
         with self.assertRaises(fixture_mod.FixtureStateError):
             self.state("cost", spend_key=cost["cost"]["spend_key"], usd=0.1)
 
+    def _account_snapshot(self):
+        # Core regression tests may inspect the disposable fixture database.
+        # Compare complete rows to catch a cost, settlement or envelope write.
+        return {table: self.fixture._db.query("SELECT * FROM " + table + " ORDER BY 1")
+                for table in ("account_reservations", "turn_costs", "account_budgets")}
+
+    def test_settlement_refuses_another_agents_key_without_writes(self):
+        other = "other-owner-8352"
+        self.fixture.agent(other)
+        opened = self.state("reservation_open", account="owner-account-8352")
+        before = self._account_snapshot()
+        for options in ({}, {"account": opened["account"]},
+                        {"account": "another-account-8352", "limit_usd": 12}):
+            with self.subTest(options=options):
+                with self.assertRaises(fixture_mod.FixtureStateError):
+                    self.fixture.agent_state(other, "reservation_settled",
+                                             spend_key=opened["spend_key"], **options)
+                self.assertEqual(self._account_snapshot(), before)
+        # The owner can still settle the key without specifying an account.
+        settled = self.state("reservation_settled", spend_key=opened["spend_key"])
+        self.assertEqual(settled["account"], opened["account"])
+        self.assertEqual(settled["reservation"]["state"], "settled")
+
+    def test_settlement_refuses_the_wrong_account_without_writes(self):
+        opened = self.state("reservation_open", account="right-account-8352")
+        before = self._account_snapshot()
+        with self.assertRaises(fixture_mod.FixtureStateError):
+            self.state("reservation_settled", spend_key=opened["spend_key"],
+                       account="wrong-account-8352", limit_usd=12)
+        self.assertEqual(self._account_snapshot(), before)
+        settled = self.state("reservation_settled", spend_key=opened["spend_key"],
+                             account=opened["account"])
+        self.assertEqual(settled["reservation"]["state"], "settled")
+
+    def test_automatic_settlement_selects_only_the_requested_agent_and_account(self):
+        other = "other-auto-8352"
+        self.fixture.agent(other)
+        first = self.state("reservation_open", account="first-auto-8352")
+        foreign = self.fixture.agent_state(other, "reservation_open",
+                                          account="second-auto-8352")
+        foreign_before = self.fixture._db.query(
+            "SELECT * FROM account_reservations WHERE spend_key = %s",
+            (foreign["spend_key"],))
+        settled = self.state("reservation_settled", account="second-auto-8352")
+        self.assertEqual(settled["account"], "second-auto-8352")
+        self.assertNotIn(settled["spend_key"], (first["spend_key"], foreign["spend_key"]))
+        self.assertEqual(settled["reservation"]["state"], "settled")
+        self.assertEqual(self.fixture._db.query(
+            "SELECT * FROM account_reservations WHERE spend_key = %s",
+            (foreign["spend_key"],)), foreign_before)
+        self.assertEqual(self.fixture._db.query(
+            "SELECT count(*) AS n FROM turn_costs WHERE spend_key = ANY(%s)",
+            ([first["spend_key"], foreign["spend_key"]],))[0]["n"], 0)
+
     def test_an_unregistered_agent_is_a_state_error_without_secret(self):
         with self.assertRaises(fixture_mod.FixtureStateError) as caught:
             self.fixture.agent_state("ima-never-registered", "lease_live")

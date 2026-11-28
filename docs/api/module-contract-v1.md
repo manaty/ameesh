@@ -744,6 +744,12 @@ minor; `ameesh.public.CONTRACT_VERSION` is then at least `"1.7"`.
 | `reservation_settled` | the agent's open reservation (or `spend_key`, or a new one) settled after its cost row, like a turn | `reservation.state` `settled`, `budget.settled` | `account`, `usd`, `spend_key`, `cost_usd`, `limit_usd` |
 | `cost` | one row in the cost ledger | `cost.rows` ≥ 1 | `usd`, `input_tokens`, `output_tokens`, `spend_key`, `account` |
 
+`reservation_settled` accepts an existing `spend_key` only for the named
+agent and, when supplied, the requested `account`. A foreign key is refused
+with `FixtureStateError` before any cost or reservation write. Without a key,
+the fixture selects this agent's latest open reservation on the requested
+account (or any account when omitted), creating one if none matches.
+
 Every report carries `agent`, `lease` (`owner`, `epoch`, `live`, `expires_ts`),
 `canon` (`state`, `last_good_commit`, `age_s`, `max_age_s`, `fresh`,
 `ref_matches`), `placement` (`ok`, `ref`, `diagnostic`), `reasons` (the
