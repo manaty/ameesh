@@ -800,6 +800,9 @@ def _trusted_env_name(value: str, profile: Profile, defaults: set[str]) -> bool:
     tel nom suivi de `_` et d'un suffixe court (`ENV_SUFFIX_RE`) — un collage
     ne produit jamais ce préfixe —, ou (c) un nom d'un profil qui porte
     `public_names: true`. Dans tous les cas, la forme `ENV_NAME_RE` est exigée.
+    La garantie vaut contre le collage par erreur (une clé ne commence jamais
+    par un nom par défaut et ne porte pas d'attestation), pas contre un
+    opérateur qui écrit délibérément une clé sous un nom de confiance.
     """
     if not ENV_NAME_RE.match(value):
         return False
