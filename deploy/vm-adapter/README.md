@@ -607,8 +607,9 @@ drainage automatique, ni `idle-drained`, ni la preuve d'arrêt du worker
 (`stop_evidence`) ne passent. `policy.runs_interface: none` ne vaut que
 si rien ne tourne hors tours et baux. **Un hôte prêteur (`policy.lend`) ne
 peut pas le déclarer** : le canon le refuse (#5905), et `lending` l'emporte
-même sur `runs_interfaces` en configuration. Depuis #7687, il déclare
-`policy.runs_interface: guest` : le comptage des jobs d'offload vivants
+sur `runs_interfaces` en configuration, sauf l'interface comptante `guest`
+(#7687) : `none` ne peut pas transformer une prêteuse en zéro prouvé. AG3
+déclare `policy.runs_interface: guest` : le comptage des jobs d'offload vivants
 (shell guest et slices `ameesh-job-*`). Un comptage absent, périmé ou
 illisible reste **inconnu**, jamais zéro : ni drainage automatique, ni
 `idle-drained` sur ce doute. AG3, prêteur qui porte le guest d'offload de la
