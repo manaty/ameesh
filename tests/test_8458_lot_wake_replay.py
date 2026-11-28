@@ -115,6 +115,53 @@ class RejeuDetteTest(_Base):
             self.assertTrue(restarted.run_turn(again))
         self.assertEqual(self.dette("t8458b"), {})
 
+    def _relance(self, worker):
+        """Un exécuteur neuf du même agent, mémoire vide, rien au repos."""
+        restarted = AgentWorker(worker.runner, registry.get(self.db, worker.name),
+                                worker.lease)
+        restarted.last_activity = time.monotonic()
+        restarted.nudged = True
+        self.addCleanup(restarted.watchdog_stop.set)
+        self.addCleanup(restarted._forget_wake_claim)
+        return restarted
+
+    def _recule(self, name, lot, seconds):
+        self.db.execute("UPDATE agent_lot_sessions SET last_wake_at = last_wake_at"
+                        " - make_interval(secs => %s) WHERE agent = %s AND work_item_id = %s",
+                        (float(seconds), name, lot))
+
+    def test_rejeu_borne_au_redemarrage_en_boucle(self):
+        # CI du paquet h-20261128-08 : un exécuteur qui redémarre en boucle
+        # rejoue la dette sans la recompter, au plus LOT_WAKE_RETRY_MAX fois ;
+        # ensuite le délai doublé reprend, sans rafale.
+        name = "t8458e"
+        worker = self._worker(name)
+        lot = self._lot(name)
+        premier = self.choix(worker)
+        self.assertEqual((premier["kind"], premier["lot"]), ("idle", str(lot)))
+        self.assertIn(str(lot), self.dette(name))
+        self.assertEqual(self.wakes(name, lot), 1)
+
+        for rejeu in range(1, worker.LOT_WAKE_RETRY_MAX + 1):
+            again = self.choix(self._relance(worker))
+            self.assertIsNotNone(again, "rejeu %d dû" % rejeu)
+            self.assertEqual(again["lot"], str(lot))
+            self.assertEqual(self.wakes(name, lot), 1, "le rejeu n'est pas recompté")
+            self.assertIn(str(lot), self.dette(name))
+
+        relance = self._relance(worker)
+        self.assertIsNone(self.choix(relance), "au-delà du plafond, aucune rafale")
+        self.assertNotIn(str(lot), self.dette(name))
+        self.assertEqual(self.wakes(name, lot), 1)
+
+        # le délai doublé reprend la main : le réveil suivant est recompté
+        base = relance.mail_batch() + relance.cfg.lot_wake_margin
+        self._recule(name, lot, 2 * base + 1)
+        again = self.choix(self._worker(name))
+        self.assertIsNotNone(again, "le délai doublé reprend après le plafond")
+        self.assertEqual(again["lot"], str(lot))
+        self.assertEqual(self.wakes(name, lot), 2, "un nouveau réveil est compté")
+
     def test_sortie_de_pick_apres_note_wake_laisse_la_dette(self):
         worker = self._worker("t8458c")
         lot = self._lot("t8458c")
