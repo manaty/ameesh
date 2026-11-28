@@ -88,7 +88,7 @@ class NocturnePartsTest(unittest.TestCase):
         self._table({m: total / len(self.mods) for m in self.mods})
         p = self._plan()
         n, lourde = self._coherent(p)
-        self.assertGreater(n, plan.PARTS["psql"][1])
+        self.assertGreater(n, plan.PSQL_FULL_PARTS_MIN)
         self.assertLessEqual(n, plan.PSQL_FULL_PARTS_MAX)
         self.assertLessEqual(lourde, self.cible)
         self.assertIn(f"psql night parts (#8291): {n} (floor 16)", plan.summary(p))
@@ -106,7 +106,7 @@ class NocturnePartsTest(unittest.TestCase):
     def test_une_suite_legere_garde_le_plancher(self):
         self._table({m: 1.0 for m in self.mods})
         n, _ = self._coherent(self._plan())
-        self.assertEqual(n, plan.PARTS["psql"][1])
+        self.assertEqual(n, plan.PSQL_FULL_PARTS_MIN)
 
     def test_un_module_insecable_est_signale_sans_multiplier_les_parts(self):
         lent = self.mods[0]
@@ -115,7 +115,7 @@ class NocturnePartsTest(unittest.TestCase):
         self._table(poids)
         p = self._plan()
         n, lourde = self._coherent(p)
-        self.assertEqual(n, plan.PARTS["psql"][1])
+        self.assertEqual(n, plan.PSQL_FULL_PARTS_MIN)
         self.assertGreater(lourde, self.cible)
         alertes = [a for a in plan.annotations(p) if "#8291" in a]
         self.assertEqual(len(alertes), 1, alertes)
