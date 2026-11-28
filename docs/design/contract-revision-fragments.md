@@ -80,6 +80,10 @@ locaux, exécute un pliage mécanique (`scripts/paquet-auto.py` s'appuie sur
   autres lignes du lot restent exigées à la tête), vérifie que le contenu des
   fragments s'y retrouve et refuse un commit cité qui touche autre chose que
   le contrat, sa surface, `CONTRACT_VERSION` et les fragments cités.
+- la porte du véhicule (#8417) relit le même commit : vérifié, il n'est pas un
+  delta propre du paquet (comme une fusion mécanique, aucun avis de véhicule) ;
+  non cité, non vérifiable ou touchant un autre chemin, il reste un delta
+  propre, avis exigé.
 
 Le pliage est idempotent : un arbre déjà plié ne porte plus de fragment, et le
 composeur ne retouche pas son en-tête.
@@ -101,3 +105,5 @@ lot n'est **pas regelé** : c'est une adaptation mécanique, sans avis
 - `scripts/paquet-auto.py` : le pliage au paquet et sa citation au manifeste.
 - `scripts/paquet-inclusion.py` : lit le commit de pliage du manifeste et
   n'accuse pas un lot d'avoir perdu ses lignes de contrat repliées.
+- `src/ameesh/review_contract_fold.py` : la vérification du commit de pliage,
+  partagée par `paquet-inclusion` et `packet_reviews.own_changes` (#8417).
