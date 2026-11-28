@@ -37,8 +37,9 @@ illisible), rien de ceci ne s'applique : aucun seuil n'est supposé (§7).
 Tant qu'un lot de roadmap du projet est prenable, un élément sous le seuil
 (panier, élément ancien) n'est pas confié à un agent (`work assign`,
 `assign_refusal`) : un agent libre ne le prend que faute de travail plus
-utile. La prise au repos (`auto_take`) tenait déjà plus large : toute la file
-attend tant qu'un lot d'un projet attend un preneur (0037, ci-dessous).
+utile. La prise au repos (`auto_take`) applique la même règle (#8388) : au
+seuil ou au-dessus, l'élément est un lot, et un lot de roadmap qui attend un
+preneur ne le retient pas.
 
 **Durée estimée (#4117)** : comme `work add`, `work backlog add` reçoit
 `--estimate`, `--estimate-source` et `--size`, et un agent qui crée un **lot**
@@ -1180,24 +1181,37 @@ def roadmap_waiting(db: Db, project: str, *, now: float | None = None) -> list:
     return sous_utilisation.waiting_project_lots(out, db=db, now=stamp)
 
 
+def _roadmap_candidate(item: dict, *, cfg=None):
+    """#2584/#8388 : `(projet, seuil, score)` d'un élément de la file qui peut
+    attendre la roadmap, ou None s'il n'attend jamais (pas un élément de la
+    file, classe sensible — qui garde son lot). `seuil` vaut None quand le
+    canon n'en déclare pas : `roadmap_first` n'attend alors pas, la prise au
+    repos garde le comportement conservateur historique."""
+    item = item or {}
+    if item.get("type") != ITEM_TYPE:
+        return None
+    project = _lot_project(item)
+    if sensitive_p2(title=item.get("title") or "",
+                    source=item.get("source") or "", app=project):
+        return None
+    rule = rules(cfg, project)
+    try:
+        score = int(item.get("value_score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    return project, (rule.lot_min_value if rule is not None else None), score
+
+
 def roadmap_first(db: Db, item: dict, *, cfg=None, now: float | None = None) -> list:
     """#2584 : les lots de roadmap qui passent avant cet élément du backlog, ou
     `[]`. Seul un élément sous le seuil de lot du canon (`rules`) attend : un
     panier, un élément ancien de faible valeur. Sans seuil au canon, rien
     n'attend (aucun seuil supposé)."""
-    item = item or {}
-    if item.get("type") != ITEM_TYPE:
+    candidate = _roadmap_candidate(item, cfg=cfg)
+    if candidate is None:
         return []
-    project = str(item.get("app") or item.get("team") or "").strip()
-    rule = rules(cfg, project)
-    if rule is None or sensitive_p2(title=item.get("title") or "",
-                                    source=item.get("source") or "", app=project):
-        return []
-    try:
-        score = int(item.get("value_score") or 0)
-    except (TypeError, ValueError):
-        score = 0
-    if score >= rule.lot_min_value:
+    project, threshold, score = candidate
+    if threshold is None or score >= threshold:
         return []
     return roadmap_waiting(db, project, now=now)
 
@@ -1629,7 +1643,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     verdict bloquant, proposées à un agent au repos d'une autre famille quand
     aucun lot n'est prenable) ou `backlog` (file d'amélioration, L119). Les
     lots de l'équipe passent d'abord ; tant qu'un lot du projet attend,
-    aucune amélioration de ce projet n'est prise. Un seuil nul désactive la prise
+    une amélioration SOUS le seuil de lot de ce projet n'est pas prise
+    (#8388 : au seuil ou au-dessus, c'est un lot). Un seuil nul désactive la prise
     correspondante — `review_max_per_hour` à 0 coupe les propositions
     (#1738 N3). Une proposition faite passe avant la file d'amélioration du
     même passage (« du travail réel sur des lots en cours ») ; propositions
@@ -1977,13 +1992,27 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     # #7525 : un projet ne retient pas les améliorations des autres. Lire
     # toute la file, puis borner le veto au projet de chaque élément ; un
     # lot sans projet conserve le comportement conservateur historique.
+    # #8388 : seuls les éléments SOUS le seuil de lot cèdent la place à la
+    # roadmap (`_roadmap_candidate`) ; au seuil ou au-dessus, c'est un lot,
+    # et `work assign` le confie déjà malgré une roadmap qui attend (#8352).
     waiting = sous_utilisation.waiting_project_lots(
         st.operations.open_lots_activity(None), db=db, now=now)
     waiting_projects = {_lot_project(item) for item in waiting}
-    queue = [item for item in queue
-             if not waiting or (_lot_project(item)
-                                and "" not in waiting_projects
-                                and _lot_project(item) not in waiting_projects)]
+
+    def roadmap_holds(item) -> bool:
+        if not waiting:
+            return False
+        candidate = _roadmap_candidate(item, cfg=cfg)
+        if candidate is None:
+            return False
+        project, threshold, score = candidate
+        if threshold is not None and score >= threshold:
+            return False
+        if not project:
+            return True
+        return "" in waiting_projects or project in waiting_projects
+
+    queue = [item for item in queue if not roadmap_holds(item)]
     # Comme pour L165, une relecture/attente humaine ou un ancien lot de
     # session validé n'occupe pas l'agent. Courrier, consigne et lot
     # actionnable continuent de fermer la prise dans candidates().

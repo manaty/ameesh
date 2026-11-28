@@ -313,6 +313,36 @@ class MainTest(unittest.TestCase):
         send.assert_called_once()
         self.assertEqual(record.call_args.kwargs["reason"], auditor_pass.DEBIT)
 
+    def test_a_persistent_capacity_alert_triggers_the_fallback(self):
+        # #8388 : une alerte de capacité qui dure au-delà de FALLBACK_S
+        # déclenche le courrier de repli, avec la clé de la passe de découpage.
+        report = dict(QUIET, totals={"slow_waits": 0, "capacity_alerts": 1},
+                      capacity={"alerts": [{"project": "ameesh", "fallback": True,
+                                            "decoupage": {"lot": 90}}]})
+        fired = [{"lot": 90, "auditor": "auditeur"}]
+        with mock.patch("ameesh.file_decoupage.fallbacks_from_capacity",
+                        return_value=fired) as fallback:
+            status, send, record, _ = self.run_main(report=report)
+        self.assertEqual(status, 0)
+        send.assert_called_once()
+        fallback.assert_called_once()
+        args, kwargs = fallback.call_args
+        self.assertEqual(args[1], report)
+        self.assertEqual(kwargs["auditor"], "auditeur")
+        self.assertFalse(kwargs["dry_run"])
+        self.assertEqual(record.call_args.kwargs["reason"], auditor_pass.DEBIT)
+
+    def test_a_fallback_error_does_not_break_the_pass(self):
+        report = dict(QUIET, totals={"slow_waits": 0, "capacity_alerts": 1},
+                      capacity={"alerts": [{"project": "ameesh", "fallback": True,
+                                            "decoupage": {"lot": 90}}]})
+        with mock.patch("ameesh.file_decoupage.fallbacks_from_capacity",
+                        side_effect=RuntimeError("boom")):
+            status, send, record, _ = self.run_main(report=report)
+        self.assertEqual(status, 0)
+        send.assert_called_once()
+        self.assertEqual(record.call_args.kwargs["reason"], auditor_pass.DEBIT)
+
     def test_an_unreadable_debit_is_played(self):
         status, send, record, _ = self.run_main(debit_error=RuntimeError("boom"))
         self.assertEqual(status, 0)

@@ -404,6 +404,19 @@ class AutoTakeTest(_Base):
         self.assertIsNone(work.get(self.db, basket["id"])["assignee"])
         self.assertIsNone(work.get(self.db, roadmap["id"])["assignee"])
 
+    def test_idle_take_takes_a_value_30_item_while_roadmap_waits(self):
+        # #8388, témoin #8352 : au seuil, l'élément est un lot ; un lot de
+        # roadmap qui attend un preneur ne le retient pas (même règle que
+        # `work assign`), et l'agent libre le prend au passage suivant.
+        self.agent("dev1")
+        self.lot("Roadmap : export des comptes")
+        item = self.element("dette réelle", 35)
+        taken = backlog.auto_take(self.cfg, self.db, now=time.time(), paid=("deepseek",),
+                                  budget_check=lambda agent: "", lot_idle_s=0,
+                                  review_max_per_hour=0)
+        self.assertEqual([t["item"]["id"] for t in taken], [item["id"]])
+        self.assertEqual(work.get(self.db, item["id"])["assignee"], "dev1")
+
 
 if __name__ == "__main__":
     unittest.main()
