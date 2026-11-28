@@ -231,6 +231,18 @@ def _as_bool(value, default: bool | None, name: str) -> bool | None:
     raise SystemExit("%s: invalid value %r (expected 1/0, true/false)" % (name, value))
 
 
+def _as_explicit_bool(value, name: str) -> bool:
+    """Booléen explicitement présent dans la configuration (#8334).
+
+    `_as_bool` lit `None` et la chaîne vide comme une absence : pratique pour
+    une variable vide, faux pour une clé de fichier écrite exprès. Ici les deux
+    sont des valeurs invalides, refusées avec le même message actionnable.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise SystemExit("%s: invalid value %r (expected 1/0, true/false)" % (name, value))
+    return bool(_as_bool(value, None, name))
+
+
 def hostname() -> str:
     """Nom court de la machine : l'hôte auquel un agent est épinglé."""
     return socket.gethostname().split(".")[0]
@@ -363,6 +375,12 @@ class Config:
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
+    #: #8334 : publieur d'aperçu par worker (#1349) — un fil et une connexion
+    #: PostgreSQL gardée par agent, capture toutes les 15 s. `False` coupe le
+    #: publieur pour tous les workers de cet exécuteur ; `Runner.peek()` et la
+    #: lecture `/peek` restent inchangés (instantané absent ou périmé).
+    #: Défaut actif ; `AMEESH_AGENT_PEEK=0` ou `agent_peek: false` le coupe.
+    agent_peek: bool = True
     #: L125 : fenêtre de regroupement du courrier ordinaire (secondes) — un
     #: agent au repos n'est réveillé qu'au bout de ce délai après l'arrivée
     #: du premier message, et son tour emporte tout ce qui est arrivé entre-
@@ -1157,6 +1175,7 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
     raw: dict = {}
     base_path = ""
     shadowed: tuple[str, ...] = ()
+    agent_peek_file: bool | None = None
     if os.path.exists(cfg_path):
         raw = _read_json_object(cfg_path)
         # #1466 : un profil (fichier rangé sous le dossier de la configuration
@@ -1176,6 +1195,11 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
                 key for key in raw
                 if key in base_raw and merged.get(key, _MISSING) != base_raw[key]))
             raw = merged
+        # #8334 : une clé `agent_peek` présente porte une valeur explicite.
+        # `null` et la chaîne vide ne sont pas « la clé absente » : ils sont
+        # refusés comme le reste des valeurs non booléennes.
+        if "agent_peek" in raw:
+            agent_peek_file = _as_explicit_bool(raw["agent_peek"], "agent_peek (config)")
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
         known.discard("extra_canons")   # `canons` (liste) ci-dessous, jamais tel quel
         known.discard("budget_explicit")  # calculé, jamais lu tel quel
@@ -1275,6 +1299,11 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
             cfg.runner_liveness_interval)),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
+        # #8334 : la clé de fichier est validée à la lecture (présence
+        # distinguée de l'absence) ; une variable vide reste « non posée ».
+        agent_peek=bool(_as_bool(pick("AMEESH_AGENT_PEEK"),
+                                 agent_peek_file if agent_peek_file is not None else True,
+                                 "AMEESH_AGENT_PEEK")),
         mail_batch=_as_seconds(pick("AMEESH_MAIL_BATCH"),
                                _as_seconds(cfg.mail_batch, Config.mail_batch)),
         lot_wake=bool(_as_bool(pick("AMEESH_LOT_WAKE"), cfg.lot_wake, "AMEESH_LOT_WAKE")),

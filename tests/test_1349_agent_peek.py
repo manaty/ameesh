@@ -5,12 +5,14 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from ameesh import adapters, agent_peek as peek, config, decisions, registry, serve, storage, work
+from ameesh import (adapters, agent_peek as peek, config, decisions, registry,
+                    runner as runner_mod, serve, storage, work)
 from tests.support import PgTestCase
 from tests.test_l84_serve import ServerMixin
 
@@ -180,6 +182,79 @@ class SelectionTest(unittest.TestCase):
             self.assertEqual(out.getvalue(), "")
             snapshot.assert_not_called()
             connect.return_value.close.assert_called_once()
+
+
+class PublisherSettingTest(unittest.TestCase):
+    """#8334 : `agent_peek` (exécuteur) coupe le publieur par worker, sans sous-classe."""
+
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        self.config_file = os.path.join(self.root.name, "config.json")
+        self.write_config({})
+
+    def write_config(self, payload):
+        Path(self.config_file).write_text(json.dumps(payload), encoding="utf-8")
+
+    def load(self, **env):
+        return config.load(env=dict({"AMEESH_CONFIG": self.config_file}, **env))
+
+    def worker(self, cfg):
+        worker = runner_mod.AgentWorker.__new__(runner_mod.AgentWorker)
+        threading.Thread.__init__(worker, name="worker", daemon=True)
+        worker.cfg = cfg
+        worker.epoch = 7
+        worker.agent = {"cwd": ""}
+        worker.runner = mock.Mock(runner_id="runner")
+        worker._peek_reader = None
+        return worker
+
+    def test_default_setting_keeps_the_publisher(self):
+        self.assertIs(self.load().agent_peek, True)
+        with mock.patch.object(peek, "Publisher") as publisher:
+            worker = self.worker(self.load())
+            worker.ensure_peek()
+        publisher.assert_called_once()
+        self.assertIs(worker._peek_publisher, publisher.return_value)
+
+    def test_disabled_setting_opens_no_thread_or_connection(self):
+        with mock.patch.object(peek, "Publisher") as publisher, \
+                mock.patch.object(peek.db_mod, "connect") as connect:
+            worker = self.worker(self.load(AMEESH_AGENT_PEEK="0"))
+            worker.ensure_peek()
+            worker.ensure_peek()  # idempotent : toujours rien
+            worker._close_peek()
+        publisher.assert_not_called()
+        connect.assert_not_called()
+        self.assertIsNone(getattr(worker, "_peek_publisher", None))
+
+    def test_environment_setting_is_validated(self):
+        for value, expected in (("0", False), ("false", False), ("off", False),
+                                ("1", True), ("true", True), ("oui", True)):
+            self.assertIs(self.load(AMEESH_AGENT_PEEK=value).agent_peek, expected, value)
+        with self.assertRaises(SystemExit) as caught:
+            self.load(AMEESH_AGENT_PEEK="maybe")
+        self.assertIn("AMEESH_AGENT_PEEK", str(caught.exception))
+
+    def test_config_file_distinguishes_absent_from_explicit_invalid(self):
+        # clé absente : défaut inchangé, publieur actif
+        self.assertIs(self.load().agent_peek, True)
+        # valeurs explicites valides, booléennes ou 1/0
+        for value, expected in (("0", False), (0, False), ("false", False),
+                                ("1", True), (1, True), ("true", True)):
+            self.write_config({"agent_peek": value})
+            self.assertIs(self.load().agent_peek, expected, value)
+        self.write_config({"agent_peek": False})
+        self.assertIs(self.load(AMEESH_AGENT_PEEK="1").agent_peek, True)
+        # `null`, `""` et le blanc sont des valeurs refusées, pas une absence
+        for invalid in ("maybe", None, "", "   "):
+            self.write_config({"agent_peek": invalid})
+            with self.assertRaises(SystemExit) as caught:
+                self.load()
+            message = str(caught.exception)
+            self.assertIn("agent_peek (config)", message)
+            self.assertIn("invalid value", message)
+            self.assertIn("expected 1/0, true/false", message)
 
 
 class DatabaseTest(PgTestCase):
