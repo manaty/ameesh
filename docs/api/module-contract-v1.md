@@ -65,14 +65,15 @@ model, the per-harness ceiling of an unknown model, and the schedule's source),
 so a consumer stops importing `cost.load_prices`/`cost.max_price_of`; it is
 additive to 1.12 and changes no pricing, reservation or accounting path.
 
+The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
+consumer and the missing surfaces. This document defines the supported boundary;
+it does not claim that the remaining adapters have already been implemented.
+
 Amendment to revision 1.9 (#8457, manaty/ameesh#6666): in
 `ameesh-account-profiles/1`, `env`/`key_env` may be `null` when the name is not
 trusted (a harness descriptor's default, that default with a short `_` suffix,
 or a profile declaring `public_names: true`), and a refused unknown harness is
 never echoed; both fields were already nullable, so no field or reason changes.
-The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
-consumer and the missing surfaces. This document defines the supported boundary;
-it does not claim that the remaining adapters have already been implemented.
 
 ## Compatibility and availability
 
