@@ -1300,6 +1300,14 @@ def retag(cfg, db, project, *, version, sha, reason, actor, now):
                 "refs/tags/" + TAG_PREFIX + version, check=True)
         if release_tags(project).get(version) != sha:
             raise rc.ReleaseError("remote release tag moved during verification")
+        integration = pending["integration"]
+        if rc._git(project.repo, "check-ref-format", "refs/heads/" + integration).returncode:
+            raise rc.ReleaseError("invalid integration ref")
+        remote_ref = "refs/remotes/%s/%s" % (project.remote, integration)
+        rc._git(project.repo, "fetch", "--no-tags", project.remote,
+                "+refs/heads/%s:%s" % (integration, remote_ref), check=True)
+        if rc.commit_of(project.repo, remote_ref) != sha:
+            raise rc.ReleaseError("remote integration branch does not point to the requested SHA")
         if rc.commit_of(project.repo, sha) != sha:
             raise rc.ReleaseError("requested SHA is not a commit")
         if rc._git(project.repo, "merge-base", "--is-ancestor", old, sha).returncode:

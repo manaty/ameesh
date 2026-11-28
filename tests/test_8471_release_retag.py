@@ -65,3 +65,54 @@ class RetagTests(unittest.TestCase):
         self.tag.return_value = {}
         with self.assertRaises(rc.ReleaseError): self.retag()
         self.assertEqual(self.saved()['sha'], OLD)
+
+class StaleIntegrationTests(unittest.TestCase):
+    def test_fetch_refreshes_integration_before_planning(self):
+        import subprocess
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            def git(where, *args):
+                return subprocess.run(['git', '-C', str(where), *args], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+            remote = root / 'remote.git'
+            subprocess.run(['git', 'init', '--bare', str(remote)], check=True, capture_output=True)
+            author = root / 'author'
+            subprocess.run(['git', 'clone', str(remote), str(author)], check=True, capture_output=True)
+            git(author, 'config', 'user.name', 'Test')
+            git(author, 'config', 'user.email', 'test@example.com')
+            (author / '.ameesh').mkdir()
+            path = author / '.ameesh' / 'staging-migrations.json'
+            path.write_text('old')
+            git(author, 'add', '.')
+            git(author, 'commit', '-m', 'old')
+            old = git(author, 'rev-parse', 'HEAD')
+            ref = 'integration/release-11ck'
+            git(author, 'push', 'origin', 'HEAD:refs/heads/' + ref)
+            clone = root / 'clone'
+            subprocess.run(['git', 'clone', str(remote), str(clone)], check=True, capture_output=True)
+            git(clone, 'fetch', 'origin', '+refs/heads/' + ref + ':refs/remotes/origin/' + ref)
+            path.write_text('new')
+            git(author, 'commit', '-am', 'new')
+            new = git(author, 'rev-parse', 'HEAD')
+            git(author, 'tag', 'release-11ck')
+            git(author, 'push', 'origin', 'HEAD:refs/heads/' + ref, 'refs/tags/release-11ck')
+            self.assertEqual(git(clone, 'rev-parse', 'refs/remotes/origin/' + ref), old)
+            project = rc.ProjectRelease('nexlink', str(clone), model='nexlink')
+            cfg = types.SimpleNamespace(state_dir=str(root / 'state'))
+            pending = dict(version='11ck', sha=old, main=old, integration=ref, handoff={'to': 'agent'})
+            rc.save_state(cfg, {'schema': rc.SCHEMA, 'projects': {'nexlink': {'pending_nexlink': pending}}})
+            run = dict(headSha=new, headBranch=ref, event='workflow_dispatch', status='completed',
+                       conclusion='success', createdAt='2026-01-01')
+            def plan(project, candidate):
+                self.assertEqual(git(clone, 'rev-parse', 'refs/remotes/origin/' + ref), new)
+                return {'parts': [{'workflow': 'sql.yml'}]}
+            with mock.patch.object(nx, 'ci_plan', side_effect=plan), \
+                 mock.patch.object(nx, 'runs', return_value=[run]), \
+                 mock.patch.object(nx, 'migration_requirements', return_value={}), \
+                 mock.patch.object(nx, 'handoff_preflight', return_value={'migrations': []}), \
+                 mock.patch.object(nx, '_announce'):
+                nx.retag(cfg, None, project, version='11ck', sha=new,
+                         reason='fix declaration', actor='pilot', now=1)
+            self.assertEqual(rc.load_state(cfg)['projects']['nexlink']['pending_nexlink']['sha'], new)
