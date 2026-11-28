@@ -8,13 +8,16 @@ déclenché 12 tours en 40 minutes : l'alerte `operator_pause_long`/
 * une pause datée et motivée ne produit aucune alerte avant son échéance ;
 * à l'échéance dépassée elle alerte (même avant le seuil de durée), parce que
   l'exécuteur aurait dû lever la pause ;
-* un avis unique par hôte part à mesh-design à la pose, en courrier passif
-  (`info`) : il ne réveille personne ;
+* un avis unique par hôte part au pilote déclaré au canon à la pose, en
+  courrier passif (`info`) : il ne réveille personne ; sans pilote lisible,
+  aucun avis n'est déposé et le journal le dit ;
 * une pause sans échéance garde l'alerte de durée de #3961, et un acteur
   machine (sommeil automatique) n'envoie aucun avis.
 """
 from __future__ import annotations
 
+import dataclasses
+import os
 import time
 import unittest
 
@@ -26,10 +29,27 @@ from .support import PgTestCase
 class PauseDateeTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        for name in ("worker", "other", "third", "mesh-design"):
+        for name in ("worker", "other", "third"):
             registry.upsert(self.db, name, harness="deepseek", host=self.cfg.host,
                             cwd=self.tmp)
+        registry.upsert(self.db, "mesh-design", chantier="ameesh",
+                        harness="deepseek", host=self.cfg.host, cwd=self.tmp)
         self.host = self.cfg.host
+        self.canon = self._pilot_canon()
+
+    def _pilot_canon(self) -> str:
+        """Un canon minimal : `mesh-design` y tient le rôle d'orchestrateur.
+
+        Le destinataire de l'avis de pose se lit au canon (#7660), jamais
+        d'un nom écrit dans le cœur : le banc le déclare donc comme le vrai
+        canon du mesh le fait."""
+        root = os.path.join(self.tmp, "canon-8391")
+        agents = os.path.join(root, "agents")
+        os.makedirs(agents, exist_ok=True)
+        with open(os.path.join(agents, "mesh-design.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\ntype: Agent\ntitle: mesh-design\nteam: ameesh\n"
+                     "roles: [orchestrateur]\nharness: claude\n---\n")
+        return root
 
     def pause(self, name="worker", **kw):
         args = dict(paused=True, reason="maintenance PR #1078", actor="human:alice")
@@ -107,9 +127,12 @@ class PauseDateeTest(PgTestCase):
 
     # -- avis de pose ------------------------------------------------------
 
-    def notifier(self):
-        return notify.Notifier(self.cfg, notify.parse_config({"default": []}),
-                               state={}, log=lambda text: None)
+    def notifier(self, *, canon=True, log=lambda text: None):
+        cfg = (dataclasses.replace(self.cfg, canon=self.canon,
+                                   canon_untrusted=True, canon_ref="",
+                                   project="ameesh") if canon else self.cfg)
+        return notify.Notifier(cfg, notify.parse_config({"default": []}),
+                               state={}, log=log)
 
     def messages(self):
         return self.db.query(
@@ -160,6 +183,14 @@ class PauseDateeTest(PgTestCase):
         self.age("worker", 10, until_in=-1)
         notifier._pause_pose_notices(self.db, time.time())
         self.assertEqual(self.messages(), [])
+
+    def test_sans_pilote_lisible_aucun_avis_et_le_journal_le_dit(self):
+        logs = []
+        notifier = self.notifier(canon=False, log=logs.append)
+        self.pause(until=time.time() + 4 * 3600)
+        notifier._pause_pose_notices(self.db, time.time())
+        self.assertEqual(self.messages(), [])
+        self.assertTrue(any("no readable pilot" in line for line in logs), logs)
 
 
 if __name__ == "__main__":
