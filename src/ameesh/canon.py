@@ -302,7 +302,12 @@ def _normalize(value: Any, memo: dict | None = None) -> Any:
 
 
 if _yaml is not None:
-    class _StrictLoader(_yaml.SafeLoader):  # type: ignore[misc,name-defined]
+    # #8474 : le lecteur C de libyaml quand PyYAML le fournit (2 à 3 fois plus
+    # rapide sur une fiche) ; le refus des clés en double est réinstallé
+    # au-dessus, comme sur SafeLoader. `use_pyyaml=False` garde `_MiniYaml`.
+    _SafeLoader = getattr(_yaml, "CSafeLoader", _yaml.SafeLoader)
+
+    class _StrictLoader(_SafeLoader):  # type: ignore[misc,name-defined]
         """SafeLoader qui refuse les clés en double (deux `responsible:` = ambigu)."""
 
     def _strict_mapping(loader, node, deep=False):

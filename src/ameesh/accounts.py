@@ -157,7 +157,9 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Callable, NamedTuple
 
@@ -234,6 +236,17 @@ PACE_CEILING_END_HOURS = 6.0
 CEILING_REASON_END = "end of window, overage impossible"
 
 
+#: #8474 : durée de vie des clés de compte lues au descripteur. `home()` les
+#: demande pour chaque compte à chaque `pick` ; chaque demande faisait un scan
+#: complet des descripteurs. Le nom d'une variable ou d'un dossier de compte ne
+#: change qu'à une livraison de descripteur : le TTL suffit, et `harnesses.get`
+#: reste l'autorité au moment de l'usage qui lance un harnais.
+ACCOUNT_KEY_TTL_S = 60.0
+_ACCOUNT_KEYS: dict[tuple[str, str, str], tuple[float, str]] = {}
+_ACCOUNT_KEYS_LOCK = threading.Lock()
+_ACCOUNT_KEYS_MAX = 256
+
+
 def _account_key(harness: str, key: str, default: str = "") -> str:
     """Une clé de compte déclarée par le descripteur du harnais (L16, R22).
 
@@ -241,11 +254,24 @@ def _account_key(harness: str, key: str, default: str = "") -> str:
     inconnu n'a simplement pas de valeur, et un harnais nouveau se décrit dans
     son descripteur (`ameesh.accounts`).
     """
+    cache_key = (harnesses.host_dir(), harness, key)
+    now = time.monotonic()
+    with _ACCOUNT_KEYS_LOCK:
+        cached = _ACCOUNT_KEYS.get(cache_key)
+    if cached is not None and now - cached[0] < ACCOUNT_KEY_TTL_S:
+        return cached[1] or default
     descriptor = harnesses.get(harness)
     if descriptor is None:
+        # harnais absent : ne pas garder le manque, un descripteur peut être
+        # installé pendant la vie du processus
         return default
-    value = descriptor.accounts.get(key)
-    return str(value) if isinstance(value, str) and value else default
+    raw = descriptor.accounts.get(key)
+    value = str(raw) if isinstance(raw, str) and raw else ""
+    with _ACCOUNT_KEYS_LOCK:
+        _ACCOUNT_KEYS[cache_key] = (now, value)
+        while len(_ACCOUNT_KEYS) > _ACCOUNT_KEYS_MAX:
+            del _ACCOUNT_KEYS[next(iter(_ACCOUNT_KEYS))]
+    return value or default
 
 
 def config_env_of(harness: str) -> str:
@@ -584,10 +610,12 @@ def parse(raw) -> dict[str, list[Profile]]:
     if not isinstance(raw, dict):
         raise AccountError("`accounts` must be an object {harness: [profiles]}")
     out: dict[str, list[Profile]] = {}
+    # #8474 : un seul scan des descripteurs par lecture, pas un par harnais
+    known = harnesses.known_ids()
     for harness, items in raw.items():
-        if harness not in harnesses.known_ids():
+        if harness not in known:
             raise AccountError("unknown harness in `accounts`: %r (known descriptors: %s)"
-                               % (harness, ", ".join(harnesses.known_ids()) or "none"))
+                               % (harness, ", ".join(known) or "none"))
         if not isinstance(items, list) or not items:
             raise AccountError("`accounts.%s` must be a non-empty list" % harness)
         seen: set[str] = set()
@@ -759,10 +787,14 @@ def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
     (`sous_utilisation._declared_profiles`) : le rythme retombait à ×1 sans
     alerte, et la sous-utilisation disparaissait — la CI du 16/10 a rougi là
     (`test_le_rythme_percu_suit_le_multiplicateur_du_profil`)."""
+    # #8474 : un seul compte `config_dir` ne peut pas déclarer deux fois le
+    # même dossier ; `home()` interroge les descripteurs (un scan) et c'était
+    # payé à chaque `pick` pour rien.
+    config_dirs = [item for item in profiles if item.kind == "config_dir"]
+    if len(config_dirs) < 2:
+        return
     seen: dict[str, tuple[str, bool]] = {}
-    for profile in profiles:
-        if profile.kind != "config_dir":
-            continue
+    for profile in config_dirs:
         home = os.path.realpath(profile.home())
         declare = bool(profile.path)
         if home in seen:
@@ -925,10 +957,56 @@ def public_profiles(raw) -> dict:
 # #3647 : rythme compilé du canon (§11, décision owner #141793 a)
 # --------------------------------------------------------------------------
 
-#: durée de vie de la règle de rythme lue au canon, par configuration : la
-#: compilation coûte une lecture Git, et `profiles` est lu à chaque tour
+#: durée de vie de la règle de rythme lue au canon, par canon configuré : la
+#: résolution coûte une découverte Git, et `profiles` est lu à chaque tour
 CANON_PACE_TTL_S = 60.0
-_CANON_PACE: dict = {}
+#: #8474 : nombre maximal de canons configurés gardés. Le cache n'est plus vidé
+#: en bloc à 16 entrées : un exécuteur à 30 workers avait une configuration par
+#: worker, la 17e vidait tout, et presque chaque `pick` repartait en lecture du
+#: canon (0,7–1,5 cœur au repos).
+CANON_PACE_MAX = 1024
+
+#: règle compilée par canon **configuré**, et non par objet de configuration :
+#: `identité -> (garde, instant, (règle, erreur))`. L'identité (chemins,
+#: références, modes) est la même pour tous les workers d'un exécuteur, qui
+#: partagent donc une seule découverte par TTL, quel que soit leur nombre.
+#: Sans canon configuré (bancs, CLI), la clé est `("cfg", id(cfg))` et la garde
+#: est l'objet lui-même : un id réutilisé après ramassage ne sert pas la valeur
+#: d'un autre. Un commit est immuable ; c'est la résolution de la configuration
+#: qui est soumise au TTL, et le document compilé reste partagé par commit
+#: exact dans `mechanics._CONFIGURED`.
+_CANON_PACE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_CANON_PACE_LOCK = threading.Lock()
+
+
+def _pace_key(cfg):
+    """Clé de cache du rythme : identité du canon configuré, ou objet local.
+
+    `(chemin, référence, non approuvé)` par canon, dans l'ordre : deux objets
+    de configuration qui lisent le même canon ont la même clé, et donc la même
+    règle de rythme. Sans canon configuré (bancs, CLI, tests), la clé reste
+    l'objet : un id réutilisé ne doit pas servir une valeur étrangère."""
+    from . import canon as canon_mod
+    entries = canon_mod.configured(cfg)
+    if not entries:
+        return ("cfg", id(cfg))
+    return tuple((entry.path, getattr(entry, "ref", ""),
+                  bool(getattr(entry, "untrusted", False)))
+                 for entry in entries)
+
+
+def _pace_remember(key, value) -> None:
+    """Insère en queue de l'ordre LRU et retire les plus anciennes entrées."""
+    _CANON_PACE[key] = value
+    _CANON_PACE.move_to_end(key)
+    while len(_CANON_PACE) > CANON_PACE_MAX:
+        _CANON_PACE.popitem(last=False)
+
+
+def _pace_fresh(key, cached, cfg, now) -> bool:
+    if cached is None or now - cached[1] >= CANON_PACE_TTL_S:
+        return False
+    return cached[0] is cfg if key[0] == "cfg" else True
 
 
 def canon_pace(cfg, *, now: float | None = None):
@@ -939,23 +1017,32 @@ def canon_pace(cfg, *, now: float | None = None):
     `(None, erreur)` : canon illisible. Dans les deux derniers cas, le réglage
     local de l'hôte reste appliqué et l'alerte `account_pace_local` le dit
     (`pace_drift`) — jamais un rythme local en silence.
+
+    #8474 : la valeur est mise en cache par canon configuré, la même clé pour
+    tous les workers d'un exécuteur — ils avaient une configuration par worker
+    et le cache, vidé à 16 entrées, repartait en lecture à presque chaque
+    `pick`. La découverte est refaite au plus tard `CANON_PACE_TTL_S` après la
+    dernière : une référence qui avance est relue une fois pour tous les
+    workers, et le cache n'est jamais vidé en bloc.
     """
-    from . import mechanics
     now = time.monotonic() if now is None else now
-    key = id(cfg)
+    key = _pace_key(cfg)
     cached = _CANON_PACE.get(key)
-    if cached is not None and cached[0] is cfg and now - cached[1] < CANON_PACE_TTL_S:
+    if _pace_fresh(key, cached, cfg, now):
         return cached[2]
-    try:
-        value = (mechanics.configured(cfg).accounts, "")
-    except mechanics.MechanicsError as exc:
-        value = (None, str(exc))
-    except Exception as exc:  # noqa: BLE001 — lecture Git : le réglage local tient, signalé
-        value = (None, "canon unreadable: %s" % exc)
-    if len(_CANON_PACE) >= 16:
-        _CANON_PACE.clear()
-    _CANON_PACE[key] = (cfg, now, value)
-    return value
+    with _CANON_PACE_LOCK:
+        cached = _CANON_PACE.get(key)
+        if _pace_fresh(key, cached, cfg, now):
+            return cached[2]
+        from . import mechanics
+        try:
+            value = (mechanics.configured(cfg).accounts, "")
+        except mechanics.MechanicsError as exc:
+            value = (None, str(exc))
+        except Exception as exc:  # noqa: BLE001 — lecture Git : le réglage local tient, signalé
+            value = (None, "canon unreadable: %s" % exc)
+        _pace_remember(key, (cfg if key[0] == "cfg" else None, now, value))
+        return value
 
 
 def with_canon_pace(cfg, declared: dict[str, list[Profile]]) -> dict[str, list[Profile]]:

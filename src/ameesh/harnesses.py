@@ -36,6 +36,8 @@ import json
 import os
 import re
 import stat
+import threading
+import time
 from dataclasses import dataclass, field
 from string import Formatter
 from typing import Any, Iterable, Mapping
@@ -1509,8 +1511,39 @@ def get(harness: str, host: str | None = None) -> HarnessDescriptor | None:
     return scan(host=host)[0].get(harness)
 
 
+#: #8474 : durée de vie des identifiants connus. `accounts.parse` les relit à
+#: chaque `pick` ; un scan relit tous les descripteurs (fichiers, JSON,
+#: validation), et un exécuteur à 30 workers en faisait plusieurs par tour.
+KNOWN_IDS_TTL_S = 60.0
+#: identifiants connus, par `(dossier du paquet, dossier de l'hôte)`
+_KNOWN_IDS: dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
+_KNOWN_IDS_LOCK = threading.Lock()
+#: nombre de couples de dossiers gardés (l'hôte en configure un ou deux)
+_KNOWN_IDS_MAX = 64
+
+
 def known_ids(host: str | None = None) -> list[str]:
-    return sorted(scan(host=host)[0])
+    """Les identifiants des descripteurs connus (paquet, puis hôte).
+
+    #8474 : gardés `KNOWN_IDS_TTL_S` par couple de dossiers — un descripteur
+    ajouté ou retiré est vu au plus tard à l'expiration, sans relire et
+    revalider tous les fichiers à chaque tour. Le scan reste l'autorité : un
+    descripteur devenu invalide n'est jamais lancé, `get`/`adapter_for`
+    relisent la fiche au moment de l'usage.
+    """
+    host = host_dir() if host is None else host
+    key = (package_dir(), host)
+    now = time.monotonic()
+    with _KNOWN_IDS_LOCK:
+        cached = _KNOWN_IDS.get(key)
+    if cached is not None and now - cached[0] < KNOWN_IDS_TTL_S:
+        return list(cached[1])
+    identifiers = tuple(sorted(scan(host=host)[0]))
+    with _KNOWN_IDS_LOCK:
+        _KNOWN_IDS[key] = (now, identifiers)
+        while len(_KNOWN_IDS) > _KNOWN_IDS_MAX:
+            del _KNOWN_IDS[next(iter(_KNOWN_IDS))]
+    return list(identifiers)
 
 
 def avatar_problems(descriptor: HarnessDescriptor) -> list[str]:
