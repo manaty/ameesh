@@ -13,6 +13,9 @@ no cluster or cloud credential.
 * return: the `busy` hook must answer before any claim reopens. After a host
   that was actually released, a *new* reading must also exist (the VM booted);
   a host that was only draining accepts a fresh post-withdrawal reading;
+  #8419: an automatic withdrawal also comes back for the first unassigned lot
+  the debit calls startable, when only stopped hosts hold a free agent for it
+  (one host per project, no idle capacity already open elsewhere);
 * runs: they come from the host measure of part A (#4147, §2.1), never from
   the hook (`busy`, `draining`, `idle-drained` only, owner decision §3.3).
   A host declares them through `runs_interface` (Host card or the
@@ -47,7 +50,7 @@ import subprocess
 import sys
 import time
 
-from . import host_lifecycle, host_idle, resources, storage
+from . import host_lifecycle, host_idle, projects as projects_mod, resources, storage
 from . import host_holds
 
 #: the only states the owner decided the hook receives (§3.3)
@@ -367,7 +370,139 @@ def _dated_manual_drain(control):
             and resources.finite_float(control.get("return_ts")) is not None)
 
 
-def return_targets(control, listing, controls, *, known_hosts, holds):
+def startable_unassigned_lots(db, lots, *, now=None):
+    """#8419: the unassigned lots the debit's own filter calls startable.
+
+    The reads are the shared ones: `waiting_project_lots` (no assignee, no
+    external executor, not a backlog item), `planned_waits` (dependency,
+    engagement, scheduled start), then `footprint_blockers` (#3185/#4561) and
+    `split_startable` (#4699). Using the debit's chain is the point: a lot the
+    debit does not call startable must not wake a VM. Unreadable evidence
+    returns `[]`: a wrong wake costs a host, a missed one is decided again at
+    the next pass.
+    """
+    from . import planned_waits, sous_utilisation, work_lifecycle as lifecycle
+    try:
+        # #8194: an open follow-up is neither a startable lot nor work in
+        # progress for the debit; it must not wake a host either.
+        lots = [lot for lot in lots or () if not lifecycle.is_follow_up(lot)]
+        waiting = sous_utilisation.waiting_project_lots(lots)
+        if not waiting:
+            return []
+        waits = planned_waits.read(db, waiting, now=now)
+        footprint = sous_utilisation.footprint_blockers(db, waiting, lots)
+        startable, _blocked = sous_utilisation.split_startable(waiting, waits,
+                                                               footprint)
+        return startable
+    except Exception:  # noqa: BLE001 - a wake is never worth a crash or a guess
+        return []
+
+
+def _free_placed_agent(row):
+    """#8419: a placed agent with no work of its own to give a lot to.
+
+    On a stopped host the runner lease is gone, so this reads the registry
+    row, unlike `idle_agents` (which requires a live lease). A reviewer or an
+    elected role is not roadmap capacity; an auth-blocked agent takes no turn
+    (`review_designation.AUTH_BLOCKED_PREFIX`, #8199).
+    """
+    from . import progress, review_designation as rd, sous_utilisation
+    from .roles import CRITICAL_ROLES
+    if row.get("mode") not in (None, "execute"):
+        return False
+    if row.get("releve") in ("election", "preference"):
+        return False
+    if row.get("ephemeral") or row.get("retired_ts") is not None:
+        return False
+    if rd.reviewer_role(row) or sous_utilisation.row_has_role(row, CRITICAL_ROLES):
+        return False
+    if progress.agent_state(row) != "idle":
+        return False
+    if str(row.get("status_text") or "").strip().lower().startswith(
+            rd.AUTH_BLOCKED_PREFIX):
+        return False
+    return not (int(row.get("actionable_lots") or 0)
+                or int(row.get("unread") or 0)
+                or row.get("has_pending_prompt")
+                or row.get("restart_requested_ts") is not None)
+
+
+def _best_wake_host(counts):
+    """The host with the most free agents for a project; the name breaks ties."""
+    if not counts:
+        return None
+    return sorted(counts, key=lambda host: (-counts[host], host))[0]
+
+
+def _unassigned_wake_hosts(listing, controls, startable, *, known_hosts, holds):
+    """#8419: `{project: host}` — the one host a startable lot wakes.
+
+    A lot wakes **one** host, not every stopped host that could take it: among
+    the automatic withdrawals holding a free placed agent for the lot's
+    project, the host with the most such agents wins (a stable name breaks
+    ties). An idle agent already on an open host is capacity for that project,
+    so nothing is woken: the open host takes the lot.
+
+    An agent admitted on another open host is left to the relocation path,
+    like the assigned-work branch. A lot without a known project wakes the
+    host with the most free agents only when no open idle capacity exists at
+    all (a missing project is never guessed into an arbitrary one).
+    """
+    from . import file_decoupage, sous_utilisation
+    if not startable:
+        return {}
+    open_hosts = _open_hosts(controls, known_hosts, holds)
+    # The open-capacity read must not count the drained hosts as open: they
+    # are not in `_open_hosts`, and a host outside `known_hosts` still carries
+    # a known control.
+    closed = ({host for host in known_hosts if host not in open_hosts}
+              | {host for host in (controls or {}) if host not in open_hosts}
+              | set(holds or {}))
+    # `wakeable` is the canon's capacity filter (no critical role, reviewer,
+    # elected role, paused/stopped executor); the registry `roles` projection
+    # is enough, no canon read here. `idle_agents` then keeps agents at rest.
+    open_pool = file_decoupage.wakeable(listing, (), configured=False,
+                                        closed_hosts=closed)
+    idle_open = sous_utilisation.idle_agents(
+        open_pool, 0.0, 0.0, waiting_free=True, actionable_idle=True)
+    open_projects = set()
+    for row in idle_open:
+        open_projects.update(projects_mod.agent_projects(row))
+    counts: dict = {}
+    totals: dict = {}
+    for row in listing or ():
+        host = row.get("host")
+        control = (controls or {}).get(host)
+        if control is None or not control.get("automatic"):
+            # A manual drain is an operator window; only #8129's own causes
+            # (assigned work, mail) or `ameesh host undrain` end it.
+            continue
+        if control.get("mode") not in ("draining", "returning"):
+            continue
+        if host in (holds or {}) or not _free_placed_agent(row):
+            continue
+        admitted = [other for other in (row.get("admitted_hosts") or ()) if other]
+        if not admitted or host not in admitted:
+            continue
+        if any(other in open_hosts and other != host for other in admitted):
+            continue
+        totals[host] = totals.get(host, 0) + 1
+        for project in projects_mod.agent_projects(row):
+            per_host = counts.setdefault(project, {})
+            per_host[host] = per_host.get(host, 0) + 1
+    chosen: dict = {}
+    for lot in startable:
+        project = projects_mod.lot_project(lot)
+        if project is None:
+            if not open_projects:
+                chosen.setdefault(None, _best_wake_host(totals))
+        elif project not in open_projects:
+            chosen.setdefault(project, _best_wake_host(counts.get(project, {})))
+    return {project: host for project, host in chosen.items() if host}
+
+
+def return_targets(control, listing, controls, *, known_hosts, holds,
+                   startable=()):
     """Agents whose pending work can only run on this withdrawn host.
 
     An elected role moves by election, never by waking a drained host. An
@@ -376,7 +511,14 @@ def return_targets(control, listing, controls, *, known_hosts, holds):
 
     #8129: during a dated manual drain, unread mail calls the host back only
     when it is `--urgent`; ordinary mail waits for the announced return. An
-    automatic drain (#8029) keeps waking on any mail, that is its purpose."""
+    automatic drain (#8029) keeps waking on any mail, that is its purpose.
+
+    #8419: `startable` (the unassigned lots of `startable_unassigned_lots`)
+    is one more cause, for an **automatic** drain only: a free placed agent
+    on the selected host for the lot's project wakes it when no open host
+    already has idle capacity for that project. A manual drain stays the
+    operator's window.
+    """
     if not control or control.get("mode") not in ("draining", "returning"):
         return []
     host = control.get("host")
@@ -384,6 +526,12 @@ def return_targets(control, listing, controls, *, known_hosts, holds):
         return []
     open_hosts = _open_hosts(controls, known_hosts, holds)
     mail_key = "urgent_unread" if _dated_manual_drain(control) else "unread"
+    wake_projects: set = set()
+    if control.get("automatic") and startable:
+        chosen = _unassigned_wake_hosts(listing, controls, startable,
+                                        known_hosts=known_hosts, holds=holds)
+        wake_projects = {project for project, chosen_host in chosen.items()
+                         if chosen_host == host}
     out = []
     for row in listing or ():
         if row.get("host") != host or row.get("releve") in ("election", "preference"):
@@ -393,6 +541,11 @@ def return_targets(control, listing, controls, *, known_hosts, holds):
         work = bool(row.get("actionable_lots") or row.get(mail_key)
                     or row.get("has_pending_prompt")
                     or row.get("restart_requested_ts"))
+        if not work and wake_projects:
+            agent_projects = set(projects_mod.agent_projects(row))
+            work = ((None in wake_projects or bool(agent_projects & wake_projects))
+                    and _free_placed_agent(row)
+                    and host in (row.get("admitted_hosts") or ()))
         if not work:
             continue
         admitted = [h for h in (row.get("admitted_hosts") or ()) if h]
@@ -670,7 +823,7 @@ def _draining_acknowledged(api, row):
 
 
 def _advance(cfg, api, db, row, *, controls, listing, canons, canon_unknown,
-             holds, known, actor, runner, now, clock):
+             holds, known, actor, runner, now, clock, startable=()):
     """One transition decision for a controlled host. Returns a short reason."""
     host = row["host"]
     mode = row.get("mode")
@@ -720,7 +873,7 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, canon_unknown,
     ci = ci_wake_evidence(db, host, now=now,
                           released_ts=resources.finite_float(row.get("released_ts")))
     need_return = (return_targets(row, listing, controls, known_hosts=known,
-                                  holds=holds)
+                                  holds=holds, startable=startable)
                    or row.get("return_requested_ts") is not None
                    or ci.get("state") == "waiting")
     reading = _fresh_reading(cfg, db, host, now=now,
@@ -965,7 +1118,7 @@ def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
     # The expensive work views are read only when a controlled host needs them
     # or the local idle scan is due, never on a quiet pass.
     cache = {"listing": None, "canons": None, "canon_unknown": False,
-             "holds": None, "known": None}
+             "holds": None, "known": None, "startable": None}
 
     def _listing():
         if cache["listing"] is None:
@@ -974,6 +1127,16 @@ def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
             except Exception:
                 cache["listing"] = None
         return cache["listing"]
+
+    def _startable():
+        """#8419: the unassigned startable lots, read once per pass."""
+        if cache["startable"] is None:
+            try:
+                lots = storage.of(db).operations.open_lots_activity(None)
+                cache["startable"] = startable_unassigned_lots(db, lots, now=now)
+            except Exception:
+                cache["startable"] = []
+        return cache["startable"]
 
     def _canons():
         if cache["canons"] is None:
@@ -1022,7 +1185,8 @@ def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
                 _advance(cfg, api, db, row, controls=controls, listing=_listing(),
                          canons=_canons(), canon_unknown=cache["canon_unknown"],
                          holds=_holds(), known=_known(),
-                         actor=actor, runner=runner, now=now, clock=clock)
+                         actor=actor, runner=runner, now=now, clock=clock,
+                         startable=_startable())
             except (ValueError, OSError):
                 # A conflicting or malformed adapter command must not stop the
                 # other hosts; the failure is named by the next alert pass

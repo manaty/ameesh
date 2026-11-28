@@ -153,6 +153,36 @@ def undrain(cfg, db, host, *, actor=None, runner=None, clock=None):
                                        runner=runner, **kwargs)
 
 
+def wake_automatic(cfg, db, *, actor=None):
+    """#8419: request the return of every automatically withdrawn host.
+
+    The owner's `ameesh host wake --all`: a manual drain is an operator
+    window and is left alone (`ameesh host undrain HOST` ends it); a lost
+    host needs a verified `reconcile`, never a wake. Returns one row per
+    selected host, a refusal named in `error` instead of stopping the others.
+    """
+    from . import host_release
+    if actor is None:
+        actor = work.corrector(cfg, db)
+    api = storage.of(db).host_lifecycle
+    out = []
+    for control in sorted(api.listing(), key=lambda row: str(row.get("host"))):
+        if not control.get("automatic"):
+            continue
+        if control.get("mode") != "draining":
+            # `returning` already asks for its return; `available` is back;
+            # `lost` needs a verified reconcile, never a wake.
+            continue
+        try:
+            row = host_release.request_return(cfg, db, control["host"], actor=actor)
+        except ValueError as exc:
+            out.append({"host": control["host"], "error": str(exc)})
+            continue
+        if row is not None:
+            out.append(row)
+    return out
+
+
 def enter_draining(cfg, db, host, *, actor, runner=None):
     """Emit the `draining` acknowledgement of a withdrawal (best effort).
 
@@ -413,6 +443,12 @@ def main(argv=None):
     restore = commands.add_parser("undrain", help="reopen the host and request agents' return")
     restore.add_argument("host")
     restore.add_argument("--actor", help="who reopens (human:<id>) from an unbound terminal")
+    wake = commands.add_parser(
+        "wake", help="request the return of automatically drained hosts")
+    wake.add_argument("host", nargs="?")
+    wake.add_argument("--all", action="store_true", dest="all_hosts",
+                      help="every automatically drained host (manual drains are left alone)")
+    wake.add_argument("--actor", help="who wakes (human:<id>) from an unbound terminal")
     recovered = commands.add_parser(
         "reconcile", help="verified reopening of a lost host whose readings returned")
     recovered.add_argument("host")
@@ -446,6 +482,18 @@ def main(argv=None):
                              actor=work.corrector(cfg, db, args.actor))
             if result is None:
                 raise ValueError("host has no drain request")
+        elif args.command == "wake":
+            if args.all_hosts and args.host:
+                raise ValueError("host wake: name a host or --all, not both")
+            if not args.all_hosts and not args.host:
+                raise ValueError("host wake: name a host or --all")
+            actor = work.corrector(cfg, db, args.actor)
+            if args.all_hosts:
+                result = wake_automatic(cfg, db, actor=actor)
+            else:
+                result = undrain(cfg, db, args.host, actor=actor)
+                if result is None:
+                    raise ValueError("host has no drain request")
         elif args.command == "reattach":
             for name in (args.host, args.agent, args.target):
                 if not NAME_RE.fullmatch(name):
@@ -475,6 +523,9 @@ def main(argv=None):
         elif args.command == "reconcile" and result.get("mode") == "lost" and not result.get("reconciled"):
             result["next_action"] = recovery_hint(args.host, cfg.resource_interval)
         print(json.dumps(result, ensure_ascii=False))
+        if args.command == "wake" and args.all_hosts \
+                and any("error" in row for row in result):
+            return 1
         if args.command == "reconcile" and not (
                 result.get("reconciled") or result.get("mode") == "available"):
             return 1

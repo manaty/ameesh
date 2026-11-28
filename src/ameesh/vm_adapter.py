@@ -397,9 +397,9 @@ def run_probe(argv, timeout, *, pending=False):
 
 
 def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, target,
-             ci=None):
-    """Only necessary capacity: immediate work, scheduled wake, CI queue or
-    enrolled release."""
+             ci=None, startable=()):
+    """Only necessary capacity: immediate work, scheduled wake, CI queue,
+    enrolled release, or a startable unassigned lot (#8419)."""
     if host in holds:
         return False
     # #8031: a job the measured CI queue holds on labels this host's runners
@@ -412,7 +412,8 @@ def wake_due(host, control, listing, lots, controls, holds, *, now, horizon, tar
     # `canon sync` carries NULL, which `get` returns as-is: NULL means no
     # declared admission, as every other reader already treats it.
     known = {h for a in listing for h in (a.get('admitted_hosts') or ())}
-    if host_release.return_targets(control, listing, controls, known_hosts=known, holds=holds):
+    if host_release.return_targets(control, listing, controls, known_hosts=known,
+                                   holds=holds, startable=startable):
         return True
     available = host_release._open_hosts(controls, known, holds)
     eligible = {a['name'] for a in listing
@@ -657,6 +658,14 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
     prepare_elected_wake(db, policy, host, store.operations.listing(),
                          store.operations.open_lots_activity(None), controls,
                          {h['host']: h for h in store.hosts.holds()})
+    # #8419: the unassigned startable lots are a wake cause; read them before
+    # the lock (the native gate holds no work view open) and once for both
+    # `wake_due` calls. Unreadable evidence is no wake (the next tick decides).
+    try:
+        startable = host_release.startable_unassigned_lots(
+            db, store.operations.open_lots_activity(None), now=time.time())
+    except Exception:  # noqa: BLE001 - a wake is never worth a failed tick
+        startable = ()
     # Operator reconciliation may itself need the native gate. Run probes
     # outside our transaction, then revalidate generation, provider and fresh
     # reading under the gate before acknowledging. No probe opens claims.
@@ -727,14 +736,15 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
         ci = host_release.ci_wake_evidence(tx, host, now=now,
                                            released_ts=control.get('released_ts'))
         due = wake_due(host, control, listing, lots, controls, holds, now=now,
-                       horizon=delay, target=target, ci=ci)
+                       horizon=delay, target=target, ci=ci, startable=startable)
         if due or control.get('return_requested_ts') is not None or control['mode'] == 'returning':
             deadline = control.get('return_ts')
             deadline_only = (due and isinstance(deadline, (float, int))
                              and deadline <= now + delay
                              and not wake_due(host, dict(control, return_ts=None), listing,
                                               lots, controls, holds, now=now,
-                                              horizon=delay, target=target, ci=ci))
+                                              horizon=delay, target=target, ci=ci,
+                                              startable=startable))
             if deadline_only:
                 for row in q.pending_all(host):
                     if row['state'] == 'idle-drained' and current(control, row):
