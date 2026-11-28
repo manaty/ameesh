@@ -316,6 +316,15 @@ class _Package:
                 self.redirects[module] = target
         #: (module, function) running, against recursion across modules
         self.stack: list[tuple[str, str]] = []
+        #: the lowest frame of `stack` a call was cut at (recursion) in the
+        #: run going on: below that run's own frame, its effect depends on
+        #: where it was called from
+        self.cut = sys.maxsize
+        #: runs already done whatever their caller (#8455): a run only adds
+        #: to `commands` and `options`, so running it again with the same
+        #: function, bindings and `unbound` adds nothing; without this, every
+        #: path of calls ran again and the time grew with their number
+        self.done: set = set()
         #: functions called somewhere in the package: their callers say
         #: which parser they fill, so they are never also read as filling the
         #: top level (inlining such a helper, or moving it, changes nothing)
@@ -576,7 +585,10 @@ class _Parsers(ast.NodeVisitor):
         if callee is not None and self.package is not None:
             callee = self.package.resolve(callee)
             parsers, function = self.package.function(callee) if callee else (None, None)
-            if function is None or callee in self.package.stack:
+            if function is None:
+                return
+            if callee in self.package.stack:
+                self.package.cut = min(self.package.cut, self.package.stack.index(callee))
                 return
             arguments = function.args
             params = [a.arg for a in arguments.posonlyargs + arguments.args]
@@ -645,19 +657,33 @@ class _Parsers(ast.NodeVisitor):
              self.outer) = saved
 
     def run(self, function, bound: dict[str, tuple[str, ...]], unbound: bool = True):
+        """Run `function` with its parameters bound to command paths. A run
+        that cut no call at a frame of its callers (recursion) is complete:
+        it is never run again with the same bindings. One that did may miss
+        what another caller would reach (`a(p)` → `c(p)` → `a(deep)` is cut,
+        `c(p)` called alone runs `a(deep)`): it runs again on each call."""
+        package = self.package
+        key = (self.module, function.name, frozenset(bound.items()), unbound)
+        if key in package.done:
+            return
         saved = (self.env, self.consts, self.unbound, self.modules, self.imported,
                  self.local, self.outer)
         self.env, self.consts, self.unbound, self.outer = dict(bound), {}, unbound, None
         self.modules, self.imported = self.scopes[function.name]
         self.local = self.own[function.name]
-        self.package.stack.append((self.module, function.name))
+        depth, cut = len(package.stack), package.cut
+        package.cut = depth + 1
+        package.stack.append((self.module, function.name))
         try:
             for statement in function.body:
                 self.visit(statement)
         finally:
-            self.package.stack.pop()
+            package.stack.pop()
             (self.env, self.consts, self.unbound, self.modules, self.imported,
              self.local, self.outer) = saved
+        if package.cut >= depth:
+            package.done.add(key)
+        package.cut = min(cut, package.cut)
 
     def walk(self):
         for statement in self.tree.body:
