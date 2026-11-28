@@ -702,9 +702,15 @@ class SousMoissonneurTest(_Base):
             self.wait_for(lambda: ressource("running"), timeout=60, interval=0.5)
             with open(fini, "w", encoding="utf-8"):
                 pass
-            # Même tour, cette fois réellement fermé par le fil `fond`.
+            # Même tour, cette fois réellement fermé par le fil `fond`. #8484 :
+            # `orphan` est aussi une clôture. Sans cgroup délégué, un relevé
+            # pris juste avant la sortie du travail montre encore un membre
+            # vivant dont le handle est déjà mort : propriété non prouvée,
+            # ressource gardée orpheline (garde d'identité). Ce test prouve
+            # le code de sortie rendu au tour suivant, vérifié plus bas.
             self.wait_for(
-                lambda: ressource("done"), timeout=60, interval=0.5,
+                lambda: ressource("done") or ressource("orphan"),
+                timeout=60, interval=0.5,
                 msg=lambda: (f"runner exit={proc.poll()}, resources="
                              f"{self._ressources('fond-code')}\n"
                              + os.pread(sortie_fichier.fileno(), 131072, 0).decode(
