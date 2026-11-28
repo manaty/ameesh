@@ -175,8 +175,14 @@ dans le canon :
   que `env`/`key_env` sont des noms de variables publiables par
   `ameesh accounts profiles`. Sans elle, seul un nom par défaut d'un
   descripteur de harnais (ou ce nom suivi de `_` et d'un court suffixe,
-  `DEEPSEEK_API_KEY_A`) est publié ; tout autre nom l'est à `null` — une clé
-  collée par erreur à la place du nom n'est jamais recopiée.
+  `DEEPSEEK_API_KEY_A`) est publié ; tout autre nom l'est à `null`.
+  Garantie bornée : elle couvre une clé collée **par erreur** à la place du
+  nom (une clé de fournisseur porte des tirets ou des minuscules, et ne
+  commence jamais par un nom par défaut). Elle ne couvre pas une écriture
+  délibérée : une valeur en majuscules, chiffres et soulignés écrite sous
+  `public_names: true`, ou après le préfixe d'un nom par défaut, est
+  recopiée telle quelle. N'attester `public_names` qu'après avoir relu les
+  noms du profil.
 * `adopts_unnamed: true` (facultatif, `api_key_env`, #4944) : déclare que
   **tous les relevés de solde sans compte de ce fournisseur** appartiennent à
   ce profil. Une seule adoption est permise par fournisseur ; sa valeur est
