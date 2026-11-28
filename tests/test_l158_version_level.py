@@ -15,7 +15,9 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("version_level_l158",
@@ -316,6 +318,32 @@ class VersionLevelTest(unittest.TestCase):
         self._commit("1.2.3", "by name")
         self.assertEqual(vl.level("case-base", "HEAD")[0], "patch")
 
+    def test_a_run_cut_by_recursion_runs_again_from_another_caller(self):
+        # #8455: `a(sub)` → `c(sub)` → `a(deep)` is cut (`a` runs); `c(sub)`
+        # called alone runs `a(deep)`: a memo of the first `c(sub)` would
+        # lose `deep a`
+        cli = ('def a(s):\n    s.add_parser("a")\n    c(s)\n\n\n'
+               'def c(s):\n    deep = s.add_parser("deep").add_subparsers()\n    a(deep)\n\n\n'
+               'def build(sub):\n    a(sub)\n    c(sub)\n')
+        self._git("checkout", "-q", "-B", "case", "v1.2.3")
+        self._write("src/ameesh/cli.py", cli)
+        self._commit("1.2.3", "cli")
+        self.assertEqual(vl.surface("HEAD")["command"], {"a", "deep", "deep a"})
+
+    def test_each_run_happens_once_whatever_the_paths_of_calls(self):
+        # #8455: twenty helpers, each calling the next twice, were 2^20 runs
+        cli = "".join('def f%d(p):\n    f%d(p)\n    f%d(p)\n\n\n' % (i, i + 1, i + 1)
+                      for i in range(20))
+        cli += ('def f20(p):\n    p.add_argument("--deep")\n\n\n'
+                'def build(sub):\n    f0(sub.add_parser("run"))\n')
+        self._git("checkout", "-q", "-B", "case", "v1.2.3")
+        self._write("src/ameesh/cli.py", cli)
+        self._commit("1.2.3", "cli")
+        with mock.patch.object(vl._Parsers, "run", autospec=True,
+                               side_effect=vl._Parsers.run) as run:
+            self.assertIn("run --deep", vl.surface("HEAD")["option"])
+        self.assertLess(run.call_count, 100)
+
     def test_a_command_moved_to_a_module_through_a_deprecated_alias_stays_present(self):
         # #4719: `ameesh.merge_pr` is only `sys.modules[__name__] = _moved`
         # (#4382); the parser its callers register is the real module's, so
@@ -519,6 +547,21 @@ class WorkflowTest(unittest.TestCase):
         # (tests/test_3251_agregat_annulation.py, témoin dédié).
         self.assertLess(text.index('--version "${{ needs.version.result }}"'),
                         text.index("--version-only"))
+
+
+class SurfaceDurationTest(unittest.TestCase):
+    """#8455: the surface of the repository itself stays well below the 300 s
+    `release_cutoff.version_floor` gives a range (two surfaces)."""
+
+    def test_the_repository_surface_is_well_below_a_minute(self):
+        if not (ROOT / ".git").exists():
+            self.skipTest("not a git checkout")
+        self.addCleanup(setattr, vl, "REPO", vl.REPO)
+        vl.REPO = str(ROOT)
+        started = time.process_time()
+        found = vl.surface("HEAD")
+        self.assertLess(time.process_time() - started, 60.0)
+        self.assertIn("work show", found["command"])
 
 
 if __name__ == "__main__":

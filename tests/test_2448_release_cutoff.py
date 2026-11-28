@@ -782,6 +782,27 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         with self.assertRaises(release_cutoff.ReleaseError):
             release_cutoff.next_version("1.11.7", bump="patch", floor="unknown")
 
+    def test_a_version_level_timeout_is_named_in_the_refusal(self):
+        """#8455: a run past the bound says so, not a bare unknown level."""
+        self.write("src/ameesh/migrations/0499_test.sql",
+                   "alter table example add column extra integer;\n")
+        self.commit("new migration")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        real = subprocess.run
+
+        def run(argv, *args, **kwargs):
+            if "level" in argv:
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return real(argv, *args, **kwargs)
+
+        with mock.patch.object(release_cutoff, "ci_reading",
+                               return_value={"green": True}), \
+                mock.patch.object(release_cutoff.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(release_cutoff.ReleaseError,
+                                        r"level is unknown \(version-level.py: 300 s "
+                                        r"timeout exceeded\): no release"):
+                release_cutoff.build_plan(self.cfg, self.project, now=_paris(11, 5))
+
     def test_patch_override_refuses_an_untagged_major_bump(self):
         """B4: an untagged major bump is refused even under a patch override."""
         project = dataclasses.replace(self.project, version_bump="patch")

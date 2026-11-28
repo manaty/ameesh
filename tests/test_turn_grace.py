@@ -19,6 +19,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -667,8 +668,20 @@ class SousMoissonneurTest(_Base):
         os.makedirs(cwd, exist_ok=True)
         self.register("fond-code", "claude", cwd=cwd, prompt="lance le travail")
         fini = os.path.join(self.tmp, "travail-fini")
-        proc = self.runner_popen(
-            "--agents", "fond-code", "--poll", "1",
+        # Le vrai fil de suivi reste actif, mais son attente de 5 s en service
+        # ajoute une latence inutile à ce test de bout en bout. Ce réglage ne
+        # concerne que le processus enfant, pas les exécuteurs en service.
+        lanceur = (
+            "import runpy; from ameesh.background import Tracker; "
+            "Tracker.TICK_S = 0.2; runpy.run_module('ameesh.runner', run_name='__main__')"
+        )
+        # Un tube non lu peut remplir son tampon et bloquer le fil de suivi
+        # lorsqu'il journalise. Le fichier garde aussi le diagnostic d'un échec.
+        sortie_fichier = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+        self.addCleanup(sortie_fichier.close)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", lanceur, "--agents", "fond-code", "--poll", "1"],
+            stdout=sortie_fichier, stderr=subprocess.STDOUT, text=True, cwd=self.tmp,
             env=self.env(AMEESH_TEST_BACKGROUND=(
                 "while [ ! -e %s ]; do sleep 0.1; done; exit 3" % shlex.quote(fini)),
                          AMEESH_TURN_GRACE_SECONDS="120"))
@@ -690,12 +703,20 @@ class SousMoissonneurTest(_Base):
             with open(fini, "w", encoding="utf-8"):
                 pass
             # Même tour, cette fois réellement fermé par le fil `fond`.
-            self.wait_for(lambda: ressource("done"), timeout=60, interval=0.5)
+            self.wait_for(
+                lambda: ressource("done"), timeout=60, interval=0.5,
+                msg=lambda: (f"runner exit={proc.poll()}, resources="
+                             f"{self._ressources('fond-code')}\n"
+                             + os.pread(sortie_fichier.fileno(), 131072, 0).decode(
+                                 "utf-8", errors="replace")),
+            )
             mail.send(self.db, "pair", "fond-code", "et ensuite ?")
             self.wait_for(lambda: len(self.turns()) >= 2, timeout=60)
         finally:
             proc.terminate()
-            sortie, _ = proc.communicate(timeout=60)
+            proc.wait(timeout=60)
+            sortie_fichier.seek(0)
+            sortie = sortie_fichier.read()
         self.assertIn("exit code 3", self.turns()[1]["argv"][-1], sortie)
 
 
