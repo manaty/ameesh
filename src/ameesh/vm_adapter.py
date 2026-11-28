@@ -25,6 +25,14 @@ state observed after our halt intent, plus a muted SSH witness
 (`halted_argv`), proves the halt; the provider `poweroff` (archive) then runs
 only if the server GET lists it in `allowed_actions`. A running VM is never
 powered off, whatever SSH says; past `halt_deadline_s` the worker alerts.
+
+#8420: a target enrolled `replica: true` carries a synchronous standby of the
+hub's database. Its `standby_enter_argv` (deploy/serveur/replication/
+mode-veille.sh entrer) runs after each quiesce of its halt phase, before the
+halt intent and again before the halt: no halt while it fails. Its
+`standby_exit_argv` (mode-veille.sh sortir) runs once its return is healthy
+and every replica target is back; a failure is journalled and alerted
+(`vm.standby_exit_failed`), the return itself stands.
 """
 from __future__ import annotations
 
@@ -152,6 +160,16 @@ def enrollment(value, *, local_host=None):
             raise Refused('positive adapter timing required')
     if value['io_timeout_s'] > 10:
         raise Refused('external call timeout exceeds 10 seconds')
+    # #8420: the standby commands wait for turns or for a replica to catch up,
+    # longer than an I/O call; their own bound is explicit once a replica is
+    # enrolled. The operator's argv bounds its waits below it (README).
+    targets = value.get('targets')
+    if isinstance(targets, dict) and any(
+            isinstance(t, dict) and t.get('replica') is True for t in targets.values()):
+        bound = value.get('standby_timeout_s')
+        if (isinstance(bound, bool) or not isinstance(bound, (float, int)) or not math.isfinite(bound)
+                or not value['io_timeout_s'] <= bound <= 120):
+            raise Refused('explicit standby timeout required (at most 120 seconds)')
     # #6074: explicit bound on the halt phase, counted from the halt intent.
     bound = value.get('halt_deadline_s')
     if (isinstance(bound, bool) or not isinstance(bound, (float, int)) or not math.isfinite(bound)
@@ -191,7 +209,14 @@ def enrollment(value, *, local_host=None):
         if identity in seen:
             raise Refused('duplicate VM mapping')
         seen.add(identity)
-        for key in ('health_argv', 'reconcile_argv', 'quiesce_argv', 'halt_argv', 'halted_argv'):
+        replica = target.get('replica', False)
+        if not isinstance(replica, bool):
+            raise Refused('replica must be true or false')
+        standby = ('standby_enter_argv', 'standby_exit_argv')
+        if not replica and any(key in target for key in standby):
+            raise Refused('standby commands require replica: true')
+        for key in ('health_argv', 'reconcile_argv', 'quiesce_argv', 'halt_argv', 'halted_argv') + (
+                standby if replica else ()):
             argv = target.get(key)
             if (not isinstance(argv, list) or not argv or not all(
                     isinstance(a, str) and a and '\x00' not in a for a in argv)
@@ -628,8 +653,8 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
     """
     tick_state = []
     try:
-        return _tick_host(cfg, db, policy, host, provider, probe=probe,
-                          evidence=evidence, tick_state=tick_state)
+        result = _tick_host(cfg, db, policy, host, provider, probe=probe,
+                            evidence=evidence, tick_state=tick_state)
     except Exception:
         if tick_state:
             try:
@@ -645,6 +670,53 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
                 # worker stall alert) carries the database side.
                 pass
         raise
+    if result == 'ready' and policy['targets'][host].get('replica'):
+        # After the commit: the return stands whatever the exit answers.
+        return standby_exit(db, policy, host, probe)
+    return result
+
+
+def replicas_back(db, policy):
+    """#8420: every replica target is back: no release, or its return done.
+
+    A completed return keeps claims closed until the native hook reopens
+    them; its `busy` request done for the live generation/epoch is the
+    healthy return (`healthy and reconciled`)."""
+    controls = {c['host']: c for c in storage.of(db).host_lifecycle.listing()}
+    q = Queue(db)
+    for name, target in policy['targets'].items():
+        if not target.get('replica'):
+            continue
+        control = controls.get(name)
+        if not control or (control['claims_open']
+                           and control['mode'] not in ('draining', 'returning')):
+            continue
+        if (control['mode'] == 'returning' and not control['claims_open']
+                and q.status(name, control['generation'], control['release_epoch'],
+                             'busy') == 'done'):
+            continue
+        return False
+    return True
+
+
+def standby_exit(db, policy, host, probe):
+    """#8420: `mode-veille.sh sortir` once every replica is back, else wait.
+
+    Idempotent on the hub (no standby mode: nothing to restore), so each
+    completed replica return may call it. A failure never undoes the return:
+    it is journalled and alerted, and the list stays empty (safe, degraded
+    durability) until an operator or the next replica return replays it."""
+    if not replicas_back(db, policy):
+        return 'ready; standby exit waits for the other replica'
+    if probe(policy['targets'][host]['standby_exit_argv'], policy['standby_timeout_s']):
+        return 'ready; standby exited'
+    control = Queue(db).control(host) or {}
+    with db.transaction() as tx:
+        tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
+                   "VALUES ('vm.standby_exit_failed',%s,NULL,%s::jsonb)",
+                   (host, json.dumps(dict(generation=control.get('generation'),
+                                          release_epoch=control.get('release_epoch')))))
+    return 'ready; standby exit failed (synchronous list left empty)'
 
 
 def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
@@ -834,6 +906,11 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
             q.refresh_stop_intent(host)
             if not probe(target['quiesce_argv'], policy['io_timeout_s']):
                 return 'quiesce pending'
+            # #8420: fail closed. No halt intent, and no halt, while the hub
+            # cannot enter standby mode (idempotent: a replay verifies it).
+            if target.get('replica') and not probe(target['standby_enter_argv'],
+                                                   policy['standby_timeout_s']):
+                return 'standby enter refused'
             if result == STOP_PREPARED:
                 q.finish(request, 'pending', HALT_INTENT)
                 return 'halt prepared'
