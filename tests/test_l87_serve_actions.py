@@ -369,7 +369,15 @@ class ActionsPgTest(PostMixin, PgTestCase):
         self.assertEqual((status, out["error"]), (400, "bad_body"))
 
     def test_drain_under_the_humans_name(self):
+        # #8384 : l'API applique la même garde d'entrée que `ameesh host
+        # drain` ; le lot du fixture, assigné à a1 sur h1, doit être déplacé
+        # hors de l'hôte avant de tester l'acteur humain.
         status, _h, out = self.post("/api/v1/hosts/h1/drain", {"duration_s": 3600})
+        self.assertEqual((status, out["error"]), (400, "bad_body"), out)
+        self.db.execute("UPDATE work_items SET assignee = 'human:owner' WHERE id = %s",
+                        (self.lot["id"],))
+        status, _h, out = self.post("/api/v1/hosts/h1/drain", {"duration_s": 3600},
+                                    key="key-0000000012")
         self.assertEqual(status, 200, out)
         self.assertEqual(out["result"]["actor"], "human:owner")
 
