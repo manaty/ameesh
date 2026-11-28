@@ -363,6 +363,12 @@ class Config:
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
+    #: #8334 : publieur d'aperçu par worker (#1349) — un fil et une connexion
+    #: PostgreSQL gardée par agent, capture toutes les 15 s. `False` coupe le
+    #: publieur pour tous les workers de cet exécuteur ; `Runner.peek()` et la
+    #: lecture `/peek` restent inchangés (instantané absent ou périmé).
+    #: Défaut actif ; `AMEESH_AGENT_PEEK=0` ou `agent_peek: false` le coupe.
+    agent_peek: bool = True
     #: L125 : fenêtre de regroupement du courrier ordinaire (secondes) — un
     #: agent au repos n'est réveillé qu'au bout de ce délai après l'arrivée
     #: du premier message, et son tour emporte tout ce qui est arrivé entre-
@@ -1275,6 +1281,10 @@ def load(env: dict | None = None, *, register_credentials: bool = True) -> Confi
             cfg.runner_liveness_interval)),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
+        # #8334 : la valeur du fichier est validée comme celle de l'environnement ;
+        # une faute de frappe ne se replie pas silencieusement sur « actif ».
+        agent_peek=bool(_as_bool(pick("AMEESH_AGENT_PEEK", default=cfg.agent_peek), True,
+                                 "AMEESH_AGENT_PEEK (config key agent_peek)")),
         mail_batch=_as_seconds(pick("AMEESH_MAIL_BATCH"),
                                _as_seconds(cfg.mail_batch, Config.mail_batch)),
         lot_wake=bool(_as_bool(pick("AMEESH_LOT_WAKE"), cfg.lot_wake, "AMEESH_LOT_WAKE")),
