@@ -203,3 +203,4 @@ test_7761_pre_act_audit  # stockage : collecte et garde de pré-geste (#7761)
 test_7865_spend_caps  # SQL: plafonds de dépense, ledger et arrêt depuis le relevé (0596) (#7865)
 
 test_7651_dev_schema_cutover  # P2 : tables/vues/ACL, garde login limité et rollback avec données (#7651)
+test_8341_fixture_states  # #8352 : réservations de fixture isolées par agent et compte
