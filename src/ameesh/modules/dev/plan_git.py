@@ -223,6 +223,77 @@ def local_commit(repo: str, rev: str, *,
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
+#: #8377 : un clone déclaré — le dépôt de référence d'un relecteur, un miroir
+#: d'hôte — n'est pas fetché par un minuteur ; un gel poussé après son dernier
+#: fetch y est absent et la lecture concluait « unavailable » (prévalidation)
+#: ou « sensitive » par doute (classe de revue, porte). La lecture d'un gel
+#: absent tente donc elle-même un fetch borné avant de conclure. Même borne
+#: que la désignation (#2561) : une forge qui ne répond pas ne tient pas le
+#: passage, et le réseau n'est touché que sur un gel réellement absent.
+FETCH_FROZEN_TIMEOUT_S = 10.0
+
+
+def _fetch_branch(branch: str) -> str:
+    """Une branche de lot utilisable comme refspec de fetch, ou ''.
+
+    Jamais une valeur qui pourrait être lue comme une option (`-…`) ou qui
+    sortirait de `refs/heads/` (`..`, `@{`, une ref déjà qualifiée, un
+    caractère de contrôle)."""
+    text = str(branch or "").strip()
+    if not text or text.startswith("-") or ".." in text:
+        return ""
+    if text.startswith("refs/") or text.endswith(".lock") or "@{" in text:
+        return ""
+    if any(ch.isspace() or ch in "~^:?*[\\" or ord(ch) < 0x20 for ch in text):
+        return ""
+    return text
+
+
+def fetch_frozen(repo: str, sha: str, branch: str = "", *,
+                 timeout: float = FETCH_TIMEOUT,
+                 deadline: Deadline | None = None) -> bool:
+    """Rapatrie la tête gelée exacte `sha` dans `repo` depuis son origine (#8377).
+
+    Le SHA exact est demandé d'abord (une forge peut servir un objet non
+    annoncé) ; la branche du lot n'est qu'un second refspec, vers une ref
+    privée `refs/ameesh/frozen/<sha>` — jamais une branche ni une cible
+    mouvante. Le fetch est explicite, borné (`timeout`, `deadline`) et
+    best-effort : toute erreur — objet non servi, réseau, remote absent —
+    rend False, et l'appelant conclut comme avant. Le commit n'est retenu
+    qu'une fois relu localement, par son identifiant complet.
+
+    Ne fetche jamais une ref symbolique : `sha` doit être un commit complet.
+    `--no-write-fetch-head` garde `FETCH_HEAD` intact : cette lecture ne doit
+    pas déplacer l'état du clone partagé (ni la date que le diagnostic de
+    fraîcheur y lit). Un appel concurrent est sans danger : la ref privée est
+    propre au SHA et les objets sont immuables."""
+    text = full_commit_id(sha)
+    if not repo or not text:
+        return False
+    forge = forge_remote(repo)
+    if forge is None:
+        return False
+    refspecs = [text]
+    name = _fetch_branch(branch)
+    if name:
+        refspecs.append("+refs/heads/%s:refs/ameesh/frozen/%s" % (name, text))
+    for refspec in refspecs:
+        try:
+            proc = _git(repo, "fetch", "--quiet", "--no-tags",
+                        "--no-write-fetch-head", "--", forge, refspec,
+                        timeout=timeout, deadline=deadline)
+        except (GitError, GitDeadline):
+            continue
+        if proc.returncode:
+            continue
+        try:
+            if _commit(repo, text, deadline=deadline):
+                return True
+        except (GitError, GitDeadline):
+            continue
+    return False
+
+
 #: #3399 : borner le relevé d'accessibilité d'un gel (revwalk sur les refs).
 REACHABLE_TIMEOUT_S = 30.0
 #: #3399 B1 : nombre de pointes heads/tags non locales qu'on accepte de

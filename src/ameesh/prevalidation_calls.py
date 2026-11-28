@@ -380,13 +380,22 @@ def parameters(cfg, project: str, *, canon_repo: str = "",
         "block-missing", "; ".join(errors[:4]) or "aucun canon ne porte de bloc prevalidation")
 
 
-def repository(cfg, db, item, head: str, *, explicit: str = "") -> str:
+def repository(cfg, db, item, head: str, *, explicit: str = "",
+               deadline: Deadline | None = None) -> str:
     """Le dépôt qui porte la tête candidate, ou ``""``.
 
     L'arbre explicite d'abord, puis le répertoire courant (le composeur est
     dans l'arbre du paquet), le worktree de l'assigné (registre) et le dépôt du
     projet. Un doute ne devine pas : un chemin qui ne porte pas le commit n'est
     pas retenu.
+
+    #8377 : un clone **déclaré** n'est pas fetché par un minuteur ; une tête
+    gelée poussée après son dernier fetch y est absente et la prévalidation
+    journalisait « aucun arbre ne porte la tête ». Après le balayage local, le
+    SHA exact est donc demandé à l'origine des clones déclarés (borné par
+    ``deadline`` et [`plan_git.FETCH_FROZEN_TIMEOUT_S`]), puis la sonde locale
+    reprend. Seul le commit exact décide : un clone qui ne l'obtient pas ne
+    change rien au doute.
     """
     wanted = (head or "").strip().lower()
     if not wanted:
@@ -399,10 +408,12 @@ def repository(cfg, db, item, head: str, *, explicit: str = "") -> str:
         except Exception:  # noqa: BLE001 - registre illisible : indice suivant
             row = {}
         candidates.append(str(row.get("cwd") or ""))
+    declared: list[str] = []
     try:
         # #6984 : le dépôt du projet et les clones déclarés par l'hôte
         # (`packet_watch`, `release`) ; un miroir bare est lu par SHA.
-        candidates.extend(lot_class.declared_repo_paths(cfg, dict(item or {})))
+        declared = lot_class.declared_repo_paths(cfg, dict(item or {}))
+        candidates.extend(declared)
     except Exception:  # noqa: BLE001 - pas de radar : indice suivant
         pass
     seen: set[str] = set()
@@ -414,8 +425,32 @@ def repository(cfg, db, item, head: str, *, explicit: str = "") -> str:
         if not top or top in seen:
             continue
         seen.add(top)
-        if plan_git._commit(top, wanted):
+        # #8377/#2851 : la sonde d'abord locale (`local_commit`) ; un clone
+        # partiel ne doit pas réveiller le promisor avant le fetch borné de
+        # la tête exacte, tenté plus bas.
+        if plan_git.local_commit(top, wanted):
             return top
+    # #8377 : la tête peut avoir été poussée après le dernier fetch du clone
+    # déclaré. Le SHA exact est demandé à l'origine de ce clone ; le commit
+    # n'est retenu qu'une fois relu localement.
+    fetched: set[str] = set()
+    branch = str((item or {}).get("branch") or "")
+    for path in declared:
+        path = os.path.expanduser(str(path or "").strip())
+        if not path or not os.path.isdir(path):
+            continue
+        top = canon_mod.git_repository(path)
+        if not top or top in fetched:
+            continue
+        fetched.add(top)
+        try:
+            if plan_git.fetch_frozen(
+                    top, wanted, branch,
+                    timeout=plan_git.FETCH_FROZEN_TIMEOUT_S,
+                    deadline=deadline):
+                return top
+        except (canon_mod.GitError, canon_mod.GitDeadline):
+            continue
     return ""
 
 
@@ -1835,7 +1870,7 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
     if deadline is None:
         deadline = caller_deadline()
     lot = int(item.get("id") or decision.get("work_item") or 0)
-    where = repository(cfg, db, item, head, explicit=repo)
+    where = repository(cfg, db, item, head, explicit=repo, deadline=deadline)
     if not where:
         return {"state": "unavailable", "cause": "selection-unsafe",
                 "why": "aucun arbre ne porte la tête %s (--prevalidation-repo)"
@@ -2003,7 +2038,7 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
     if tested:
         _journal(db, lot, skipped_text(tested))
         return {"state": "skipped", **tested, "why": skipped_text(tested)}
-    where = repository(cfg, db, item, head, explicit=repo)
+    where = repository(cfg, db, item, head, explicit=repo, deadline=deadline)
     if not where:
         key = "%s unavailable: aucun arbre ne porte" % JOURNAL_PREFIX
         _journal(db, lot, "%s %s" % (key, head[:12]), key=key)

@@ -94,29 +94,30 @@ class UnnamedTargetGitTest(unittest.TestCase):
 
     def test_a_declared_target_is_read_on_origin(self):
         # la forme de `work show` : ni `base`, ni `base_sha`, ni `head`
-        agents, _a, _b, c = self.witness()
+        agents, _a, b, c = self.witness()
         klass = lot_class.of_lot(None, 42, cfg=None, item=self.row(branch_target="main"),
                                  repo=agents, milestones=self.marks(c))
         self.assertEqual(klass["class"], "light", klass["why"])
         self.assertEqual([entry["path"] for entry in klass["files"]], ["README.md"])
         self.assertEqual(klass["target"], "main")
-        self.assertEqual(klass["base_sha"], "refs/remotes/origin/main")
+        # #8377 B1 : la cible publiée est relue, pas seulement la ref locale.
+        self.assertEqual(klass["base_sha"], b)
 
     def test_the_clone_default_target_is_read_on_origin(self):
         # sans `branch_target` ni projet : `origin/HEAD` du clone, déjà distante
-        agents, _a, _b, c = self.witness()
+        agents, _a, b, c = self.witness()
         klass = lot_class.of_lot(None, 42, cfg=None, item=self.row(),
                                  repo=agents, milestones=self.marks(c))
         self.assertEqual(klass["class"], "light", klass["why"])
-        self.assertEqual(klass["base_sha"], "refs/remotes/origin/main")
+        self.assertEqual(klass["base_sha"], b)
 
     def test_a_qualified_target_is_read_on_its_full_remote_ref(self):
-        agents, _a, _b, c = self.witness()
+        agents, _a, b, c = self.witness()
         klass = lot_class.of_lot(None, 42, cfg=None,
                                  item=self.row(branch_target="origin/main"),
                                  repo=agents, milestones=self.marks(c))
         self.assertEqual(klass["class"], "light", klass["why"])
-        self.assertEqual(klass["base_sha"], "refs/remotes/origin/main")
+        self.assertEqual(klass["base_sha"], b)
 
     def test_a_homonym_tag_does_not_mask_the_remote_target(self):
         # B1 de la relecture cx2 : `origin/main` en nom court se résout
@@ -133,7 +134,8 @@ class UnnamedTargetGitTest(unittest.TestCase):
                                      repo=agents, milestones=self.marks(d))
             self.assertEqual(klass["class"], "sensitive", (target, klass["why"]))
             self.assertFalse(klass["doubt"], klass["why"])
-            self.assertEqual(klass["base_sha"], "refs/remotes/origin/main")
+            # l'étiquette homonyme ne masque pas la cible publiée
+            self.assertEqual(klass["base_sha"], b)
             self.assertEqual([entry["path"] for entry in klass["files"]],
                              ["src/ameesh/migrations/9998_lot.sql"])
 
