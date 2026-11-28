@@ -3441,7 +3441,7 @@ def offload_host(tooling: Tooling | None = None) -> str:
         try:
             host, why = choose_offload_host(_offload_readings(hosts)) if hosts \
                 else ("", "hôtes admis indisponibles pour ce lancement")
-        except Exception as exc:  # noqa: BLE001 — illisible = local
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 — illisible = local
             host, why = "", "relevés illisibles (%s)" % _one_line(str(exc))[:160]
         if host != _OFFLOAD["host"] or _OFFLOAD["at"] is None:
             print("déport des séries heavy : %s" % (
@@ -3794,14 +3794,16 @@ def contract_tail_share(remaining: int, pending_after: int,
 
 def run_contract_modules(worktree: Path, modules: list[str], *,
                          end: float, parallel: int,
-                         tooling: Tooling | None = None) -> TestRun:
+                         tooling: Tooling | None = None,
+                         host: str | None = None) -> TestRun:
     """One isolated heavy process per module under a shared wall deadline."""
     if not modules:
         return ContractTestRun("contrats", [], None, "aucun contrat sélectionné", 0.0)
     tooling = tooling or _TOOLING
     if tooling.declared:
         return run_declared_contracts(worktree, modules, end=end, tooling=tooling)
-    host = offload_host(tooling)
+    # #8437 : `host` décidé par l'appelant (scellé dans l'attestation), sinon ici
+    host = offload_host(tooling) if host is None else host
     if host:
         return run_offloaded_contracts(worktree, modules, end=end, parallel=parallel,
                                        host=host, tooling=tooling)
@@ -3870,7 +3872,7 @@ def merge_contract_runs(modules: list[str], children: list[TestRun],
 
 
 def offload_contract_flow(worktree: Path, modules: list[str], *, end: float,
-                          host: str) -> list[TestRun] | None:
+                          host: str, parallel: int = 1) -> list[TestRun] | None:
     """#8437 : les contrats en un seul job du guest de `host`.
 
     Une seule base jetable et un seul créneau pour toute la série : le plan
@@ -3899,6 +3901,9 @@ def offload_contract_flow(worktree: Path, modules: list[str], *, end: float,
     script = prevalidation.remote_script(
         OFFLOAD_PLAN_REL, [{"driver": OFFLOAD_DRIVER, "part": 1}],
         parts_script=DEFAULT_PARTS_SCRIPT)
+    # les lanes du composeur deviennent le plancher `--parallel` de la part
+    # (#3754 : la charge mesurée du guest peut en ouvrir plus)
+    script = script.replace(" --flow ", " --parallel %d --flow " % max(1, parallel), 1)
     print("contrats : %d module(s) déportés sur %s, borne %d s (#8437)"
           % (len(modules), host, remaining), flush=True)
     proc, outcome = _offload_call(worktree, host, script, timeout=remaining,
@@ -3979,8 +3984,8 @@ def run_offloaded_contracts(worktree: Path, modules: list[str], *, end: float,
     with ThreadPoolExecutor(max_workers=1) as pool:
         here = pool.submit(_local_contract_modules, worktree, local, end=end,
                            parallel=parallel) if local else None
-        flow = offload_contract_flow(worktree, remote, end=end, host=host) \
-            if remote else None
+        flow = offload_contract_flow(worktree, remote, end=end, host=host,
+                                     parallel=parallel) if remote else None
         children: list[TestRun] = []
         executor = ""
         if flow is not None:
@@ -4051,8 +4056,13 @@ def attestation_execution_inputs(cfg):
 
 def contract_attestation_context(worktree: Path, *, base: str, modules: list,
                                  timeout: float, project: str = "", target: str | None = None,
-                                 carrier: int = 0) -> tuple[dict, Path, list, int | None]:
+                                 carrier: int = 0,
+                                 executor: str = "") -> tuple[dict, Path, list, int | None]:
     """Exact local execution inputs; unavailable context disables caching.
+
+    #8437 : `executor` (hôte dont le guest jouera les contrats) entre dans le
+    scope scellé (`profile` offload-…, `drivers.executor`) : un rapport déporté
+    et un rapport local ne se réutilisent jamais l'un pour l'autre.
 
     The Git tree covers runner code, migrations and repository fixtures. The
     external interpreter/dependencies, heavy launcher, declared execution
@@ -4109,8 +4119,11 @@ def contract_attestation_context(worktree: Path, *, base: str, modules: list,
              "registry_digest": evidence.digest({"tree": tree}),
              "runner_digest": evidence.digest({"runtime": runtime, "binary": binary,
                                                 "launcher": launcher}),
-             "profile": "local-heavy", "drivers": dict(
-                 attestation_execution_inputs(cfg), driver=test_driver(worktree)),
+             "profile": ("offload-" + (project or "ameesh")) if executor else "local-heavy",
+             "drivers": dict(
+                 attestation_execution_inputs(cfg), driver=test_driver(worktree),
+                 **({"executor": executor, "executor_driver": OFFLOAD_DRIVER}
+                    if executor else {})),
              "database_schema": tree, "fixtures": {"tree": tree}, "exclusions": {}}
     lots = []
     from ameesh import packet_snapshot
@@ -4211,6 +4224,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
     modules = []
     context = None
     cached = None
+    executor = ""
     try:
         if not budget:
             raise PaquetAutoError("budget de contrats absent du canon")
@@ -4218,6 +4232,8 @@ def prepublication_contracts(worktree: Path, *, base: str,
             raise PaquetAutoError("créneau heavy indisponible")
         modules = contract_modules(worktree, base=base,
                                    timeout=max(0.1, end - time.monotonic()))
+        # #8437 : l'hôte est décidé avant l'attestation, qui le scelle
+        executor = offload_host() if modules else ""
         from datetime import datetime, timezone
         from ameesh import db as ameesh_db, packet_snapshot, prevalidation
         try:
@@ -4225,7 +4241,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
             try:
                 context = contract_attestation_context(
                     worktree, base=base, modules=modules, timeout=end - time.monotonic(), project=project,
-                    target=target, carrier=carrier)
+                    target=target, carrier=carrier, executor=executor)
             except GitDeadline as exc:
                 raise ValueError("attestation context budget exhausted") from exc
             scope, path, lots, max_age = context
@@ -4254,7 +4270,14 @@ def prepublication_contracts(worktree: Path, *, base: str,
             run = budget_spent("contrats", modules,
                                budget=max(0.0, end - start))
         else:
-            run = run_contract_modules(worktree, modules, end=end, parallel=parallel)
+            run = run_contract_modules(worktree, modules, end=end, parallel=parallel,
+                                       host=executor)
+            if getattr(run, "executor", "") != executor:
+                # #8437 : repli local après un refus du guest : le scope scellé
+                # ne décrit plus le run, rien n'est attesté ni réutilisable
+                print("attestation contrats : non écrite, contrats joués %s au lieu de %s"
+                      % (getattr(run, "executor", "") or "ici", executor or "ici"), flush=True)
+                context = None
     except PaquetAutoError as exc:
         # #7950 : la passe n'a pas démarré (budget, créneau, arbre) : ses
         # modules sont « non lancés », jamais un « code de retour None ».

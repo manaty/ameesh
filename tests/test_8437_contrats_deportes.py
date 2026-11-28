@@ -11,6 +11,8 @@ réveillé : repli local, comme un refus du job avant qu'il ne parte.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import stat
@@ -167,6 +169,7 @@ class OffloadedContractsTest(unittest.TestCase):
                 host="ameesh-agents-3", tooling=TOOLING)
         self.assertEqual(local.call_args.args[1], ["tests.test_5947_preflight_cli_n_moins_1"])
         self.assertEqual(call.call_args.args[1], "ameesh-agents-3")
+        self.assertIn("--parallel 2 --flow", call.call_args.args[2])
         self.assertEqual(run.returncode, 0)
         self.assertEqual(run.executor, "ameesh-agents-3")
         self.assertEqual(sorted(m for c in run.children for m in c.modules),
@@ -198,6 +201,46 @@ class OffloadedContractsTest(unittest.TestCase):
         local.assert_not_called()
         self.assertIsNone(run.returncode)
         self.assertTrue(run.children[0].inconclusive)
+
+
+class SealedExecutorTest(unittest.TestCase):
+    """L'hôte est décidé avant l'attestation ; un repli local n'atteste rien."""
+
+    def run_pass(self, executed_by):
+        seen = {}
+
+        def context(*args, **kwargs):
+            seen["executor"] = kwargs.get("executor")
+            raise ValueError("isolated test: no canon")
+
+        def contracts(*args, **kwargs):
+            seen["host"] = kwargs.get("host")
+            return auto.merge_contract_runs(["tests.test_a"], [auto.TestRun(
+                "contrats tests.test_a", ["tests.test_a"], 0, "Ran 1 test\n\nOK\n", 0.1)],
+                executed_by)
+
+        with mock.patch.object(auto, "contract_scope", return_value=("a" * 40, "b" * 40)), \
+                mock.patch.object(auto, "verify_contract_scope"), \
+                mock.patch.object(auto.shutil, "which", return_value="/bin/ameesh"), \
+                mock.patch.object(auto, "contract_modules", return_value=["tests.test_a"]), \
+                mock.patch.object(auto, "offload_host", return_value="ameesh-agents-3"), \
+                mock.patch.object(auto, "contract_attestation_context", side_effect=context), \
+                mock.patch.object(auto, "run_contract_modules", side_effect=contracts), \
+                mock.patch.object(auto, "save_test_log", side_effect=lambda run: run):
+            report = auto.prepublication_contracts(Path("."), base="c" * 40, budget=600)
+        return seen, report
+
+    def test_the_decided_host_is_sealed_and_played(self):
+        seen, report = self.run_pass("ameesh-agents-3")
+        self.assertEqual(seen, {"executor": "ameesh-agents-3", "host": "ameesh-agents-3"})
+        self.assertEqual(report.run.executor, "ameesh-agents-3")
+
+    def test_a_local_fallback_writes_no_attestation(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _, report = self.run_pass("")
+        self.assertIsNone(report.evidence)
+        self.assertIn("attestation contrats : non écrite", out.getvalue())
 
 
 class OffloadedSeriesTest(unittest.TestCase):
