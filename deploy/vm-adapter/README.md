@@ -607,8 +607,13 @@ drainage automatique, ni `idle-drained`, ni la preuve d'arrêt du worker
 (`stop_evidence`) ne passent. `policy.runs_interface: none` ne vaut que
 si rien ne tourne hors tours et baux. **Un hôte prêteur (`policy.lend`) ne
 peut pas le déclarer** : le canon le refuse (#5905), et `lending` l'emporte
-même sur `runs_interfaces` en configuration. AG3 est prêteur : il porte le
-guest d'offload de la prévalidation au gel.
+sur `runs_interfaces` en configuration, sauf l'interface comptante `guest`
+(#7687) : `none` ne peut pas transformer une prêteuse en zéro prouvé. AG3
+déclare `policy.runs_interface: guest` : le comptage des jobs d'offload vivants
+(shell guest et slices `ameesh-job-*`). Un comptage absent, périmé ou
+illisible reste **inconnu**, jamais zéro : ni drainage automatique, ni
+`idle-drained` sur ce doute. AG3, prêteur qui porte le guest d'offload de la
+prévalidation au gel, est dans ce cas depuis #8418.
 
 Déclarer le hook arme deux effets à toute heure :
 - le drainage automatique (`_auto_drain`, burst inactif depuis
@@ -620,27 +625,76 @@ Déclarer le hook arme deux effets à toute heure :
   `host_release_adapter_stalled` le signale, au bout de
   `AMEESH_HOST_RELEASE_ADAPTER_STALL`.
 
+Le drainage automatique ne part que sur un hôte `burst` dont le relevé est
+frais et dont la fenêtre de repos est prouvée sans trou depuis
+`idle_after_s` (1800 s par défaut) : `guest_jobs = 0`, aucun tour, aucun bail
+de lot, aucune retenue, et l'hôte n'est ni détenteur ni réserve d'un rôle élu
+(`baseline_guard`). L'hystérésis d'allumage (`min_on_s`) et la durée de
+drainage native restent celles de l'adaptateur. Un job guest vivant, un
+relevé illisible ou un run non déclaré bloquent le drainage **et** la preuve
+`idle-drained` ; le doute ne vaut jamais zéro.
+
 Ce qui ne peut pas servir de garde-fou permanent :
 - une retenue (`ameesh hosts HOST --hold`) : elle ferme les baux de tous
   les agents de l'hôte (`claimable`) et expire au bout de 24 h ;
 - `capacity: baseline` : `stop_evidence` exige un hôte burst, ce qui
   bloquerait aussi la fenêtre.
 
-L'ordre retenu tient donc à **ne rien déclarer hors fenêtre**. Hors
-fenêtre, le hook est absent et `lend` présent. Le drainage automatique est
-refusé deux fois (`no lifecycle hook`, `declared runs unknown: lending`), et
-un drainage manuel se rouvre au retour par L232e (tests
-`test_4148_host_release`, `test_5905_runs_interface`). La déclaration passe
-par une PR canon « fenêtre », fusionnée au feu par le pilote, et retirée par
-une PR inverse :
+Jusqu'au R1 v3 (#6002), l'ordre retenu était de **ne rien déclarer hors
+fenêtre** : hors fenêtre, le hook était absent et `lend` présent ; la
+déclaration passait par une PR canon « fenêtre » (manaty/home#297), fusionnée
+au feu par le pilote, et retirée par une PR inverse (manaty/home#298). Le
+drainage automatique était refusé deux fois (`no lifecycle hook`, `declared
+runs unknown: lending`), et un drainage manuel se rouvrait au retour par
+L232e (tests `test_4148_host_release`, `test_5905_runs_interface`).
 
-| | hors fenêtre (carte actuelle) | PR fenêtre (au feu) |
-|---|---|---|
-| `policy.lend` | présent | retiré |
-| `policy.runs_interface` | absent | `none` |
-| `policy.lifecycle_hook` | absent | la commande ci-dessus |
+Depuis #7687 (comptage des jobs guest) et #8418, le mode permanent remplace
+cette fenêtre pour AG3 : la carte garde `lend` et déclare `runs_interface:
+guest` et le hook. C'est la carte qui est l'activation durable ; sa PR
+inverse est le retour arrière, sans fenêtre à refermer.
+
+### AG3 en permanent (#8418, tranche 1 de #8029)
+
+La carte `hotes/ameesh-agents-3.md` porte, dans `policy:` :
+
+    lend: ...                       # conservé
+    runs_interface: guest           # compte les jobs d'offload vivants
+    lifecycle_hook: "@ameesh-python -m ameesh.vm_adapter request"
+
+`@ameesh-python` est remplacé par le Python du scanner (#8068) ; le runtime
+doit contenir `ameesh.vm_adapter` sur chaque hôte au runner vivant.
+
+Ordre d'activation (aucun geste cloud) :
+
+1. **Bureau, avant la fusion de la carte** : copier
+   `/etc/ameesh-vm-adapter/enrollment.json` (0600), passer `"enabled": true`,
+   puis `systemctl enable --now ameesh-vm-adapter.timer` sur bureau-goal.
+   Vérifier une passe worker récente dans le journal et une ligne
+   `vm_adapter_observations` pour AG3 (sans elle, un hook resterait fermé en
+   `hook_wait`). Hors coupure (10:00Z, 22:00Z) et hors CI de paquet.
+2. **Pilote** : fusionner la PR canon sur sa tête gelée
+   (`gh pr merge --match-head-commit`), puis `ameesh canon sync --fetch
+   --json` sur chaque hôte au runner vivant. `ameesh hosts ameesh-agents-3`
+   doit rendre `runs_interface: guest (Host card)` et le hook.
+3. **Observation** : quand AG3 reste sans tour, sans bail de lot et sans job
+   guest pendant `idle_after_s`, le scanner démarre un drainage `automatic`.
+   Le worker acquitte `draining`, puis `idle-drained`, arrête l'OS, prouve
+   l'arrêt et archive ; une cause de réveil (courrier d'un agent placé, lot
+   assigné, job CI de ses runners, `return_ts`) redemande `busy`, rallume,
+   admet la sonde, vérifie santé et réconciliation, puis rouvre les prises.
+   Le lot #8418 exige cette observation une fois en staging.
+
+Retour arrière : si AG3 est arrêté ou en retour, d'abord le ramener et
+attendre `available` **en gardant le hook** ; puis fusionner la PR inverse
+(hook et `runs_interface` retirés, `lend` conservé), faire la synchronisation
+prouvée, et seulement ensuite, si le worker n'est plus nécessaire, arrêter
+le timer et remettre `enabled: false`. Ne jamais retirer le hook d'une VM
+encore arrêtée (« Contrôle et retour arrière »).
 
 ### Séquence R1 (plan de #6002, remplace l'étape « drain » de v3.4.1)
+
+> R1 est clos (28/11 02:31Z, #6002). Cette séquence est conservée comme
+> historique de la fenêtre ; le mode permanent d'AG3 est décrit ci-dessus.
 
 Deux PR canon home sont préparées, relues par une autre famille que Claude
 et gelées avant le feu : « fenêtre » (manaty/home#297) et « R2 »
@@ -785,10 +839,10 @@ largeur des cycles suivants.
      arrière »). Ensuite seulement : #298, synchronisation, R2.
 
 Pendant la fenêtre, la prévalidation au gel est indisponible (son seul hôte
-est AG3). C'est un résultat non concluant, qui ne retient rien (§3). Pour
-déclarer le hook en permanence, et rendre un burst après 30 min sans
-travail hors fenêtre, il faut une interface qui compte les jobs guest d'un
-hôte prêteur (C5). C'est un lot de suite.
+est AG3). C'est un résultat non concluant, qui ne retient rien (§3). Depuis
+#7687 (comptage des jobs guest) et #8418, le hook est déclaré en
+permanence : le mode décrit ci-dessus rend un burst après 30 min sans
+travail, hors fenêtre, sans retirer `lend`.
 
 ## Mode veille de la base (#8420, #8029)
 
