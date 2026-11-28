@@ -228,21 +228,33 @@ class PublisherSettingTest(unittest.TestCase):
         connect.assert_not_called()
         self.assertIsNone(getattr(worker, "_peek_publisher", None))
 
-    def test_setting_is_validated_from_environment_and_config_file(self):
+    def test_environment_setting_is_validated(self):
         for value, expected in (("0", False), ("false", False), ("off", False),
                                 ("1", True), ("true", True), ("oui", True)):
             self.assertIs(self.load(AMEESH_AGENT_PEEK=value).agent_peek, expected, value)
-        self.write_config({"agent_peek": False})
-        self.assertIs(self.load().agent_peek, False)
-        self.write_config({"agent_peek": "maybe"})
-        with self.assertRaises(SystemExit) as caught:
-            self.load()
-        self.assertIn("AMEESH_AGENT_PEEK", str(caught.exception))
-        self.assertIn("config key agent_peek", str(caught.exception))
-        self.assertIn("expected 1/0, true/false", str(caught.exception))
         with self.assertRaises(SystemExit) as caught:
             self.load(AMEESH_AGENT_PEEK="maybe")
         self.assertIn("AMEESH_AGENT_PEEK", str(caught.exception))
+
+    def test_config_file_distinguishes_absent_from_explicit_invalid(self):
+        # clé absente : défaut inchangé, publieur actif
+        self.assertIs(self.load().agent_peek, True)
+        # valeurs explicites valides, booléennes ou 1/0
+        for value, expected in (("0", False), (0, False), ("false", False),
+                                ("1", True), (1, True), ("true", True)):
+            self.write_config({"agent_peek": value})
+            self.assertIs(self.load().agent_peek, expected, value)
+        self.write_config({"agent_peek": False})
+        self.assertIs(self.load(AMEESH_AGENT_PEEK="1").agent_peek, True)
+        # `null`, `""` et le blanc sont des valeurs refusées, pas une absence
+        for invalid in ("maybe", None, "", "   "):
+            self.write_config({"agent_peek": invalid})
+            with self.assertRaises(SystemExit) as caught:
+                self.load()
+            message = str(caught.exception)
+            self.assertIn("agent_peek (config)", message)
+            self.assertIn("invalid value", message)
+            self.assertIn("expected 1/0, true/false", message)
 
 
 class DatabaseTest(PgTestCase):
