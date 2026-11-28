@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.11",
+  "contract": "1.12",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -8,6 +8,7 @@
     "ameesh modules": ["--active", "--help", "--json", "--no-canon"],
     "ameesh module": ["--help"],
     "ameesh canon check": ["--canon", "--fetch", "--help", "--host", "--json", "--project-repo", "--ref"],
+    "ameesh canon refuse": ["--canon", "--commit", "--help", "--json", "--reason"],
     "ameesh canon sync": [
       "--allow-rewind",
       "--bootstrap-ref",

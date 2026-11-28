@@ -15,9 +15,9 @@ distribution (copied outside the checkout, imports only
 `tests.test_7665_module_contract.CoverageTableTest` checks that every element
 has exactly one row and that every cited test exists.
 
-The surface freezes revision 1.11; its baseline commit stays the revision 1.0
+The surface freezes revision 1.12; its baseline commit stays the revision 1.0
 comparison point, and the elements that revisions 1.1, 1.2, 1.3, 1.5, 1.6, 1.7,
-1.8, 1.9, 1.10 and 1.11 add are now listed (revision 1.4 adds no name). The
+1.8, 1.9, 1.10, 1.11 and 1.12 add are now listed (revision 1.4 adds no name). The
 comparison is additive-compatible, as the contract's compatibility rule states:
 
 - HTTP: every schema is flattened per field (type, `const`, `enum`, bounds,
@@ -41,6 +41,7 @@ comparison is additive-compatible, as the contract's compatibility rule states:
 | `cli:ameesh modules` | `tests.test_7665_module_contract.CliContractTest.test_modules_json_describes_the_installed_witness`, `tests.test_7665_module_contract.CliContractTest.test_a_reserved_or_mismatched_entry_point_is_refused` |
 | `cli:ameesh module` | `tests.test_7665_module_contract.CliContractTest.test_module_list_is_reserved_installation_evidence`, `tests.test_7665_module_contract.CliContractTest.test_module_help_runs_without_a_database_and_dispatch_needs_one`, `tests.test_7665_module_contract.StoreAndViewsTest.test_activation_dispatch_and_named_store_operations` |
 | `cli:ameesh canon check` | `tests.test_7665_module_contract.CliContractTest.test_canon_selection_validates_the_witness_options` |
+| `cli:ameesh canon refuse` | `tests.test_8340_canon_refusal.RefusalTest.test_the_cli_records_a_refusal_and_canon_check_sees_it`, `tests.test_8340_canon_refusal.RefusalTest.test_the_same_refusal_is_idempotent`, `tests.test_8340_canon_refusal.RefusalTest.test_a_successful_sync_replaces_the_refusal`, `tests.test_8340_canon_refusal.RefusalTest.test_the_refusal_blocks_claims_until_a_new_sync`, `tests.test_8340_canon_refusal.RefusalTest.test_a_secret_or_unreadable_reason_is_refused_and_not_stored`, `tests.test_8340_canon_refusal.RefusalTest.test_the_cli_refuses_a_secret_without_echoing_it` |
 | `cli:ameesh canon sync` | `tests.test_7665_module_contract.StoreAndViewsTest.test_activation_dispatch_and_named_store_operations` |
 | `cli:ameesh canon snapshot` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_7669_canon_snapshot.SnapshotContract` |
 | `cli:ameesh turn current` | `tests.test_7665_module_contract.CliContractTest.test_the_help_documents_exactly_the_frozen_options`, `tests.test_l2894_turn_context` |
@@ -119,3 +120,6 @@ join the `cli:ameesh reservations` row, and the route's schema and
 shared-serialisation witnesses are already exercised by the `http:schemas`
 row and
 `tests.test_8343_account_reservations.AccountReservationsTest.test_cli_and_http_are_one_document`.
+Revision 1.12 (#8340) adds the public canon-refusal CLI and no Python name; its
+recording, idempotence, replacement, claim-blocking and secret-refusal
+witnesses join the `cli:ameesh canon refuse` row.
