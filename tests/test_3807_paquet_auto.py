@@ -1061,6 +1061,20 @@ class PaquetAutoBanc(unittest.TestCase):
             log=lambda _line: None, contract_date="2026-11-28")
         return worktree, composition
 
+    def assertFold(self, worktree, composition, name: str) -> None:
+        from ameesh import review_contract_fold
+
+        manifest = paquet_auto.build_manifest(
+            name=name, target="main", base_sha=self.base, carrier=99,
+            composition=composition,
+            table=self.contract_table(composition.units), tests=[],
+            freeze_seconds=0.0)
+        commit, errors = review_contract_fold.verified_fold_commit(
+            worktree, composition.head, manifest)
+        self.assertEqual(errors, [])
+        self.assertEqual(commit, self.rev(composition.contract.head,
+                                          cwd=worktree))
+
     def test_two_fragments_are_folded_in_one_contract_commit(self) -> None:
         self.install_contract()
         first = self.contract_lot(
@@ -1106,6 +1120,8 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertIn("%s (#4, fragment), %s (#5, fragment)" % (four, five),
                       manifest)
         self.assertIn("`%s`" % composition.contract.head, manifest)
+        # #8417 : le pliage réel du composeur passe le contrôle partagé
+        self.assertFold(worktree, composition, "contrat-deux")
 
     def test_an_old_style_revision_is_renumbered_after_a_fragment(self) -> None:
         self.install_contract()
@@ -1137,6 +1153,7 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertIn("Revision %s adds `ameesh ancien` (#4); it is additive "
                       "to %s." % (second, first), text)
         self.assertNotIn("Revision %s adds `ameesh ancien`" % first, text)
+        self.assertFold(worktree, composition, "contrat-ancien")
 
     def test_a_malformed_fragment_refuses_composition_naming_the_lot(self) -> None:
         self.install_contract()
