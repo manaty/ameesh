@@ -6,14 +6,16 @@ from dataclasses import replace
 from ameesh import db as db_mod
 from ameesh import dsn as dsn_mod
 
-#: Bases d'administration présentes dans toute grappe PostgreSQL. Un verrou
+#: Base d'administration commune à tous les workers d'une grappe. Un verrou
 #: consultatif ne vaut que pour UNE base : le prendre sur la base jetable du
 #: processus (#6803, `test-parts.py run --parallel`) ne sérialise pas les
 #: workers entre eux, alors que l'audit du contrat (`pg_database`) et les
 #: `GRANT ... TO PUBLIC` touchent toutes les bases de la grappe (#8481).
 #: Chaque worker dérive donc la même base de son DSN : seuls le nom de base et
 #: le schéma changent, l'hôte et le rôle restent ceux du banc.
-ADMIN_DATABASES = ("postgres", "template1")
+#: `template1` est écartée : une session de garde y bloquerait les
+#: `CREATE DATABASE` sans `TEMPLATE` (« source database is being accessed »).
+ADMIN_DATABASES = ("postgres",)
 
 
 class RoleAclGuard:
@@ -28,13 +30,12 @@ class RoleAclGuard:
 def _admin_database(cfg):
     """Connexion ouverte sur une base commune de la grappe, ou None.
 
-    `postgres` puis `template1` : présentes dans toute grappe et joignables par
-    le rôle du banc. On vérifie la base réellement atteinte (`current_database`)
-    plutôt que le DSN : un `dbname=` de la requête ou un profil de connexion
-    peut rediriger. Sans aucune des deux (profil limité à sa base), le fallback
-    est la base du processus : la garde reste utile entre classes d'une même
-    base, sans sérialiser les workers — c'est le mieux possible sans base
-    commune.
+    `postgres` est présente dans toute grappe et joignable par le rôle du banc.
+    On vérifie la base réellement atteinte (`current_database`) plutôt que le
+    DSN : un `dbname=` de la requête ou un profil de connexion peut rediriger.
+    Si elle n'est pas joignable (profil limité à sa base), le fallback est la
+    base du processus : la garde reste utile entre classes d'une même base,
+    sans sérialiser les workers — c'est le mieux possible sans base commune.
     """
     if getattr(cfg, "backend", "") == "mediated":
         return None
@@ -68,11 +69,11 @@ def serialize_role_acl(test_class):
     avec les deux pilotes. Le cleanup unittest passe aussi si setUpClass
     échoue ; la fermeture du processus libère le verrou si le worker meurt.
 
-    #8481 : le verrou est pris sur une base d'administration commune
-    (`postgres`, sinon `template1`), pas sur la base jetable du worker : deux
-    instances de la même classe dans deux processus de la part doivent
-    s'attendre, puisque leurs `GRANT ... TO PUBLIC` temporaires et l'audit
-    `pg_database` du contrat se croisent à l'échelle de la grappe.
+    #8481 : le verrou est pris sur `postgres` (base d'administration commune),
+    # pas sur la base jetable du worker : deux instances de la même classe dans
+    # deux processus de la part doivent s'attendre, puisque leurs
+    # `GRANT ... TO PUBLIC` temporaires et l'audit `pg_database` du contrat se
+    # croisent à l'échelle de la grappe.
     """
     stack = ExitStack()
     test_class.addClassCleanup(stack.close)
