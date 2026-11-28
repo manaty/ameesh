@@ -2451,6 +2451,10 @@ class Watcher:
                             state.append({"id": r.get("id"), "name": name, "busy": busy,
                                           "job": holding.get(name) if busy else None,
                                           "stuck": busy and name not in holding,
+                                          # #8422 : un runner hors ligne n'est
+                                          # jamais busy ; l'adaptateur distingue
+                                          # les deux pour prouver le retour.
+                                          "online": online,
                                           # #8031 : en ligne ou hors ligne, la VM
                                           # arrêtée garde ses runners enregistrés
                                           # et leurs étiquettes pour le réveil ;

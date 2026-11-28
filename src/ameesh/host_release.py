@@ -712,6 +712,60 @@ def ci_wake_evidence(db, host, *, now, released_ts=None):
                 % type(exc).__name__}
 
 
+def ci_runner_activity(db, host, *, now, fresh_s=CI_WAKE_FRESH_S, after=None):
+    """#8422: measured rest and return of a CI host's registered runners.
+
+    Read-only and never fatal: an unreadable domain is `unknown` (doubt, never
+    a stop or a return). A host with no measured runner is `inert` (a non-CI
+    host, or a fleet never enrolled): the adapter requires `ok` for a `kind:
+    ci` target, so inert never proves anything.
+
+    * `busy` lists the runners a job still occupies; a stop is refused while
+      one exists.
+    * `last_busy_ts` is the last scan that saw any runner busy (the value
+      survives the job's end, unlike `busy_since`). A stop needs it older than
+      the quiet bound.
+    * `online` is true when **every** registered runner of the host is
+      connected. A CI host has no host reading nor probe agent; that reading,
+      made after the power-on (`after`), is its return proof. An offline slot
+      keeps the return open: the runner service of the VM is not back.
+    * `state_seen_ts` dates `online` and `last_busy_ts`, in the same statement
+      as `seen_ts`; it must equal `seen_ts`. A veilleur N-1 refreshes
+      `seen_ts` without writing those facts, so the gap is doubt (never a
+      return or a rest proof), like 0603's `wait_seen_at` for the wake queue.
+    * `seen_ts` freshness bounds every fact: a reading older than `fresh_s` is
+      `unknown`, never a silent idle or online.
+    """
+    try:
+        store = storage.of(db)
+        ci = getattr(store, "ci", None)
+        if ci is None:
+            return {"state": "inert"}
+        rows = [row for row in ci.all_runners() if _host_runner(row, host)]
+    except Exception as exc:  # noqa: BLE001 - doubt, never a crash
+        return {"state": "unknown",
+                "reason": "CI runners unreadable (%s)" % type(exc).__name__}
+    if not rows:
+        return {"state": "inert"}
+    if any(row.get("seen_ts") is None or row.get("state_seen_ts") is None
+           or float(row["state_seen_ts"]) != float(row["seen_ts"])
+           for row in rows):
+        return {"state": "unknown",
+                "reason": "CI runner state not dated by this scan"}
+    if any(now - float(row["state_seen_ts"]) > fresh_s for row in rows):
+        return {"state": "unknown", "reason": "CI runner reading stale"}
+    if after is not None and any(float(row["state_seen_ts"]) < float(after)
+                                 for row in rows):
+        return {"state": "stale",
+                "reason": "CI runners not measured since the wake"}
+    busy = sorted(str(row.get("name") or "?") for row in rows if row.get("busy"))
+    last_busy = max((float(row["last_busy_ts"]) for row in rows
+                     if row.get("last_busy_ts") is not None), default=None)
+    return {"state": "ok", "runners": len(rows),
+            "online": all(bool(row.get("online")) for row in rows),
+            "busy": busy, "last_busy_ts": last_busy}
+
+
 def release_check(host, listing, lots, *, controls, holds):
     """#7874: the R1 entry guard of deploy/vm-adapter, read before a drain.
 
