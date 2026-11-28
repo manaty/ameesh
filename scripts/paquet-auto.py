@@ -242,6 +242,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -2685,6 +2686,8 @@ class Tooling:
     parts_script: str = ""
     contracts: tuple[str, ...] = (CONTRACT_ALWAYS,)
     project: str = ""
+    #: #8437 : les hôtes admis du bloc (`hosts`), candidats au déport des séries
+    hosts: tuple[str, ...] = ()
 
     @property
     def declared(self) -> bool:
@@ -2718,7 +2721,9 @@ def resolve_tooling(project: str, *, log=print) -> Tooling:
     return Tooling(plan_script=str(getattr(params, "plan_script", None)
                                    or DEFAULT_PLAN_SCRIPT),
                    parts_script=str(getattr(params, "parts_script", None) or ""),
-                   contracts=contracts, project=project)
+                   contracts=contracts, project=project,
+                   hosts=tuple(str(host) for host in (getattr(params, "hosts", ()) or ())
+                               if str(host).strip()))
 
 
 def _contract_names(worktree: Path, rel: str) -> list[str]:
@@ -3264,7 +3269,8 @@ def probe_engines(result: TestRun, env: dict) -> TestRun:
 
 def run_tests(worktree: Path, label: str, modules: list[str], *,
               timeout: int, heavy: bool = False,
-              wall: int | None = None, failfast: bool = False) -> TestRun:
+              wall: int | None = None, failfast: bool = False,
+              offload: bool = True) -> TestRun:
     """Une série unittest bornée par `timeout` (au-delà : non concluant).
 
     #4271 : avec `heavy`, la série prend un créneau de l'hôte
@@ -3276,11 +3282,33 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
     créneau et exécution tiennent ensemble dans `wall` secondes (`run_walled`) ;
     au-delà, la série est non concluante. #7195 : `timeout` reste le plafond
     d'exécution (`ameesh heavy --max-duration`), l'attente du créneau ne le
-    consomme donc pas."""
+    consomme donc pas.
+
+    #8437 : une série `heavy` (sauf `offload=False`) est jouée par le guest de
+    l'hôte admis le moins chargé (`offload_host`) ; ici sinon."""
     if not modules:
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
     start = time.monotonic()
+    if heavy and offload:
+        # #8437 : l'hôte admis le moins chargé joue la série ; repli local si
+        # aucun n'est prêt ou s'il refuse le job avant de le jouer
+        host = offload_host()
+        if host and not guest_excluded(modules):
+            result = run_tests_offloaded(worktree, label, modules, host=host,
+                                         timeout=timeout, wall=wall,
+                                         failfast=failfast)
+            if result is not None:
+                return result
+            if wall is not None:
+                wall = int(wall - (time.monotonic() - start))
+                if wall <= 0:
+                    return save_test_log(TestRun(
+                        label=label, modules=list(modules), returncode=None,
+                        output="déport refusé, borne totale atteinte avant le "
+                               "repli local : série non jouée (#8437)",
+                        seconds=time.monotonic() - start, timed_out=True,
+                        not_started="déport refusé, délai global atteint"))
     cmd = [project_python(worktree), "-m", "unittest", "-q",
            *(["-f"] if failfast else []), *modules]
     env = python_env(worktree)
@@ -3317,10 +3345,202 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
     return save_test_log(result)
 
 
+# ---------------------------------------------------------------------------
+# #8437 : séries heavy déportées sur l'hôte admis le moins chargé
+# ---------------------------------------------------------------------------
+
+#: `0`, `off`, `none` : aucun déport, tout se joue en local comme avant #8437
+OFFLOAD_ENV = "AMEESH_PAQUET_OFFLOAD"
+#: un relevé `host_resources` plus vieux : l'hôte est réputé arrêté (veille
+#: #8418/#8422) ; on se replie sans le réveiller
+OFFLOAD_FRESH_S = 300.0
+#: charge par cœur (load1 / cpu) à partir de laquelle un hôte n'est plus candidat
+OFFLOAD_MAX_LOAD = 1.0
+#: durée de validité d'un choix d'hôte (une composition le relit au plus ainsi)
+OFFLOAD_CHOICE_TTL_S = 120.0
+#: marge laissée au client offload sous la borne murale : il annule son job et
+#: rend son résultat avant que `run_walled` n'arrête son groupe
+OFFLOAD_WALL_GRACE_S = 15
+#: pilote du lanceur de parts sur le guest (son venv porte psycopg)
+OFFLOAD_DRIVER = "psycopg"
+#: plan des contrats ajouté à l'instantané envoyé (jamais à l'arbre composé)
+OFFLOAD_PLAN_REL = ".ameesh-paquet-contrats.json"
+#: sorts du client offload (`prevalidation.classify`) qui disent que le job n'a
+#: pas été joué jusqu'au bout par le guest : la série est rejouée en local
+OFFLOAD_FALLBACK = ("no-vm", "gate-preempted")
+
+_OFFLOAD_LOCK = threading.Lock()
+_OFFLOAD: dict = {"at": None, "host": "", "down": set()}
+
+
+def choose_offload_host(readings: dict, *, fresh_s: float = OFFLOAD_FRESH_S,
+                        max_load: float = OFFLOAD_MAX_LOAD) -> tuple[str, str]:
+    """#8437 : l'hôte admis le moins chargé, ou `""` et la raison du repli.
+
+    `readings` : hôte → dernier relevé (`role_standings_pg.latest_reading`) ou
+    None. Un hôte sans relevé frais est réputé arrêté (jamais réveillé pour
+    rien), une porte autre qu'`available` refuse, une charge par cœur à
+    `max_load` ou plus le dit saturé."""
+    best, why = None, []
+    for host, row in readings.items():
+        if not row:
+            why.append("%s : aucun relevé" % host)
+            continue
+        try:
+            age = float(row["now_ts"]) - float(row["sampled_ts"])
+            ratio = float(row["load1"]) / float(row["cpu_count"])
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            why.append("%s : charge illisible" % host)
+            continue
+        if age > fresh_s:
+            why.append("%s : relevé de %d s, hôte réputé arrêté" % (host, age))
+            continue
+        gate = row.get("gate_state")
+        if gate not in (None, "", "available"):
+            why.append("%s : porte %s" % (host, gate))
+            continue
+        if ratio >= max_load:
+            why.append("%s : saturé (%.2f par cœur)" % (host, ratio))
+            continue
+        if best is None or ratio < best[1]:
+            best = (host, ratio)
+    if best is not None:
+        return best[0], "%.2f par cœur" % best[1]
+    return "", " ; ".join(why) or "aucun hôte admis"
+
+
+def _offload_readings(hosts) -> dict:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh import config, db, role_standings_pg
+    conn = db.connect(config.load())
+    if conn is None:
+        raise RuntimeError("base absente")
+    try:
+        return {host: role_standings_pg.latest_reading(conn, host) for host in hosts}
+    finally:
+        conn.close()
+
+
+def offload_host(tooling: Tooling | None = None) -> str:
+    """#8437 : l'hôte où déporter une série heavy, `""` pour la jouer ici.
+
+    Candidats : les hôtes admis du bloc `prevalidation` du projet, moins ceux
+    qui ont refusé un job pendant ce lancement. Le choix est relu au plus
+    toutes les `OFFLOAD_CHOICE_TTL_S` ; une base illisible vaut un repli
+    local, jamais un arrêt de la composition."""
+    tooling = tooling or _TOOLING
+    if (os.environ.get(OFFLOAD_ENV) or "").strip().lower() in ("0", "off", "none") \
+            or tooling.declared or not tooling.project or not tooling.hosts \
+            or shutil.which("ameesh") is None:
+        return ""
+    with _OFFLOAD_LOCK:
+        now = time.monotonic()
+        if _OFFLOAD["at"] is not None and now - _OFFLOAD["at"] < OFFLOAD_CHOICE_TTL_S:
+            return _OFFLOAD["host"]
+        hosts = [host for host in tooling.hosts if host not in _OFFLOAD["down"]]
+        try:
+            host, why = choose_offload_host(_offload_readings(hosts)) if hosts \
+                else ("", "hôtes admis indisponibles pour ce lancement")
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 — illisible = local
+            host, why = "", "relevés illisibles (%s)" % _one_line(str(exc))[:160]
+        if host != _OFFLOAD["host"] or _OFFLOAD["at"] is None:
+            print("déport des séries heavy : %s" % (
+                "%s (%s)" % (host, why) if host else "local (%s)" % why), flush=True)
+        _OFFLOAD.update(at=now, host=host)
+        return host
+
+
+def offload_down(host: str, why: str) -> None:
+    """#8437 : `host` a refusé un job : plus candidat pendant ce lancement."""
+    with _OFFLOAD_LOCK:
+        _OFFLOAD["down"].add(host)
+        if _OFFLOAD["host"] == host:
+            _OFFLOAD.update(at=None, host="")
+    print("déport : %s écarté (%s), repli local" % (host, _one_line(why)[:200]),
+          flush=True)
+
+
+def guest_excluded(modules, tooling: Tooling | None = None) -> list[str]:
+    """#8437 : les modules que le guest ne peut pas jouer (#4071), joués ici."""
+    from ameesh import prevalidation
+    excluded = prevalidation.GUEST_EXCLUSIONS.get((tooling or _TOOLING).project, {})
+    return [module for module in modules if module.removeprefix("tests.") in excluded]
+
+
+def _offload_snapshot(worktree: Path, files: dict | None = None) -> str:
+    """L'arbre de HEAD (plus `files`) figé pour le guest : rien de local n'y entre."""
+    from ameesh import offload
+    head = _decode(git(worktree, "rev-parse", "HEAD").stdout).strip()
+    try:
+        return offload.snapshot_with(str(worktree), head, dict(files or {}),
+                                     deadline=time.monotonic() + GIT_TIMEOUT)
+    except offload.OffloadError as exc:
+        raise PaquetAutoError("instantané du déport : %s" % exc) from exc
+
+
+def _offload_call(worktree: Path, host: str, script: str, *, timeout: int,
+                  wall: int, snapshot: str):
+    """Le job sur `host` borné en temps mural : (proc ou None, sort)."""
+    from ameesh import prevalidation
+    cmd = prevalidation.offload_argv(
+        host, script, timeout=max(1, timeout),
+        wait_timeout=max(1, wall - OFFLOAD_WALL_GRACE_S), snapshot=snapshot,
+        profile=_TOOLING.project, executable=shutil.which("ameesh") or "ameesh")
+    proc = run_walled(cmd, cwd=worktree, env=dict(os.environ), wall=wall)
+    if proc is None:
+        return None, "run-incomplete"
+    return proc, prevalidation.classify(proc.returncode, _output(proc))
+
+
+def run_tests_offloaded(worktree: Path, label: str, modules: list[str], *,
+                        host: str, timeout: int, wall: int | None,
+                        failfast: bool = False) -> TestRun | None:
+    """#8437 : la série unittest jouée par le guest de `host`.
+
+    None : le job n'a pas été joué (hôte injoignable, porte fermée ou drain),
+    l'appelant rejoue la série en local. Une connexion perdue en cours de job
+    n'est jamais rejouée (la série tourne peut-être encore) : non concluant."""
+    start = time.monotonic()
+    try:
+        snapshot = _offload_snapshot(worktree)
+    except PaquetAutoError as exc:
+        offload_down(host, str(exc))
+        return None
+    script = ('py="${AMEESH_TEST_VENV:+$AMEESH_TEST_VENV/bin/python3}"; '
+              '[ -n "$py" ] || py=python3; PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 '
+              'exec "$py" -m unittest -q %s%s'
+              % ("-f " if failfast else "", " ".join(shlex.quote(m) for m in modules)))
+    bound = wall if wall is not None else timeout + 60
+    proc, outcome = _offload_call(worktree, host, script, timeout=timeout,
+                                  wall=bound, snapshot=snapshot)
+    seconds = time.monotonic() - start
+    if proc is None:
+        return save_test_log(TestRun(
+            label=label, modules=list(modules), returncode=None,
+            output="borne totale des tests par unité atteinte après %d s sur %s "
+                   "(déport, attente du créneau comprise) : série arrêtée" % (bound, host),
+            seconds=seconds, timed_out=True,
+            deadline_cut=bound if wall is not None else None))
+    output = "déport sur %s (#8437)\n%s" % (host, _output(proc))
+    if outcome in OFFLOAD_FALLBACK:
+        offload_down(host, _tail(_output(proc), 2))
+        return None
+    if outcome == "transport-lost" or proc.returncode in (70, 75, 130):
+        return save_test_log(TestRun(
+            label=label, modules=list(modules), returncode=None, output=output,
+            seconds=seconds, timed_out=True))
+    return save_test_log(TestRun(
+        label=label, modules=list(modules), returncode=proc.returncode,
+        output=output, seconds=seconds,
+        timed_out=proc.returncode == HEAVY_CAPPED_EXIT))
+
+
 @dataclass
 class ContractTestRun(TestRun):
     """Merged module reports, retaining partial/inconclusive evidence."""
     children: list[TestRun] = field(default_factory=list)
+    #: #8437 : l'hôte dont le guest a joué des contrats, vide si tout est local
+    executor: str = ""
 
     def _summary(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -3574,13 +3794,25 @@ def contract_tail_share(remaining: int, pending_after: int,
 
 def run_contract_modules(worktree: Path, modules: list[str], *,
                          end: float, parallel: int,
-                         tooling: Tooling | None = None) -> TestRun:
+                         tooling: Tooling | None = None,
+                         host: str | None = None) -> TestRun:
     """One isolated heavy process per module under a shared wall deadline."""
     if not modules:
         return ContractTestRun("contrats", [], None, "aucun contrat sélectionné", 0.0)
     tooling = tooling or _TOOLING
     if tooling.declared:
         return run_declared_contracts(worktree, modules, end=end, tooling=tooling)
+    # #8437 : `host` décidé par l'appelant (scellé dans l'attestation), sinon ici
+    host = offload_host(tooling) if host is None else host
+    if host:
+        return run_offloaded_contracts(worktree, modules, end=end, parallel=parallel,
+                                       host=host, tooling=tooling)
+    return _local_contract_modules(worktree, modules, end=end, parallel=parallel)
+
+
+def _local_contract_modules(worktree: Path, modules: list[str], *,
+                            end: float, parallel: int) -> ContractTestRun:
+    """One isolated local heavy process per module (the pre-#8437 path)."""
     start = time.monotonic()
     budget = max(0.0, end - start)
     stop = threading.Event()
@@ -3609,7 +3841,7 @@ def run_contract_modules(worktree: Path, modules: list[str], *,
                                         parallel)
             result = run_tests(worktree, "contrats " + module, [module],
                                timeout=share, heavy=True, wall=remaining,
-                               failfast=True)
+                               failfast=True, offload=False)
             if share < remaining and result.timed_out \
                     and result.deadline_cut is None:
                 # #7950 : coupé par la part de fin de passe, pas par une
@@ -3624,6 +3856,11 @@ def run_contract_modules(worktree: Path, modules: list[str], *,
         return run
     children = _run_series([module_job(m) for m in contract_order(worktree, modules)],
                            parallel=max(1, parallel))
+    return merge_contract_runs(modules, children)
+
+
+def merge_contract_runs(modules: list[str], children: list[TestRun],
+                        executor: str = "") -> ContractTestRun:
     negative = any(run.real_failure for run in children)
     incomplete = any(run.inconclusive for run in children)
     rc = 1 if negative else (None if incomplete else 0)
@@ -3631,7 +3868,135 @@ def run_contract_modules(worktree: Path, modules: list[str], *,
         ", ".join(run.modules), run.seconds, run.returncode, run.output) for run in children)
     return ContractTestRun("contrats", list(modules), rc, output, 0.0,
                            timed_out=not negative and any(r.timed_out for r in children),
-                           children=children)
+                           children=children, executor=executor)
+
+
+def offload_contract_flow(worktree: Path, modules: list[str], *, end: float,
+                          host: str, parallel: int = 1) -> list[TestRun] | None:
+    """#8437 : les contrats en un seul job du guest de `host`.
+
+    Une seule base jetable et un seul créneau pour toute la série : le plan
+    (une part, pilote `OFFLOAD_DRIVER`) entre dans l'instantané envoyé, le
+    lanceur de parts (`scripts/test-parts.py`, comme la prévalidation) joue
+    ses modules en parallèle et rend son flux, qui fait foi (`FlowTestRun`,
+    une par module, `split_flow`). None : le job n'a pas été joué, l'appelant
+    rejoue en local."""
+    from ameesh import prevalidation
+    start = time.monotonic()
+    remaining = int(end - start)
+    if remaining <= 0:
+        return [budget_spent("contrats", [module]) for module in modules]
+    names = {module.removeprefix("tests."): module for module in modules}
+    head = _decode(git(worktree, "rev-parse", "HEAD").stdout).strip()
+    plan = {"schema": "ameesh-test-plan/1", "mode": "lot", "head": head,
+            "parts": {OFFLOAD_DRIVER: [{
+                "part": 1, "of": 1, "label": DECLARED_PART_LABEL,
+                "modules": list(names), "estimate_s": 0.0}]},
+            "contract": list(names)}
+    try:
+        snapshot = _offload_snapshot(worktree, {OFFLOAD_PLAN_REL: json.dumps(plan)})
+    except PaquetAutoError as exc:
+        offload_down(host, str(exc))
+        return None
+    script = prevalidation.remote_script(
+        OFFLOAD_PLAN_REL, [{"driver": OFFLOAD_DRIVER, "part": 1}],
+        parts_script=DEFAULT_PARTS_SCRIPT)
+    # les lanes du composeur deviennent le plancher `--parallel` de la part
+    # (#3754 : la charge mesurée du guest peut en ouvrir plus)
+    script = script.replace(" --flow ", " --parallel %d --flow " % max(1, parallel), 1)
+    print("contrats : %d module(s) déportés sur %s, borne %d s (#8437)"
+          % (len(modules), host, remaining), flush=True)
+    proc, outcome = _offload_call(worktree, host, script, timeout=remaining,
+                                  wall=remaining, snapshot=snapshot)
+    seconds = time.monotonic() - start
+    if proc is None:
+        return [save_test_log(FlowTestRun(
+            "contrats " + module, [module], None,
+            "borne des contrats atteinte après %d s (déport sur %s)" % (remaining, host),
+            seconds, timed_out=True, deadline_cut=remaining)) for module in modules]
+    if outcome in OFFLOAD_FALLBACK:
+        offload_down(host, _tail(_output(proc), 2))
+        return None
+    lost = outcome == "transport-lost" or proc.returncode in (70, 75, 130)
+    return split_flow(_decode(proc.stdout), names, host=host, seconds=seconds,
+                      returncode=None if lost else proc.returncode,
+                      timed_out=lost or proc.returncode == HEAVY_CAPPED_EXIT,
+                      output=_tail(_output(proc), 40))
+
+
+def split_flow(events: str, names: dict, *, host: str, seconds: float,
+               returncode: int | None, timed_out: bool,
+               output: str) -> list[FlowTestRun]:
+    """#8437 : le flux d'un job déporté, une `FlowTestRun` par module.
+
+    `names` : identité du flux (`test_x`) → module du composeur. Chaque module
+    garde ses propres événements `test` ; la fin de part est commune : un
+    rouge d'un autre module ne rend pas le sien rouge, et une fin autre que
+    `succes`/`echec` (part interrompue) reste la sienne. Un job coupé ou perdu
+    (`returncode` None) laisse chaque module non concluant (§3)."""
+    from ameesh import prevalidation
+    lines = events.splitlines()
+
+    def module_of(line: str) -> str | None:
+        if not line.lstrip().startswith("{"):
+            return None
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return None
+        if isinstance(event, dict) and event.get("type") == "test":
+            return str(event.get("module") or "")
+        return None
+
+    tagged = [(module_of(line), line) for line in lines]
+    runs = []
+    for name, module in names.items():
+        mine = "\n".join(line for owner, line in tagged if owner in (None, name))
+        parsed = prevalidation.parse_flow(mine)
+        played = _flow_play(mine, prevalidation.FLOW_SCHEMA)
+        played["played"] = tuple(names.get(item, item) for item in played["played"])
+        parsed.update(played)
+        red = [test for test in parsed["failed"] if test not in parsed["environment"]]
+        parsed["fins"] = ["echec" if parsed["failed"] and fin == "echec" else
+                          ("succes" if fin == "echec" else fin)
+                          for fin in parsed.get("fins") or ()]
+        rc = returncode
+        if rc is not None:
+            rc = 1 if red else (0 if parsed["fins"] else rc)
+        text = "déport sur %s (#8437)\n%s" % (host, output)
+        if parsed["failed"]:
+            text = "échecs (flux) : %s\n%s" % (", ".join(parsed["failed"]), text)
+        runs.append(save_test_log(FlowTestRun(
+            "contrats " + module, [module], rc, text, seconds,
+            timed_out=timed_out, flow=parsed)))
+    return runs
+
+
+def run_offloaded_contracts(worktree: Path, modules: list[str], *, end: float,
+                            parallel: int, host: str,
+                            tooling: Tooling | None = None) -> ContractTestRun:
+    """#8437 : contrats déportés, modules exclus du guest (#4071) joués ici.
+
+    Les deux moitiés partent ensemble sous la même borne ; un job refusé
+    avant d'être joué rejoue ses modules en local dans le temps qui reste."""
+    local = guest_excluded(modules, tooling)
+    remote = [module for module in modules if module not in local]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        here = pool.submit(_local_contract_modules, worktree, local, end=end,
+                           parallel=parallel) if local else None
+        flow = offload_contract_flow(worktree, remote, end=end, host=host,
+                                     parallel=parallel) if remote else None
+        children: list[TestRun] = []
+        executor = ""
+        if flow is not None:
+            children.extend(flow)
+            executor = host
+        elif remote:
+            children.extend(_local_contract_modules(
+                worktree, remote, end=end, parallel=parallel).children)
+        if here is not None:
+            children.extend(here.result().children)
+    return merge_contract_runs(modules, children, executor)
 
 
 @dataclass
@@ -3851,6 +4216,7 @@ def prepublication_contracts(worktree: Path, *, base: str,
     modules = []
     context = None
     cached = None
+    executor = ""
     try:
         if not budget:
             raise PaquetAutoError("budget de contrats absent du canon")
@@ -3858,9 +4224,17 @@ def prepublication_contracts(worktree: Path, *, base: str,
             raise PaquetAutoError("créneau heavy indisponible")
         modules = contract_modules(worktree, base=base,
                                    timeout=max(0.1, end - time.monotonic()))
+        # #8437 : l'hôte est décidé avant l'attestation : un run déporté n'en a pas
+        executor = offload_host() if modules else ""
         from datetime import datetime, timezone
         from ameesh import db as ameesh_db, packet_snapshot, prevalidation
         try:
+            if executor:
+                # #8437 : le runtime et les dépendances du guest ne se scellent
+                # pas d'ici (runner_digest décrit le composeur) : un run déporté
+                # n'est ni attesté ni réutilisé
+                raise ValueError("contrats déportés sur %s : ni attestation ni "
+                                 "réutilisation" % executor)
             from ameesh.canon import GitDeadline
             try:
                 context = contract_attestation_context(
@@ -3894,7 +4268,8 @@ def prepublication_contracts(worktree: Path, *, base: str,
             run = budget_spent("contrats", modules,
                                budget=max(0.0, end - start))
         else:
-            run = run_contract_modules(worktree, modules, end=end, parallel=parallel)
+            run = run_contract_modules(worktree, modules, end=end, parallel=parallel,
+                                       host=executor)
     except PaquetAutoError as exc:
         # #7950 : la passe n'a pas démarré (budget, créneau, arbre) : ses
         # modules sont « non lancés », jamais un « code de retour None ».
