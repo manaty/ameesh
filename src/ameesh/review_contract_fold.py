@@ -352,12 +352,25 @@ def contract_fold_paths(repo: Path, head: str, text: str
 
     # #8417 (B cx2, dev5) : un fragment cité est retiré par le pliage, jamais
     # réécrit ni ajouté ; sa ligne garderait sinon un contenu non relu.
+    # B cx2 (gel 5481c17f4) : chaque fragment cité au manifeste comme plié est
+    # retiré par ce commit, même absent du diff ; aucun fragment d'un lot cité
+    # ne reste dans l'arbre plié.
     statuses = dict((path, kind) for kind, path in status)
-    for path in sorted(changed & fragments):
+    folded_fragments = {
+        f"{CONTRACT_DIR_REL}/{match.group(2)}.md"
+        for match in CONTRACT_REVISION_LOT_RE.finditer(
+            _contract_section(text) or "")
+        if (match.group(3) or "").strip().casefold().startswith("fragment")}
+    for path in sorted((changed & fragments) | folded_fragments):
         if statuses.get(path) != "D":
             return {}, ["commit de pliage du contrat %s : le fragment %s n'est "
                         "pas retiré (statut %s) : refusé"
-                        % (sha, path, statuses.get(path) or "?")]
+                        % (sha, path, statuses.get(path) or "inchangé")]
+    for path in sorted(fragments):
+        if git(repo, "cat-file", "-e", "%s:%s" % (commit, path),
+               check=False).returncode == 0:
+            return {}, ["commit de pliage du contrat %s : le fragment %s reste "
+                        "dans l'arbre plié : refusé" % (sha, path)]
 
     patch = git(repo, "-c", "core.quotePath=false", "diff", "--no-renames",
                 "-U0", "--no-color", "--no-ext-diff", parent, commit).stdout

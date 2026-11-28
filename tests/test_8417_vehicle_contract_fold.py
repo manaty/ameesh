@@ -155,6 +155,25 @@ class ContractFoldVehicleTest(unittest.TestCase):
         self.assertIsNone(found)
         self.assertEqual(own["commits"], [fold])
 
+    def test_a_cited_fragment_left_untouched_counts(self):
+        """B cx2 (gel 5481c17f4) : un second fragment cité, absent du diff,
+        reste dans l'arbre alors que l'en-tête porte déjà son numéro."""
+        other = "docs/api/module-contract-v1.d/501.md"
+        _write(self.repo, other, "adds: a write; it is additive to "
+                                 "{previous}.\n")
+        _commit_all(self.repo, "#501 : fragment")
+        fold = self.fold(contract=FOLDED.replace("**1.12, ", "**1.13, "))
+        _write(self.repo, MANIFEST,
+               "# Paquet\n\n## Contrat module v1\n\n"
+               "- Révisions attribuées : 1.12 (#500, fragment), "
+               "1.13 (#501, fragment).\n"
+               "- Commit de composition : `%s`.\n" % fold)
+        head = _commit_all(self.repo, "paquet t : manifeste")
+        self.assertTrue(os.path.exists(os.path.join(self.repo, other)))
+        found, own = self.own(head)
+        self.assertIsNone(found)
+        self.assertIn(fold, own["commits"])
+
     def test_a_fold_to_another_revision_counts(self):
         """B dev5 : en-tête seul à 9.99 quand le manifeste cite 1.12."""
         fold = self.fold(contract=FOLDED.replace("**1.12, ", "**9.99, "))
