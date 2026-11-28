@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 import subprocess
 from collections import Counter
+from datetime import date as _date
 from pathlib import Path
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
@@ -291,6 +292,53 @@ def _render_fragment_adds(adds: str, previous: str) -> str:
     return text
 
 
+#: une ligne d'en-tête, quelle que soit sa forme
+HEADER_ANY_RE = re.compile(r"^Contract revision:")
+#: l'en-tête que le composeur écrit : numéro et date anglaise (``english_date``)
+FOLDED_HEADER_RE = re.compile(
+    r"^Contract revision: \*\*(\d+\.\d+), ([1-9]\d?) ([A-Z][a-z]+) "
+    r"(\d{4})\*\*")
+
+
+def _header_error(parent: str, folded: str, header: str) -> str | None:
+    """#8417 (B dev5, cx2) : l'en-tête plié est celui du composeur, ou une erreur.
+
+    Le composeur ne remplace que le span ``**1.N, date**`` (et l'éventuelle
+    parenthèse de résumé, ``contract_fragments._HEADER_LINE``) de l'unique
+    ligne d'en-tête ; la suite de la ligne (« . Scope: … ») est conservée. Le
+    contrat parent et l'arbre plié portent donc chacun une seule ligne
+    d'en-tête, la date est une date réelle au format anglais, et la queue
+    pliée est celle du parent, à l'octet près.
+    """
+    from . import contract_fragments
+
+    parents = [line for line in parent.splitlines() if HEADER_ANY_RE.match(line)]
+    if len(parents) != 1:
+        return "le parent porte %d ligne(s) d'en-tête" % len(parents)
+    folded_lines = [line for line in folded.splitlines()
+                    if HEADER_ANY_RE.match(line)]
+    if folded_lines != [header]:
+        return "l'arbre plié porte %d ligne(s) d'en-tête" % len(folded_lines)
+    before = contract_fragments._HEADER_LINE.match(parents[0])
+    if before is None:
+        return "en-tête du parent illisible"
+    match = FOLDED_HEADER_RE.match(header)
+    if match is None:
+        return "en-tête plié hors de la forme du composeur"
+    day, month, year = match.group(2), match.group(3), match.group(4)
+    try:
+        when = _date(int(year), contract_fragments._MONTHS.index(month) + 1,
+                     int(day))
+    except ValueError:
+        return "date d'en-tête invalide : %s %s %s" % (day, month, year)
+    if contract_fragments.english_date(when.isoformat()) != "%s %s %s" % (
+            day, month, year):
+        return "date d'en-tête invalide : %s %s %s" % (day, month, year)
+    if header[match.end():] != parents[0][before.end():]:
+        return "la suite de l'en-tête diffère du parent"
+    return None
+
+
 def _revision_parts(number: str) -> tuple[int, int] | None:
     """``(majeur, mineur)`` d'un numéro de révision ``1.N``, ou None."""
     major, _dot, minor = str(number).partition(".")
@@ -388,6 +436,7 @@ def contract_fold_paths(repo: Path, head: str, text: str
         return [line for line in value if line.strip()]
 
     header_value = None
+    folded_header = None
     if CONTRACT_REL in changed:
         added_lines = lines_for(added, CONTRACT_REL, "ajoutées")
         parent_contract = git(repo, "show", "%s:%s" % (parent, CONTRACT_REL),
@@ -430,6 +479,16 @@ def contract_fold_paths(repo: Path, head: str, text: str
                           "en-tête" % (sha, CONTRACT_REL))
         else:
             header_value = headers[0].group(1)
+            folded_header = headers[0].string
+            header_error = _header_error(
+                parent_contract.stdout.decode("utf-8", "replace")
+                if parent_contract.returncode == 0 else "",
+                git(repo, "show", "%s:%s" % (commit, CONTRACT_REL),
+                    check=False).stdout.decode("utf-8", "replace"),
+                folded_header)
+            if header_error:
+                errors.append("commit de pliage %s : %s : %s"
+                              % (sha, CONTRACT_REL, header_error))
 
     version_value = None
     if VERSION_REL in changed:
@@ -603,8 +662,12 @@ def contract_fold_paths(repo: Path, head: str, text: str
         moved = Counter(_norm_revision_line(line)
                         for line in removed.get(CONTRACT_REL) or []
                         if line.strip())
+        header_seen = False
         for line in added.get(CONTRACT_REL) or []:
-            if not line.strip() or CONTRACT_HEADER_LINE_RE.match(line):
+            if not line.strip():
+                continue
+            if line == folded_header and not header_seen:
+                header_seen = True
                 continue
             if pool[line] > 0:
                 pool[line] -= 1

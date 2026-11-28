@@ -174,6 +174,28 @@ class ContractFoldVehicleTest(unittest.TestCase):
         self.assertIsNone(found)
         self.assertIn(fold, own["commits"])
 
+    def test_a_fold_changing_the_header_tail_counts(self):
+        """B dev5 #47613/#47622, cx2 #47621 : seule l'étendue ``**…**`` de
+        l'en-tête change ; sa suite, une seconde ligne d'en-tête ou une date
+        impossible ne passent pas."""
+        for contract in (
+                FOLDED.replace("2026**.", "2026**. Scope: an unreviewed "
+                                          "instruction.", 1),
+                FOLDED.replace("\n\nRevision 1.11",
+                               "\nContract revision: **1.12, 2 January "
+                               "2026**. Extra.\n\nRevision 1.11", 1),
+                FOLDED.replace("2 January", "31 February", 1),
+                FOLDED.replace("2 January", "02 January", 1)):
+            with self.subTest(contract=contract.splitlines()[:3]):
+                fold = self.fold(contract=contract)
+                head = self.manifest(fold)
+                try:
+                    found, own = self.own(head)
+                finally:
+                    _git(self.repo, "reset", "-q", "--hard", "HEAD~2")
+                self.assertIsNone(found)
+                self.assertIn(fold, own["commits"])
+
     def test_a_fold_to_another_revision_counts(self):
         """B dev5 : en-tête seul à 9.99 quand le manifeste cite 1.12."""
         fold = self.fold(contract=FOLDED.replace("**1.12, ", "**9.99, "))
