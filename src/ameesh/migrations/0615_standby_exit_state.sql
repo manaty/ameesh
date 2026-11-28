@@ -8,9 +8,9 @@
 -- unless the debt is durable.
 --
 -- * `standby_entered_at`: standby mode may be active, `sortir` is owed. The
---   VM adapter writes it under the tick's transaction BEFORE the external
---   `entrer`, like the halt intent, so a failed or killed probe still records
---   that the list may be empty. A successful `sortir` clears it.
+--   VM adapter commits it with the stop intent, in the tick before the
+--   external `entrer` (like the halt intent), so a failed or killed probe
+--   still records that the list may be empty. A successful `sortir` clears it.
 -- * `standby_exit_failed_at`: first failed `sortir` of the current debt. The
 --   adapter keeps replaying `sortir` at every tick while either column is
 --   set, and `host_release.alerts` raises `host_release_standby_exit_failed`

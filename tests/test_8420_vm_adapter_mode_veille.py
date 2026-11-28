@@ -172,11 +172,35 @@ class EnterTest(Base):
         self.assertEqual(self.argvs(), [['/quiesce'], ['/quiesce'], ['/halt']])
 
     def test_enter_records_a_durable_standby_debt(self):
-        """#8459: written before `entrer`, so a killed worker still owes `sortir`."""
+        """#8459 B1: committed with the stop intent, a tick before `entrer`."""
         self.assertEqual(self.tick(), 'stop prepared')
-        self.assertIsNone(self.q.control('burst')['standby_entered_ts'])
+        self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
         self.assertEqual(self.tick(), 'halt prepared')
         self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
+
+    def test_a_killed_worker_after_enter_keeps_the_debt(self):
+        """#8459 B1 (cx2): the debt is committed before the external call, so
+        a worker killed after `entrer` and before the tick commits still owes
+        `sortir`; the rolled-back probe cannot erase the earlier commit."""
+        self.assertEqual(self.tick(), 'stop prepared')
+        self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
+        entered = []
+
+        def killed(argv, *args, **kwargs):
+            if argv == ['/entrer']:
+                entered.append(argv)
+                raise RuntimeError('worker killed after entrer')
+            return True
+
+        self.probe.side_effect = killed
+        with self.assertRaisesRegex(RuntimeError, 'killed after entrer'):
+            self.tick()
+        self.assertEqual(entered, [['/entrer']])
+        # The probe transaction rolled back; the committed debt stands.
+        self.assertIsNotNone(self.q.control('burst')['standby_entered_ts'])
+        self.probe.side_effect = None
+        self.probe.return_value = True
+        self.assertEqual(self.tick(), 'halt prepared')
 
     def test_refused_enter_still_records_the_debt(self):
         self.answer(['/entrer'])

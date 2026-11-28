@@ -236,10 +236,11 @@ class Queue:
 
     # -- #8459: the hub's standby debt, carried by each replica control -------
     def note_standby_enter(self, host):
-        """Standby may be active: `sortir` is owed. Written BEFORE `entrer`
-        runs (durable intent like the halt intent): a failed or killed probe
-        still records that the synchronous list may be empty. Idempotent: the
-        first instant of the debt is kept across replays and waves."""
+        """Standby may be active: `sortir` is owed. Committed with the stop
+        intent, a tick before `entrer` runs (durable like the halt intent): a
+        failed or killed probe still records that the synchronous list may be
+        empty. Idempotent: the first instant of the debt is kept across
+        replays and waves."""
         self.db.execute("UPDATE host_lifecycle SET standby_entered_at="
                         "coalesce(standby_entered_at,clock_timestamp()) "
                         "WHERE host=%s", (host,))

@@ -946,17 +946,25 @@ def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
                 return 'on hysteresis'
             if result not in (STOP_PREPARED, HALT_INTENT):
                 q.stop_intent(request)
+                # #8459 B1 (cx2): the standby debt is committed with the stop
+                # intent, a tick before `entrer`; a worker killed while the
+                # probe runs can no longer roll it back. Conservative: if the
+                # host never enters standby, the replay of `sortir` is a no-op.
+                if target.get('replica'):
+                    q.note_standby_enter(host)
                 return 'stop prepared'
             q.refresh_stop_intent(host)
             if not probe(target['quiesce_argv'], policy['io_timeout_s']):
                 return 'quiesce pending'
             # #8420: fail closed. No halt intent, and no halt, while the hub
             # cannot enter standby mode (idempotent: a replay verifies it).
-            # #8459: the intent is durable before the external call, so a
-            # failed or killed `entrer` still records that the synchronous
-            # list may be empty and that `sortir` is owed.
+            # #8459 B1 (cx2): the debt was committed with the stop intent (or
+            # by this branch for a request prepared before this version); a
+            # failed or killed `entrer` cannot erase it.
             if target.get('replica'):
-                q.note_standby_enter(host)
+                if control.get('standby_entered_ts') is None:
+                    q.note_standby_enter(host)
+                    return 'standby enter prepared'
                 if not probe(target['standby_enter_argv'], policy['standby_timeout_s']):
                     return 'standby enter refused'
             if result == STOP_PREPARED:
