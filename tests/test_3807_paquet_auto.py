@@ -130,6 +130,25 @@ class PaquetAutoBanc(unittest.TestCase):
         return sha
 
     @staticmethod
+    def contract_revisions() -> tuple[str, str, str]:
+        """La révision de base du contrat et les deux suivantes (#8395).
+
+        Le contrat copié dans le banc est celui de l'arbre courant : ses
+        numéros ne sont pas écrits ici, le composeur les attribue à partir de
+        l'en-tête.
+        """
+        import re
+
+        text = (REPO / "docs/api/module-contract-v1.md").read_text(
+            encoding="utf-8")
+        match = re.search(r"(?m)^Contract revision: \*\*(\d+)\.(\d+),", text)
+        assert match, "en-tête du contrat introuvable"
+        major, minor = int(match.group(1)), int(match.group(2))
+        return ("%d.%d" % (major, minor),
+                "%d.%d" % (major, minor + 1),
+                "%d.%d" % (major, minor + 2))
+
+    @staticmethod
     def contract_table(units) -> str:
         """La table `## Composition` du manifeste, sans lancer paquet-compose."""
         rows = "\n".join(
@@ -1059,13 +1078,14 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertEqual(self.rev("HEAD", cwd=worktree), composition.head)
         subject = self.git("log", "-1", "--format=%s", cwd=worktree).stdout
         self.assertIn("contrat module v1", subject)
+        base, four, five = self.contract_revisions()
         text = (worktree / "docs/api/module-contract-v1.md").read_text(
             encoding="utf-8")
-        self.assertIn("Contract revision: **1.13, 28 November 2026**", text)
-        self.assertIn("Revision 1.12 adds `ameesh quatre --json` (#4)", text)
-        self.assertIn("additive to 1.11", text)
-        self.assertIn("Revision 1.13 adds `ameesh cinq --json` (#5)", text)
-        self.assertIn("additive to 1.12", text)
+        self.assertIn("Contract revision: **%s, 28 November 2026**" % five, text)
+        self.assertIn("Revision %s adds `ameesh quatre --json` (#4)" % four, text)
+        self.assertIn("additive to %s" % base, text)
+        self.assertIn("Revision %s adds `ameesh cinq --json` (#5)" % five, text)
+        self.assertIn("additive to %s" % four, text)
         self.assertIn("## Quatre\n\nThe quatre read.", text)
         self.assertLess(text.index("## Quatre"), text.index(
             "<!-- contract-revision-sections:"))
@@ -1073,29 +1093,32 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertFalse((worktree / "docs/api/module-contract-v1.d/5.md").exists())
         surface = json.loads((worktree / "docs/api/module-contract-v1.surface.json")
                              .read_text(encoding="utf-8"))
-        self.assertEqual(surface["contract"], "1.13")
+        self.assertEqual(surface["contract"], five)
         version = (worktree / "src/ameesh/public/__init__.py").read_text(
             encoding="utf-8")
-        self.assertIn('CONTRACT_VERSION = "1.13"', version)
+        self.assertIn('CONTRACT_VERSION = "%s"' % five, version)
         manifest = paquet_auto.build_manifest(
             name="contrat-deux", target="main", base_sha=self.base, carrier=99,
             composition=composition,
             table=self.contract_table(composition.units), tests=[],
             freeze_seconds=0.0)
         self.assertIn("## Contrat module v1", manifest)
-        self.assertIn("1.12 (#4, fragment), 1.13 (#5, fragment)", manifest)
+        self.assertIn("%s (#4, fragment), %s (#5, fragment)" % (four, five),
+                      manifest)
         self.assertIn("`%s`" % composition.contract.head, manifest)
 
     def test_an_old_style_revision_is_renumbered_after_a_fragment(self) -> None:
         self.install_contract()
-        # Le lot 4 écrit son numéro à l'ancienne manière (1.12 et son en-tête).
+        base, first, second = self.contract_revisions()
+        # Le lot 4 écrit son numéro à l'ancienne manière (base + 1, son en-tête).
         self.git("switch", "-q", "-c", "lot/4", "main", cwd=self.repo)
         text = (self.repo / "docs/api/module-contract-v1.md").read_text(
             encoding="utf-8")
-        text = text.replace("Contract revision: **1.11,", "Contract revision: **1.12,")
+        text = text.replace("Contract revision: **%s," % base,
+                            "Contract revision: **%s," % first)
         text = text.replace(
-            "The [IMA mapping]", "Revision 1.12 adds `ameesh ancien` (#4); it is "
-            "additive to 1.11.\nThe [IMA mapping]", 1)
+            "The [IMA mapping]", "Revision %s adds `ameesh ancien` (#4); it is "
+            "additive to %s.\nThe [IMA mapping]" % (first, base), 1)
         self.write("docs/api/module-contract-v1.md", text)
         old_style = self.commit("#4 : révision écrite")
         self.git("switch", "-q", "main", cwd=self.repo)
@@ -1105,13 +1128,14 @@ class PaquetAutoBanc(unittest.TestCase):
         worktree, composition = self._compose_contract(
             [(5, fragment_lot), (4, old_style)], "contrat-ancien")
         self.assertEqual(composition.contract.revisions,
-                         [("1.12", 5, "fragment"), ("1.13", 4, "legacy")])
+                         [(first, 5, "fragment"), (second, 4, "legacy")])
         text = (worktree / "docs/api/module-contract-v1.md").read_text(
             encoding="utf-8")
-        self.assertIn("Contract revision: **1.13, 28 November 2026**", text)
-        self.assertIn("Revision 1.13 adds `ameesh ancien` (#4); it is additive "
-                      "to 1.12.", text)
-        self.assertNotIn("Revision 1.12 adds `ameesh ancien`", text)
+        self.assertIn("Contract revision: **%s, 28 November 2026**" % second,
+                      text)
+        self.assertIn("Revision %s adds `ameesh ancien` (#4); it is additive "
+                      "to %s." % (second, first), text)
+        self.assertNotIn("Revision %s adds `ameesh ancien`" % first, text)
 
     def test_a_malformed_fragment_refuses_composition_naming_the_lot(self) -> None:
         self.install_contract()
