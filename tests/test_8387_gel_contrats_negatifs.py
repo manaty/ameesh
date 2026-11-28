@@ -90,6 +90,25 @@ class ParserTest(unittest.TestCase):
                "reviewed_by timestamp, failed_by bigint[]);\n")
         self.assertEqual(self.columns(sql), [("t", "failed_by")])
 
+    def test_chaque_add_est_lu_seul_dans_l_alter(self):
+        # #8387 B1 : un type de tableau suivi d'un `ADD` ne doit pas être
+        # ignoré parce que le dernier type de l'ALTER est numérique.
+        sql = ("ALTER TABLE demo ADD COLUMN approved_by bigint[], "
+               "ADD COLUMN note integer;\n")
+        self.assertEqual(self.columns(sql), [("demo", "approved_by")])
+
+    def test_un_type_numerique_ne_devient_pas_identite_par_le_voisin(self):
+        # #8387 B1 : le `text[]` du second `ADD` ne doit pas faire passer le
+        # `bigint` du premier pour un tableau ; seul `note` est de type lu.
+        sql = ("ALTER TABLE demo ADD COLUMN approved_by bigint, "
+               "ADD COLUMN note text[];\n")
+        self.assertEqual(self.columns(sql), [("demo", "note")])
+
+    def test_les_virgules_des_parentheses_ne_coupent_pas_l_action(self):
+        sql = ("ALTER TABLE demo ADD COLUMN amount numeric(10, 2), "
+               "ADD COLUMN reviewed_by text[];\n")
+        self.assertEqual(self.columns(sql), [("demo", "reviewed_by")])
+
     def test_les_contraintes_ne_sont_pas_des_colonnes(self):
         sql = ("CREATE TABLE t (id bigint, CONSTRAINT approved_by CHECK (id > 0));\n"
                "ALTER TABLE t ADD CONSTRAINT planned_by CHECK (id > 0);\n"
@@ -304,6 +323,30 @@ class FreezeTest(unittest.TestCase):
         self.assertEqual(caught.exception.cause, "checks-red")
         self.assertIn("work_items.approved_by", str(caught.exception))
         self.assertNotIn("work_items.planned_by", str(caught.exception))
+
+    def test_un_tableau_suivi_d_un_add_numerique_reste_vu(self):
+        # #8387 B1, sens faux négatif : le `bigint[]` reste une identité,
+        # même si le dernier `ADD` de l'ALTER est numérique.
+        self.tree.agent_rename_stub()
+        self.tree.migration(
+            "ALTER TABLE work_items ADD COLUMN approved_by bigint[], "
+            "ADD COLUMN planned_by text;\n")
+        sha = self.tree.commit()
+        with self.assertRaises(freeze_checks.Refused) as caught:
+            self.run_freeze(sha, ["src/ameesh/migrations/0099_test.sql"])
+        self.assertEqual(caught.exception.cause, "checks-red")
+        self.assertIn("work_items.approved_by", str(caught.exception))
+
+    def test_un_add_numerique_ne_blanchit_pas_le_suivant(self):
+        # #8387 B1, sens faux positif : le `bigint` n'est pas une identité,
+        # et le `text[]` qui suit ne doit pas le faire passer pour une.
+        self.tree.agent_rename_stub()
+        self.tree.migration(
+            "ALTER TABLE work_items ADD COLUMN approved_by bigint, "
+            "ADD COLUMN planned_by text[];\n")
+        sha = self.tree.commit()
+        result = self.run_freeze(sha, ["src/ameesh/migrations/0099_test.sql"])
+        self.assertEqual(result["result"], "green")
 
     def test_une_migration_classee_reste_verte(self):
         self.tree.agent_rename_stub()

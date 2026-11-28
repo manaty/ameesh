@@ -238,16 +238,6 @@ def _create_columns(sql: str) -> list[Finding]:
     return out
 
 
-def _depth(actions: str, offset: int) -> int:
-    depth = 0
-    for char in actions[:offset]:
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-    return depth
-
-
 def _alter_columns(sql: str) -> list[Finding]:
     out = []
     for start in ALTER_TABLE.finditer(sql):
@@ -265,16 +255,22 @@ def _alter_columns(sql: str) -> list[Finding]:
         end = sql.find(";", offset)
         end = len(sql) if end < 0 else end
         actions = sql[offset:end]
-        for add in ADD_ACTION.finditer(actions):
-            if _depth(actions, add.start()):
+        for part_offset, part in split_top(actions):
+            # #8387 B1 : une action à la fois. Lire le type jusqu'au bout de
+            # l'ALTER laissait le `ADD` suivant contaminer la définition
+            # (`bigint[], ADD COLUMN note integer` ignoré ; `bigint, ADD
+            # COLUMN note text[]` retenu à tort).
+            definition = part.lstrip()
+            lead = len(part) - len(definition)
+            add = ADD_ACTION.match(definition)
+            if not add:
                 continue
             quoted = add.group(1) is not None
             column = add.group(1) if quoted else add.group(2).lower()
             if not quoted and column in NOT_A_COLUMN:
                 continue
-            rest = actions[add.end():]
-            if type_is_identity(rest):
-                out.append(Finding("", line_of(sql, offset + add.start()),
+            if type_is_identity(definition[add.end():]):
+                out.append(Finding("", line_of(sql, offset + part_offset + lead),
                                    table, column))
     return out
 
