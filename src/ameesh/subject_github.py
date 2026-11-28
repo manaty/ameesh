@@ -155,12 +155,20 @@ class Context:
     """Ce qu'il faut pour publier : le client `gh`, la garde et la visibilité
     (en cache) des dépôts."""
 
-    def __init__(self, cfg, db, gh, *, cache: dict | None = None, local_host=None):
+    def __init__(self, cfg, db, gh, *, cache: dict | None = None, local_host=None,
+                 writes=None):
         """Échoue fermé : des réglages `github` invalides (`SettingsError`) ou
         une liste d'hôtes illisible lèvent ; jamais de publication avec une
-        garde privée de ses termes exclus ou des noms d'hôtes du mesh."""
+        garde privée de ses termes exclus ou des noms d'hôtes du mesh.
+
+        #8389 : `writes` est le crédit d'écritures partagé de la projection
+        (`plan_github._Writes`). Sans lui (état d'hôte absent), les deux
+        écritures de ce module reprennent leur `gh api` direct, comme avant ;
+        le défaut le construit depuis la base, pour que la CLI et la passe
+        automatique débitent le même budget."""
         self.gh = gh
         self.cache = {} if cache is None else cache
+        self.writes = writes if writes is not None else plan_github._writes_for(db, gh)
         settings = plan_github.settings_of(cfg) if cfg is not None else plan_github.Settings()
         hosts = {local_host or getattr(cfg, "host", None)}
         hosts |= {row.get("host") for row in storage.of(db).hosts.current(None)}
@@ -189,8 +197,20 @@ def write_section(db, ctx: Context, subject: dict, repo: str, number: int,
     new = splice(body, subject["id"], section)
     if new == body:
         return False
-    code, out, err = ctx.gh.run(["api", "-X", "PATCH", "repos/%s/issues/%d" % (repo, number),
-                                 "--input", "-"], json.dumps({"body": new}))
+    path = "repos/%s/issues/%d" % (repo, number)
+    if ctx.writes is not None:
+        try:
+            ctx.writes.write("PATCH", path, {"body": new})
+        except plan_github.ContentLimitReached:
+            raise                       # sync arrête la passe ; la CLI l'explique
+        except plan_github.GithubRateLimited:
+            raise                       # limite mémorisée : arrête la passe
+        except plan_github.GithubError as exc:
+            raise _access(ref_of(repo, number), "edit the issue body",
+                          plan_github._one_line(exc)) from exc
+        return True
+    code, out, err = ctx.gh.run(["api", "-X", "PATCH", path, "--input", "-"],
+                                json.dumps({"body": new}))
     if code != 0:
         raise _access(ref_of(repo, number), "edit the issue body", err or out)
     return True
@@ -226,7 +246,16 @@ def adopt(db, ctx: Context, subject: dict, ref: str) -> dict:
     if subject["state"] != "open":
         raise WorkError("subject %s is closed" % subject["slug"])
     repo, number, read = check_adoptable(db, ctx.gh, ref, subject=subject)
-    write_section(db, ctx, subject, repo, number, issue=read)
+    try:
+        write_section(db, ctx, subject, repo, number, issue=read)
+    except plan_github.ContentLimitReached as exc:
+        raise WorkError(
+            "%s: GitHub content credit spent (%s); retry after the window"
+            % (ref_of(repo, number), plan_github._one_line(exc))) from exc
+    except plan_github.GithubRateLimited as exc:
+        raise WorkError(
+            "%s: GitHub rate limit (%s); retry after the window"
+            % (ref_of(repo, number), plan_github._one_line(exc))) from exc
     row = storage.of(db).work.subject_set_github(int(subject["id"]), ref_of(repo, number))
     if row is None:
         raise WorkError("%s was adopted by another subject meanwhile; the section of %s "
@@ -255,14 +284,36 @@ def create_epic(db, ctx: Context, subject: dict, repo: str) -> dict:
                         % (subject["slug"], repo,
                            ", ".join(ctx.guard.problems(title, public=ctx.public(repo)))))
     body = section_for(db, ctx, subject, repo)
-    code, out, err = ctx.gh.run(["api", "-X", "POST", "repos/%s/issues" % repo, "--input", "-"],
-                                json.dumps({"title": plan_github._quiet(title), "body": body}))
-    if code != 0:
-        raise _access(repo, "create an issue", err or out)
-    try:
-        number = int(json.loads(out)["number"])
-    except (ValueError, KeyError, TypeError) as exc:
-        raise WorkError("%s: unreadable answer from GitHub after creating the epic" % repo) from exc
+    payload = {"title": plan_github._quiet(title), "body": body}
+    path = "repos/%s/issues" % repo
+    if ctx.writes is not None:
+        try:
+            created = ctx.writes.write("POST", path, payload)
+        except plan_github.ContentLimitReached as exc:
+            raise WorkError(
+                "%s: GitHub content credit spent (%s); retry after the window"
+                % (repo, plan_github._one_line(exc))) from exc
+        except plan_github.GithubRateLimited as exc:
+            raise WorkError(
+                "%s: GitHub rate limit (%s); retry after the window"
+                % (repo, plan_github._one_line(exc))) from exc
+        except plan_github.GithubError as exc:
+            raise _access(repo, "create an issue", plan_github._one_line(exc)) from exc
+        try:
+            number = int(created["number"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkError(
+                "%s: unreadable answer from GitHub after creating the epic" % repo) from exc
+    else:
+        code, out, err = ctx.gh.run(["api", "-X", "POST", path, "--input", "-"],
+                                    json.dumps(payload))
+        if code != 0:
+            raise _access(repo, "create an issue", err or out)
+        try:
+            number = int(json.loads(out)["number"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise WorkError(
+                "%s: unreadable answer from GitHub after creating the epic" % repo) from exc
     row = storage.of(db).work.subject_set_github(int(subject["id"]), ref_of(repo, number))
     if row is None:
         raise WorkError("%s created, but subject %s got another epic meanwhile; close "
@@ -288,7 +339,7 @@ def sync(cfg, db, gh, *, written: dict, cache: dict | None = None, log=None) -> 
     sujet: empreinte}, gardé par l'appelant). Un ticket trouvé fermé clôt
     son sujet. Une erreur reste par sujet et n'arrête pas les autres."""
     log = log or (lambda _text: None)
-    report = {"updated": 0, "closed": 0, "errors": []}
+    report = {"updated": 0, "closed": 0, "errors": [], "deferred": 0}
     subjects = [s for s in storage.of(db).work.subjects(open_only=True) if s.get("github_ref")]
     if not subjects:
         return report
@@ -311,6 +362,21 @@ def sync(cfg, db, gh, *, written: dict, cache: dict | None = None, log=None) -> 
             if write_section(db, ctx, subject, repo, number, issue=issue, section=section):
                 report["updated"] += 1
             written[int(subject["id"])] = stamp
+        except plan_github.ContentLimitReached as exc:
+            # #8389 : le crédit d'écritures est partagé et dépensé ; les
+            # sections restantes repartent à la fenêtre suivante, sans
+            # interroger GitHub une fois par sujet.
+            report["deferred"] += 1
+            log("GitHub subject epics: write credit spent, %s deferred: %s"
+                % (subject["github_ref"], plan_github._one_line(exc)))
+            break
+        except plan_github.GithubRateLimited as exc:
+            # #8357 : une limite mémorisée arrête la passe, pas seulement ce
+            # sujet ; le suivant serait refusé sans requête mais compterait
+            # une erreur de plus.
+            report["errors"].append({"subject": subject["slug"], "ref": subject["github_ref"],
+                                     "detail": plan_github._one_line(exc)})
+            break
         except (WorkError, plan_github.GithubError) as exc:
             report["errors"].append({"subject": subject["slug"], "ref": subject["github_ref"],
                                      "detail": plan_github._one_line(exc)})

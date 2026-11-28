@@ -1790,16 +1790,32 @@ ISSUES_PAGE_TIMEOUT = 120.0
 #: qu'au plus `MAX_COMMENTS_PER_PASS`, espacés, et le suivant reprend le reste.
 MAX_COMMENTS_PER_PASS = 20
 COMMENT_INTERVAL_S = 1.0
+#: #8389 : toutes les écritures de la projection (créations d'issues, PATCH,
+#: cartes du plan, sous-issues, épiques de sujets) partagent le même crédit
+#: que les commentaires. Sans lui, 40 créations par passage de 90 s font
+#: jusqu'à ~1 600 POST/h, au-dessus des ~500/h de GitHub et sans marge pour
+#: les fusions, la CI et les autres écrivains du jeton. Le crédit horaire
+#: reste à 200/h, tous gestes confondus ; le plafond par passage les espace.
+MAX_WRITES_PER_PASS = 20
+MAX_WRITES_PER_HOUR = 200
+WRITE_INTERVAL_S = 1.0
+CONTENT_CREDIT_WINDOW_S = 3600.0
+#: nom du fichier de crédit partagé : un seul budget pour tout le contenu
+#: écrit par la projection sur cet hôte (commentaires compris). Le nom
+#: historique « comments » est gardé pour que la fenêtre de #8357 survive à
+#: la mise à jour ; il ne désigne plus que les commentaires.
+CONTENT_CREDIT_NAME = "comments"
 #: #8357 : crédit horaire persistant. La cadence de 90 s ferait 800
 #: commentaires/h avec le seul plafond par passage, au-dessus des ~500/h de
 #: GitHub et sans marge pour les fusions, la CI et les autres écrivains du
-#: jeton partagé. 200/h laisse 300 créations à ces autres gestes.
-MAX_COMMENTS_PER_HOUR = 200
-COMMENT_CREDIT_WINDOW_S = 3600.0
+#: jeton partagé. 200/h pour toute la projection laisse 300 créations à ces
+#: autres gestes.
+MAX_COMMENTS_PER_HOUR = MAX_WRITES_PER_HOUR
+COMMENT_CREDIT_WINDOW_S = CONTENT_CREDIT_WINDOW_S
 
 
 class ContentLimitReached(Exception):
-    """#8357 : le quota de commentaires du passage ou de l'heure est dépensé.
+    """#8357 : le quota d'écritures du passage ou de l'heure est dépensé.
 
     Ce n'est pas une panne GitHub : aucune requête n'est partie, et la passe
     suivante (ou la fenêtre horaire suivante) reprend les marqueurs restants.
@@ -1808,38 +1824,49 @@ class ContentLimitReached(Exception):
 
 
 class _Writes:
-    """#8357 : écritures GitHub par le quota partagé, débitées par passage.
+    """#8357/#8389 : écritures GitHub par le quota partagé, débitées ensemble.
 
     Les lectures passent par `Api`/`GhApi`, qui mémorisent une limite primaire
     ou secondaire et son `Retry-After` dans `SharedReads` (#1405). Les POST et
     PATCH de la projection appelaient `gh api` directement, hors de ce quota :
     le 403 secondaire n'était jamais retenu, et chaque lot suivant le
-    répétait. Ici chaque écriture :
+    répétait. Ici chaque écriture — commentaire, création d'issue, PATCH,
+    carte du plan, sous-issue, épique de sujet :
 
     * refuse sans requête pendant la fenêtre mémorisée (`SharedReads.blocked`) ;
     * lit les en-têtes (`gh api -i`) et les remet à `SharedReads.note` : une
       limite primaire ou secondaire arrête le passage, et son `Retry-After`
       est respecté au passage suivant ;
-    * borne les commentaires à `comments_per_pass`, espacés d'au moins
-      `comment_interval`, et à `comments_per_hour` par fenêtre fixe sur
-      disque : un rattrapage s'étale sur plusieurs passages sans dépasser
-      le budget horaire du jeton partagé.
+    * est bornée par passage (`writes_per_pass`) et par heure
+      (`writes_per_hour`, fenêtre fixe sur disque, verrou du cache) : un
+      rattrapage s'étale sur plusieurs passages sans dépasser le budget
+      horaire du jeton partagé ;
+    * est espacée d'au moins `write_interval` de la précédente.
     """
 
     def __init__(self, gh, reads: "SharedReads | None" = None, *, clock=time.time,
-                 sleep=time.sleep, comments_per_pass: int = MAX_COMMENTS_PER_PASS,
+                 sleep=time.sleep, writes_per_pass: int = MAX_WRITES_PER_PASS,
+                 writes_per_hour: int = MAX_WRITES_PER_HOUR,
+                 write_interval: float = WRITE_INTERVAL_S,
+                 comments_per_pass: int = MAX_COMMENTS_PER_PASS,
                  comments_per_hour: int = MAX_COMMENTS_PER_HOUR,
                  comment_interval: float = COMMENT_INTERVAL_S):
         self.gh = gh
         self.reads = reads
         self.clock = clock
         self.sleep = sleep
+        self.writes_per_pass = int(writes_per_pass)
+        self.writes_per_hour = int(writes_per_hour)
+        self.write_interval = float(write_interval)
         self.comments_per_pass = int(comments_per_pass)
         self.comments_per_hour = int(comments_per_hour)
         self.comment_interval = float(comment_interval)
-        #: commentaires tentés dans ce passage (le plafond se vérifie avant).
+        #: écritures tentées dans ce passage (le plafond se vérifie avant) ;
+        #: les commentaires y comptent comme les autres écritures.
+        self.writes = 0
+        self._last_write: float | None = None
+        #: commentaires tentés dans ce passage (borne propre, plus fine).
         self.comments = 0
-        self._last_comment: float | None = None
 
     def _refuse_while_blocked(self, path: str, now: float) -> None:
         if self.reads is None:
@@ -1849,10 +1876,41 @@ class _Writes:
             raise GithubRateLimited(
                 path, until, reserve=self.reads.reserve_only(now, DEFAULT_RESOURCE))
 
-    def write(self, method: str, path: str, payload: dict | None = None) -> dict:
-        """Un POST/PATCH/DELETE derrière le quota partagé, en-têtes compris."""
+    def _content_credit(self, path: str, now: float, limit: int) -> None:
+        if self.reads is None:
+            return
+        if not self.reads.take_content_credit(
+                limit=int(limit), window=CONTENT_CREDIT_WINDOW_S, now=now,
+                name=CONTENT_CREDIT_NAME):
+            raise ContentLimitReached(
+                "GitHub writes: hourly credit spent; the next window resumes")
+
+    def _pace(self, now: float, interval: float) -> float:
+        if self._last_write is not None:
+            wait = float(interval) - (now - self._last_write)
+            if wait > 0:
+                self.sleep(wait)
+                now = float(self.clock())
+        return now
+
+    def write(self, method: str, path: str, payload: dict | None = None, *,
+              credit_limit: int | None = None, interval: float | None = None) -> dict:
+        """Un POST/PATCH/DELETE derrière le quota partagé, en-têtes compris.
+
+        `credit_limit` abaisse le crédit horaire pour un geste plus sensible
+        (les commentaires gardent leur propre borne) ; `interval` remplace
+        l'espacement par défaut de ce geste."""
         now = float(self.clock())
         self._refuse_while_blocked(path, now)
+        if self.writes >= self.writes_per_pass:
+            raise ContentLimitReached(
+                "GitHub writes: %d per pass reached; the next pass resumes"
+                % self.writes_per_pass)
+        limit = self.writes_per_hour if credit_limit is None else min(
+            int(credit_limit), self.writes_per_hour)
+        self._content_credit(path, now, limit)
+        now = self._pace(now, self.write_interval if interval is None else interval)
+        self.writes += 1
         argv = ["api", "-X", method.upper(), path]
         stdin = None
         if payload is not None:
@@ -1862,51 +1920,62 @@ class _Writes:
         # ordre, et les appels de test gardent `["api", "-X", <méthode>, …]`.
         argv.append("-i")
         try:
-            status, headers, body = gh_api_http(self.gh, argv, stdin, path=path)
-        except GithubError as exc:
-            # Repli : un `gh` qui renvoie le refus dans stderr sans ligne
-            # d'état ne donne pas ses en-têtes. Le texte suffit à reconnaître
-            # une limite ; `SharedReads` retient alors la fenêtre par défaut,
-            # et le passage s'arrête au lieu de répéter sur chaque lot.
-            text = "%s %s" % (exc, getattr(exc, "body", "") or "")
-            lowered = text.lower()
-            if ("http 429" in lowered or "too many requests" in lowered
-                    or SECONDARY_LIMIT_MARK in lowered
-                    or "api rate limit exceeded" in lowered):
-                until = self.reads.note({}, status=429, now=float(self.clock()),
-                                        body=text) if self.reads is not None else None
-                raise GithubRateLimited(path, until) from exc
-            raise
-        now = float(self.clock())
-        until = None
-        if self.reads is not None:
-            resource = _resource_header(headers) or resource_of(path)
-            until = self.reads.note(headers, status=status, now=now,
-                                    resource=resource, body=body)
-        # #8357 : tout 429 est une limite ; un 403 n'en est une que sur un
-        # marqueur ou une fenêtre déjà mémorisée (un 403 de droits reste une
-        # erreur de droits).
-        limited = status == 429 or (
-            status == 403
-            and (until or SECONDARY_LIMIT_MARK in body.lower()
-                 or "api rate limit exceeded" in body.lower()))
-        if limited:
-            raise GithubRateLimited(path, until)
-        if status >= 400:
-            raise GithubError("GitHub %s: HTTP %d" % (path, status),
-                              status=status, body=body)
-        try:
-            return json.loads(body) if body.strip() else {}
-        except ValueError as exc:
-            raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
+            try:
+                status, headers, body = gh_api_http(self.gh, argv, stdin, path=path)
+            except GithubError as exc:
+                # Repli : un `gh` qui renvoie le refus dans stderr sans ligne
+                # d'état ne donne pas ses en-têtes. Le texte suffit à reconnaître
+                # une limite ; `SharedReads` retient alors la fenêtre par défaut,
+                # et le passage s'arrête au lieu de répéter sur chaque lot.
+                text = "%s %s" % (exc, getattr(exc, "body", "") or "")
+                lowered = text.lower()
+                if ("http 429" in lowered or "too many requests" in lowered
+                        or SECONDARY_LIMIT_MARK in lowered
+                        or "api rate limit exceeded" in lowered):
+                    until = self.reads.note({}, status=429, now=float(self.clock()),
+                                            body=text) if self.reads is not None else None
+                    raise GithubRateLimited(path, until) from exc
+                raise
+            now = float(self.clock())
+            until = None
+            if self.reads is not None:
+                resource = _resource_header(headers) or resource_of(path)
+                until = self.reads.note(headers, status=status, now=now,
+                                        resource=resource, body=body)
+            # #8357 : tout 429 est une limite ; un 403 n'en est une que sur un
+            # marqueur ou une fenêtre déjà mémorisée (un 403 de droits reste une
+            # erreur de droits).
+            limited = status == 429 or (
+                status == 403
+                and (until or SECONDARY_LIMIT_MARK in body.lower()
+                     or "api rate limit exceeded" in body.lower()))
+            if limited:
+                raise GithubRateLimited(path, until)
+            if status >= 400:
+                raise GithubError("GitHub %s: HTTP %d" % (path, status),
+                                  status=status, body=body)
+            try:
+                return json.loads(body) if body.strip() else {}
+            except ValueError as exc:
+                raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
+        finally:
+            self._last_write = float(self.clock())
+
+    def writes_available(self) -> bool:
+        """#8389 : le crédit horaire d'écriture permet-il encore un geste ?"""
+        if self.reads is None:
+            return True
+        return self.reads.content_credit_available(
+            limit=self.writes_per_hour, window=CONTENT_CREDIT_WINDOW_S,
+            name=CONTENT_CREDIT_NAME)
 
     def comments_available(self) -> bool:
         """#8357 : le crédit horaire permet-il encore une écriture ?"""
         if self.reads is None:
             return True
         return self.reads.content_credit_available(
-            limit=self.comments_per_hour, window=COMMENT_CREDIT_WINDOW_S,
-            name="comments")
+            limit=min(self.comments_per_hour, self.writes_per_hour),
+            window=CONTENT_CREDIT_WINDOW_S, name=CONTENT_CREDIT_NAME)
 
     def comment(self, path: str, body: str) -> dict:
         """Un commentaire, borné par passage et par heure, et espacé (#8357)."""
@@ -1914,23 +1983,10 @@ class _Writes:
             raise ContentLimitReached(
                 "GitHub comments: %d per pass reached; the next pass resumes"
                 % self.comments_per_pass)
-        now = float(self.clock())
-        self._refuse_while_blocked(path, now)
-        if self.reads is not None and not self.reads.take_content_credit(
-                limit=self.comments_per_hour, window=COMMENT_CREDIT_WINDOW_S,
-                now=now, name="comments"):
-            raise ContentLimitReached(
-                "GitHub comments: hourly credit spent; the next window resumes")
-        if self._last_comment is not None:
-            wait = self.comment_interval - (now - self._last_comment)
-            if wait > 0:
-                self.sleep(wait)
-                now = float(self.clock())
         self.comments += 1
-        try:
-            return self.write("POST", path, {"body": body})
-        finally:
-            self._last_comment = float(self.clock())
+        return self.write("POST", path, {"body": body},
+                          credit_limit=self.comments_per_hour,
+                          interval=max(self.comment_interval, self.write_interval))
 
 
 class _Repo:
@@ -2063,8 +2119,9 @@ class _Repo:
 def _writes_for(db, gh) -> _Writes:
     """Les écritures d'une projection, derrière le quota partagé de l'hôte.
 
-    #8357 : sans `state_dir`, la fenêtre n'est pas mémorisée, mais le plafond
-    et l'espacement des commentaires tiennent quand même le débit."""
+    #8357/#8389 : sans `state_dir`, la fenêtre n'est pas mémorisée, mais le
+    plafond par passage et l'espacement des écritures tiennent quand même le
+    débit."""
     state_dir = str(getattr(getattr(db, "cfg", None), "state_dir", "") or "").strip()
     reads = SharedReads(state_dir, caller="github-projection") if state_dir else None
     return _Writes(gh, reads=reads)
@@ -2087,7 +2144,11 @@ def _payload(view: Desired, body: str, issue: dict | None) -> dict:
 
 def project_github(db, gh, repo: str, *, dry_run: bool = False,
                    canon_url: str | None = None) -> dict:
-    """Projette le plan sur les issues de `repo`. Rend le compte rendu."""
+    """Projette le plan sur les issues de `repo`. Rend le compte rendu.
+
+    #8389 : les écritures passent par le crédit de contenu partagé. Le crédit
+    épuisé arrête la projection proprement : les cartes déjà écrites restent,
+    les suivantes repartent à la prochaine exécution ou fenêtre."""
     check_repo(repo)
     st = storage.of(db)
     packages = st.packages.all()
@@ -2098,7 +2159,22 @@ def project_github(db, gh, repo: str, *, dry_run: bool = False,
                     "labels_created": [], "sub_issues": [], "sub_issues_api": None,
                     "orphans": [], "duplicates": [], "notes": []}
     present = {p["id"] for p in packages}
+    try:
+        _project_github_body(gh_repo, report, views, present, dry_run)
+    except ContentLimitReached as exc:
+        report["notes"].append(
+            "GitHub writes: projection stopped (%s); rerun after the window"
+            % _one_line(exc))
+    except GithubRateLimited as exc:
+        report["notes"].append(
+            "GitHub writes: quota (%s); projection stopped, retry after the window"
+            % _one_line(exc))
+    return report
 
+
+def _project_github_body(gh_repo: "_Repo", report: dict, views, present: set,
+                         dry_run: bool) -> None:
+    """Le corps de `project_github`, après les lectures et le compte rendu."""
     # labels
     wanted = sorted({lab for v in views for lab in v.labels}
                     | {"%s:%s" % (BASE_LABEL, s) for s in STATE_LABELS})
@@ -2213,7 +2289,6 @@ def project_github(db, gh, repo: str, *, dry_run: bool = False,
         report["notes"] += ["sub-issues API not probed (dry run without a projected epic): "
                            "sub-issues or task list decided at the first real projection"]
     report["sub_issues_api"] = api
-    return report
 
 
 # ==========================================================================
@@ -2223,8 +2298,10 @@ def project_github(db, gh, repo: str, *, dry_run: bool = False,
 #: lots lus au plus par une projection (ouverts, ou porteurs d'une issue_ref)
 FEED_LIMIT = 5000
 #: issues créées au plus par passage (limites secondaires de GitHub sur la
-#: création de contenu) : le reste attend le passage suivant
-MAX_CREATES = 40
+#: création de contenu) : le reste attend le passage suivant. #8389 : la borne
+#: réelle est celle des écritures (`MAX_WRITES_PER_PASS`), étiquettes et PATCH
+#: compris ; celle-ci garde le plafond historique des seules créations.
+MAX_CREATES = MAX_WRITES_PER_PASS
 #: bornes des textes publiés (GitHub : titre 256 caractères, corps 65 536)
 TITLE_MAX = 256
 BODY_MAX = 30000
@@ -3119,7 +3196,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
                     "public": public, "dry_run": bool(dry_run), "issues": [],
                     "labels_created": [], "refused": [], "withheld": [], "human_edits": [],
                     "issue_refs": [], "duplicates": [], "orphans": [], "errors": [],
-                    "projection_refused": [], "comments": []}
+                    "projection_refused": [], "comments": [], "notes": []}
     issues = gh_repo.issues()
     by_number = {int(i["number"]): i for i in issues if i.get("number") is not None}
     markers: dict = {}
@@ -3280,15 +3357,34 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
         plans.append({"entry": entry, "item": item, "payload": payload,
                       "labels": view.labels if "labels" in write else []})
     needed = sorted({lab for plan in plans for lab in plan["labels"]})
+    halted = False
     if needed:
         existing = gh_repo.labels()
         for name in needed:
             if name not in existing:
                 report["labels_created"].append(name)
                 if not dry_run:
-                    gh_repo.create_label(name, _label_description(name))
-    halted = False
-    if not dry_run:
+                    try:
+                        gh_repo.create_label(name, _label_description(name))
+                    except ContentLimitReached as exc:
+                        # #8389 : les étiquettes sont des écritures comme les
+                        # autres ; le crédit épuisé arrête la passe, et les
+                        # issues déjà planifiées repartent à la suivante.
+                        _defer_plans(plans)
+                        report["notes"].append(
+                            "GitHub writes: labels deferred (%s)" % _one_line(exc))
+                        halted = True
+                        break
+                    except GithubRateLimited as exc:
+                        # #8357/#8389 : la fenêtre est mémorisée ; la passe
+                        # s'arrête sans tenter les issues suivantes.
+                        _defer_plans(plans)
+                        report["errors"].append({
+                            "work_item": None, "number": None, "action": "label",
+                            "detail": _one_line(exc)})
+                        halted = True
+                        break
+    if not dry_run and not halted:
         for index, plan in enumerate(plans):
             try:
                 _execute(db, st, gh_repo, report, plan)
