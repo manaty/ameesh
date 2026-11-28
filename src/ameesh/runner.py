@@ -431,6 +431,8 @@ LAST_CONTEXT_STATE = "last_turn_context"
 #: journalisation). En deçà, l'allocateur garde sa marge : un tour ordinaire ne
 #: paie pas le geste.
 TURN_TRIM_RSS_GROWTH = 32 * 1024 * 1024
+#: #8423 : résultat d'un tour sorti sur une exception (`run_turn`)
+_TURN_RAISED = object()
 
 
 def _finite_ts(value) -> bool:
@@ -935,6 +937,9 @@ class AgentWorker(threading.Thread):
         self.last_activity = time.monotonic()
         #: #408 : dernière lecture des lots actionnables (règle 1)
         self._lot_wake_checked = float("-inf")
+        #: #8423 : réveil de lot compté dont le tour n'a pas été lancé
+        #: ({lot, reason, retries}) ; rejoué sans être recompté
+        self._lot_wake_retry = None
         #: #2466 : dernière lecture des réveils programmés échus
         self._scheduled_wake_checked = float("-inf")
         #: #2614 : réveil programmé réclamé, pas encore consommé ({lot,
@@ -7161,7 +7166,7 @@ class AgentWorker(threading.Thread):
         now_wall = time.time()
         try:
             for row in lots:
-                if self.lot_wake_allowed(row, now_wall, base):
+                if self._lot_wake_retried(row) or self.lot_wake_allowed(row, now_wall, base):
                     return True
         except Exception:  # noqa: BLE001 - ligne illisible : plein choix
             return True
@@ -8128,9 +8133,13 @@ class AgentWorker(threading.Thread):
         now = time.time()
         try:
             lots = st.actionable(self.name, today=_dt.date.today().isoformat())
+            reprise = self._lot_wake_retry
+            if reprise is not None and reprise["lot"] not in {str(r["id"]) for r in lots}:
+                self._lot_wake_retry = reprise = None  # lot fini, réassigné ou tenu
             refused = False
             for row in lots:
-                if not self.lot_wake_allowed(row, now, base):
+                rejoue = self._lot_wake_retried(row)
+                if not rejoue and not self.lot_wake_allowed(row, now, base):
                     continue
                 if self._lot_workdir_blocked(row["id"]):
                     # #811 (B2) : pas de réveil consommé pour un lot dont le
@@ -8141,9 +8150,15 @@ class AgentWorker(threading.Thread):
                     # réveil refusé ne compte ni au plafond ni au délai
                     refused = True
                     continue
-                note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
-                log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
-                          % (self.name, row["id"], row["state"], note.get("wakes")))
+                if rejoue:
+                    # #8423 : le réveil est déjà compté ; son tour n'est pas parti
+                    log_async("[%s] idle with actionable lot #%s (%s): wake retried, "
+                              "not counted again (previous turn not started: %s)"
+                              % (self.name, row["id"], row["state"], reprise["reason"]))
+                else:
+                    note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
+                    log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
+                              % (self.name, row["id"], row["state"], note.get("wakes")))
                 return {"kind": "idle", "ids": [], "lot": str(row["id"]), "lot_wake": True,
                         "prompt": adapters.LOT_WAKE_PROMPT % {
                             "id": int(row["id"]), "title": row.get("title") or "",
@@ -8157,6 +8172,65 @@ class AgentWorker(threading.Thread):
         except db_mod.DbError as exc:
             log_async("[%s] actionable lots unreadable (%s)" % (self.name, exc))
         return None
+
+    #: #8423 : rejeux au plus d'un réveil de lot dont le tour ne part pas ;
+    #: au-delà, le délai doublé de `lot_wake_allowed` reprend la main
+    LOT_WAKE_RETRY_MAX = 5
+
+    def _lot_wake_retried(self, row: dict) -> bool:
+        """#8423 : `row` porte-t-il un réveil déjà compté dont le tour n'a pas
+        été lancé ? Il est alors dû sans attendre le délai doublé."""
+        reprise = getattr(self, "_lot_wake_retry", None)
+        return reprise is not None and reprise["lot"] == str(row.get("id"))
+
+    def _settle_lot_wake(self, spec: dict, result) -> None:
+        """#8423 : après un tour de réveil de lot (`_lot_wake_spec`).
+
+        Le réveil est compté au choix (`note_wake`) ; un tour qui ne lance
+        pas son harnais (pression de l'hôte relue au lancement, admission
+        refusée, préparation interrompue…) le laissait consommé sans trace :
+        le délai doublé repoussait le suivant et seul un courrier démarrait
+        le lot. La raison est dite, et le réveil rejoué à la passe suivante,
+        sans être recompté, au plus `LOT_WAKE_RETRY_MAX` fois."""
+        lot = str(spec.get("lot") or "")
+        if getattr(self, "_turn_launched", False) or not lot:
+            self._lot_wake_retry = None
+            return
+        reason = self._turn_not_started_reason(result)
+        previous = getattr(self, "_lot_wake_retry", None)
+        retries = (previous["retries"] + 1
+                   if previous is not None and previous["lot"] == lot else 1)
+        if retries > self.LOT_WAKE_RETRY_MAX:
+            self._lot_wake_retry = None
+            log_async("[%s] wake on lot #%s: turn not started (%s); given up after "
+                      "%d retries, the next wake follows the doubled delay"
+                      % (self.name, lot, reason, self.LOT_WAKE_RETRY_MAX))
+            return
+        self._lot_wake_retry = {"lot": lot, "reason": reason, "retries": retries}
+        log_async("[%s] wake on lot #%s: turn not started (%s); retried at the next "
+                  "pass, not counted again" % (self.name, lot, reason))
+
+    def _turn_not_started_reason(self, result) -> str:
+        """#8423 : pourquoi le tour n'a pas lancé son harnais, au mieux de ce
+        que le worker sait (les sorties les plus détaillées ont déjà leur
+        ligne de journal)."""
+        if result is None:
+            return "deferred: %s" % (getattr(self, "deferred_reason", "") or "unknown")
+        if getattr(self, "_refus_pression", False):
+            return "host pressure at launch"
+        if self.lease_lost.is_set():
+            return "lease lost"
+        if self.stopping.is_set() or self.runner.draining.is_set():
+            return "runner stopping or draining"
+        if getattr(self.runner, "restart_for_stale", False):
+            return "outdated runner"
+        if self.host_yield is not None or self.runner.gate_holds():
+            return "host gate closed"
+        if getattr(self, "_admission_reportee", False):
+            return "turn admission postponed (account window)"
+        if result is _TURN_RAISED:
+            return "error during turn setup"
+        return "turn setup refused before the harness launch"
 
     def _mail_spec(self, messages: list[dict]) -> dict | None:
         """Messages non remis -> un tour, ou None : rien n'est encore dû.
@@ -8926,11 +9000,17 @@ class AgentWorker(threading.Thread):
         # `_run_turn`, remis à faux ici pour qu'un report ne lise pas le tour
         # précédent et ne clôt pas à tort la relance A11.
         self._turn_launched = False
+        # #8423 : la raison d'un tour non lancé ne lit pas le refus d'un autre
+        self._refus_pression = False
+        result = _TURN_RAISED
         try:
-            return self._run_turn_or_defer(spec)
+            result = self._run_turn_or_defer(spec)
+            return result
         finally:
             if spec.get("scheduled_wake"):
                 self._forget_wake_claim()
+            if spec.get("lot_wake"):
+                self._settle_lot_wake(spec, result)
             self._settle_runner_retry(spec)
             if (getattr(self, "agent", None) or {}).get("created_by"):
                 # B 40615 : toute sortie du tour (préparation refusée, échec
