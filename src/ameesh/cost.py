@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import glob
+import hashlib
 import json
 import os
 import re
@@ -1002,21 +1003,162 @@ def load_prices(path: str | None = None) -> dict:
     """Le barème : les défauts, corrigés par le fichier JSON s'il existe.
 
     Un fichier illisible ou mal formé ne doit pas casser la comptabilité : on
-    garde les défauts (et l'appelant peut le dire).
+    garde les défauts (et l'appelant peut le dire, `price_schedule`).
     """
     prices = dict(DEFAULT_PRICES)
-    if path and os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                loaded = json.load(fh)
-            if isinstance(loaded, dict):
-                for key, value in loaded.items():
-                    triplet = _valid_triplet(value)
-                    if triplet is not None:
-                        prices[str(key)] = triplet
-        except (OSError, ValueError):
-            pass
+    prices.update(_read_price_file(path)["entries"])
     return prices
+
+
+def _read_price_file(path: str | None) -> dict:
+    """#8338 : la lecture du fichier de barème, et ce qu'elle a donné.
+
+    `status` : `none` (aucun chemin), `absent`, `unreadable` (erreur
+    d'entrée-sortie), `malformed` (pas un objet JSON) ou `loaded` ; `entries`
+    ne garde que les triplets valides (`_valid_triplet`), `rejected` compte les
+    autres ; `digest` (sha256) et `mtime` datent le contenu lu. Jamais fatal."""
+    out = {"status": "none", "entries": {}, "rejected": 0, "digest": None,
+           "mtime": None}
+    if not path:
+        return out
+    if not os.path.exists(path):
+        out["status"] = "absent"
+        return out
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        out["mtime"] = os.stat(path).st_mtime
+        out["digest"] = hashlib.sha256(raw).hexdigest()
+        loaded = json.loads(raw.decode("utf-8"))
+    except OSError:
+        out["status"] = "unreadable"
+        return out
+    except ValueError:
+        out["status"] = "malformed"
+        return out
+    if not isinstance(loaded, dict):
+        out["status"] = "malformed"
+        return out
+    out["status"] = "loaded"
+    for key, value in loaded.items():
+        triplet = _valid_triplet(value)
+        if triplet is None:
+            out["rejected"] += 1
+        else:
+            out["entries"][str(key)] = triplet
+    return out
+
+
+def prices_path(env=None) -> tuple[str, str]:
+    """#8338 : (chemin, origine) du barème que lit la comptabilité (`CostBook`) :
+    `$AMEESH_PRICES` (origine `AMEESH_PRICES`), sinon `DEFAULT_PRICES_FILE`
+    (origine `default`)."""
+    env = os.environ if env is None else env
+    explicit = env.get("AMEESH_PRICES")
+    if explicit:
+        return explicit, "AMEESH_PRICES"
+    return os.path.expanduser(DEFAULT_PRICES_FILE), "default"
+
+
+#: #8338 : schéma de la lecture publique du barème (`ameesh prices --json`)
+PRICES_SCHEMA = "ameesh-prices/1"
+#: composantes d'un triplet du barème, dans l'ordre
+PRICE_COMPONENTS = ("input", "cached_input", "output")
+
+
+def _components(triplet) -> dict | None:
+    if triplet is None:
+        return None
+    return {name: float(value) for name, value in zip(PRICE_COMPONENTS, triplet)}
+
+
+def _family_of(model: str) -> str | None:
+    if model.startswith("default-"):
+        harness = model[len("default-"):]
+        return harness if harness in PRICE_FAMILY else None
+    for harness, prefixes in PRICE_FAMILY.items():
+        if any(model.startswith(prefix) for prefix in prefixes):
+            return harness
+    return None
+
+
+def price_schedule(path: str | None = None, env=None,
+                   now: float | None = None) -> dict:
+    """#8338 (manaty/ameesh#6578) : le barème effectif, lecture publique.
+
+    Document `ameesh-prices/1` : la source (défauts seuls ou fichier local,
+    son chemin, son état de lecture, son empreinte et sa date), chaque modèle
+    avec ses trois composantes en USD par million de jetons et son origine,
+    et par harnais le prix qu'y paierait un modèle **inconnu** — le majorant
+    de la famille (`max_price_of`), sinon le repli prudent sur tout le barème
+    (`worst_price_of`), marqué `fallback` ; jamais un prix nul supposé. Le
+    barème est relu à chaque tour : `source.sha256` et `source.mtime` disent
+    quel contenu a été lu. Aucune base, aucun secret : un fichier illisible ou
+    mal formé est signalé (`source.status`), les défauts restent en vigueur.
+    """
+    from . import version as package_version
+    origin = "argument"
+    if path is None:
+        path, origin = prices_path(env)
+    read = _read_price_file(path)
+    prices = dict(DEFAULT_PRICES)
+    prices.update(read["entries"])
+    models = []
+    for name in sorted(prices):
+        from_file = name in read["entries"]
+        entry = {"model": name, "harness": _family_of(name),
+                 "origin": "file" if from_file else "default",
+                 "overrides_default": from_file and name in DEFAULT_PRICES}
+        entry.update(_components(prices[name]))
+        tier = prompt_tier(prices, name)
+        entry["prompt_tier"] = None if tier is None else {
+            "max_prompt_tokens": tier[0], "price": _components(tier[1])}
+        period = PRICE_PERIODS.get(name)
+        entry["off_peak"] = None
+        if period is not None and list(prices[name]) == DEFAULT_PRICES.get(name):
+            entry["off_peak"] = {
+                "price": _components(period["off_peak"]),
+                "peak_utc_hours": [list(span) for span in period["peak_utc"]],
+                "peak_weekdays": list(period["peak_days"])}
+        models.append(entry)
+    harnesses = []
+    worst = worst_price_of(prices)
+    for harness in sorted(PRICE_FAMILY):
+        family_max = max_price_of(prices, harness)
+        unknown, basis = (family_max, "family_max") if family_max else (
+            (worst, "schedule_max") if worst else (None, None))
+        default_name = "default-%s" % harness
+        harnesses.append({
+            "harness": harness,
+            "model_prefixes": list(PRICE_FAMILY[harness]),
+            "max_price": _components(family_max),
+            "unknown_model_price": _components(unknown),
+            "unknown_model_basis": basis,
+            "fallback": basis != "family_max",
+            "default_entry": default_name if default_name in prices else None,
+            "service_tier_multipliers": dict(SERVICE_TIER_MULTIPLIERS)
+            if harness == "codex" else None,
+        })
+    return {
+        "schema": PRICES_SCHEMA,
+        "version": package_version(),
+        "observed_ts": time.time() if now is None else float(now),
+        "unit": "USD per million tokens",
+        "components": list(PRICE_COMPONENTS),
+        "source": {
+            "kind": "file" if read["entries"] else "defaults",
+            "path": path,
+            "path_origin": origin,
+            "status": read["status"],
+            "entries": len(read["entries"]),
+            "rejected_entries": read["rejected"],
+            "sha256": read["digest"],
+            "mtime": read["mtime"],
+        },
+        "models": models,
+        "harnesses": harnesses,
+        "schedule_max": _components(worst),
+    }
 
 
 def _valid_triplet(value) -> list | None:

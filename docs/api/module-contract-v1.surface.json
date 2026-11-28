@@ -1,6 +1,6 @@
 {
   "schema": "ameesh-module-contract-surface/1",
-  "contract": "1.12",
+  "contract": "1.13",
   "document": "docs/api/module-contract-v1.md",
   "baseline": "aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007",
   "cli": {
@@ -35,6 +35,7 @@
     "ameesh agent observe": ["--account-profile", "--help", "--json"],
     "ameesh accounts profiles": ["--help", "--json"],
     "ameesh reservations": ["--account", "--agent", "--help", "--json", "--limit", "--state"],
+    "ameesh prices": ["--help", "--json"],
     "ameesh list": ["--help", "--json"],
     "ameesh show": ["--help", "--json"],
     "ameesh migrate": ["--additive-only", "--allow-live-executors", "--dry-run", "--help", "--json"],

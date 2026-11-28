@@ -162,6 +162,33 @@ def cmd_reservations(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prices(cfg: Config, args: argparse.Namespace) -> int:
+    """#8338 : le barème effectif (défauts et fichier local), sans base."""
+    document = cost_mod.price_schedule()
+    if args.json:
+        print(json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False))
+        return 0
+    source = document["source"]
+    print("PRICES  %s (USD per million tokens)  source %s  file %s: %s%s" % (
+        document["version"], source["kind"], source["path_origin"],
+        source["status"], "  (%d invalid entries ignored)" % source["rejected_entries"]
+        if source["rejected_entries"] else ""))
+    if source["status"] in ("unreadable", "malformed"):
+        print("prices file %s: defaults kept" % source["status"], file=sys.stderr)
+    print("  model                          input  cached  output  origin")
+    for row in document["models"]:
+        print("  %-30s %6.3f %7.4f %7.3f  %s" % (
+            row["model"], row["input"], row["cached_input"], row["output"],
+            row["origin"]))
+    for row in document["harnesses"]:
+        price = row["unknown_model_price"]
+        print("  unknown %s model: %s%s" % (
+            row["harness"], "none" if price is None else "%.3f / %.4f / %.3f" % (
+                price["input"], price["cached_input"], price["output"]),
+            "  (fallback: %s)" % row["unknown_model_basis"] if row["fallback"] else ""))
+    return 0
+
+
 def _fmt_age(seconds: float) -> str:
     seconds = max(0, int(seconds))
     if seconds < 60:
@@ -5433,6 +5460,14 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     p_reservations.add_argument("--json", action="store_true",
                                 help="ameesh-reservations/1 document")
     p_reservations.set_defaults(func=cmd_reservations)
+    # #8338 (manaty/ameesh#6578) : barème effectif, lecture publique sans base
+    p_prices = sub.add_parser(
+        "prices",
+        help="effective price schedule: per model input/cached/output, unknown-model "
+             "ceiling per harness, source (read-only; #8338)")
+    p_prices.add_argument("--json", action="store_true",
+                          help="ameesh-prices/1 document")
+    p_prices.set_defaults(func=cmd_prices)
     # L131 : suites lourdes plafonnées par hôte
     from . import heavy as heavy_mod
     heavy_mod.add_parser(sub)
