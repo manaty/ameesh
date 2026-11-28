@@ -1916,6 +1916,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind in ("train_paused", "train_stuck"):
             text = alert["detail"]
             teams = {alert["project"]} if alert.get("project") else set()
+            if kind == "train_stuck":
+                # #8480 : un train figé tient la cible de tout le projet ; le
+                # bureau est prévenu avec le pilote, pas seulement l'auditeur.
+                extra.update(_fallback_avatar(by_name, text, desks))
         elif kind == "release_project_undeclared":
             text = alert["detail"]
             teams = {alert["project"]} if alert.get("project") else set()

@@ -392,6 +392,7 @@ class Passage:
         refused = self.canon_refusal(db, runtime)
         result = refused if refused is not None else self._step(runtime, now)
         self._notify_paused(db, runtime, result)
+        self._notify_incident(db, result)
         return result
 
     def scheduled_step(self, db, now):
@@ -406,6 +407,7 @@ class Passage:
         refused = self.canon_refusal(db, runtime)
         result = refused if refused is not None else self._step(runtime, now)
         self._notify_paused(db, runtime, result)
+        self._notify_incident(db, result)
         if isinstance(result, dict) and result.get("result") == "paused":
             # #8096 : un plan en pause ne repart jamais seul et aucun créneau
             # ne le réveille. On le revoit dans l'heure pour appliquer la
@@ -445,6 +447,30 @@ class Passage:
                    ", ".join(runs) or "aucun run disponible", plan_id))
         mail.send(db, "ameesh", recipient, body,
                   idempotency_key="train-paused:%s:%s" % (plan_id, recipient))
+
+    def _notify_incident(self, db, result):
+        """#8480 : un commit du plan absent du clone après fetch est un
+        incident nommé ; le pilote du projet est prévenu une fois par plan et
+        par commit (clé d'idempotence), jamais à chaque passe."""
+        incident = result.get("incident") if isinstance(result, dict) else None
+        if not isinstance(incident, dict) or incident.get("kind") != "train-object-missing":
+            return
+        from . import mail, train_canon
+        recipient = train_canon.pilot_of(self.cfg, self.project.name)(db)
+        if not recipient:
+            self.notify("train object missing, no project pilot recipient: %s"
+                        % result.get("error"), incident)
+            return
+        body = ("Train %s (%s) : incident train-object-missing, plan %s.\n%s\n"
+                "Le plan reste en draining et tient la cible. Vérifier la référence "
+                "integration/train-* du plan à la forge et le clone du train de ce "
+                "runner (%s), puis débloquer ou abandonner le plan "
+                "(python -m ameesh.train_cli --project %s show)."
+                % (self.project.name, self.project.target, incident.get("plan") or "?",
+                   result.get("error"), self.owner, self.project.name))
+        mail.send(db, "ameesh", recipient, body,
+                  idempotency_key="train-object-missing:%s:%s:%s"
+                  % (incident.get("plan"), incident.get("sha"), recipient))
 
     def canon_refusal(self, db, runtime):
         """#2914: refuse by name to compose while the pin differs from the gate.
