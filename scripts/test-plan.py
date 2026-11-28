@@ -249,9 +249,23 @@ RECENT_FAILURE_DAYS = 7
 #: poids comparables : la répartition par hôte (8 jobs chacun) redevient
 #: équilibrée même si le planificateur place les parts psycopg en premier, et
 #: la simulation sur les charges de h-11 ramène le mur médian de 28,6 à
-#: 26,5 min (p80 31,3 → 27,2, max 38,5 → 29,0). psql reste à 16 : sa part
-#: nocturne complète garde son découpage (#6437, #1692).
-PARTS = {"psycopg": (4, 12), "psql": (3, 16)}
+#: 26,5 min (p80 31,3 → 27,2, max 38,5 → 29,0). psql restait à 16 : sa part
+#: nocturne complète garde son découpage (#6437, #1692), que
+#: `PSQL_FULL_PARTS_MIN` fixe désormais à part.
+#:
+#: #8436 (28/11) : le canon §6 demande une CI sous 30 min ; 26 runs de paquet
+#: des 24 h mesurent p50 38,0 min, p80 46,1, p90 48,3, max 49,8. Deux causes,
+#: toutes deux au découpage. 28 jobs (16 psql + 12 psycopg) pour 24 runners :
+#: quatre parts attendent un runner jusqu'à 24 min. Et des durées périmées
+#: (table du 26/10) : les parts psql mesurées vont de 854 à 5 788 s de tests
+#: (×6,8) et les psycopg de 4 023 à 6 855 s (×1,7) quand le plan les croyait
+#: égales. Table rafraîchie sur la médiane de 4 ci-full ; le découpage psql
+#: lit cette mesure comme celui de psycopg (#7590) ; 12 + 12 = 24 parts,
+#: exactement le pool. Charges simulées : 5 098 s psycopg et 5 230 s psql au
+#: plus lourd, soit ~21-22 min de tests par part à 4 processus et un mur
+#: attendu ~26-27 min avec la mise en route. À confirmer sur les premiers
+#: paquets.
+PARTS = {"psycopg": (4, 12), "psql": (3, 12)}
 #: #8291 : le nocturne psql dimensionne ses parts sur le plafond, comme la
 #: carte depuis #8261. Les 25 et 26/11, une part coupée à 60 min par nuit
 #: (7/16 puis 10/16, run 45738064364) : la table `psql_full` du 08/11
@@ -280,6 +294,11 @@ PSQL_FULL_ADMISSIONS = 4
 PSQL_FULL_WAVES = ((PSQL_FULL_WINDOW_END_MIN - PSQL_FULL_WINDOW_START_MIN - 1)
                    // PSQL_FULL_PLAFOND_MIN + 1)
 PSQL_FULL_PARTS_MAX = PSQL_FULL_ADMISSIONS * PSQL_FULL_WAVES
+#: #8436 : le plancher du nocturne reste 16, indépendant de `PARTS["psql"]`
+#: (12 depuis #8436). Sa suite est entière, pas la liste pilote, et #8291 l'a
+#: mesurée sous 60 min à 16 parts ; la fenêtre d'admission 06Z en admet 20 au
+#: plus (`PSQL_FULL_PARTS_MAX`).
+PSQL_FULL_PARTS_MIN = 16
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 45 min de psycopg
 #: comme dans celui de 60 min de psql (#1251).
@@ -1670,9 +1689,10 @@ def split_weights(modules: list[str], driver: str, card: dict | None) -> dict[st
     convertie à l'échelle de la carte par le `surcout` du pilote ; la carte ne
     comble que les modules que la table ne connaît pas. `weights()` garde son
     contrat L148/#2397 pour les estimations et la sélection d'un lot ; ce
-    découpage-ci ne s'applique qu'aux parts psycopg d'une suite déjà complète
+    découpage-ci ne s'applique qu'aux parts d'une suite déjà complète
     (paquet, main, release), où aucune sélection ne dépend des poids et où la
-    table psycopg a été mesurée sur la même suite sans couverture.
+    table a été mesurée sur la même suite sans couverture : la suite entière
+    sous psycopg, la liste pilote et le contrat sous psql (#8436).
 
     #3754/#8208 : la conversion n'a de sens que si la table ne couvre pas
     tous les modules découpés et que la carte en comble les trous. Quand
@@ -1736,7 +1756,7 @@ def psql_full_count(weighed: dict[str, float]) -> int:
     tant que la plus lourde dépasse la cible sous le plafond du job.
     #8292 : borné par la fenêtre d'admission 06Z (`PSQL_FULL_PARTS_MAX`),
     pas par le seul plafond d'une part."""
-    return parts.nombre_de_parts(weighed, PARTS["psql"][1], PSQL_FULL_PLAFOND_MIN,
+    return parts.nombre_de_parts(weighed, PSQL_FULL_PARTS_MIN, PSQL_FULL_PLAFOND_MIN,
                                  PSQL_FULL_PARTS_MAX, debit=PSQL_FULL_DEBIT)
 
 
@@ -2240,15 +2260,15 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
             n = min(n, lot_part_count(driver, selected, card))
         if driver == "psql" and psql_full and chosen_set is None:
             n = psql_full_count({m: pleine[m] for m in selected})
-        #: #7590 : hors sélection d'un lot, la suite est complète. Le
-        #: découpage psycopg lit alors les durées sans couverture (la
-        #: stabilité prime sur la fraîcheur de la carte, qui reste
-        #: l'estimation publiée) ; le pilote psql garde la carte, dont la
-        #: mesure porte sur ces modules-là (la table psql vient du nocturne,
-        #: qui exécute la suite entière, et ne décrit pas ce sous-ensemble).
+        #: #7590/#8436 : hors sélection d'un lot, la suite est complète. Le
+        #: découpage lit alors les durées sans couverture (la stabilité prime
+        #: sur la fraîcheur de la carte, qui reste l'estimation publiée) :
+        #: psycopg sur la suite entière, psql sur sa liste pilote et le
+        #: contrat, que la table `psql` mesure depuis #8436 (elle décrivait
+        #: auparavant une autre suite, d'où la carte pour ce pilote).
         weighed = (pleine if driver == "psql" and psql_full
                    else split_weights(selected, driver, card)
-                   if driver == "psycopg" and not lot else None)
+                   if not lot else None)
         plan["parts"][driver] = [] if skip else split(
             selected, driver, n, card, classes, weighed=weighed)
     every = [m for m in modules]
@@ -2474,7 +2494,8 @@ def summary(plan: dict) -> str:
                 # #8291 : le nombre de parts suit le plafond, plus un 16 figé
                 lourde = max(p["estimate_s"] for p in nuit)
                 lines.append(
-                    f"* psql night parts (#8291): {nuit[0]['of']} (floor {PARTS['psql'][1]}), "
+                    f"* psql night parts (#8291): {nuit[0]['of']} "
+                    f"(floor {PSQL_FULL_PARTS_MIN}), "
                     f"heaviest ~{lourde:.0f} s of tests for a target of "
                     f"~{psql_full_target_s():.0f} s under the {PSQL_FULL_PLAFOND_MIN} min "
                     f"job timeout; the 06Z window admits at most {PSQL_FULL_PARTS_MAX} "

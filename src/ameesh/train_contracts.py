@@ -13,7 +13,7 @@ its ``suite`` job calls ``tests.yml`` and the API exposes the called jobs in
 the same caller run (prefixed by the caller job). There is **no** separate
 ``tests.yml?event=workflow_call`` run. The contract therefore pins the caller
 workflow, the called suite and the planning blobs, and requires the called
-jobs (prefixed by the caller job) — the full 12 psycopg + 16 psql matrix, the
+jobs (prefixed by the caller job) — the full 12 psycopg + 12 psql matrix, the
 short macOS platform job and the aggregate ``tests`` check. #3198: the full
 macOS suite is no longer part of the packet run (it moved to ``macos.yml``,
 nightly and on the ``ci-macos`` label); what this contract requires is the
@@ -32,9 +32,10 @@ def ameesh() -> tuple[Workflow, ...]:
     jobs prefixed by the caller job (e.g. ``suite complète du paquet / plan``).
     A covered push (open PR) leaves ``suite`` skipped, so the called jobs are
     absent and supply no packet CI: the train refuses it.
-    The full matrix is 12 psycopg parts, 16 psql parts, the short macOS
-    platform job and the aggregate ``tests`` check; doc-only and version lanes
-    are conditional outside this contract. #3749: the 16 psql parts run the
+    The full matrix is 12 psycopg parts, 12 psql parts (#8436, 24 jobs = the
+    24 runners), the short macOS platform job and the aggregate ``tests``
+    check; doc-only and version lanes
+    are conditional outside this contract. #3749: the 12 psql parts run the
     pilot list and the contract, the whole suite under psql is nightly
     (``psql-nocturne.yml``, outside the packet proof).
 
@@ -59,14 +60,14 @@ def ameesh() -> tuple[Workflow, ...]:
         path=".github/workflows/paquet.yml",
         jobs=("plan",
               *("psycopg %d/12" % n for n in range(1, 13)),
-              *("psql %d/16" % n for n in range(1, 17)),
+              *("psql %d/12" % n for n in range(1, 13)),
               "plateforme macOS", "tests"),
         event="push",
         called=".github/workflows/tests.yml",
         sources=((".github/workflows/paquet.yml", "fa502a79d4f696b82f77350fbac43b394983e38e"),
-                 (".github/workflows/tests.yml", "f0678c1d8d46cd6b809a45fc4d433f82b946bb5c"),
-                 ("scripts/test-plan.py", "28f13fe305dd2ccfdb28781ed15fa13914911fc3"),
-                 ("scripts/test-parts.py", "9534c4e4827674bbbb6de048c994c38deb5cb008"),
+                 (".github/workflows/tests.yml", "abcd04991f0f1ac9b07f7d6ad0349380bc6bf8cd"),
+                 ("scripts/test-plan.py", "09cc6ef857293ad7045a68829a812585e2bfa2d2"),
+                 ("scripts/test-parts.py", "305c23ab2441463ff0bd2d2371f65793b16102c8"),
                  ("scripts/ci-flow.py", "c81e4aff4fcaf1b9ec9a75ba987b3beba50258c2"),
                  ("scripts/ci-test-space.py", "f5535ce3eadcd0b6a6e69567a8c36ed3a121420f"),
                  ("scripts/ci-agregat.py", "b3b84b3d9f40ce567ded8dd446a7d561e9aa5747"),
