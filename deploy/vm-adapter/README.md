@@ -165,6 +165,12 @@ arrêt ni archivage. La version **réellement lancée** sur chaque cible
 (`ameesh version`, version des runners) se vérifie et se consigne avant le
 premier geste, comme le mode.
 
+Un refus de cette garde n'est pas un trou de suivi : la lecture fournisseur du
+tick est rejouée dans sa propre transaction avant que l'échec ne sorte
+(#8382), donc `on_since` et la continuité de 90 s ne repartent pas à zéro.
+Seuls un fournisseur illisible ou un worker arrêté réinitialisent la preuve de
+durée.
+
 ## Préparer l'installation (bureau, feu distinct)
 
 1. Appliquer les migrations additives 0547 et 0552 (#6017) avant le nouveau code. Installer la

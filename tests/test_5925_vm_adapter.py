@@ -534,9 +534,44 @@ class AdapterTest(PgTestCase):
 
     def test_observation_gap_resets_hysteresis(self):
         self.observe_old()
+        before = self.q.observations()[0]['on_ts']
         self.db.execute("UPDATE vm_adapter_observations SET updated_at=clock_timestamp()-interval '5 minutes'")
         self.request()
         self.assertEqual(self.tick(), 'on hysteresis')
+        self.provider.action.assert_not_called()
+        self.assertGreater(self.q.observations()[0]['on_ts'], before)
+
+    def test_idle_guard_refusal_keeps_the_tick_observation_and_hysteresis(self):
+        # #8382: the idle guard refuses inside the tick's transaction; its
+        # rollback used to drop the provider observation of the tick, so a
+        # drainage that waited for leases starved the 90 s continuity and
+        # restarted `on_since` despite a healthy provider and worker.
+        self.request()
+        self.observe_old('running')
+        before = self.q.observations()[0]
+        self.db.execute("UPDATE vm_adapter_observations SET updated_at="
+                        "clock_timestamp()-interval '80 seconds' WHERE host='burst'")
+        stale = self.q.observations()[0]
+        refusal = mock.Mock(side_effect=vm.Refused(
+            'host no longer idle: a lease is still held: impl-01'))
+        with mock.patch('ameesh.vm_adapter.storage.of', return_value=self.store):
+            with self.assertRaisesRegex(vm.Refused, 'host no longer idle'):
+                vm.tick_host(self.cfg, self.db, policy(), 'burst', self.provider,
+                             probe=self.probe, evidence=refusal)
+        after = self.q.observations()[0]
+        self.assertEqual(after['provider_state'], 'running')
+        # 80 s < observation_gap_s (90 s): the refusal extended the observed
+        # interval instead of being treated as a gap.
+        self.assertEqual(after['on_ts'], before['on_ts'])
+        self.assertGreater(after['seen_ts'], stale['seen_ts'] + 60)
+        # No intention, probe or provider order left the rolled-back tick.
+        control = self.q.control('burst')
+        self.assertIsNone(control['hook_attempt_state'])
+        self.assertIsNone(self.q.pending('burst')[0]['result'])
+        self.provider.action.assert_not_called()
+        self.probe.assert_not_called()
+        # The unchanged two-hour `on_since` still carries the hysteresis.
+        self.assertEqual(self.tick(), 'stop prepared')
         self.provider.action.assert_not_called()
 
     def test_reconciliation_runs_outside_gate(self):

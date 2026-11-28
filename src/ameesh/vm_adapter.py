@@ -616,7 +616,37 @@ def prepare_elected_wake(db, policy, host, listing, lots, controls, holds):
 
 
 def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop_evidence):
-    """One bounded operator tick; never opens native claims itself."""
+    """One bounded operator tick; never opens native claims itself.
+
+    #8382: the successful provider read of a tick stays durable even when the
+    tick aborts (an idle guard refusal is the normal case). Its transaction
+    rolls back, so `_tick_host` hands the state back through `tick_state` and
+    it is replayed in its own transaction before the failure leaves. Only a
+    real observation gap (unreadable provider, stopped worker) then breaks the
+    90 s continuity and resets `on_since`.
+    """
+    tick_state = []
+    try:
+        return _tick_host(cfg, db, policy, host, provider, probe=probe,
+                          evidence=evidence, tick_state=tick_state)
+    except Exception:
+        if tick_state:
+            try:
+                # Same adapter lock as the tick: a duplicate worker in flight
+                # keeps its own observation rather than being overwritten by
+                # this older read.
+                with db.transaction() as tx:
+                    q = Queue(tx)
+                    if q.worker_lock(host):
+                        q.observe(host, tick_state[0], policy['observation_gap_s'])
+            except Exception:
+                # Never replace the tick's own failure: the next tick (or the
+                # worker stall alert) carries the database side.
+                pass
+        raise
+
+
+def _tick_host(cfg, db, policy, host, provider, *, probe, evidence, tick_state):
     target = policy['targets'][host]
     store = storage.of(db)
     controls = {c['host']: c for c in store.host_lifecycle.listing()}
@@ -661,6 +691,7 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
         if any(h['host'] == host for h in store.hosts.holds()):
             return 'held'
         state = provider.state(target)
+        tick_state.append(state)
         observed = q.observe(host, state, policy['observation_gap_s'])
         delay = observed['wake_delay_s'] or policy['wake_delay_s']
         # Assess the first worker tick of each drain, not the dwindling time
