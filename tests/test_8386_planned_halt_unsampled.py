@@ -97,6 +97,15 @@ class PlannedHaltTest(unittest.TestCase):
         self.assertEqual(self.types(now=NOW + 900.0, controls=[booting],
                                     provider="running"), ["host_unsampled"])
 
+    def test_a_lost_host_alerts_at_once(self):
+        # B2 : detect_losses garde release/hook `busy` et `released_ts`
+        lost = control(mode="lost", release_state="busy", hook_state="busy",
+                       released_ts=NOW - 3600.0, updated_ts=NOW)
+        self.assertEqual(self.types(controls=[lost], provider="running"),
+                         ["host_unsampled"])
+        self.assertEqual(self.types(controls=[control(mode="lost")]),
+                         ["host_unsampled"])
+
     def test_an_unreadable_adapter_state_alerts(self):
         self.assertEqual(self.types(controls=[control()], provider=None),
                          ["host_unsampled"])
