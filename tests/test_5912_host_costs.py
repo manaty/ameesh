@@ -83,6 +83,13 @@ class CostStatesTest(unittest.TestCase):
     def test_no_configured_canon_still_allows_drain(self):
         store = mock.Mock()
         store.host_lifecycle.drain.return_value = {'mode': 'draining'}
+        # #8384 : le drainage relit la garde d'entrée avant d'ouvrir la
+        # fenêtre ; ce témoin ne porte que sur l'absence de canon, donc un
+        # relevé vide (aucun lot ouvert, aucun agent placé).
+        store.host_lifecycle.listing.return_value = []
+        store.operations.listing.return_value = []
+        store.operations.open_lots_activity.return_value = []
+        store.hosts.holds.return_value = []
         with mock.patch.object(host_lifecycle, 'critical_names', return_value=set()), \
              mock.patch.object(host_lifecycle.work, 'configured_canons', return_value=[]), \
              mock.patch('ameesh.canon.configured', return_value=[]), \

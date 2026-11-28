@@ -865,12 +865,30 @@ class Discarded:
 
 
 @dataclass
+class ContractFold:
+    """#8395 : le commit de pliage des fragments de révision du contrat.
+
+    ``revisions`` porte ``(numéro, lot, manière)`` dans l'ordre du manifeste ;
+    ``files`` les chemins écrits ou retirés (contrat, surface,
+    ``CONTRACT_VERSION`` et fragments). Le manifeste cite ``head`` et ces
+    révisions : le contrôle d'inclusion sait alors que les lignes de contrat
+    ont été repliées par le composeur, pas perdues par un lot.
+    """
+
+    head: str
+    revisions: list[tuple[str, int, str]]
+    files: list[str]
+
+
+@dataclass
 class Composition:
     units: list[Unit]
     discarded: list[Discarded]
     head: str
     #: #4025 : la provenance de la sélection des modules voisins (carte)
     selection: str = ""
+    #: #8395 : le pliage du contrat, quand ce paquet porte des fragments
+    contract: ContractFold | None = None
 
 
 @dataclass
@@ -2409,20 +2427,142 @@ def contained_discard(worktree: Path, source: str, head: str,
     return None
 
 
+def _contract_fragments():
+    """Le module de pliage, importé du ``src`` de ce composeur (#8395).
+
+    Le processus parent reste stdlib-only pour un lancement manuel système :
+    l'import n'a lieu qu'au pliage, et seulement si le projet porte le
+    contrat module v1.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh import contract_fragments
+    return contract_fragments
+
+
+def legacy_contract_paragraphs(worktree: Path,
+                               units: list[Unit]) -> dict[int, tuple[str, ...]]:
+    """#8395 : les révisions écrites à l'ancienne manière, par unité.
+
+    Le diff de l'unité de fusion contre sa première parente porte exactement
+    ce que le lot a ajouté au contrat ; on n'y lit que les paragraphes
+    « Revision 1.N adds … ». Un lot qui a écrit son numéro reste ainsi
+    renuméroté mécaniquement, sans regel.
+    """
+    module = _contract_fragments()
+    found: dict[int, tuple[str, ...]] = {}
+    for unit in units:
+        proc = git(worktree, "diff", "--no-color", "-U0", "%s^" % unit.commit,
+                   unit.commit, "--", module.CONTRACT_REL, check=False)
+        if proc.returncode != 0:
+            raise PaquetAutoError(
+                "diff du contrat illisible pour l'unité #%d : %s"
+                % (unit.lot, _tail(_decode(proc.stderr))))
+        paragraphs = module.added_revision_paragraphs(_decode(proc.stdout))
+        if paragraphs:
+            found[unit.lot] = paragraphs
+    return found
+
+
+def fold_contract(worktree: Path, base_sha: str, composition: Composition, *,
+                  lots: list[int] | None = None, date: str = "",
+                  log=print) -> Composition:
+    """#8395 : plie les fragments de révision et commite le résultat.
+
+    Après les unités de fusion et avant les contrôles locaux : les numéros
+    sont attribués dans l'ordre du manifeste, l'en-tête, la surface et
+    ``CONTRACT_VERSION`` sont alignés, les fragments retirés. Le contenu du
+    commit est déterministe (même arbre, même date ⇒ même contenu ; son SHA
+    dépend aussi des dates auteur/committer que git pose au commit) et il
+    devient la tête du paquet ; le manifeste le cite. Un fragment mal formé
+    refuse la composition en nommant le lot. Un arbre sans contrat, ou sans
+    fragment ni révision écrite, n'est pas touché.
+    """
+    module = _contract_fragments()
+    contract_path = worktree / module.CONTRACT_REL
+    if not contract_path.is_file():
+        return composition
+    try:
+        fragments = module.read_fragments(worktree)
+    except module.FragmentError as error:
+        raise PaquetAutoError("composition refusée : %s" % error) from error
+    legacy = legacy_contract_paragraphs(worktree, composition.units)
+    if not fragments and not legacy:
+        return composition
+    base_show = git(worktree, "show",
+                    "%s:%s" % (base_sha, module.CONTRACT_REL), check=False)
+    if base_show.returncode != 0:
+        raise PaquetAutoError(
+            "composition refusée : contrat de la base %s illisible : %s"
+            % (base_sha[:12], _tail(_decode(base_show.stderr))))
+    try:
+        fold = module.plan_fold(
+            _decode(base_show.stdout), contract_path.read_text(encoding="utf-8"),
+            (worktree / module.SURFACE_REL).read_text(encoding="utf-8"),
+            (worktree / module.VERSION_REL).read_text(encoding="utf-8"),
+            fragments, legacy,
+            [unit.lot for unit in composition.units] if lots is None else lots,
+            date or datetime.now().date().isoformat())
+    except (module.FragmentError, OSError) as error:
+        raise PaquetAutoError("composition refusée : %s" % error) from error
+    if not fold.changed:
+        return composition
+    changed = module.apply_fold(worktree, fold)
+    git(worktree, "add", "-A", "--", *changed)
+    subjects = ", ".join("%s (#%d)" % (revision.number, revision.lot)
+                         for revision in fold.revisions)
+    lines = ["contrat module v1 : révisions %s attribuées" % subjects, ""]
+    for revision in fold.revisions:
+        lines.append("- %s : lot #%d (%s)"
+                     % (revision.number, revision.lot,
+                        "fragment" if revision.kind == "fragment"
+                        else "révision écrite"))
+    lines += ["",
+              "Pliage mécanique par scripts/paquet-auto.py (#8395) : en-tête, "
+              "surface et CONTRACT_VERSION alignés, fragments retirés. Aucun "
+              "contenu nouveau : les révisions viennent des fragments relus "
+              "avec leurs lots."]
+    commit = git(worktree, "commit", "-m", "\n".join(lines), check=False)
+    if commit.returncode != 0:
+        raise PaquetAutoError(
+            "pliage du contrat : git commit a échoué : %s"
+            % _tail(_decode(commit.stderr)))
+    head = rev(worktree, "HEAD")
+    if head is None or head == composition.head:
+        raise PaquetAutoError(
+            "pliage du contrat : aucun nouveau commit (tête inchangée)")
+    composition.head = head
+    composition.contract = ContractFold(
+        head=head,
+        revisions=[(revision.number, revision.lot, revision.kind)
+                   for revision in fold.revisions],
+        files=changed)
+    log("contrat module v1 : révisions %s, commit de composition %s"
+        % (subjects, head[:12]))
+    return composition
+
+
 def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int,
                        *, compose_script: Path, record_package: bool,
                        expect_pushed: str = "",
                        removed: dict[int, str] | None = None,
-                       log=print, guard=None) -> Composition:
+                       log=print, guard=None,
+                       contract_date: str = "") -> Composition:
     """Compose les candidats dans l'ordre ; un conflit est écarté, jamais résolu.
 
     `removed` (#5084) : lot → source des lots déjà écartés ; un candidat dont
     la source en contient une est écarté à son tour, et un lot écarté ici
     (conflit, contenance) s'y ajoute pour les candidats suivants.
+
+    #8395 : après les unités, les fragments de révision du contrat sont pliés
+    dans un commit de composition (`fold_contract`).
     """
     units: list[Unit] = []
     discarded: list[Discarded] = []
     removed = dict(removed or {})
+    # #8395 : la base du pliage est la tête du premier candidat avant sa
+    # fusion, lue sur le chemin existant : aucun appel `rev` supplémentaire
+    # (le test d'époque #4113 compte ces appels, et la base est la même).
+    base = ""
     for candidate in candidates:
         if guard is not None:
             guard()
@@ -2430,6 +2570,8 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
         before = rev(worktree, "HEAD")
         if before is None:
             raise PaquetAutoError("worktree sans commit")
+        if not base:
+            base = before
         contained = contained_discard(worktree, candidate.source, before, removed)
         if contained is not None:
             lot, gone = contained
@@ -2486,14 +2628,28 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
     head = rev(worktree, "HEAD")
     if head is None:
         raise PaquetAutoError("worktree sans commit après composition")
-    return Composition(units=units, discarded=discarded, head=head)
+    base = base or head
+    composition = Composition(units=units, discarded=discarded, head=head)
+    # #8395 : un lot écarté dont la source est déjà portée par une unité (le
+    # contenu est dans l'arbre) garde son fragment ; il est plié à sa place
+    # dans l'ordre des candidats. Un fragment qui n'appartient à aucun
+    # candidat reste refusé par le pliage.
+    unit_lots = {unit.lot for unit in units}
+    contract_lots = [
+        candidate.lot for candidate in candidates
+        if candidate.lot in unit_lots
+        or git(worktree, "merge-base", "--is-ancestor", candidate.source,
+               head, check=False).returncode == 0]
+    return fold_contract(worktree, base, composition, lots=contract_lots,
+                         date=contract_date, log=log)
 
 
 def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
               carrier: int, *, compose_script: Path, record_package: bool,
               expect_pushed: str = "",
               removed: dict[int, str] | None = None,
-              log=print, guard=None) -> Composition:
+              log=print, guard=None,
+              contract_date: str = "") -> Composition:
     """Repart de la base exacte et recompose, sans les unités fautives."""
     if guard is not None:
         guard()
@@ -2504,7 +2660,8 @@ def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
                               record_package=record_package,
                               expect_pushed=expect_pushed,
                               removed=removed,
-                              log=log, guard=guard)
+                              log=log, guard=guard,
+                              contract_date=contract_date)
 
 
 # ---------------------------------------------------------------------------
@@ -5609,7 +5766,11 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     leur cause calculée et le geste attendu ; le manifeste ne se limite plus
     au compteur. La section « En attente » est ignorée du contrôle
     d'inclusion, qui ne lit que « Écartés » : un lot en attente n'est pas un
-    lot prêt à expliquer."""
+    lot prêt à expliquer.
+
+    #8395 : la section « Contrat module v1 » cite le commit de pliage des
+    fragments et les révisions attribuées ; `paquet-inclusion.py` la lit pour
+    ne pas tenir un lot pour amputé quand le composeur a replié ses lignes."""
     try:
         admissions = parse_composition_table(table)
     except InputError:
@@ -5642,6 +5803,27 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         for lot in members:
             lines.append("| #%d | `%s` |" % (lot, source))
     lines += ["", table.rstrip(), ""]
+    # #8395 : le pliage des fragments de révision du contrat, cité au
+    # manifeste. Un paquet sans fragment le dit : aucune révision attribuée.
+    lines += ["## Contrat module v1", ""]
+    if composition.contract is not None:
+        revisions = ", ".join(
+            "%s (#%d, %s)" % (number, lot,
+                              "fragment" if kind == "fragment"
+                              else "révision écrite")
+            for number, lot, kind in composition.contract.revisions)
+        lines += [
+            "- Révisions attribuées : %s." % revisions,
+            "- Commit de composition : `%s` (en-tête, surface et "
+            "`CONTRACT_VERSION` alignés ; fragments retirés)."
+            % composition.contract.head,
+            "- Chemins du pliage : %s."
+            % ", ".join("`%s`" % path for path in composition.contract.files),
+        ]
+    else:
+        lines.append("- Aucun fragment de révision de contrat dans ce paquet : "
+                     "aucune révision attribuée.")
+    lines += [""]
     lines += [
         "## Écartés",
         "",
@@ -7290,7 +7472,8 @@ def compose_packet(args: argparse.Namespace) -> int:
             compose_script=compose_script,
             record_package=not args.no_packet_record,
             expect_pushed=remote_sha or "", removed=removed_sources,
-            guard=guard)
+            guard=guard,
+            contract_date=getattr(args, "contract_date", "") or "")
         if not composition.units:
             print("aucune unité composée : %s"
                   % ", ".join("#%d (%s)" % (item.lot, item.reason)
@@ -7555,7 +7738,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                             compose_script=compose_script,
                             record_package=not args.no_packet_record,
                             expect_pushed=lease or "", removed=removed_sources,
-                            guard=guard)
+                            guard=guard,
+                            contract_date=getattr(args, "contract_date", "") or "")
                         composition.discarded = unique_discarded(
                             previous + composition.discarded + changes,
                             composition.units)
@@ -7680,7 +7864,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                 compose_script=compose_script,
                 record_package=not args.no_packet_record,
                 expect_pushed=lease or "", removed=removed_sources,
-                guard=guard)
+                guard=guard,
+                contract_date=getattr(args, "contract_date", "") or "")
             composition.discarded = unique_discarded(
                 previous + composition.discarded + reasons,
                 composition.units)
@@ -8033,6 +8218,10 @@ def main(argv: list[str] | None = None) -> int:
                              "heures (défaut : 24 ; 0 = jamais)")
     parser.add_argument("--contract-publication", choices=("contracts-first", "legacy"),
                         default=None, help="#6183 : politique du projet compilée par le composeur")
+    parser.add_argument("--contract-date", default="", metavar="AAAA-MM-JJ",
+                        help="#8395 : date de l'en-tête du contrat pour le pliage "
+                             "des fragments (défaut : le jour de composition ; "
+                             "les tests fixent la date)")
     parser.add_argument("--publish", default=None, metavar="REF",
                         help="#4237 : publier sans retester la tête testée gardée "
                              "sous REF (%s<nom>) : chaîne et branche vérifiées, "

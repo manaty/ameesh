@@ -108,7 +108,9 @@ class PlanTest(unittest.TestCase):
                 self.assertEqual(p["parts"]["psycopg"], [])
                 self.assertEqual(self._ran(p, "psql"), self.mods)
                 attendu = self._night_count()
-                self.assertGreaterEqual(attendu, plan.PARTS["psql"][1])
+                # #8436 : le plancher du nocturne (16) ne suit plus
+                # `PARTS["psql"]`, passé à 12 pour la CI de jour.
+                self.assertGreaterEqual(attendu, plan.PSQL_FULL_PARTS_MIN)
                 self.assertEqual({ps["of"] for ps in p["parts"]["psql"]}, {attendu})
                 self.assertEqual(len(p["parts"]["psql"]), attendu)
                 out = plan.outputs(p)

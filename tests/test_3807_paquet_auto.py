@@ -109,6 +109,56 @@ class PaquetAutoBanc(unittest.TestCase):
         third = self.lot(3, "trois.txt", "trois\n")
         return first, conflict, third
 
+    def install_contract(self) -> None:
+        """#8395 : le contrat module v1 et ses deux satellites dans la base."""
+        for rel in ("docs/api/module-contract-v1.md",
+                    "docs/api/module-contract-v1.surface.json",
+                    "src/ameesh/public/__init__.py"):
+            self.write(rel, (REPO / rel).read_text(encoding="utf-8"))
+        self.commit("contrat de base")
+        self.base = self.rev("HEAD")
+
+    def contract_lot(self, lot: int, content: str, *, path: str | None = None,
+                     code: bool = True) -> str:
+        """Un lot qui ajoute un fragment (ou le contenu brut donné)."""
+        self.git("switch", "-q", "-c", "lot/%d" % lot, "main", cwd=self.repo)
+        self.write(path or "docs/api/module-contract-v1.d/%d.md" % lot, content)
+        if code:
+            self.write("lot-%d.txt" % lot, "lot %d\n" % lot)
+        sha = self.commit("#%d : contrat" % lot)
+        self.git("switch", "-q", "main", cwd=self.repo)
+        return sha
+
+    @staticmethod
+    def contract_revisions() -> tuple[str, str, str]:
+        """La révision de base du contrat et les deux suivantes (#8395).
+
+        Le contrat copié dans le banc est celui de l'arbre courant : ses
+        numéros ne sont pas écrits ici, le composeur les attribue à partir de
+        l'en-tête.
+        """
+        import re
+
+        text = (REPO / "docs/api/module-contract-v1.md").read_text(
+            encoding="utf-8")
+        match = re.search(r"(?m)^Contract revision: \*\*(\d+)\.(\d+),", text)
+        assert match, "en-tête du contrat introuvable"
+        major, minor = int(match.group(1)), int(match.group(2))
+        return ("%d.%d" % (major, minor),
+                "%d.%d" % (major, minor + 1),
+                "%d.%d" % (major, minor + 2))
+
+    @staticmethod
+    def contract_table(units) -> str:
+        """La table `## Composition` du manifeste, sans lancer paquet-compose."""
+        rows = "\n".join(
+            "| %d | #%d | `%s` | `%s` | composition |"
+            % (index, unit.lot, unit.source, unit.commit[:12])
+            for index, unit in enumerate(units, start=1))
+        return ("## Composition (%d unités, %d lots)\n\n"
+                "| unité | lot(s) | source | commit | note |\n"
+                "|---|---|---|---|---|\n%s\n" % (len(units), len(units), rows))
+
     # -- témoins -----------------------------------------------------------
     def test_fresh_base_rapatrie_un_tag_sans_changement_de_branche(self):
         clone = pathlib.Path(self.tmp.name) / "composeur"
@@ -1000,6 +1050,108 @@ class PaquetAutoBanc(unittest.TestCase):
             self.git("rev-parse", "--verify", "--quiet", "MERGE_HEAD",
                      cwd=worktree, check=False).returncode, 0)
         self.assertEqual(self.rev("HEAD", cwd=worktree), composition.head)
+
+    # -- #8395 : fragments de révision du contrat --------------------------
+    def _compose_contract(self, lots, name: str):
+        worktree = self.worktree(name)
+        composition = paquet_auto.compose_candidates(
+            worktree,
+            [paquet_auto.Candidate(lot, source) for lot, source in lots],
+            99, compose_script=COMPOSE, record_package=False,
+            log=lambda _line: None, contract_date="2026-11-28")
+        return worktree, composition
+
+    def test_two_fragments_are_folded_in_one_contract_commit(self) -> None:
+        self.install_contract()
+        first = self.contract_lot(
+            4, "adds: `ameesh quatre --json` (#4): a read; it is additive to "
+               "{previous}.\n\n## Quatre\n\nThe quatre read.\n")
+        second = self.contract_lot(
+            5, "adds: `ameesh cinq --json` (#5): a read; it is additive to "
+               "{previous}.\n")
+        worktree, composition = self._compose_contract(
+            [(4, first), (5, second)], "contrat-deux")
+        self.assertEqual([unit.lot for unit in composition.units], [4, 5])
+        self.assertIsNotNone(composition.contract)
+        self.assertEqual(composition.head, composition.contract.head)
+        self.assertNotEqual(composition.head, composition.units[-1].commit)
+        self.assertEqual(self.rev("HEAD", cwd=worktree), composition.head)
+        subject = self.git("log", "-1", "--format=%s", cwd=worktree).stdout
+        self.assertIn("contrat module v1", subject)
+        base, four, five = self.contract_revisions()
+        text = (worktree / "docs/api/module-contract-v1.md").read_text(
+            encoding="utf-8")
+        self.assertIn("Contract revision: **%s, 28 November 2026**" % five, text)
+        self.assertIn("Revision %s adds `ameesh quatre --json` (#4)" % four, text)
+        self.assertIn("additive to %s" % base, text)
+        self.assertIn("Revision %s adds `ameesh cinq --json` (#5)" % five, text)
+        self.assertIn("additive to %s" % four, text)
+        self.assertIn("## Quatre\n\nThe quatre read.", text)
+        self.assertLess(text.index("## Quatre"), text.index(
+            "<!-- contract-revision-sections:"))
+        self.assertFalse((worktree / "docs/api/module-contract-v1.d/4.md").exists())
+        self.assertFalse((worktree / "docs/api/module-contract-v1.d/5.md").exists())
+        surface = json.loads((worktree / "docs/api/module-contract-v1.surface.json")
+                             .read_text(encoding="utf-8"))
+        self.assertEqual(surface["contract"], five)
+        version = (worktree / "src/ameesh/public/__init__.py").read_text(
+            encoding="utf-8")
+        self.assertIn('CONTRACT_VERSION = "%s"' % five, version)
+        manifest = paquet_auto.build_manifest(
+            name="contrat-deux", target="main", base_sha=self.base, carrier=99,
+            composition=composition,
+            table=self.contract_table(composition.units), tests=[],
+            freeze_seconds=0.0)
+        self.assertIn("## Contrat module v1", manifest)
+        self.assertIn("%s (#4, fragment), %s (#5, fragment)" % (four, five),
+                      manifest)
+        self.assertIn("`%s`" % composition.contract.head, manifest)
+
+    def test_an_old_style_revision_is_renumbered_after_a_fragment(self) -> None:
+        self.install_contract()
+        base, first, second = self.contract_revisions()
+        # Le lot 4 écrit son numéro à l'ancienne manière (base + 1, son en-tête).
+        self.git("switch", "-q", "-c", "lot/4", "main", cwd=self.repo)
+        text = (self.repo / "docs/api/module-contract-v1.md").read_text(
+            encoding="utf-8")
+        text = text.replace("Contract revision: **%s," % base,
+                            "Contract revision: **%s," % first)
+        text = text.replace(
+            "\n\nThe [IMA mapping]",
+            "\nRevision %s adds `ameesh ancien` (#4); it is additive to %s."
+            "\n\nThe [IMA mapping]" % (first, base), 1)
+        self.write("docs/api/module-contract-v1.md", text)
+        old_style = self.commit("#4 : révision écrite")
+        self.git("switch", "-q", "main", cwd=self.repo)
+        fragment_lot = self.contract_lot(
+            5, "adds: `ameesh cinq --json` (#5): a read; it is additive to "
+               "{previous}.\n")
+        worktree, composition = self._compose_contract(
+            [(5, fragment_lot), (4, old_style)], "contrat-ancien")
+        self.assertEqual(composition.contract.revisions,
+                         [(first, 5, "fragment"), (second, 4, "legacy")])
+        text = (worktree / "docs/api/module-contract-v1.md").read_text(
+            encoding="utf-8")
+        self.assertIn("Contract revision: **%s, 28 November 2026**" % second,
+                      text)
+        self.assertIn("Revision %s adds `ameesh ancien` (#4); it is additive "
+                      "to %s." % (second, first), text)
+        self.assertNotIn("Revision %s adds `ameesh ancien`" % first, text)
+
+    def test_a_malformed_fragment_refuses_composition_naming_the_lot(self) -> None:
+        self.install_contract()
+        broken = self.contract_lot(4, "## section without adds\n\ntext\n")
+        worktree = self.worktree("contrat-casse")
+        with self.assertRaises(paquet_auto.PaquetAutoError) as caught:
+            paquet_auto.compose_candidates(
+                worktree, [paquet_auto.Candidate(4, broken)], 99,
+                compose_script=COMPOSE, record_package=False,
+                log=lambda _line: None, contract_date="2026-11-28")
+        self.assertIn("#4", str(caught.exception))
+        self.assertIn("adds:", str(caught.exception))
+        # Aucun commit de pliage : la tête reste la fusion de l'unité.
+        self.assertNotIn("contrat module v1", self.git(
+            "log", "--format=%s", cwd=worktree).stdout)
 
     def _fake_candidates(self, payload: dict, code: int) -> str:
         data = pathlib.Path(self.tmp.name) / "candidats.json"

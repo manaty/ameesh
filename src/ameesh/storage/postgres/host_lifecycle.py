@@ -229,11 +229,16 @@ class HostLifecycle(interface.HostLifecycle):
         return bool(rows and rows[0]["claims_open"])
 
     def drain(self, host, *, actor, duration=None, critical=(), automatic=False,
-              close_claims=False, force_short_reason=None):
+              close_claims=False, force_short_reason=None, force_reason=None):
         if not isinstance(automatic, bool):
             raise ValueError("automatic: a boolean expected")
         if not isinstance(close_claims, bool):
             raise ValueError("close_claims: a boolean expected")
+        if force_reason is not None and (
+                not isinstance(force_reason, str) or not force_reason.strip()
+                or len(force_reason.strip()) > 500):
+            raise ValueError("force_reason: a non-empty reason of at most 500"
+                             " characters expected")
         with self.db.transaction() as tx:
             Hosts._lock_gate(tx, host)
             # A claim or turn that wins this lock finishes before withdrawal;
@@ -297,6 +302,15 @@ class HostLifecycle(interface.HostLifecycle):
                 tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
                            "VALUES ('host.drain_short_forced',%s,NULL,%s::jsonb)",
                            ('host:' + host, json.dumps({'actor': actor, 'reason': force_short_reason,
+                                                       'generation': row['generation'],
+                                                       'duration_s': duration})))
+            if force_reason is not None:
+                # #8384: the release-check guard was overridden on purpose;
+                # the reason stays with the drain that opened the window.
+                tx.execute("INSERT INTO ameesh_events(type,object,project,data) "
+                           "VALUES ('host.drain_forced',%s,NULL,%s::jsonb)",
+                           ('host:' + host, json.dumps({'actor': actor,
+                                                       'reason': force_reason.strip(),
                                                        'generation': row['generation'],
                                                        'duration_s': duration})))
             return row

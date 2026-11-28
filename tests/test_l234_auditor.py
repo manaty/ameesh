@@ -126,11 +126,15 @@ class AuditorTest(unittest.TestCase):
         load_patch = (mock.patch("ameesh.auditor.load_all", wraps=auditor.load_all)
                       if real_cfg else mock.patch("ameesh.auditor.load_all",
                           return_value=canons or [loaded], side_effect=load_error))
+        # #8384 : L165 lit les sondes de fenêtre d'hôte ; un db lisible sans
+        # fence laisse la prise des auditeurs inchangée (`storage.of` est
+        # simulé ci-dessous).
+        db = types.SimpleNamespace(query=lambda *a, **kw: [])
         with mock.patch("ameesh.backlog.storage.of", return_value=st), \
                 mock.patch("ameesh.registry.get", return_value=dict(row, capabilities=[])), \
                 load_patch, \
                 mock.patch("ameesh.sous_utilisation.idle_agents", return_value=[row]):
-            return backlog.auto_take(cfg, object(), now=10000, listing=[row],
+            return backlog.auto_take(cfg, db, now=10000, listing=[row],
                                      paid=set(), budget_check=lambda n: "", dry_run=True,
                                      orchestras=[])
 

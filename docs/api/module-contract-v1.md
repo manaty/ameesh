@@ -1,10 +1,13 @@
 # External module public contract, version 1
 
-Contract revision: **1.13, 28 November 2026** (additive public price-schedule
-read). Scope: an
+Contract revision: **1.13, 28 November 2026**. Scope: an
 installed external module and its client processes. Reference:
 [#5827](https://github.com/manaty/ameesh/issues/5827),
 first document tranche [#5856](https://github.com/manaty/ameesh/issues/5856).
+<!-- The revision number and date above are assigned by the packet composer at
+composition; a lot that changes the contract adds a fragment under
+docs/api/module-contract-v1.d/<lot>.md and does not edit this header or the
+revision list. See docs/design/contract-revision-fragments.md. -->
 Revision 1.1 adds the E1a canon/directory snapshot and the read-only agent
 observation (tranche E1b; CLI `ameesh agent observe`, HTTP
 `/api/v1/agents/{agent}/observation`); it is additive to revision 1.0.
@@ -61,6 +64,7 @@ read-only `ameesh-prices/1` document of the effective price schedule (per
 model, the per-harness ceiling of an unknown model, and the schedule's source),
 so a consumer stops importing `cost.load_prices`/`cost.max_price_of`; it is
 additive to 1.12 and changes no pricing, reservation or accounting path.
+
 The [IMA mapping](../design/ima-public-contract-mapping.md) records the concrete
 consumer and the missing surfaces. This document defines the supported boundary;
 it does not claim that the remaining adapters have already been implemented.
@@ -97,19 +101,14 @@ surface becomes available only in a released version that implements it and
 lists it in this contract. Clients check that version before enabling it.
 In particular, the baseline here is ameesh commit
 `aeca7e2ebca4994d477cc9e2a7cb2970a4fdf007`; an open PR is not an installed feature.
-The revision 1.1 elements (#7669 E1a, #7670 E1b), revision 1.2 elements
-(#7671 E2a, #7674 E3a, #7675 E3b), the revision 1.3 element (#7672 E2b), the
-revision 1.4 element (#7673 E2c), the revision 1.5 element (#7701 F2), the
-revision 1.6 element (#6573), the revision 1.7 element (#8341), the
-revision 1.8 element (#8342), the revision 1.9 element (#8337), the
-revision 1.10 element (#8339), the revision 1.11 element (#8343) and the
-revision 1.12 element (#8340) are available only in a released version that
-carries those lots; at the 1.0 baseline they are absent, and a consumer must
-still treat their absence as "unknown", never as permission. The frozen
+Every revision later than 1.0, as listed above, is available only in a
+released version that carries the lots it names; at the 1.0 baseline those
+elements are absent, and a consumer must still treat their absence as
+"unknown", never as permission. The frozen
 [surface](module-contract-v1.surface.json) and its
-[coverage table](module-contract-v1-coverage.md) carry the 1.1, 1.2, 1.3, 1.5,
-1.6, 1.7, 1.8, 1.9, 1.10, 1.11 and 1.12 elements from the release that
-implements them, and freeze revision 1.12; the surface keeps the 1.0 commit as
+[coverage table](module-contract-v1-coverage.md) carry the elements of every
+revision up to the one they freeze, from the release that implements them, and
+freeze the latest revision listed above; the surface keeps the 1.0 commit as
 its comparison point.
 
 External modules follow the [weekly stable channel](stable-channel.md)
@@ -822,6 +821,11 @@ observes the documented schema, storage and unavailable refusals without
 importing an internal module. `tests/test_8333_public_connect.py` covers the
 same elements in-process and in a subprocess; the
 [coverage table](module-contract-v1-coverage.md) cites both.
+
+<!-- contract-revision-sections: the packet composer folds the sections of the
+pending revision fragments here, in manifest order. Do not remove this anchor
+or add a revision section after it by hand; see
+docs/design/contract-revision-fragments.md. -->
 
 ## Consumer qualification and delivery
 

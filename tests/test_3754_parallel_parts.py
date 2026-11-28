@@ -193,6 +193,11 @@ class DuréesDepuisFluxTest(unittest.TestCase):
                 parts.durations(SimpleNamespace(driver="psql", files=[], flows=[str(flux)],
                                                 min_test_s=5.0))
                 data = json.loads(table.read_text(encoding="utf-8"))
+                # #8436 : un identifiant qui ne nomme aucun module de tests/
+                # n'entre pas dans la table — sinon la clé `runTest` d'un
+                # sous-test égaré y restait et rougissait test_l148.
+                self.assertNotIn("test_inconnu", data["psql"])
+                self.assertNotIn("tests.test_inconnu.X.test_y", data["tests"]["psql"])
                 # Rejouer les mêmes flux remplace la table du pilote : les
                 # durées par test ne s'additionnent pas deux fois.
                 parts.durations(SimpleNamespace(driver="psql", files=[], flows=[str(flux)],

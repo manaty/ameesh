@@ -112,7 +112,8 @@ class WorkflowTest(unittest.TestCase):
         tests = canon.load_yaml((REPO / ".github/workflows/tests.yml").read_text())
         job = tests["jobs"]["psql"]
         self.assertFalse(job["strategy"]["fail-fast"])
-        self.assertEqual(job["strategy"]["max-parallel"], "${{ inputs.psql-full && 4 || 16 }}")
+        # #8436 : 12 parts psql hors nocturne, 4 au nocturne
+        self.assertEqual(job["strategy"]["max-parallel"], "${{ inputs.psql-full && 4 || 12 }}")
         steps = job["steps"]
         guard = next(i for i, step in enumerate(steps) if step.get("run") == "python3 -m ameesh psql-nocturne guard")
         checkout = next(i for i, step in enumerate(steps) if step.get("uses", "").startswith("actions/checkout@"))

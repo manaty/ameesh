@@ -2171,7 +2171,8 @@ class PlanTest(unittest.TestCase):
             plan.read_list(plan.ALWAYS_FILE, mods))
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]),
                          sorted(pilot))
-        # #1476 : la suite complète passe à 16 psql et 8 psycopg, puis 12 (#6880)
+        # #1476 : la suite complète passe à 16 psql et 8 psycopg, puis 12 psql
+        # (#8436) et 12 psycopg (#6880)
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
                          _full_suite_parts("psycopg"))
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
@@ -2181,6 +2182,30 @@ class PlanTest(unittest.TestCase):
                          list(range(1, plan.PARTS["psycopg"][1] + 1)))
         self.assertEqual(out["psql_parts"], str(plan.PARTS["psql"][1]))
         self.assertEqual(out["code"], "true")
+
+    def test_a_full_plan_splits_psql_on_the_measured_table(self):
+        # #8436 : hors lot, psql lit la table relevée sur sa liste pilote et le
+        # contrat (`split_weights`, comme psycopg depuis #7590), pas la carte
+        # sous couverture — même quand la carte est plus récente. Sans cela,
+        # `weights` rendait des parts psql égales à ~1 379 s quand la mesure
+        # en donnait 854 à 5 788, et le mur restait à 39-48 min.
+        original = plan.weights
+
+        def guard(modules, driver, card):
+            if driver == "psql":
+                raise AssertionError("a full plan must split psql on the table")
+            return original(modules, driver, card)
+
+        with mock.patch.object(plan, "weights", side_effect=guard):
+            p = plan.make_plan("push", None, NOW, repo=str(REPO))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
+        table = json.loads(parts.TABLE.read_text(encoding="utf-8"))["psql"]
+        for ps in p["parts"]["psql"]:
+            self.assertAlmostEqual(
+                ps["estimate_s"],
+                round(sum(max(float(table[m]), parts.MIN_WEIGHT)
+                          for m in ps["modules"]), 1), places=1)
 
     def test_push_full_suite_skips_import_resolution(self):
         # #7590 : une poussée (main/release) ou un paquet a déjà la suite
@@ -2232,8 +2257,12 @@ class PlanTest(unittest.TestCase):
         # pèse ~1 423 s contre ~1 227 s en psql ; à huit parts, une part
         # psycopg pèse ~1,7x une part psql et la répartition par hôte
         # (quatre parts lourdes sur un hôte contre zéro) domine le mur.
-        self.assertEqual(plan.PARTS["psql"][1], 16)
+        # #8436 : psql redescend à douze (24 jobs, le pool) et son découpage
+        # lit la table mesurée sur la liste pilote ; le nocturne garde son
+        # plancher de seize parts à part (`PSQL_FULL_PARTS_MIN`).
+        self.assertEqual(plan.PARTS["psql"][1], 12)
         self.assertEqual(plan.PARTS["psycopg"][1], 12)
+        self.assertEqual(plan.PSQL_FULL_PARTS_MIN, 16)
 
     def test_full_suite_psycopg_is_split_for_the_cap(self):
         # #2292 : à quatre parts, 14,3-30,5 min sous saturation sur les cinq

@@ -19,7 +19,8 @@
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; hors lot (#3749), la liste
-#               pilote et tout le contrat, en 16 parts (#1476), sur push vers
+#               pilote et tout le contrat, en 12 parts (#1476, #8436 : 12 + 12
+#               jobs remplissent les 24 runners), sur push vers
 #               main ou release/**, sur une PR de release, à la main
 #               (workflow_dispatch, hors tête de PR ouverte, #1635), sur
 #               l'appel du portier de paquet (workflow_call) et sur une
@@ -35,9 +36,11 @@
 # n'est jamais le check requis d'une PR.
 # #1476 : 16 psql + 8 psycopg = 24 jobs, la taille du pool de #1468 ; le
 # découpage suit les durées mesurées (scripts/test-plan.py, PARTS), jamais ce
-# fichier (rééquilibrage : #3754). #6880 : psycopg passe à 12 parts (28 jobs) ;
-# les quatre parts au-delà du pool attendent qu'un runner se libère, ce qui
-# lisse la fin de paquet au lieu de laisser un hôte avec quatre parts lourdes.
+# fichier (rééquilibrage : #3754). #6880 : psycopg passe à 12 parts (28 jobs).
+# #8436 (28/11) : mesuré, les quatre parts au-delà du pool n'ont pas lissé la
+# fin ; elles ont attendu un runner jusqu'à 24 min et fini le run (p90 48 min
+# contre la cible de 30). psql redescend à 12 : 12 + 12 = 24 jobs, le pool
+# exactement.
 # #3754 — chaque part psql/psycopg tourne en deux processus de test
 # (`--parallel 2`), chacun son schéma : les runners auto-hébergés offrent
 # 8 vCPU pour 8 jobs (#6880 : la flotte est à 8 vCPU par hôte, pas 16), une
@@ -999,15 +1002,17 @@ jobs:
     strategy:
       fail-fast: false
       # #7483: leave pool capacity for packets during the nocturne.
-      max-parallel: ${{ inputs.psql-full && 4 || 16 }}
+      # #8436 : 12 parts hors lot avec les 12 psycopg, les 24 jobs du pool
+      # exactement (16 + 12 = 28 en laissaient quatre attendre un runner).
+      max-parallel: ${{ inputs.psql-full && 4 || 12 }}
       matrix:
         # sur une PR de lot (L1211) : les modules « pilote » parmi les
         # impactés et le contrat, plus la liste « always » déclenchée (#749) ;
         # une part, deux ou trois selon l'estimation (scripts/test-plan.py,
         # lot_part_count), trois au plus (#947 : sous saturation, une part
         # unique atteignait le plafond de 30 min) ; hors lot, la liste pilote
-        # et tout le contrat en 16 parts (#1476, #3749) ; la suite entière
-        # seulement au nocturne (psql-nocturne.yml).
+        # et tout le contrat en 12 parts (#1476, #3749, #8436) ; la suite
+        # entière seulement au nocturne (psql-nocturne.yml).
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:
