@@ -879,13 +879,20 @@ sinon la demande de retour), et exige **tous** les runners enregistrés de
 l'hôte en ligne et aucun occupé. La requête `busy` est alors terminée
 (`runners online`), puis le contrôle est rouvert (`undrain`, prises ouvertes)
 et rendu `available` (`complete_return`), ce qui autorise un drainage
-ultérieur. Un runner hors ligne ou un relevé antérieur à l'allumage laisse le
-retour ouvert.
+ultérieur : le contrôle revient `available` avec les prises **ouvertes**, et
+le tick suivant les referme en ouvrant le cycle suivant (aucun agent ne prend
+de prise sur une VM CI). Un runner hors ligne ou un relevé antérieur à
+l'allumage laisse le retour ouvert.
 
-La mesure des runners persiste deux faits sur `ci_runner_state` (migration
-0616) : `online` et `last_busy_at`, ce dernier survivant à la fin du job
-(contrairement à `busy_since`). La migration est additive : l'appliquer
-**avant** de redémarrer les workers (règle de staging, §11 bis).
+La mesure des runners persiste trois colonnes sur `ci_runner_state` (migration
+0616) : `online`, `last_busy_at` (qui survit à la fin du job, contrairement à
+`busy_since`) et `state_seen_at`, qui date les deux premiers dans la même
+écriture que `seen_at`. Un veilleur N-1 rafraîchit `seen_at` sans les écrire :
+l'écart est un doute, jamais une preuve de repos ou de retour ; le premier
+relevé courant qui le suit repart de son propre instant pour `last_busy_at`,
+car un job a pu tourner et finir sans être vu. La migration
+est additive : l'appliquer **avant** de redémarrer les workers (règle de
+staging, §11 bis).
 
 Les cartes d'hôte du canon `hotes/ameesh-ci-1..3.md` ne portent ni hook ni
 `staging.kind` (l'énumération n'a pas de valeur `ci`), avec

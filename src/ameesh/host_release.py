@@ -729,6 +729,10 @@ def ci_runner_activity(db, host, *, now, fresh_s=CI_WAKE_FRESH_S, after=None):
       connected. A CI host has no host reading nor probe agent; that reading,
       made after the power-on (`after`), is its return proof. An offline slot
       keeps the return open: the runner service of the VM is not back.
+    * `state_seen_ts` dates `online` and `last_busy_ts`, in the same statement
+      as `seen_ts`; it must equal `seen_ts`. A veilleur N-1 refreshes
+      `seen_ts` without writing those facts, so the gap is doubt (never a
+      return or a rest proof), like 0603's `wait_seen_at` for the wake queue.
     * `seen_ts` freshness bounds every fact: a reading older than `fresh_s` is
       `unknown`, never a silent idle or online.
     """
@@ -743,10 +747,14 @@ def ci_runner_activity(db, host, *, now, fresh_s=CI_WAKE_FRESH_S, after=None):
                 "reason": "CI runners unreadable (%s)" % type(exc).__name__}
     if not rows:
         return {"state": "inert"}
-    if any(row.get("seen_ts") is None
-           or now - float(row["seen_ts"]) > fresh_s for row in rows):
+    if any(row.get("seen_ts") is None or row.get("state_seen_ts") is None
+           or float(row["state_seen_ts"]) != float(row["seen_ts"])
+           for row in rows):
+        return {"state": "unknown",
+                "reason": "CI runner state not dated by this scan"}
+    if any(now - float(row["state_seen_ts"]) > fresh_s for row in rows):
         return {"state": "unknown", "reason": "CI runner reading stale"}
-    if after is not None and any(float(row["seen_ts"]) < float(after)
+    if after is not None and any(float(row["state_seen_ts"]) < float(after)
                                  for row in rows):
         return {"state": "stale",
                 "reason": "CI runners not measured since the wake"}

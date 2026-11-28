@@ -6,5 +6,6 @@
 -- refuserait ses ticks (le doute est sûr, mais aucun retour ne se prouverait).
 -- Retirer ces colonnes ne change pas l'état des VM.
 ALTER TABLE ci_runner_state
+    DROP COLUMN IF EXISTS state_seen_at,
     DROP COLUMN IF EXISTS last_busy_at,
     DROP COLUMN IF EXISTS online;

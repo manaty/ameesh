@@ -98,18 +98,34 @@ class CiDomainTest(PgTestCase):
         self.st = storage.of(self.db)
         self.now = Queue(self.db).now()
 
+    def scan_runner(self, *, name=None, online=True, busy=False):
+        self.st.ci.observe_runners(REPO, [{
+            "id": 1, "name": name or (HOST + "-1"), "busy": busy and online,
+            "job": None, "stuck": False, "labels": list(LABELS),
+            "online": online}])
+
     def seed_runner(self, *, name=None, online=True, busy=False,
                     seen=None, last_busy=None):
         name = name or (HOST + "-1")
-        self.st.ci.observe_runners(REPO, [{
-            "id": 1, "name": name, "busy": busy and online, "job": None,
-            "stuck": False, "labels": list(LABELS), "online": online}])
+        self.scan_runner(name=name, online=online, busy=busy)
+        # A current watcher writes `state_seen_at` with the same instant as
+        # `seen_at`; the fixture keeps that identity when it dates the row.
+        seen = self.now if seen is None else seen
         self.db.execute(
             "UPDATE ci_runner_state SET seen_at=to_timestamp(%s), "
-            "last_busy_at=%s WHERE name=%s",
-            (self.now if seen is None else seen,
+            "state_seen_at=to_timestamp(%s), last_busy_at=%s WHERE name=%s",
+            (seen, seen,
              None if last_busy is None else datetime.fromtimestamp(
                  float(last_busy), timezone.utc), name))
+
+    def n1_scan(self, *, seen=None, busy=False):
+        """An N-1 watcher: it refreshes `seen_at` and the legacy busy state,
+        never the 0616 facts (`online`, `last_busy_at`) nor their stamp."""
+        self.db.execute(
+            "UPDATE ci_runner_state SET seen_at=to_timestamp(%s), busy=%s, "
+            "busy_since=CASE WHEN %s THEN now() END WHERE name=%s",
+            (self.now if seen is None else seen, bool(busy), bool(busy),
+             HOST + "-1"))
 
     def seed_idle_queue(self):
         self.st.ci.observe_queue_wait(REPO, [])
@@ -164,10 +180,37 @@ class CiRunnerActivityTest(CiDomainTest):
         self.seed_runner(online=True, busy=True, last_busy=self.now - 10)
         activity = vm.host_release.ci_runner_activity(self.db, HOST, now=self.now)
         self.assertEqual(activity["busy"], [HOST + "-1"])
-        self.db.execute("UPDATE ci_runner_state SET seen_at=to_timestamp(%s)",
-                        (self.now - 4000,))
+        self.db.execute("UPDATE ci_runner_state SET seen_at=to_timestamp(%s), "
+                        "state_seen_at=to_timestamp(%s)",
+                        (self.now - 4000, self.now - 4000))
         self.assertEqual(vm.host_release.ci_runner_activity(
             self.db, HOST, now=self.now)["state"], "unknown")
+
+    def test_an_n1_scan_is_not_a_proof(self):
+        # The N-1 watcher refreshed the scan age after the power-on while
+        # `online=true` came from before the stop: it must not prove a return.
+        self.seed_runner(online=True, seen=self.now - 120,
+                         last_busy=self.now - 7200)
+        self.n1_scan(seen=self.now - 10)
+        activity = vm.host_release.ci_runner_activity(
+            self.db, HOST, now=self.now)
+        self.assertEqual(activity["state"], "unknown")
+        self.assertIn("not dated", activity["reason"])
+        self.assertEqual(vm.host_release.ci_runner_activity(
+            self.db, HOST, now=self.now, after=self.now - 30)["state"],
+            "unknown")
+
+    def test_a_current_scan_restores_the_reading(self):
+        self.seed_runner(online=True, seen=self.now - 4000,
+                         last_busy=self.now - 7200)
+        self.n1_scan(seen=self.now - 10)
+        self.assertEqual(vm.host_release.ci_runner_activity(
+            self.db, HOST, now=self.now)["state"], "unknown")
+        self.seed_runner(online=True, last_busy=self.now - 7200)
+        activity = vm.host_release.ci_runner_activity(
+            self.db, HOST, now=self.now)
+        self.assertEqual(activity["state"], "ok")
+        self.assertTrue(activity["online"])
 
     def test_a_reading_before_the_poweron_is_stale(self):
         self.seed_runner(seen=self.now - 60)
@@ -212,6 +255,35 @@ class CiStopEvidenceTest(CiDomainTest):
             self.evidence()
         self.db.execute("DELETE FROM ci_runner_state")
         self.seed_runner(busy=False, last_busy=self.now - 60)
+        with self.assertRaisesRegex(vm.Refused, "not at rest"):
+            self.evidence()
+
+    def test_an_n1_busy_scan_ending_between_readings_refuses_the_stop(self):
+        # The last current scan saw the fleet idle; an N-1 watcher then saw a
+        # job busy and its end without writing `last_busy_at`. The row looks
+        # idle with an old last busy, but its state stamp no longer matches
+        # the scan: the stop must not read it.
+        self.seed_idle_queue()
+        self.seed_runner(online=True, seen=self.now - 4000,
+                         last_busy=self.now - 7200)
+        self.n1_scan(seen=self.now - 60, busy=True)
+        self.n1_scan(seen=self.now - 10, busy=False)
+        with self.assertRaisesRegex(vm.Refused, "not dated"):
+            self.evidence()
+
+    def test_the_first_current_scan_after_an_n1_write_resets_the_rest(self):
+        # An N-1 watcher saw a job busy and its end; the next current scan
+        # cannot know when that job ended, so it dates the rest from its own
+        # scan instead of the stale last busy.
+        self.seed_idle_queue()
+        self.seed_runner(online=True, seen=self.now - 4000,
+                         last_busy=self.now - 7200)
+        self.n1_scan(seen=self.now - 60, busy=True)
+        self.n1_scan(seen=self.now - 10, busy=False)
+        self.scan_runner(online=True)
+        activity = vm.host_release.ci_runner_activity(self.db, HOST, now=self.now)
+        self.assertEqual(activity["state"], "ok")
+        self.assertGreaterEqual(activity["last_busy_ts"], self.now - 1)
         with self.assertRaisesRegex(vm.Refused, "not at rest"):
             self.evidence()
 
@@ -355,6 +427,13 @@ class CiReturnTickTest(CiDomainTest):
                 self.cfg, self.db, policy(targets={HOST: ci_target()}),
                 HOST, self.provider, probe=mock.Mock(return_value=True))
 
+    def tick_target(self):
+        with mock.patch.object(vm.host_release, "_canon_read",
+                               return_value=([object()], False)):
+            return vm.tick_target(
+                self.cfg, self.db, policy(targets={HOST: ci_target()}),
+                HOST, self.provider)
+
     def wake(self):
         self.observe("stopped", off_since=self.now - 7200)
         self.assertEqual(self.tick(), "starting")
@@ -382,6 +461,30 @@ class CiReturnTickTest(CiDomainTest):
             "SELECT result FROM vm_adapter_requests WHERE host=%s AND state='busy'",
             (HOST,))[0]
         self.assertEqual(row["result"], "runners online")
+
+    def test_a_returned_host_opens_a_new_drain_cycle(self):
+        self.wake()
+        self.seed_runner(online=True, seen=self.now - 10,
+                         last_busy=self.now - 7200)
+        self.assertEqual(self.tick(), "ready")
+        returned = Queue(self.db).control(HOST)
+        self.assertEqual(returned["mode"], "available")
+        # `ci_ready` reopens the claims before `complete_return`: an available
+        # CI control with claims open is the normal start of the next cycle,
+        # not a concurrent wave.
+        self.assertTrue(returned["claims_open"])
+        self.db.execute(
+            "UPDATE vm_adapter_observations SET on_since=to_timestamp(%s) "
+            "WHERE host=%s", (self.now - 7200, HOST))
+        self.seed_idle_queue()
+        self.assertEqual(self.tick_target(), "draining requested")
+        control = Queue(self.db).control(HOST)
+        self.assertEqual(control["mode"], "draining")
+        self.assertFalse(control["claims_open"])
+        self.assertGreater(control["generation"], returned["generation"])
+        self.assertEqual(
+            [row["state"] for row in Queue(self.db).pending_all(HOST)],
+            ["draining", "idle-drained"])
 
     def test_offline_or_stale_runners_keep_the_return_open(self):
         self.wake()

@@ -808,6 +808,14 @@ def ci_start(cfg, db, policy, host, provider):
     right after, so the existing two-phase stop carries it. A failure between
     the two writes is repaired by the next tick (the control is draining and
     its `draining` request is missing).
+
+    A returned CI host is `available` with claims **open**: `ci_ready`
+    reopens them (`undrain`) before `complete_return`, and no agent ever
+    claims on a CI VM. That state is the normal start of a new cycle, not a
+    concurrent wave. The generation/epoch read before the stop proof must
+    still be the live one when the proof is done; `drain` is then the atomic
+    decision (it closes claims in its own transaction), and a concurrent wave
+    that won it keeps its generation and requests.
     """
     try:
         holds = {row['host']: row for row in storage.of(db).hosts.holds()}
@@ -828,14 +836,19 @@ def ci_start(cfg, db, policy, host, provider):
                          quiet_s=quiet_s, on_ts=observed['on_ts'])
     except Refused as exc:
         return 'CI rest: ' + str(exc)
-    control = Queue(db).control(host)
-    if control and (control['mode'] not in (None, 'available')
-                    or control['claims_open']):
+    fresh = Queue(db).control(host)
+    if fresh and fresh['mode'] not in (None, 'available'):
+        return 'CI control changed'
+    if ((fresh or {}).get('generation') != (control or {}).get('generation')
+            or (fresh or {}).get('release_epoch')
+            != (control or {}).get('release_epoch')):
         return 'CI control changed'
     row = storage.of(db).host_lifecycle.drain(
         host, actor='vm-adapter', automatic=True, close_claims=True)
     if row is None:
         return 'drain refused'
+    if row['mode'] != 'draining' or row['claims_open']:
+        return 'CI control changed'
     q = Queue(db)
     q.request(host, row['generation'], row['release_epoch'], 'draining')
     q.request(host, row['generation'], row['release_epoch'], 'idle-drained')
