@@ -12464,6 +12464,16 @@ class AgentWorker(threading.Thread):
             return None
 
     def ensure_peek(self) -> None:
+        # #8334 : `agent_peek: false` (`AMEESH_AGENT_PEEK=0`) coupe le publieur
+        # à la source — ni fil, ni connexion PostgreSQL par worker. La lecture
+        # (`Runner.peek()`, `/api/v1/agents/{agent}/peek`) ne change pas : elle
+        # rend le dernier instantané connu, ou aucun (dit `stale`).
+        if not getattr(self.cfg, "agent_peek", True):
+            if not getattr(self, "_peek_disabled_logged", False):
+                self._peek_disabled_logged = True
+                log_async("[%s] agent peek publisher disabled (agent_peek=false)"
+                          % self.name)
+            return
         if getattr(self, "_peek_publisher", None) is None:
             from .agent_peek import Publisher
             self._peek_publisher = Publisher(
