@@ -15,10 +15,10 @@ distribution (copied outside the checkout, imports only
 `tests.test_7665_module_contract.CoverageTableTest` checks that every element
 has exactly one row and that every cited test exists.
 
-The surface freezes revision 1.13; its baseline commit stays the revision 1.0
-comparison point, and the elements that revisions 1.1, 1.2, 1.3, 1.5, 1.6, 1.7,
-1.8, 1.9, 1.10, 1.11, 1.12 and 1.13 add are now listed (revision 1.4 adds no name). The
-comparison is additive-compatible, as the contract's compatibility rule states:
+The surface freezes the latest contract revision; its baseline commit stays the
+revision 1.0 comparison point, and the elements that every later revision adds
+are listed here (revision 1.4 adds no name). The comparison is
+additive-compatible, as the contract's compatibility rule states:
 
 - HTTP: every schema is flattened per field (type, `const`, `enum`, bounds,
   `pattern`, `format`, `required`, `additionalProperties`), for parameters,

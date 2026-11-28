@@ -805,6 +805,48 @@ class PaquetInclusionTest(unittest.TestCase):
         with self.assertRaises(inclusion.InputError):
             inclusion.read_ready_file(ready)
 
+    # -- #8395 : pliage du contrat ----------------------------------------
+    def test_a_contract_fold_commit_explains_the_rewritten_paths(self) -> None:
+        """Le composeur replie en-tête et fragment : le lot n'est pas amputé."""
+        self.git("switch", "-q", "-c", "lot/500", "main")
+        (self.repo / "docs/api/module-contract-v1.d").mkdir(
+            parents=True, exist_ok=True)
+        self.write("docs/api/module-contract-v1.md",
+                   "Contract revision: **1.11, 1 January 2026**.\n")
+        self.write("docs/api/module-contract-v1.d/500.md",
+                   "adds: a read; it is additive to {previous}.\n")
+        source = self.commit("#500 : contrat")
+        self.git("switch", "-q", "main")
+        merge = self.merge("500")
+        # le commit de pliage du composeur : en-tête réécrit, fragment retiré
+        self.write("docs/api/module-contract-v1.md",
+                   "Contract revision: **1.12, 2 January 2026**.\n")
+        (self.repo / "docs/api/module-contract-v1.d/500.md").unlink()
+        fold = self.commit("contrat module v1 : révisions 1.12 (#500) attribuées")
+        self.head = self.rev("HEAD")
+        manifest = self.manifest_simple(500, source, merge)
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8")
+            + "\n## Contrat module v1\n\n"
+            + "- Révisions attribuées : 1.12 (#500, fragment).\n"
+            + "- Commit de composition : `%s` (en-tête, surface et "
+              "`CONTRACT_VERSION` alignés ; fragments retirés).\n" % fold,
+            encoding="utf-8")
+        rc, payload = inclusion.run(self.namespace(expected=[500],
+                                                   manifest=manifest))
+        self.assertEqual(rc, 0, payload["errors"])
+        entry = payload["entries"][0]
+        self.assertEqual(entry["verdict"], "présent")
+        self.assertIn("replié", {check["verdict"] for check in entry["paths"]})
+        self.assertFalse(payload["removed"])
+        # sans la section, le même arbre est refusé : le lot semble avoir
+        # perdu son contenu sous la tête
+        bare = self.manifest_simple(500, source, merge)
+        rc, payload = inclusion.run(self.namespace(expected=[500], manifest=bare))
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("#500" in error for error in payload["errors"]),
+                        payload["errors"])
+
     # -- helpers de banc ---------------------------------------------------
     def ecrire_manifeste_sans_admissions(self) -> None:
         self.manifest.write_text(

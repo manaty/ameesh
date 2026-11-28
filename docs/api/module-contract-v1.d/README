@@ -1,0 +1,15 @@
+Fragments de révision du contrat module v1
+==========================================
+
+Un lot qui change docs/api/module-contract-v1.md écrit ici <lot>.md :
+
+  adds: <texte de la révision, « {previous} » pour la révision précédente>
+
+puis, après une ligne vide, les sections qu'il ajoute. Il ne touche ni
+l'en-tête du contrat, ni la liste des révisions, ni la valeur "contract" de la
+surface, ni CONTRACT_VERSION : le composeur du paquet attribue les numéros et
+plie les fragments à la composition.
+
+Format complet et gestes du composeur : docs/design/contract-revision-fragments.md
+
+Le présent README n'est pas un fragment : seuls les fichiers <lot>.md le sont.

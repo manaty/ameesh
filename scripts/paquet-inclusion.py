@@ -477,8 +477,16 @@ def parse_added(patch: bytes) -> dict[str, list[str] | None]:
     return result
 
 
-def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
-    """Vérifie qu'une entrée de composition est encore dans l'arbre de tête."""
+def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict,
+                exempt: set[str] | None = None) -> dict:
+    """Vérifie qu'une entrée de composition est encore dans l'arbre de tête.
+
+    #8395 : ``exempt`` porte les chemins que le commit de pliage du contrat a
+    réécrits (en-tête, surface, ``CONTRACT_VERSION``, fragments) ; leurs lignes
+    d'origine ne peuvent pas être exigées telles quelles. Elles sont lues
+    « repliées », ce qui n'est ni une omission ni un retrait.
+    """
+    exempt = set(exempt or ())
     result: dict = {
         "row": entry.row,
         "line": entry.line_no,
@@ -566,6 +574,21 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
 
     checks: list[PathCheck] = []
     for status, path in name_status:
+        if path in exempt:
+            # #8395 : le composeur a replié ce chemin (contrat, surface,
+            # CONTRACT_VERSION, fragment) ; ses lignes d'origine ont été
+            # réécrites par le commit de composition cité au manifeste.
+            checks.append(
+                PathCheck(
+                    path=path,
+                    status=status,
+                    added=0,
+                    present=0,
+                    verdict="replié",
+                    note="chemin replié par le commit de composition du contrat",
+                )
+            )
+            continue
         if status == "D":
             present = blob_id(repo, head, path) is None
             checks.append(
@@ -677,6 +700,79 @@ def lot_verdict(entries: list[dict]) -> str:
     return "non_vérifiable"
 
 
+CONTRACT_HEADING_RE = re.compile(r"contrat module v1", re.IGNORECASE)
+CONTRACT_COMMIT_RE = re.compile(
+    r"Commit de composition\s*:\s*`([0-9a-f]{7,40})`")
+CONTRACT_REVISION_LOT_RE = re.compile(r"(\d+\.\d+)\s*\(#(\d+)")
+
+
+def contract_fold(text: str) -> tuple[str, list[int]] | None:
+    """#8395 : le commit de pliage du contrat et ses lots, lus au manifeste.
+
+    La section « Contrat module v1 » cite le commit déterministe qui a replié
+    les fragments de révision et les lots concernés ; ``None`` quand le
+    manifeste n'en porte pas (paquet sans changement de contrat).
+    """
+    lines = str(text).splitlines()
+    section: list[str] | None = None
+    level = 0
+    for line in lines:
+        match = HEADING_RE.match(line)
+        if not match:
+            if section is not None:
+                section.append(line)
+            continue
+        if section is None:
+            if CONTRACT_HEADING_RE.search(match.group(2)):
+                section = []
+                level = len(match.group(1))
+            continue
+        if len(match.group(1)) <= level:
+            break
+        section.append(line)
+    if section is None:
+        return None
+    body = "\n".join(section)
+    commit = CONTRACT_COMMIT_RE.search(body)
+    if not commit:
+        return None
+    lots = [int(match.group(2))
+            for match in CONTRACT_REVISION_LOT_RE.finditer(body)]
+    return commit.group(1), lots
+
+
+def contract_fold_paths(repo: Path, head: str, text: str
+                        ) -> tuple[dict[int, set[str]], list[str]]:
+    """#8395 : les chemins repliés par le commit de pliage, par lot.
+
+    Un lot dont le diff touchait le contrat, la surface ou ``CONTRACT_VERSION``
+    a vu ces lignes réécrites par le composeur : le contrôle d'inclusion ne
+    peut pas exiger de les retrouver telles quelles à la tête. Ces chemins-là
+    sont donc lus comme repliés pour les lots cités ; le commit doit exister et
+    être ancêtre de la tête, sinon le manifeste est refusé.
+    """
+    fold = contract_fold(text)
+    if fold is None:
+        return {}, []
+    sha, lots = fold
+    errors: list[str] = []
+    commit = rev_parse(repo, sha)
+    if commit is None:
+        return {}, [f"commit de pliage du contrat {sha} introuvable"]
+    if git(repo, "merge-base", "--is-ancestor", commit, head,
+           check=False).returncode != 0:
+        return {}, [f"commit de pliage du contrat {sha} non ancêtre de la tête"]
+    parent = rev_parse(repo, f"{commit}^")
+    if parent is None:
+        return {}, [f"commit de pliage du contrat {sha} sans parent"]
+    proc = git(repo, "diff", "--no-renames", "--name-only", parent, commit)
+    paths = {line for line in proc.stdout.decode("utf-8", "replace").splitlines()
+             if line}
+    if not paths:
+        errors.append(f"commit de pliage du contrat {sha} sans fichier")
+    return {lot: paths for lot in lots}, errors
+
+
 # --------------------------------------------------------------------------
 # Rapport
 # --------------------------------------------------------------------------
@@ -697,11 +793,16 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
             target=getattr(args, "target", None) or None,
             package_id=getattr(args, "carrier", 0) or None)
     if receipt:
-        manifest = parse_manifest(manifest_path, text=receipt["payload"]["manifest"])
+        manifest_text = receipt["payload"]["manifest"]
+        manifest = parse_manifest(manifest_path, text=manifest_text)
     else:
         if not manifest_path.is_file():
             raise InputError(f"manifeste introuvable : {manifest_path}")
-        manifest = parse_manifest(manifest_path)
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+        manifest = parse_manifest(manifest_path, text=manifest_text)
+    # #8395 : le commit de pliage du contrat, cité au manifeste, explique les
+    # chemins du contrat que le composeur a réécrits pour les lots composés.
+    fold_exempt, fold_errors = contract_fold_paths(repo, head, manifest_text)
 
     expected = collect_ids(args.expected, args.expected_file)
     if not expected and manifest.admissions:
@@ -749,7 +850,11 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
 
     line_cache: dict = {}
     entry_results = [
-        check_entry(repo, entry, head, line_cache) for entry in manifest.entries
+        check_entry(
+            repo, entry, head, line_cache,
+            exempt=set().union(*(fold_exempt.get(lot, set())
+                                 for lot in entry.lots)))
+        for entry in manifest.entries
     ]
 
     composed: dict[int, list[dict]] = {}
@@ -766,6 +871,9 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
     contents: list[dict] = []
     errors: list[str] = []
     warnings: list[str] = []
+    # #8395 : un commit de pliage cité mais introuvable ou hors de la tête est
+    # un défaut du manifeste, pas une exemption silencieuse.
+    errors.extend(fold_errors)
     # #4240 : les commits de composition dont le message n'a pas le trailer du
     # lot qu'ils portent. Le défaut est bloquant : la composition n'est pas
     # déclarable, `packet record` échoue ou ignore l'unité.

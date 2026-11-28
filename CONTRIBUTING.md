@@ -12,6 +12,11 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 - **Revue proportionnée au risque** : SQL, sécurité, autorisation, exécuteur et
   tout ce qui touche à la production sont relus avant fusion ; voir
   `docs/design/decisions/0018-vitesse-des-agents.md`.
+- **Contrat module v1** : un changement du contrat public s'écrit dans un
+  fragment `docs/api/module-contract-v1.d/<lot>.md`, sans numéro ni retouche de
+  l'en-tête ; le composeur du paquet attribue la révision et plie les
+  fragments. Voir
+  [`docs/design/contract-revision-fragments.md`](docs/design/contract-revision-fragments.md).
 - **Tests** : la suite tourne sur un vrai Postgres avec les deux pilotes ;
   `scripts/test.sh` en local (ou `scripts/test-parallele.sh -n 4`, en parts
   parallèles), l'intégration continue sur chaque PR : les tests impactés et le
