@@ -192,6 +192,24 @@ class PauseDateeTest(PgTestCase):
         self.assertEqual(self.messages(), [])
         self.assertTrue(any("no readable pilot" in line for line in logs), logs)
 
+    def test_sans_pilote_le_journal_parle_une_fois_par_episode(self):
+        # #8431 : une ligne par épisode et par hôte, la passe suivante réessaie.
+        logs = []
+        notifier = self.notifier(canon=False, log=logs.append)
+        self.pause(until=time.time() + 4 * 3600)
+        for offset in (0, 30, 60):
+            notifier._pause_pose_notices(self.db, time.time() + offset)
+        lines = [line for line in logs if "no readable pilot" in line]
+        self.assertEqual(len(lines), 1, logs)
+        self.assertIn(self.host, lines[0])
+        self.assertNotIn(self.host, notifier.state["pause_notices"])
+        self.lift()
+        notifier._pause_pose_notices(self.db, time.time() + 90)
+        self.pause(until=time.time() + 4 * 3600)
+        notifier._pause_pose_notices(self.db, time.time() + 120)
+        lines = [line for line in logs if "no readable pilot" in line]
+        self.assertEqual(len(lines), 2, logs)
+
 
 if __name__ == "__main__":
     unittest.main()
