@@ -263,14 +263,28 @@ def _norm(text: str) -> str:
 
 
 def _render_adds(adds: str, previous: str) -> str:
+    """Substitue ``{previous}``, puis la référence finale « additive to 1.N ».
+
+    Seule la **dernière** mention est réécrite (N2) : un fragment peut citer
+    une autre révision plus tôt dans sa phrase sans que le pliage la change.
+    """
     text = str(adds).replace("{previous}", previous)
-    return _ADDITIVE.sub("additive to " + previous, text)
+    return _rewrite_last_additive(text, previous)
+
+
+def _rewrite_last_additive(text: str, previous: str) -> str:
+    """Réécrit la dernière mention « additive to 1.N » seulement."""
+    matches = list(_ADDITIVE.finditer(text))
+    if not matches:
+        return text
+    match = matches[-1]
+    return text[:match.start()] + "additive to " + previous + text[match.end():]
 
 
 def _renumber(paragraph: str, number: str, previous: str) -> str:
     """Renumérote un paragraphe de l'ancienne manière, sans le relire."""
     text = _REVISION_ITEM.sub("Revision %s adds" % number, paragraph, count=1)
-    return _ADDITIVE.sub("additive to " + previous, text)
+    return _rewrite_last_additive(text, previous)
 
 
 def plan_fold(base_contract: str, contract: str, surface: str, version: str,
@@ -292,8 +306,10 @@ def plan_fold(base_contract: str, contract: str, surface: str, version: str,
     for lot in fragments:
         if int(lot) not in ordered:
             raise FragmentError(
-                "fragment présent mais lot absent de la composition", lot=lot,
-                path=fragments[lot].path)
+                "fragment présent mais lot absent de la composition (fusionné "
+                "hors paquet ?) : geste = replier le fragment dans la cible "
+                "avec ce lot dans l'ordre, ou retirer le fragment",
+                lot=lot, path=fragments[lot].path)
     for lot, paragraphs in legacy.items():
         if int(lot) not in ordered:
             raise FragmentError(

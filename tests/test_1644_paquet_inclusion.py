@@ -812,15 +812,20 @@ class PaquetInclusionTest(unittest.TestCase):
         (self.repo / "docs/api/module-contract-v1.d").mkdir(
             parents=True, exist_ok=True)
         self.write("docs/api/module-contract-v1.md",
-                   "Contract revision: **1.11, 1 January 2026**.\n")
+                   "Contract revision: **1.11, 1 January 2026**.\n\n"
+                   "Revision 1.11 adds eleven (#11); it is additive to 1.10.\n")
         self.write("docs/api/module-contract-v1.d/500.md",
-                   "adds: a read; it is additive to {previous}.\n")
+                   "adds: a read; it is additive to {previous}.\n\n"
+                   "## Demo\n\nThe body.\n")
         source = self.commit("#500 : contrat")
         self.git("switch", "-q", "main")
         merge = self.merge("500")
         # le commit de pliage du composeur : en-tête réécrit, fragment retiré
         self.write("docs/api/module-contract-v1.md",
-                   "Contract revision: **1.12, 2 January 2026**.\n")
+                   "Contract revision: **1.12, 2 January 2026**.\n\n"
+                   "Revision 1.11 adds eleven (#11); it is additive to 1.10.\n"
+                   "Revision 1.12 adds a read; it is additive to 1.11.\n\n"
+                   "## Demo\n\nThe body.\n")
         (self.repo / "docs/api/module-contract-v1.d/500.md").unlink()
         fold = self.commit("contrat module v1 : révisions 1.12 (#500) attribuées")
         self.head = self.rev("HEAD")
@@ -839,13 +844,125 @@ class PaquetInclusionTest(unittest.TestCase):
         self.assertEqual(entry["verdict"], "présent")
         self.assertIn("replié", {check["verdict"] for check in entry["paths"]})
         self.assertFalse(payload["removed"])
-        # sans la section, le même arbre est refusé : le lot semble avoir
-        # perdu son contenu sous la tête
+        # sans la section, le même arbre est signalé : l'en-tête du lot manque
+        # sous la tête et seule la lecture du paquet peut l'expliquer
         bare = self.manifest_simple(500, source, merge)
         rc, payload = inclusion.run(self.namespace(expected=[500], manifest=bare))
+        self.assertEqual(payload["entries"][0]["verdict"], "partiel")
+        self.assertTrue(
+            any("#500" in warning and "partiel" in warning
+                for warning in payload["warnings"]), payload["warnings"])
+
+    def test_a_fold_commit_exempts_only_the_lines_it_rewrote(self) -> None:
+        """B1 (#8395) : une ligne du lot hors en-tête reste exigée à la tête."""
+        (self.repo / "src/ameesh/public").mkdir(parents=True, exist_ok=True)
+        (self.repo / "docs/api/module-contract-v1.d").mkdir(
+            parents=True, exist_ok=True)
+        self.write("src/ameesh/public/__init__.py",
+                   'CONTRACT_VERSION = "1.11"\n\n__all__ = []\n')
+        self.write("docs/api/module-contract-v1.md",
+                   "Contract revision: **1.11, 1 January 2026**.\n")
+        self.commit("base contrat")
+        self.git("switch", "-q", "-c", "lot/501", "main")
+        self.write("src/ameesh/public/__init__.py",
+                   'CONTRACT_VERSION = "1.11"\n\n'
+                   'reviewed_feature = True\n\n__all__ = []\n')
+        self.write("docs/api/module-contract-v1.d/501.md",
+                   "adds: a read; it is additive to {previous}.\n")
+        source = self.commit("#501 : lecture publique")
+        self.git("switch", "-q", "main")
+        merge = self.merge("501")
+        self.write("docs/api/module-contract-v1.md",
+                   "Contract revision: **1.12, 2 January 2026**.\n\n"
+                   "Revision 1.12 adds a read; it is additive to 1.11.\n")
+        self.write("src/ameesh/public/__init__.py",
+                   'CONTRACT_VERSION = "1.12"\n\n'
+                   'reviewed_feature = True\n\n__all__ = []\n')
+        (self.repo / "docs/api/module-contract-v1.d/501.md").unlink()
+        fold = self.commit("contrat module v1 : révisions 1.12 (#501)")
+        # une unité suivante perd la ligne ajoutée par le lot hors en-tête
+        self.write("src/ameesh/public/__init__.py",
+                   'CONTRACT_VERSION = "1.12"\n\n__all__ = []\n')
+        self.head = self.commit("composition : perte de reviewed_feature")
+        manifest = self.manifest_simple(501, source, merge)
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8")
+            + "\n## Contrat module v1\n\n"
+            + "- Révisions attribuées : 1.12 (#501, fragment).\n"
+            + "- Commit de composition : `%s`.\n" % fold,
+            encoding="utf-8")
+        rc, payload = inclusion.run(self.namespace(expected=[501],
+                                                   manifest=manifest))
         self.assertEqual(rc, 1)
-        self.assertTrue(any("#500" in error for error in payload["errors"]),
-                        payload["errors"])
+        entry = payload["entries"][0]
+        checks = {check["path"]: check for check in entry["paths"]}
+        public = checks["src/ameesh/public/__init__.py"]
+        self.assertEqual(public["verdict"], "absent", public)
+        self.assertIn("reviewed_feature = True",
+                      " ".join(public["missing_sample"]))
+        self.assertEqual(
+            checks["docs/api/module-contract-v1.d/501.md"]["verdict"], "replié")
+
+    def test_a_cited_fold_commit_touching_other_files_is_refused(self) -> None:
+        """cx2 (#8395) : un commit cité qui retire du contenu hors contrat
+        ne vaut pas exemption."""
+        (self.repo / "docs/api/module-contract-v1.d").mkdir(
+            parents=True, exist_ok=True)
+        self.write("docs/api/module-contract-v1.md",
+                   "Contract revision: **1.11, 1 January 2026**.\n")
+        self.write("feature.py", "reviewed_feature = True\n")
+        base = self.commit("base")
+        self.write("docs/api/module-contract-v1.md",
+                   "Contract revision: **1.12, 2 January 2026**.\n")
+        self.write("feature.py", "")
+        cited = self.commit("faux pliage")
+        self.head = cited
+        manifest = self.manifest_simple(7, base, base)
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8")
+            + "\n## Contrat module v1\n\n"
+            + "- Révisions attribuées : 1.12 (#7, fragment).\n"
+            + "- Commit de composition : `%s`.\n" % cited,
+            encoding="utf-8")
+        rc, payload = inclusion.run(self.namespace(expected=[7],
+                                                   manifest=manifest))
+        self.assertEqual(rc, 1)
+        self.assertTrue(
+            any("hors du contrat module v1" in error
+                for error in payload["errors"]), payload["errors"])
+
+    def test_a_fold_commit_must_keep_the_fragment_sections(self) -> None:
+        """#8395 : une section du fragment perdue au pliage est refusée."""
+        self.git("switch", "-q", "-c", "lot/502", "main")
+        (self.repo / "docs/api/module-contract-v1.d").mkdir(
+            parents=True, exist_ok=True)
+        self.write("docs/api/module-contract-v1.md",
+                   "Contract revision: **1.11, 1 January 2026**.\n")
+        self.write("docs/api/module-contract-v1.d/502.md",
+                   "adds: a read; it is additive to {previous}.\n\n"
+                   "## Demo\n\nThe body.\n")
+        source = self.commit("#502 : contrat")
+        self.git("switch", "-q", "main")
+        merge = self.merge("502")
+        self.write("docs/api/module-contract-v1.md",
+                   "Contract revision: **1.12, 2 January 2026**.\n\n"
+                   "Revision 1.12 adds a read; it is additive to 1.11.\n")
+        (self.repo / "docs/api/module-contract-v1.d/502.md").unlink()
+        fold = self.commit("contrat module v1 : révisions 1.12 (#502)")
+        self.head = self.rev("HEAD")
+        manifest = self.manifest_simple(502, source, merge)
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8")
+            + "\n## Contrat module v1\n\n"
+            + "- Révisions attribuées : 1.12 (#502, fragment).\n"
+            + "- Commit de composition : `%s`.\n" % fold,
+            encoding="utf-8")
+        rc, payload = inclusion.run(self.namespace(expected=[502],
+                                                   manifest=manifest))
+        self.assertEqual(rc, 1)
+        self.assertTrue(
+            any("ligne(s) pliée(s) absente(s) du contrat" in error
+                for error in payload["errors"]), payload["errors"])
 
     # -- helpers de banc ---------------------------------------------------
     def ecrire_manifeste_sans_admissions(self) -> None:

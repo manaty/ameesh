@@ -69,11 +69,15 @@ locaux, exécute un pliage mécanique (`scripts/paquet-auto.py` s'appuie sur
   `<!-- contract-revision-sections: … -->` ;
 - il met à jour `"contract"` dans la surface et `CONTRACT_VERSION`, puis
   supprime les fragments ;
-- il crée **un commit de composition déterministe** (même arbre, même date de
-  composition ⇒ même contenu), dont le SHA et le tableau révision → lot sont
-  cités dans la section `## Contrat module v1` du manifeste. Le manifeste de
-  paquet est la preuve : le contrôle d'inclusion lit ce commit et sait que les
-  chemins du contrat ont été repliés par le composeur, pas perdus par un lot.
+- il crée **un commit de composition au contenu déterministe** (même arbre,
+  même date de composition ⇒ même contenu ; son SHA dépend aussi des dates
+  auteur/committer posées par git), dont le SHA et le tableau révision → lot
+  sont cités dans la section `## Contrat module v1` du manifeste. Le manifeste
+  de paquet est la preuve : le contrôle d'inclusion lit ce commit, n'exempte
+  que les lignes que le pliage a effectivement retirées ou réécrites (les
+  autres lignes du lot restent exigées à la tête), vérifie que le contenu des
+  fragments s'y retrouve et refuse un commit cité qui touche autre chose que
+  le contrat, sa surface, `CONTRACT_VERSION` et les fragments cités.
 
 Le pliage est idempotent : un arbre déjà plié ne porte plus de fragment, et le
 composeur ne retouche pas son en-tête.

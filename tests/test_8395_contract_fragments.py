@@ -142,6 +142,14 @@ class PlanFoldTest(unittest.TestCase):
         self.assertIn('"contract": "1.13"', fold.surface)
         self.assertIn('CONTRACT_VERSION = "1.13"', fold.version)
 
+    def test_only_the_last_additive_reference_is_rewritten(self):
+        """N2 (#8395) : une référence voulue à une autre révision est gardée."""
+        fold = self.fold({7: fragment(
+            7, "a read; additive to 1.5 for the old object; it is additive "
+               "to 1.9.")})
+        self.assertIn("additive to 1.5 for the old object", fold.contract)
+        self.assertIn("it is additive to 1.11.", fold.contract)
+
     def test_an_old_style_paragraph_is_renumbered_without_a_refreeze(self):
         legacy = ("Revision 1.12 adds an old read (#12); it is additive to 1.11.",
                   "Revision 1.12 adds a second read (#13); it is additive to 1.11.")

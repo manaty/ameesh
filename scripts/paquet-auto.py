@@ -2470,11 +2470,12 @@ def fold_contract(worktree: Path, base_sha: str, composition: Composition, *,
 
     Après les unités de fusion et avant les contrôles locaux : les numéros
     sont attribués dans l'ordre du manifeste, l'en-tête, la surface et
-    ``CONTRACT_VERSION`` sont alignés, les fragments retirés. Le commit est
-    déterministe (même arbre, même date ⇒ même contenu) et devient la tête du
-    paquet ; le manifeste le cite. Un fragment mal formé refuse la
-    composition en nommant le lot. Un arbre sans contrat, ou sans fragment ni
-    révision écrite, n'est pas touché.
+    ``CONTRACT_VERSION`` sont alignés, les fragments retirés. Le contenu du
+    commit est déterministe (même arbre, même date ⇒ même contenu ; son SHA
+    dépend aussi des dates auteur/committer que git pose au commit) et il
+    devient la tête du paquet ; le manifeste le cite. Un fragment mal formé
+    refuse la composition en nommant le lot. Un arbre sans contrat, ou sans
+    fragment ni révision écrite, n'est pas touché.
     """
     module = _contract_fragments()
     contract_path = worktree / module.CONTRACT_REL
