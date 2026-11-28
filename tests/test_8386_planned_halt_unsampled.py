@@ -80,6 +80,23 @@ class PlannedHaltTest(unittest.TestCase):
         self.assertEqual(self.types(now=RETURN + 900.0, controls=[back],
                                     provider="starting"), ["host_unsampled"])
 
+    def test_an_early_wake_is_quiet_within_the_boot_bound(self):
+        # retour anticipé demandé avant la date : la VM démarre, en `draining`
+        early = control(return_requested_ts=NOW)
+        self.assertEqual(self.types(now=NOW + 300.0, controls=[early],
+                                    provider="starting"), [])
+        self.assertEqual(self.types(now=NOW + 900.0, controls=[early],
+                                    provider="running"), ["host_unsampled"])
+
+    def test_a_released_host_booting_after_busy_is_quiet_within_the_bound(self):
+        # #4148 B1 : `busy` acquitté, release `busy`, claims encore fermés
+        booting = control(release_state="busy", hook_state="busy",
+                          released_ts=NOW - 3600.0, updated_ts=NOW)
+        self.assertEqual(self.types(now=NOW + 300.0, controls=[booting],
+                                    provider="running"), [])
+        self.assertEqual(self.types(now=NOW + 900.0, controls=[booting],
+                                    provider="running"), ["host_unsampled"])
+
     def test_an_unreadable_adapter_state_alerts(self):
         self.assertEqual(self.types(controls=[control()], provider=None),
                          ["host_unsampled"])
@@ -91,6 +108,8 @@ class PlannedHaltTest(unittest.TestCase):
 
     def test_no_proof_of_a_planned_halt_alerts(self):
         for row in (control(release_state="draining"), control(return_ts=None),
+                    control(release_state="busy", hook_state="busy", claims_open=True,
+                            released_ts=NOW - 3600.0),
                     control(mode="returning", claims_open=True, return_ts=None)):
             with self.subTest(row=row):
                 self.assertEqual(self.types(controls=[row]), ["host_unsampled"])
