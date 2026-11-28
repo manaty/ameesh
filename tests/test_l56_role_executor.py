@@ -18,6 +18,7 @@ from ameesh import db as db_mod, decisions, mail, registry, work, modules
 from ameesh.modules.storage import ModuleStore
 from tests.test_l317_project_modules import federation
 
+from .role_acl import serialize_role_acl
 from .support import REPO, PgTestCase, attendu
 from .test_cluster import TEST_DSN, _dsn_for
 
@@ -72,6 +73,13 @@ class RoleExecutorTest(PgTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        # #8481 : le contrat d'exécuteur parcourt toutes les bases du cluster
+        # (pg_database) et la classe pose des GRANT ... TO PUBLIC temporaires.
+        # La garde des contrats ACL la sérialise avec les autres classes du
+        # banc et avec ses propres instances quand le plan découpe la classe
+        # entre les processus de la part. Sans elle, le GRANT d'une instance
+        # faisait échouer le contrat de l'autre (CI 46167715827, psql 9/12).
+        serialize_role_acl(cls)
         # Database ACL tests must not change PUBLIC privileges in the shared bench.
         cls.admin_db = cls.db
         cls.database = "t_executor_db_" + uuid.uuid4().hex[:8]
