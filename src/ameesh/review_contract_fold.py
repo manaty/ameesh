@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
@@ -290,6 +291,14 @@ def _render_fragment_adds(adds: str, previous: str) -> str:
     return text
 
 
+def _revision_parts(number: str) -> tuple[int, int] | None:
+    """``(majeur, mineur)`` d'un numéro de révision ``1.N``, ou None."""
+    major, _dot, minor = str(number).partition(".")
+    if not major.isdigit() or not minor.isdigit():
+        return None
+    return int(major), int(minor)
+
+
 def contract_fold_paths(repo: Path, head: str, text: str
                         ) -> tuple[dict[int, dict[str, set[str]]], list[str]]:
     """#8395 : les lignes que le pliage a retirées, par lot et par chemin.
@@ -340,6 +349,15 @@ def contract_fold_paths(repo: Path, head: str, text: str
         return {}, [
             "commit de pliage du contrat %s touche %s, hors du contrat "
             "module v1 : refusé" % (sha, path) for path in outside]
+
+    # #8417 (B cx2, dev5) : un fragment cité est retiré par le pliage, jamais
+    # réécrit ni ajouté ; sa ligne garderait sinon un contenu non relu.
+    statuses = dict((path, kind) for kind, path in status)
+    for path in sorted(changed & fragments):
+        if statuses.get(path) != "D":
+            return {}, ["commit de pliage du contrat %s : le fragment %s n'est "
+                        "pas retiré (statut %s) : refusé"
+                        % (sha, path, statuses.get(path) or "?")]
 
     patch = git(repo, "-c", "core.quotePath=false", "diff", "--no-renames",
                 "-U0", "--no-color", "--no-ext-diff", parent, commit).stdout
@@ -450,6 +468,33 @@ def contract_fold_paths(repo: Path, head: str, text: str
     revisions = [(match.group(1), int(match.group(2)),
                   (match.group(3) or "").strip().casefold())
                  for match in CONTRACT_REVISION_LOT_RE.finditer(body)]
+    # #8417 (B dev5) : les trois versions de l'arbre plié valent la dernière
+    # révision citée au manifeste, pas seulement entre elles : un pliage qui
+    # ne change qu'un composant, ou vers un autre numéro, est refusé.
+    if not revisions:
+        errors.append("commit de pliage %s : aucune révision citée au "
+                      "manifeste" % sha)
+    else:
+        cited = revisions[-1][0]
+        for rel, pattern, name in ((CONTRACT_REL, CONTRACT_HEADER_LINE_RE,
+                                    "en-tête"),
+                                   (VERSION_REL, CONTRACT_VERSION_RE,
+                                    "CONTRACT_VERSION"),
+                                   (SURFACE_REL, CONTRACT_SURFACE_RE,
+                                    "surface")):
+            folded_lines = blob_lines(repo, commit, rel)
+            if folded_lines is None:
+                if rel == CONTRACT_REL:
+                    errors.append("commit de pliage %s : %s illisible"
+                                  % (sha, rel))
+                continue
+            values = {match.group(1) for match in
+                      (pattern.match(line) for line in folded_lines) if match}
+            if values != {cited}:
+                errors.append(
+                    "commit de pliage %s : %s %s, la révision citée est %s"
+                    % (sha, name, ", ".join(sorted(values)) or "absent",
+                       cited))
     head_contract = blob_lines(repo, head, CONTRACT_REL)
     if head_contract is None:
         errors.append("contrat %s illisible à la tête %s"
@@ -479,14 +524,22 @@ def contract_fold_paths(repo: Path, head: str, text: str
             errors.append(
                 "révision écrite %s (#%d) absente de la liste des révisions "
                 "à la tête" % (number, lot))
+    # #8417 : le composeur attribue des révisions consécutives depuis l'en-tête
+    # de la base du paquet ; la révision qui précède la première citée se
+    # déduit donc de son numéro. L'en-tête du parent du pliage ne la donne
+    # pas : il est en ligne 3 du contrat (``^`` sans MULTILINE ne le trouvait
+    # jamais), et un lot à l'ancienne manière l'a peut-être déjà avancé.
+    numbers = [_revision_parts(number) for number, _lot, _kind in revisions]
+    for before, after in zip(numbers, numbers[1:]):
+        if (before is None or after is None or after[0] != before[0]
+                or after[1] != before[1] + 1):
+            errors.append("commit de pliage %s : révisions citées non "
+                          "consécutives au manifeste" % sha)
+            break
     header_before = None
-    base_contract = git(repo, "show", "%s:%s" % (parent, CONTRACT_REL),
-                        check=False)
-    if base_contract.returncode == 0:
-        match = CONTRACT_HEADER_LINE_RE.search(
-            base_contract.stdout.decode("utf-8", "replace"))
-        if match:
-            header_before = match.group(1)
+    if numbers and numbers[0] is not None and numbers[0][1] > 0:
+        header_before = "%d.%d" % (numbers[0][0], numbers[0][1] - 1)
+    expected_added: list[str] = []
     for path in sorted(changed & fragments):
         name = Path(path).name
         match = FRAGMENT_FILE_RE.match(name)
@@ -517,6 +570,8 @@ def contract_fold_paths(repo: Path, head: str, text: str
         expected = "Revision %s adds %s" % (
             revisions[index][0], _render_fragment_adds(adds, previous))
         blocks = expected + ("\n" + sections if sections else "")
+        expected_added.extend(line for line in blocks.splitlines()
+                              if line.strip())
         missing = [line for line in blocks.splitlines()
                    if line.strip() and head_contract is not None
                    and line not in head_contract]
@@ -524,6 +579,31 @@ def contract_fold_paths(repo: Path, head: str, text: str
             errors.append("fragment %s : ligne(s) pliée(s) absente(s) du "
                           "contrat à la tête : %s"
                           % (path, missing[0].strip()[:80]))
+
+    # #8417 (B cx2, dev5) : chaque ligne ajoutée au contrat est justifiée par
+    # le pliage, compte tenu de ses répétitions : l'en-tête, une ligne pliée
+    # d'un fragment cité, ou une ligne retirée réécrite (renumérotée, même
+    # contenu au numéro et à la dernière référence additive près, ou
+    # déplacée). Toute autre ligne est un contenu que personne n'a relu.
+    if CONTRACT_REL in changed and not errors:
+        pool = Counter(expected_added)
+        moved = Counter(_norm_revision_line(line)
+                        for line in removed.get(CONTRACT_REL) or []
+                        if line.strip())
+        for line in added.get(CONTRACT_REL) or []:
+            if not line.strip() or CONTRACT_HEADER_LINE_RE.match(line):
+                continue
+            if pool[line] > 0:
+                pool[line] -= 1
+                continue
+            norm = _norm_revision_line(line)
+            if moved[norm] > 0:
+                moved[norm] -= 1
+                continue
+            errors.append(
+                "commit de pliage %s : %s ajoute une ligne hors du pliage "
+                "attendu : %s" % (sha, CONTRACT_REL, line.strip()[:80]))
+            break
 
     if errors:
         return {}, errors

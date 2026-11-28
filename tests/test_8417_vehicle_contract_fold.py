@@ -133,6 +133,53 @@ class ContractFoldVehicleTest(unittest.TestCase):
         self.assertEqual(own["paths"], [FRAGMENT, CONTRACT])
         self.assertEqual(own["commits"], [fold])
 
+    def test_a_fold_adding_an_arbitrary_line_counts(self):
+        """B cx2/dev5 : une ligne ajoutée hors du pliage attendu."""
+        for extra in ("Revision 9.99 adds anything; it is additive to 1.12.\n",
+                      "An unreviewed sentence.\n", "The body.\n"):
+            with self.subTest(extra=extra):
+                fold = self.fold(contract=FOLDED + extra)
+                head = self.manifest(fold)
+                found, own = self.own(head)
+                self.assertIsNone(found)
+                self.assertEqual(own["paths"], [FRAGMENT, CONTRACT])
+                _git(self.repo, "reset", "-q", "--hard", "HEAD~2")
+
+    def test_a_fold_rewriting_a_cited_fragment_counts(self):
+        """B dev5 : le fragment cité modifié au lieu d'être retiré."""
+        _write(self.repo, CONTRACT, FOLDED)
+        _write(self.repo, FRAGMENT, "adds: a read.\n\nKept, unreviewed.\n")
+        fold = _commit_all(self.repo, "faux pliage")
+        head = self.manifest(fold)
+        found, own = self.own(head)
+        self.assertIsNone(found)
+        self.assertEqual(own["commits"], [fold])
+
+    def test_a_fold_to_another_revision_counts(self):
+        """B dev5 : en-tête seul à 9.99 quand le manifeste cite 1.12."""
+        fold = self.fold(contract=FOLDED.replace("**1.12, ", "**9.99, "))
+        head = self.manifest(fold)
+        found, _own = self.own(head)
+        self.assertIsNone(found)
+
+    def test_a_fold_leaving_one_component_behind_counts(self):
+        """B dev5 : CONTRACT_VERSION resté à 1.11 sous un en-tête 1.12."""
+        _write(self.repo, "src/ameesh/public/__init__.py",
+               'CONTRACT_VERSION = "1.11"\n')
+        _commit_all(self.repo, "version publique")
+        fold = self.fold()
+        head = self.manifest(fold)
+        found, _own = self.own(head)
+        self.assertIsNone(found)
+        # aligné, le même pliage est exempté
+        _git(self.repo, "reset", "-q", "--hard", "HEAD~2")
+        fold = self.fold(extra={"src/ameesh/public/__init__.py":
+                                'CONTRACT_VERSION = "1.12"\n'})
+        head = self.manifest(fold)
+        found, own = self.own(head)
+        self.assertEqual(found, fold)
+        self.assertNotIn(fold, own["commits"])
+
     def test_an_unreadable_manifest_grants_nothing(self):
         fold = self.fold()
         head = self.manifest(fold)
