@@ -94,7 +94,7 @@ class PublicProfilesTest(unittest.TestCase):
              ("deepseek", 3, "relative", "invalid_profile"),
              ("deepseek", 4, "cle-a", "duplicate_name"),
              ("deepseek", 5, None, "not_an_object"),
-             ("inconnu", None, None, "unknown_harness")])
+             (None, None, None, "unknown_harness")])
         self.assertLessEqual({r["reason"] for r in document["refused"]},
                              set(accounts.PUBLIC_REFUSALS))
         self.assertNoSecret(document)
@@ -164,6 +164,58 @@ class PublicProfilesTest(unittest.TestCase):
         self.assertFalse(document["valid"])
         self.assertEqual([r["reason"] for r in document["refused"]],
                          ["unpublishable_variable_name", "invalid_profile"])
+
+
+class KeyShapedValuesAreNeverPublishedTest(unittest.TestCase):
+    """#8457 (manaty/ameesh#6666) : témoin de non-publication.
+
+    Une valeur au format clé collée dans `env`/`key_env`, ou à la place d'un
+    nom de harnais, n'apparaît jamais dans le document public, JSON compris.
+    """
+
+    #: formes de clés qui passaient l'ancien `ENV_NAME_RE`
+    KEYS = ("a3f9c2e1d4b5a6978877665544332211",      # hex minuscule
+            "DeadBeef0123456789abcdefCAFE",           # hex mêlé
+            "A3F9C2E1D4B5A6978877665544332211",      # hex majuscule
+            "AKIAIOSFODNN7EXAMPLE",                   # identifiant d'accès
+            "ghpTokenAbc123XyZ")
+
+    def assertNotPublished(self, document, key):
+        self.assertNotIn(key, json.dumps(document))
+        self.assertNotIn(key, json.dumps(document, ensure_ascii=False))
+        self.assertNotIn(key.lower(), json.dumps(document).lower())
+
+    def test_key_pasted_in_env_or_key_env_is_refused_and_not_copied(self):
+        for key in self.KEYS:
+            for field in ("key_env", "env"):
+                item = {"name": "collee", "type": "api_key_env", "key_env": "DEEPSEEK_API_KEY"}
+                item[field] = key
+                with self.subTest(key=key, field=field):
+                    document = accounts.public_profiles({"deepseek": [item]})
+                    self.assertFalse(document["valid"])
+                    self.assertEqual(document["profiles"], [])
+                    self.assertEqual(document["refused"], [
+                        {"harness": "deepseek", "index": 0, "name": "collee",
+                         "reason": "unpublishable_variable_name"}])
+                    self.assertNotPublished(document, key)
+
+    def test_key_pasted_as_harness_is_refused_and_not_copied(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                document = accounts.public_profiles({key: [{"name": "x"}]})
+                self.assertEqual(document["refused"], [
+                    {"harness": None, "index": None, "name": None,
+                     "reason": "unknown_harness"}])
+                self.assertNotPublished(document, key)
+
+    def test_variable_names_stay_published(self):
+        for name in ("DEEPSEEK_API_KEY_A", "OPENAI_API_KEY", "K", "_X", "DSK",
+                     "AMEESH_TEST_CLE_1021", "SHORTNAME123"):
+            with self.subTest(name=name):
+                document = accounts.public_profiles(
+                    {"deepseek": [{"name": "a", "type": "api_key_env", "key_env": name}]})
+                self.assertEqual(document["refused"], [])
+                self.assertEqual(document["profiles"][0]["key_env"], name)
 
 
 if __name__ == "__main__":

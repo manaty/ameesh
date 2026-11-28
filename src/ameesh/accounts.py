@@ -775,8 +775,19 @@ def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
 #: schéma du document `ameesh accounts profiles --json`
 PUBLIC_PROFILES_SCHEMA = "ameesh-account-profiles/1"
 #: un nom de variable publiable ; toute autre valeur dans `env`/`key_env`
-#: (une clé collée par erreur à la place du nom) n'est jamais recopiée
-ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+#: (une clé collée par erreur à la place du nom) n'est jamais recopiée.
+#: #8457 : la forme d'un nom de variable d'environnement (majuscules, chiffres,
+#: soulignés) — une clé en minuscules ou en hex mêlé n'y entre plus
+ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+#: #8457 : forme d'une clé même en majuscules (hex, identifiant d'accès) :
+#: un seul bloc sans souligné, long, mêlant lettres et chiffres
+_KEY_SHAPED_RE = re.compile(r"^(?=[A-Z0-9]*[0-9])(?=[A-Z0-9]*[A-Z])[A-Z0-9]{16,}$")
+
+
+def _publishable_env_name(value: str) -> bool:
+    """#8457 : `value` peut être recopié comme nom de variable public."""
+    return bool(ENV_NAME_RE.match(value)) and not _KEY_SHAPED_RE.match(value)
+
 #: raisons fermées d'un profil écarté : jamais le texte de `AccountError`,
 #: qui cite des valeurs et des chemins
 PUBLIC_REFUSALS = ("invalid_accounts", "unknown_harness", "invalid_profile_list",
@@ -827,17 +838,19 @@ def public_profiles(raw) -> dict:
 
     def refuse(harness, index, name, reason):
         refused.append({
-            "harness": harness if isinstance(harness, str) and NAME_RE.match(harness) else None,
+            # #8457 : un harnais inconnu n'est jamais recopié (une clé collée
+            # à la place du nom de harnais correspondrait à NAME_RE)
+            "harness": harness if harness in known else None,
             "index": index,
             "name": name if isinstance(name, str) and NAME_RE.match(name) else None,
             "reason": reason})
 
+    known = set(harnesses.known_ids())
     if raw in (None, "", {}):
         raw = {}
     if not isinstance(raw, dict):
         refuse(None, None, None, "invalid_accounts")
         raw = {}
-    known = harnesses.known_ids()
     for harness in sorted(raw, key=str):
         items = raw[harness]
         if harness not in known:
@@ -865,7 +878,7 @@ def public_profiles(raw) -> dict:
             except AccountError:
                 refuse(harness, index, name, "invalid_profile")
                 continue
-            if any(value and not ENV_NAME_RE.match(value)
+            if any(value and not _publishable_env_name(value)
                    for value in (profile.env, profile.key_env)):
                 refuse(harness, index, name, "unpublishable_variable_name")
                 continue
