@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import contextlib
 import os
+from pathlib import Path
 import types
 import unittest
 from unittest import mock
 
-from ameesh import mail, registry
+from ameesh import contract_fragments, mail, registry
 from ameesh.public import mail as public_mail
 from ameesh.public.mail import (
     InvalidSubmission, ScopeRefused, Submission,
@@ -406,10 +407,14 @@ class ContractVersionTest(unittest.TestCase):
         # 1.8, #8337 the public account profiles in 1.9, #8339 the migration
         # dry-run report in 1.10, #8343 the account reservations in 1.11,
         # #8340 the public canon-refusal CLI in 1.12, #8338 the public price
-        # schedule in 1.13); the
-        # mail surface keeps the revision that last changed it, so a caller's
-        # 1.4 gate stays true.
-        self.assertEqual(public.CONTRACT_VERSION, "1.13")
+        # schedule in 1.13); a later revision is assigned by the packet composer
+        # from a fragment (#8395), so the package revision is read from the
+        # contract header, never hard-coded. The mail surface keeps the revision
+        # that last changed it, so a caller's 1.4 gate stays true.
+        root = Path(__file__).resolve().parents[1]
+        header = contract_fragments.header_revision(
+            (root / contract_fragments.CONTRACT_REL).read_text(encoding="utf-8"))
+        self.assertEqual(public.CONTRACT_VERSION, header)
         self.assertEqual(public_mail.CONTRACT_VERSION, "1.4")
         self.assertEqual(public.fixture.CONTRACT_VERSION, "1.7")
         self.assertEqual(public.database.CONTRACT_VERSION, "1.6")

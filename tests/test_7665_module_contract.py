@@ -36,8 +36,8 @@ from tests import support  # isolate host config before product imports
 from tests.support import PgTestCase
 from tests.test_canon import commit_all, publish, write
 from ameesh import (accounts, auth_failure, budget, canon, connectors as connectors_mod,
-                    db as db_mod, deferral_observation, migrations,
-                    provider_credits, public, resources, serve)
+                    contract_fragments, db as db_mod, deferral_observation,
+                    migrations, provider_credits, public, resources, serve)
 from ameesh.modules import registry
 from ameesh.modules.storage import ModuleStore
 from ameesh.public import connectors as public_connectors
@@ -1057,6 +1057,53 @@ class StoreAndViewsTest(PgTestCase):
                 self.assertEqual({name: described.get(name) for name in columns}, columns)
         with self.assertRaises(ValueError):
             client.view_select("agent_mesh_overview", ["*"])
+
+
+class ContractRevisionTreeTest(unittest.TestCase):
+    """#8395: a lot tree may carry revision fragments; the packet folds them.
+
+    The number of a revision is assigned by the packet composer, so a lot that
+    changes the contract leaves the header, the surface's ``contract`` field
+    and ``public.CONTRACT_VERSION`` at the base revision and adds an unnumbered
+    fragment. Both states are checked: on a lot tree the fragments are valid
+    and unfolded; on the packet tree (no fragment left) every revision is
+    present once and the three witnesses agree.
+    """
+
+    def fragments(self):
+        return contract_fragments.read_fragments(ROOT)
+
+    def test_a_lot_tree_may_carry_unfolded_fragments(self):
+        text = CONTRACT.read_text(encoding="utf-8")
+        fragments = self.fragments()
+        for lot, fragment in sorted(fragments.items()):
+            self.assertGreater(lot, 0)
+            self.assertTrue(fragment.adds.strip())
+            self.assertTrue(fragment.path.endswith("%d.md" % lot))
+            # not folded yet: the adds paragraph is not in the contract
+            self.assertNotIn(fragment.adds.splitlines()[0][:60], text)
+        # folded or not, the three revision witnesses never disagree
+        header = contract_fragments.header_revision(text)
+        self.assertEqual(header, SURFACE["contract"])
+        self.assertEqual(header, public.CONTRACT_VERSION)
+        self.assertIn(contract_fragments.ANCHOR, text)
+
+    def test_the_folded_tree_names_every_revision_once(self):
+        if self.fragments():
+            self.skipTest("lot tree: revision fragments are not folded yet")
+        text = CONTRACT.read_text(encoding="utf-8")
+        block = text.split("\nThe [IMA mapping]", 1)[0]
+        numbers = [int(major) * 1000 + int(minor) for major, minor in re.findall(
+            r"(?m)^Revision (\d+)\.(\d+) adds\b", block)]
+        self.assertTrue(numbers, "no revision line in the contract")
+        self.assertEqual(numbers, sorted(set(numbers)),
+                         "a revision is missing, duplicated or out of order")
+        self.assertEqual(numbers, list(range(1001, 1001 + len(numbers))))
+        header = contract_fragments.header_revision(text)
+        self.assertEqual(header, SURFACE["contract"])
+        self.assertEqual(header, public.CONTRACT_VERSION)
+        last = numbers[-1]
+        self.assertEqual(header, "%d.%d" % (last // 1000, last % 1000))
 
 
 class CoverageTableTest(unittest.TestCase):

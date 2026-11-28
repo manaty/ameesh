@@ -40,7 +40,10 @@ refuse`` (#8340), so an installed module no longer imports ``ameesh.canon_sync``
 it is additive to 1.11 and changes no other state. Contract 1.13 adds no Python
 name: the CLI ``ameesh prices --json`` (#8338), schema ``ameesh-prices/1``,
 publishes the effective price schedule so a module no longer imports
-``ameesh.cost``; it is additive to 1.12.
+``ameesh.cost``; it is additive to 1.12. A later revision is written as a
+fragment under ``docs/api/module-contract-v1.d`` and its number is assigned by
+the packet composer, which also updates ``CONTRACT_VERSION`` below; the contract
+document is the authority for every revision.
 """
 from __future__ import annotations
 
