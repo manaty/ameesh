@@ -8,13 +8,14 @@ from .role_acl import serialize_role_acl
 from .support import PgTestCase
 
 
-def lock_holders(db) -> list[int]:
+def lock_holders(db, database) -> list[int]:
+    """Porteurs du verrou dans `database` (le verrou est propre à une base)."""
     return [row["pid"] for row in db.query(
-        "SELECT pid FROM pg_locks l, pg_database d WHERE l.locktype = 'advisory' "
-        "AND l.granted AND l.objsubid = 1 AND l.database = d.oid "
-        "AND d.datname = current_database() "
+        "SELECT l.pid FROM pg_locks l JOIN pg_database d ON l.database = d.oid "
+        "WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 1 "
+        "AND d.datname = %s "
         "AND (l.classid::bigint << 32 | l.objid::bigint) = "
-        "hashtextextended('ameesh-test-role-public-acl', 0)")]
+        "hashtextextended('ameesh-test-role-public-acl', 0)", (database,))]
 
 
 class RoleAclIsolationTest(PgTestCase):
@@ -31,19 +32,18 @@ class RoleAclIsolationTest(PgTestCase):
         self.addCleanup(probe.close)
         try:
             with self.assertRaisesRegex(RuntimeError, "échec simulé"):
-                serialize_role_acl(Fixture)
+                guard = serialize_role_acl(Fixture)
                 # Les scripts sont lancés sur d'autres connexions ; une requête
                 # terminée sur la connexion de classe ne doit pas lever la garde.
                 self.db.query("SELECT 1")
-                holders = lock_holders(probe)
-                self.assertEqual(len(holders), 1)
+                self.assertIn(guard.pid, lock_holders(probe, guard.database))
                 raise RuntimeError("échec simulé de setUpClass")
         finally:
             for cleanup in reversed(Fixture.cleanups):
                 cleanup()
         # Pas de nouvel essai de verrou : une autre classe en file le prend
         # dès la libération, seule compte la session de cette garde.
-        self.assertNotIn(holders[0], lock_holders(probe))
+        self.assertNotIn(guard.pid, lock_holders(probe, guard.database))
 
 
 class RoleContractGuardCoverageTest(unittest.TestCase):
