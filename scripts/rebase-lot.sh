@@ -27,7 +27,12 @@
 #    « #<id> … » : un bisect reste rattachable au lot ;
 # 2. aucun commit rejoué n'introduit de marqueur de conflit (`<<<<<<<`,
 #    `|||||||`, `>>>>>>>`) : un tel commit casse le bisect.
-# Ces deux contrôles échouent aussi en 4, avec les commits fautifs.
+# #8441 : 3. aucun message rejoué ne garde le gabarit de l'éditeur
+#    (« Please enter the commit message », « rebase in progress; onto ») :
+#    `commit.cleanup=whitespace` (ou `verbatim`), pris pour garder le sujet
+#    « #… » à la place de ce lanceur, conserve tout le gabarit quand l'éditeur
+#    ne s'ouvre pas (GIT_EDITOR=true) — vu sur deux commits de #8395 sur main.
+# Ces contrôles échouent aussi en 4, avec les commits fautifs.
 #
 # Usage : scripts/rebase-lot.sh <arguments de git rebase>
 #   scripts/rebase-lot.sh origin/main
@@ -261,6 +266,22 @@ if [ -f "$etat" ] && ! en_cours; then
     if ((${#marqueurs[@]})); then
       printf 'rebase-lot : marqueurs de conflit committés dans :\n' >&2
       printf '  %s\n' "${marqueurs[@]}" >&2
+      echec=1
+    fi
+    # #8441 : le gabarit de l'éditeur, quel que soit le caractère de
+    # commentaire (« # » par défaut, « ; » sous ce lanceur).
+    gabarits=()
+    while IFS= read -r sha; do
+      [ -n "$sha" ] || continue
+      message=$(git show -s --format='%B' "$sha" || :)
+      grep -qE '^. (Please enter the commit message|(interactive )?rebase in progress; onto )' \
+        <<<"$message" || continue
+      gabarits+=("$(git show -s --format='%h %s' "$sha")")
+    done < <(git rev-list --no-merges "${plage[@]}" -- || :)
+    if ((${#gabarits[@]})); then
+      printf "rebase-lot : gabarit de l'éditeur resté dans le message de :\n" >&2
+      printf '  %s\n' "${gabarits[@]}" >&2
+      printf "rebase-lot : jamais commit.cleanup=whitespace/verbatim ; réécrire le message (reword).\n" >&2
       echec=1
     fi
   fi
