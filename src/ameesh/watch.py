@@ -585,24 +585,26 @@ def stable_binary(binary: str, home: str | None = None) -> str:
 
 
 def _ameesh_binary(env: dict | None = None) -> str:
-    """The binary a watch or wake unit will run, never the caller's first
-    `ameesh` (#8390).
+    """The binary a watch or wake unit will run: the stable launcher, never
+    the caller's first `ameesh` (#8390, #8458).
 
     `~/.local/bin/ameesh` is the launcher `UNIT_PATH` names and the stable
     entry point of an installation; a caller's `PATH` may put a private
     directory (an agent's `.menage/bin`, a temporary tree) first, and writing
     that path into `ExecStart` made the unit depend on who armed it. The
-    launcher wins when it is executable; otherwise `stable_binary` keeps the
-    #4754 rule on the binary the caller's `PATH` resolves."""
+    launcher wins when it is executable. Without it the choice is REFUSED:
+    falling back to the caller's `PATH` (or keeping any other non-installed
+    path) would render two different `ExecStart` from two shells, and a
+    private path could disappear before the deadline. #4754's remapping stays
+    in `stable_binary` for an existing unit's exec line (`repin_units`)."""
     env = os.environ if env is None else env
     home = env.get("HOME") or os.path.expanduser("~")
     stable = os.path.join(home, ".local", "bin", "ameesh")
     if os.access(stable, os.X_OK):
         return stable
-    found = shutil.which("ameesh", path=env.get("PATH") or None)
-    if found:
-        return stable_binary(os.path.abspath(found), home=home)
-    return stable
+    raise WatchError(
+        "stable launcher %s is missing or not executable: a watch or wake unit "
+        "names it, never the caller's PATH; install it before arming" % stable)
 
 
 def repin_units(directory: str, *, run: Callable = subprocess.run, dry_run: bool = False,

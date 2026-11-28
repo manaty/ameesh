@@ -171,6 +171,21 @@ def _cleanup_temp_dirs() -> None:
         shutil.rmtree(_TEMP_DIRS.pop(), ignore_errors=True)
 
 
+def launcher_home(prefix: str = "ameesh-launcher-home-") -> str:
+    """#8458 : un HOME de banc qui porte le lanceur stable `~/.local/bin/ameesh`.
+
+    `watch.enable` et `watch.arm` refusent d'écrire une unité sans ce lanceur :
+    un banc qui les exerce pose donc ce HOME au lieu de dépendre de celui du
+    poste (un exécuteur de CI n'en a pas, et la suite doit y être verte)."""
+    home = _mkdtemp(prefix=prefix)
+    launcher = os.path.join(home, ".local", "bin", "ameesh")
+    os.makedirs(os.path.dirname(launcher))
+    with open(launcher, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n")
+    os.chmod(launcher, 0o755)
+    return home
+
+
 atexit.register(_cleanup_temp_dirs)
 
 #: et la configuration de l'hôte (~/.config/ameesh/config.json, ou l'ancienne

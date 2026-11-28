@@ -18,7 +18,7 @@ from unittest import mock
 from ameesh import db as db_mod
 from ameesh import fil, projects, storage, watch, work
 
-from .support import EMPTY_CONFIG, PgTestCase
+from .support import EMPTY_CONFIG, PgTestCase, launcher_home
 
 
 class TextTest(unittest.TestCase):
@@ -324,6 +324,7 @@ class WatchTest(PgTestCase):
         self.units = tempfile.mkdtemp(prefix="ameesh-l121-")
         self.addCleanup(shutil.rmtree, self.units, True)
         self.env = {watch.UNIT_DIR_ENV: self.units, "PATH": "/usr/bin:/bin",
+                    "HOME": launcher_home("ameesh-l121-home-"),
                     "AMEESH_DSN": "postgres://u:secret@db/x", "AMEESH_HOST": "laptop"}
         self.linger = "yes"
         self.calls: list = []
@@ -813,6 +814,7 @@ class WakeTest(PgTestCase):
         self.units = tempfile.mkdtemp(prefix="ameesh-1020-")
         self.addCleanup(shutil.rmtree, self.units, True)
         self.env = {watch.UNIT_DIR_ENV: self.units, "PATH": "/usr/bin:/bin",
+                    "HOME": launcher_home("ameesh-1020-home-"),
                     "AMEESH_DSN": "postgres://u:secret@db/x", "AMEESH_HOST": "laptop"}
         self.here = dataclasses.replace(self.cfg, host="laptop")
         patcher = mock.patch.object(watch.platform, "is_linux", return_value=True)
