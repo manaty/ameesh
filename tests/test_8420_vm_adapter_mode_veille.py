@@ -161,12 +161,15 @@ class ExitTest(Base):
 
     def other(self, mode, claims_open, busy_done=False):
         self.db.execute("INSERT INTO host_lifecycle(host,mode,actor,claims_open,release_state,hook_state) "
-                        "VALUES ('other',%s,'tester',%s,'draining','draining')", (mode, claims_open))
+                        "VALUES ('other',%s,'tester',%s,'draining','draining')",
+                        (mode, claims_open and not busy_done))
         if busy_done:
             control = self.q.control('other')
             self.q.request('other', control['generation'], control['release_epoch'], 'busy')
             row = self.request_of('other')
             self.q.complete(row, 'healthy and reconciled')
+            self.db.execute("UPDATE host_lifecycle SET claims_open=%s WHERE host='other'",
+                            (claims_open,))
 
     def request_of(self, host):
         return self.db.query("SELECT * FROM vm_adapter_requests WHERE host=%s AND state='busy'",
@@ -188,8 +191,11 @@ class ExitTest(Base):
         self.assertEqual(self.request_of('burst')['status'], 'done')
 
     def test_exit_after_both_replicas_are_back(self):
-        for mode, claims, done in (('available', True, False), ('returning', False, True)):
-            with self.subTest(other=mode):
+        # The native hook may reopen the claims before `complete_return`
+        # (review of #8420): a done return counts in both gate states.
+        for mode, claims, done in (('available', True, False), ('returning', False, True),
+                                   ('returning', True, True)):
+            with self.subTest(other=mode, claims_open=claims):
                 self.db.execute("DELETE FROM host_lifecycle WHERE host='other'")
                 self.db.execute("DELETE FROM vm_adapter_requests WHERE host='other'")
                 self.other(mode, claims, done)

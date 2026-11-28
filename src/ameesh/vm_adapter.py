@@ -679,9 +679,10 @@ def tick_host(cfg, db, policy, host, provider, *, probe=run_probe, evidence=stop
 def replicas_back(db, policy):
     """#8420: every replica target is back: no release, or its return done.
 
-    A completed return keeps claims closed until the native hook reopens
-    them; its `busy` request done for the live generation/epoch is the
-    healthy return (`healthy and reconciled`)."""
+    Its `busy` request done for the live generation/epoch is the healthy
+    return (`healthy and reconciled`), claims still closed or already
+    reopened by the native hook (the mode stays `returning` until
+    `complete_return`)."""
     controls = {c['host']: c for c in storage.of(db).host_lifecycle.listing()}
     q = Queue(db)
     for name, target in policy['targets'].items():
@@ -691,7 +692,7 @@ def replicas_back(db, policy):
         if not control or (control['claims_open']
                            and control['mode'] not in ('draining', 'returning')):
             continue
-        if (control['mode'] == 'returning' and not control['claims_open']
+        if (control['mode'] == 'returning'
                 and q.status(name, control['generation'], control['release_epoch'],
                              'busy') == 'done'):
             continue
