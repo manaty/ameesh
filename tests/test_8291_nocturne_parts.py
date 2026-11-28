@@ -155,6 +155,7 @@ class EcheanceTest(unittest.TestCase):
         debut = time.monotonic()
         self.assertTrue(parts.attendre(procs, time.time() + 0.3, pas_s=0.05))
         procs[0].wait(timeout=10)
+        # hermeticity: allow — borne haute anti-blocage (10 s pour une échéance de 0,3 s), pas une mesure de performance
         self.assertLess(time.monotonic() - debut, 10)
 
     SOURD = ("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
@@ -169,6 +170,7 @@ class EcheanceTest(unittest.TestCase):
         procs = [self._sourd()]
         debut = time.monotonic()
         self.assertTrue(parts.attendre(procs, time.time() + 1.0, pas_s=0.05, grace_s=0.5))
+        # hermeticity: allow — borne haute anti-blocage (10 s pour une échéance de 0,3 s), pas une mesure de performance
         self.assertLess(time.monotonic() - debut, 10)
         self.assertEqual(procs[0].returncode, -signal.SIGKILL)
 
@@ -213,6 +215,7 @@ class EcheanceTest(unittest.TestCase):
             finally:
                 if minuterie:
                     minuterie.cancel()
+        # hermeticity: allow — borne haute anti-blocage (30 s pour une course bornée), pas une mesure de performance
         self.assertLess(time.monotonic() - debut, 30)
         evenements = [json.loads(l) for l in flux.read_text(encoding="utf-8").splitlines()]
         fin = [e for e in evenements if e["type"] == "fin"]
