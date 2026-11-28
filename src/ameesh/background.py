@@ -511,6 +511,7 @@ class Tracker:
                 # L498 : avec un cgroup, la propriété ne dépend pas du pid.
                 if not entry.cgroup:
                     entry.unverified = any(p["pgid"] == entry.pgid and not p["zombie"]
+                                           and not self._exited(entry, p)
                                            for p in table)
                 entry.pgid = None
                 # Detached members remain ours through their retained handle.
@@ -814,8 +815,35 @@ class Tracker:
                 return True
         return entry.unverified or live
 
+    @staticmethod
+    def _exited(entry: Entry, p: dict) -> bool:
+        """#8484 : ce membre d'un relevé est-il sorti depuis ? Un relevé pris
+        juste avant la sortie du travail le montre encore vivant ; il ne fait
+        pas pour autant de lui un membre vivant non prouvé. Preuves, de cette
+        identité (pid + heure de début) : son handle retenu n'est plus vivant,
+        ou elle a quitté l'OS (disparue, numéro recyclé, zombie). Dans le
+        doute (heure inconnue, relevé impossible) : pas sorti."""
+        start = p.get("start")
+        if start is None:
+            return False
+        handle = entry.handles.get(p["pid"])
+        if handle is not None and getattr(handle, "start", None) == start:
+            return not handle.live()
+        return Tracker._gone(p["pid"], start)
+
+    @staticmethod
+    def _gone(pid: int, start: float) -> bool:
+        """Cette identité a-t-elle quitté l'OS (disparue, recyclée, zombie) ?"""
+        try:
+            if not platform.same_start(start, platform.start_time(pid)):
+                return True
+            return not platform.alive(pid)
+        except Exception:
+            return False
+
     def _owned_members(self, entry: Entry, table: list[dict]) -> list[dict]:
-        members = [p for p in table if p["pgid"] == entry.pgid and not p["zombie"]]
+        members = [p for p in table if p["pgid"] == entry.pgid and not p["zombie"]
+                   and not self._exited(entry, p)]
         if any(p["pid"] in entry.handles and entry.handles[p["pid"]].live()
                for p in members):
             return members

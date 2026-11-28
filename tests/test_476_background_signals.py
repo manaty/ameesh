@@ -35,6 +35,11 @@ def fake_handle():
 class BackgroundSignalTest(unittest.TestCase):
     def setUp(self):
         self.notes = []
+        # #8484 : les relevés de ces tests décrivent des processus vivants ;
+        # leurs pid fictifs, absents de l'OS, ne doivent pas passer pour sortis.
+        gone = mock.patch.object(background.Tracker, "_gone", return_value=False)
+        gone.start()
+        self.addCleanup(gone.stop)
         self.runner = SimpleNamespace(db=None, host="test", runner_id="test",
                                       container_runtime=lambda: None)
         self.tracker = background.Tracker(self.runner, log=self.notes.append)
@@ -647,6 +652,89 @@ class BackgroundSignalTest(unittest.TestCase):
                     parent.kill()
                 parent.wait(timeout=60)
                 parent.stdout.close()
+
+class StaleSnapshotTest(unittest.TestCase):
+    """#8484 : un relevé pris juste avant la sortie du travail ne rend pas
+    orpheline la ressource d'un travail fini proprement."""
+
+    def setUp(self):
+        self.notes = []
+        self.runner = SimpleNamespace(db=None, host="test", runner_id="test",
+                                      container_runtime=lambda: None)
+        self.tracker = background.Tracker(self.runner, log=self.notes.append)
+        self.entry = background.Entry(agent="test", turn_id="stale", pgid=7000,
+                                      ended=0, deadline=100, grace_s=100,
+                                      lineage={7001})
+
+    def test_dead_handle_of_the_same_identity_proves_the_exit(self):
+        handle = fake_handle()
+        handle.start = 10.0
+        self.entry.handles[7001] = handle
+        with mock.patch.object(background.Tracker, "_gone") as gone:
+            handle.live.return_value = False
+            self.assertTrue(self.tracker._exited(self.entry, row()))
+            handle.live.return_value = True
+            self.assertFalse(self.tracker._exited(self.entry, row()))
+        gone.assert_not_called()
+        # another identity behind the same numeric PID: the OS decides
+        with mock.patch.object(background.Tracker, "_gone", return_value=False) as gone:
+            self.assertFalse(self.tracker._exited(self.entry, row(start=99.0)))
+        gone.assert_called_once_with(7001, 99.0)
+        self.assertFalse(self.tracker._exited(self.entry, row(start=None)))
+
+    @unittest.skipUnless(platform.is_linux(), "process start times: Linux")
+    def test_identity_gone_recycled_or_zombie(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        start = platform.start_time(child.pid)
+        self.assertFalse(background.Tracker._gone(child.pid, start))
+        self.assertTrue(background.Tracker._gone(child.pid, start + 1000))
+        with mock.patch.object(platform, "start_time",
+                               side_effect=platform.NotAvailable("start", "test")):
+            self.assertFalse(background.Tracker._gone(child.pid, start))
+        child.kill()
+        deadline = time.monotonic() + 10
+        while platform.alive(child.pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(background.Tracker._gone(child.pid, start))  # zombie
+        child.wait()
+        self.assertTrue(background.Tracker._gone(child.pid, start))  # gone
+
+    def test_stale_snapshot_of_a_finished_job_closes_done(self):
+        # The snapshot still shows the job (retained handle, now dead) and
+        # its short-lived child (never captured, now gone).
+        job = fake_handle()
+        job.start = 10.0
+        job.live.return_value = False
+        self.entry.handles[7001] = job
+        self.entry.jobs[7001] = background.Job(7001, "job", start=10.0)
+        child = row(pid=7002)
+        child["ppid"] = 7001
+        with mock.patch.object(background.Tracker, "_gone",
+                               side_effect=lambda pid, start: pid == 7002), \
+                mock.patch.object(self.tracker, "_containers"), \
+                mock.patch.object(self.tracker, "_reap_job", return_value=3), \
+                mock.patch.object(self.tracker, "_close") as close, \
+                mock.patch.object(os, "killpg") as killpg:
+            self.tracker._refresh(self.entry, [row(), child], now=2)
+        killpg.assert_not_called()
+        self.assertFalse(any("ownership unknown" in note for note in self.notes))
+        self.assertFalse(self.entry.unverified)
+        self.assertEqual(self.entry.jobs[7001].code, 3)
+        close.assert_called_once_with(self.entry, "done", 2, survives=False)
+
+    def test_a_live_uncaptured_member_stays_unverified(self):
+        job = fake_handle()
+        job.start = 10.0
+        job.live.return_value = False
+        self.entry.handles[7001] = job
+        with mock.patch.object(background.Tracker, "_gone", return_value=False), \
+                mock.patch.object(self.tracker, "_containers"), \
+                mock.patch.object(self.tracker, "_close"):
+            self.tracker._refresh(self.entry, [row(), row(pid=7002)], now=2)
+        self.assertTrue(any("ownership unknown" in note for note in self.notes))
+        self.assertTrue(self.entry.unverified)
+
 
 if __name__ == "__main__":
     unittest.main()

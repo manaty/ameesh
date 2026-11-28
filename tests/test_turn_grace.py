@@ -230,7 +230,7 @@ class KillVerdictTest(unittest.TestCase):
         tracker.TERM_GRACE_S = 0
         entry = background.Entry(agent="a", turn_id="t" * 32, pgid=4242, ended=0.0,
                                  deadline=1.0, grace_s=1, lineage={4242})
-        handle = background.ProcessHandle(4242, 42)
+        handle = background.ProcessHandle(4242, 42, 0.0)  # identité du relevé `vivant`
         entry.handles[4242] = handle
         tracker.entries = [entry]
         alive = True
@@ -664,16 +664,73 @@ class ReglagesTest(_Base):
 @unittest.skipUnless(platform.is_linux(), "sous-moissonneur : Linux")
 class SousMoissonneurTest(_Base):
     def test_code_de_sortie_du_travail_de_fond_au_tour_suivant(self):
+        self._code_au_tour_suivant()
+
+    def test_releve_perime_sans_cgroup_le_travail_fini_reste_done(self):
+        # #8484 : sans cgroup délégué, un relevé pris juste avant la sortie du
+        # travail le montrait vivant (son handle déjà mort, son `sleep` jamais
+        # vu) : « ownership unknown », ressource orpheline pour un travail fini
+        # proprement (run 46171525217). Le fil de suivi reçoit ici, à coup
+        # sûr, un relevé pris avant la sortie et rendu après.
+        self._code_au_tour_suivant(perime=True)
+
+    # Dans l'exécuteur enfant : au premier passage du fil de suivi après le
+    # déclencheur, relevé pris pendant que le travail et un enfant vivent,
+    # fin du travail demandée, relevé rendu une fois le travail sorti.
+    PERIME = """
+import os, sys, time
+import ameesh.platform as pf
+from ameesh.platform import turn_cgroup
+turn_cgroup.root_for_runner = lambda **k: (None, "test sans cgroup")
+releve = pf.process_table
+
+def etat(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return None
+
+def process_table(*a, **k):
+    if sys._getframe(1).f_code.co_name != "tick":
+        return releve(*a, **k)
+    try:
+        os.unlink(DECLENCHEUR)
+    except FileNotFoundError:
+        return releve(*a, **k)
+    with open(PIDFILE) as fh:
+        sh = int(fh.read())
+    groupe, fin = os.getpgid(sh), time.monotonic() + 10
+    while True:
+        table = releve(*a, **k)
+        if time.monotonic() > fin or any(
+                p["pgid"] == groupe and p["pid"] != sh and not p["zombie"] for p in table):
+            break
+        time.sleep(0.01)
+    open(FINI, "w").close()
+    while time.monotonic() < fin and etat(sh) not in (None, "Z", "X"):
+        time.sleep(0.01)
+    return table
+
+pf.process_table = process_table
+"""
+
+    def _code_au_tour_suivant(self, perime: bool = False):
         cwd = os.path.join(self.tmp, "work", "fond-code")
         os.makedirs(cwd, exist_ok=True)
         self.register("fond-code", "claude", cwd=cwd, prompt="lance le travail")
         fini = os.path.join(self.tmp, "travail-fini")
+        declencheur = os.path.join(self.tmp, "releve-perime")
+        pidfile = os.path.join(self.tmp, "travail.pid")
+        injection = "exec(%r, {'DECLENCHEUR': %r, 'PIDFILE': %r, 'FINI': %r}); " % (
+            self.PERIME, declencheur, pidfile, fini) if perime else ""
         # Le vrai fil de suivi reste actif, mais son attente de 5 s en service
         # ajoute une latence inutile à ce test de bout en bout. Ce réglage ne
         # concerne que le processus enfant, pas les exécuteurs en service.
         lanceur = (
             "import runpy; from ameesh.background import Tracker; "
-            "Tracker.TICK_S = 0.2; runpy.run_module('ameesh.runner', run_name='__main__')"
+            "Tracker.TICK_S = 0.2; " + injection
+            + "runpy.run_module('ameesh.runner', run_name='__main__')"
         )
         # Un tube non lu peut remplir son tampon et bloquer le fil de suivi
         # lorsqu'il journalise. Le fichier garde aussi le diagnostic d'un échec.
@@ -684,6 +741,7 @@ class SousMoissonneurTest(_Base):
             stdout=sortie_fichier, stderr=subprocess.STDOUT, text=True, cwd=self.tmp,
             env=self.env(AMEESH_TEST_BACKGROUND=(
                 "while [ ! -e %s ]; do sleep 0.1; done; exit 3" % shlex.quote(fini)),
+                         AMEESH_TEST_BACKGROUND_PID=pidfile,
                          AMEESH_TURN_GRACE_SECONDS="120"))
         try:
             tour = self.wait_for(self.turns, timeout=60)[0]["env"]["AMEESH_TURN_ID"]
@@ -700,7 +758,7 @@ class SousMoissonneurTest(_Base):
             # #1917 : le travail reste vivant jusqu'à son inscription en grâce
             # (running + ended_at), même si la fin du tour prend plus de 4 s.
             self.wait_for(lambda: ressource("running"), timeout=60, interval=0.5)
-            with open(fini, "w", encoding="utf-8"):
+            with open(declencheur if perime else fini, "w", encoding="utf-8"):
                 pass
             # Même tour, cette fois réellement fermé par le fil `fond`.
             self.wait_for(
