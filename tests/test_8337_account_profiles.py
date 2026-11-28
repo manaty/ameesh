@@ -178,7 +178,15 @@ class KeyShapedValuesAreNeverPublishedTest(unittest.TestCase):
             "DeadBeef0123456789abcdefCAFE",           # hex mêlé
             "A3F9C2E1D4B5A6978877665544332211",      # hex majuscule
             "AKIAIOSFODNN7EXAMPLE",                   # identifiant d'accès
-            "ghpTokenAbc123XyZ")
+            "ghpTokenAbc123XyZ",
+            # relecture ameesh-cx2 : majuscules avec soulignés, lettres seules
+            "ABCDEFGH12345678_IJKLMNOP12345678",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF",
+            "ABCDEFGHIJKLMNOP",
+            "KEY_ABCDEFGHIJKLMNOPQRSTUV",
+            "AB12_CD3456789_EF",
+            "SK_LIVE_51H8X9AB",
+            "TOKEN_123456789012")
 
     def assertNotPublished(self, document, key):
         self.assertNotIn(key, json.dumps(document))
@@ -210,7 +218,9 @@ class KeyShapedValuesAreNeverPublishedTest(unittest.TestCase):
 
     def test_variable_names_stay_published(self):
         for name in ("DEEPSEEK_API_KEY_A", "OPENAI_API_KEY", "K", "_X", "DSK",
-                     "AMEESH_TEST_CLE_1021", "SHORTNAME123"):
+                     "AMEESH_TEST_CLE_1021", "CLAUDE2_KEY",
+                     "OWNING_EXECUTOR_KEY_REFERENCE", "CODEX1_FAKE_SOURCE_A",
+                     "AMEESH_3969_ABSENTE", "SUPER_SECRET_KEY_ENV"):
             with self.subTest(name=name):
                 document = accounts.public_profiles(
                     {"deepseek": [{"name": "a", "type": "api_key_env", "key_env": name}]})

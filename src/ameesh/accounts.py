@@ -779,14 +779,28 @@ PUBLIC_PROFILES_SCHEMA = "ameesh-account-profiles/1"
 #: #8457 : la forme d'un nom de variable d'environnement (majuscules, chiffres,
 #: soulignés) — une clé en minuscules ou en hex mêlé n'y entre plus
 ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
-#: #8457 : forme d'une clé même en majuscules (hex, identifiant d'accès) :
-#: un seul bloc sans souligné, long, mêlant lettres et chiffres
-_KEY_SHAPED_RE = re.compile(r"^(?=[A-Z0-9]*[0-9])(?=[A-Z0-9]*[A-Z])[A-Z0-9]{16,}$")
+#: #8457 : un nom de variable est fait de mots : chaque segment entre
+#: soulignés est court, et un segment qui mêle lettres et chiffres en porte
+#: peu (`CODEX1`, `1021`). Une clé, même en majuscules ou découpée par des
+#: soulignés (hex, identifiant d'accès, suite de lettres), a au moins un long
+#: segment ou un segment chargé de chiffres
+ENV_SEGMENT_MAX = 12
+ENV_DIGITS_ONLY_MAX = 4
+ENV_MIXED_DIGITS_MAX = 2
+
+
+def _word_segment(segment: str) -> bool:
+    digits = sum(c.isdigit() for c in segment)
+    if digits == len(segment):
+        return digits <= ENV_DIGITS_ONLY_MAX
+    return len(segment) <= ENV_SEGMENT_MAX and digits <= ENV_MIXED_DIGITS_MAX
 
 
 def _publishable_env_name(value: str) -> bool:
     """#8457 : `value` peut être recopié comme nom de variable public."""
-    return bool(ENV_NAME_RE.match(value)) and not _KEY_SHAPED_RE.match(value)
+    return bool(ENV_NAME_RE.match(value)) and all(
+        _word_segment(segment) for segment in value.split("_"))
+
 
 #: raisons fermées d'un profil écarté : jamais le texte de `AccountError`,
 #: qui cite des valeurs et des chemins
