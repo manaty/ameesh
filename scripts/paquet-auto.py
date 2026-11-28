@@ -2559,9 +2559,10 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
     units: list[Unit] = []
     discarded: list[Discarded] = []
     removed = dict(removed or {})
-    base = rev(worktree, "HEAD")
-    if base is None:
-        raise PaquetAutoError("worktree sans commit")
+    # #8395 : la base du pliage est la tête du premier candidat avant sa
+    # fusion, lue sur le chemin existant : aucun appel `rev` supplémentaire
+    # (le test d'époque #4113 compte ces appels, et la base est la même).
+    base = ""
     for candidate in candidates:
         if guard is not None:
             guard()
@@ -2569,6 +2570,8 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
         before = rev(worktree, "HEAD")
         if before is None:
             raise PaquetAutoError("worktree sans commit")
+        if not base:
+            base = before
         contained = contained_discard(worktree, candidate.source, before, removed)
         if contained is not None:
             lot, gone = contained
@@ -2625,6 +2628,7 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
     head = rev(worktree, "HEAD")
     if head is None:
         raise PaquetAutoError("worktree sans commit après composition")
+    base = base or head
     composition = Composition(units=units, discarded=discarded, head=head)
     # #8395 : un lot écarté dont la source est déjà portée par une unité (le
     # contenu est dans l'arbre) garde son fragment ; il est plié à sa place
